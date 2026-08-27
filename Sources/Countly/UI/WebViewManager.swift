@@ -1,0 +1,888 @@
+//
+//  WebViewManager.swift
+//
+//  This code is provided under the MIT License.
+//
+//  Please visit www.count.ly for more information.
+//
+
+#if os(iOS) || os(visionOS)
+import UIKit
+import WebKit
+
+/// Presents server-rendered content and feedback widgets, and interprets what the
+/// page asks the SDK to do.
+///
+/// The page talks back through navigation attempts to a sentinel URL rather than
+/// a script bridge, because the same pages are rendered by every Countly SDK and
+/// a URL is the one channel every platform's web view exposes identically.
+///
+/// One manager presents one page. It is shared between content and feedback, so
+/// behavior that only applies to content is gated on `isFeedbackWidget`.
+final class WebViewManager: NSObject {
+
+    private static let module = "WebView"
+
+    /// Prefix of the sentinel URL the page navigates to when it wants something.
+    private static let actionURLPrefix = "https://countly_action_event"
+
+    /// Marker that means "open this in the browser, not in the web view".
+    private static let externalLinkMarker = "cly_x_int=1"
+
+    /// Parameters whose values may themselves contain an unescaped `&`.
+    private static let reservedKeys = ["action", "event", "resize_me", "close", "link"]
+
+    private unowned let core: SDKCore
+
+    private var window: OverlayWindow?
+    private var backgroundView: PassThroughBackgroundView?
+    private var webView: WKWebView?
+
+    private var appearBlock: (() -> Void)?
+    private var dismissBlock: (() -> Void)?
+
+    private var hasAppeared = false
+    private var isClosed = false
+
+    /// Set when the presented page is a feedback widget rather than content.
+    private var isFeedbackWidget = false
+
+    /// Set when content is pinned to the portrait layout.
+    private var isPinnedToPortrait = false
+
+    /// Fires when a content page has not reported itself shown in time.
+    private var stallTimer: Timer?
+
+    /// How many times a load has been retried after a critical resource failed.
+    private var resourceRetryCount = 0
+
+    /// How many reloads a failed critical resource is worth before the page is
+    /// given up on. One transient hiccup is common; three in a row is a real
+    /// failure.
+    private static let maxResourceRetries = 3
+
+    /// Base of the linear backoff between resource retries, in seconds.
+    private static let resourceRetryBaseDelay: TimeInterval = 1.0
+
+    /// Used when the configured stall timeout is not a usable positive number.
+    private static let defaultStallTimeout: TimeInterval = 1.0
+
+    /// The reload a failure scheduled, held so a load that succeeds in the delay
+    /// window can cancel it. Non-nil also means "a retry is already scheduled", so
+    /// several failures from one page load coalesce into one.
+    private var pendingReload: DispatchWorkItem?
+
+    /// Message names the injected scripts post back on.
+    private enum ScriptMessage {
+        static let resourceLoadError = "resourceLoadError"
+        static let resourceVerifyResult = "resourceVerifyResult"
+    }
+
+    init(core: SDKCore) {
+        self.core = core
+        super.init()
+    }
+
+    // MARK: - Presentation
+
+    /// Puts a page on screen.
+    ///
+    /// - Parameters:
+    ///   - url: The page to load.
+    ///   - frame: Where to place it. Defaults to filling the overlay.
+    ///   - appear: Called once the page has loaded and is visible.
+    ///   - dismiss: Called once the page has been taken off screen.
+    func present(url: URL?,
+                 frame: CGRect? = nil,
+                 appear: (() -> Void)?,
+                 dismiss: (() -> Void)?) {
+        guard let url else {
+            core.logger.e(Self.module, "present", "web view presentation is dropped, the URL could not be built")
+            return
+        }
+
+        isFeedbackWidget = url.path.contains(Endpoint.feedback)
+        isPinnedToPortrait = !isFeedbackWidget && core.config.content.disableRotation
+
+        // Host and path only: the query string carries the app key and device ID.
+        core.logger.i(Self.module, "present", "web view presentation requested, host: [\(url.host ?? "")], path: [\(url.path)], isFeedbackWidget: [\(isFeedbackWidget)], pinnedToPortrait: [\(isPinnedToPortrait)]")
+        core.logger.v(Self.module, "present", "web view presentation URL detail, url: [\(url.absoluteString)]")
+
+        appearBlock = appear
+        dismissBlock = dismiss
+        hasAppeared = false
+        isClosed = false
+        resourceRetryCount = 0
+        cancelPendingReload()
+
+        let overlayWindow = OverlayWindow()
+        let controller = WebViewController()
+        controller.modalPresentationStyle = .overFullScreen
+        controller.sizeChangeHandler = { [weak self] in
+            self?.handleInterfaceSizeChange()
+        }
+        overlayWindow.rootViewController = controller
+
+        let background = PassThroughBackgroundView(frame: controller.view.bounds)
+        background.backgroundColor = .clear
+        background.reportPortraitSizeOnly = isPinnedToPortrait
+        background.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        controller.contentView = background
+
+        let configuration = WKWebViewConfiguration()
+        // A non-persistent store keeps widget answers and content state out of the
+        // host application's cookie jar.
+        configuration.websiteDataStore = .nonPersistent()
+
+        if core.config.content.disableZoom {
+            configuration.userContentController.addUserScript(Self.disableZoomScript)
+        }
+
+        // Held weakly through a proxy: `WKUserContentController` retains its
+        // message handlers, and the controller is reachable from the web view this
+        // object owns, so registering directly would be a cycle nothing breaks.
+        let proxy = ScriptMessageProxy(target: self)
+        configuration.userContentController.addUserScript(Self.resourceErrorScript)
+        configuration.userContentController.add(proxy, name: ScriptMessage.resourceLoadError)
+        configuration.userContentController.add(proxy, name: ScriptMessage.resourceVerifyResult)
+
+        let targetFrame = frame ?? background.bounds
+        let web = WKWebView(frame: targetFrame, configuration: configuration)
+        web.navigationDelegate = self
+        web.isOpaque = false
+        web.backgroundColor = .clear
+        web.scrollView.backgroundColor = .clear
+        web.scrollView.bounces = false
+        web.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        // Hidden until the page loads, so a blank rectangle never flashes over the
+        // application.
+        web.isHidden = true
+
+        background.addSubview(web)
+
+        self.window = overlayWindow
+        self.backgroundView = background
+        self.webView = web
+
+        overlayWindow.isHidden = false
+        web.load(URLRequest(url: url))
+
+        armStallTimerIfNeeded()
+    }
+
+    /// Takes the page off screen and reports the dismissal once.
+    func close() {
+        guard !isClosed else { return }
+        isClosed = true
+
+        core.logger.d(Self.module, "close", "web view is being closed")
+
+        let finish = { [weak self] in
+            guard let self else { return }
+            // Invalidated here rather than above: a `Timer` has to be invalidated on
+            // the thread that scheduled it, and `close()` accepts calls from any.
+            self.cancelStallTimer()
+            self.pendingReload?.cancel()
+            self.pendingReload = nil
+            self.webView?.stopLoading()
+            self.webView?.navigationDelegate = nil
+            let controller = self.webView?.configuration.userContentController
+            controller?.removeScriptMessageHandler(forName: ScriptMessage.resourceLoadError)
+            controller?.removeScriptMessageHandler(forName: ScriptMessage.resourceVerifyResult)
+            controller?.removeAllUserScripts()
+            self.webView?.removeFromSuperview()
+            self.webView = nil
+            self.window?.isHidden = true
+            self.window?.rootViewController = nil
+            self.window = nil
+            self.backgroundView = nil
+
+            let dismiss = self.dismissBlock
+            self.dismissBlock = nil
+            dismiss?()
+        }
+
+        if Thread.isMainThread {
+            finish()
+        } else {
+            DispatchQueue.main.async(execute: finish)
+        }
+    }
+
+    private func reportAppearance() {
+        guard !hasAppeared else { return }
+        // A pending reload is cancelled by this flag alone: the scheduled block
+        // checks it before reloading, so a load that succeeded during the delay
+        // window is never wiped by the retry the earlier failure scheduled.
+        hasAppeared = true
+        webView?.isHidden = false
+
+        // Released once fired, the way the dismissal block is. It captures the
+        // presenting module, which holds this manager, so keeping it would be a
+        // cycle that only unwinds if a dismissal happens to arrive.
+        let appear = appearBlock
+        appearBlock = nil
+        appear?()
+    }
+
+    // MARK: - Recovery
+
+    /// Arms the deadline by which a content page has to report itself shown.
+    ///
+    /// A page whose scripts failed renders nothing and would otherwise sit over the
+    /// application forever. Feedback widgets never report the shown event, so the
+    /// deadline is content only.
+    private func armStallTimerIfNeeded() {
+        guard !isFeedbackWidget, core.config.content.enableContentReloadOnStall else { return }
+
+        // Floored: a zero or negative value, which reads like "no timeout", would
+        // otherwise arm a timer that fires on the next run loop turn and dismiss
+        // every page before it could load.
+        let configured = TimeInterval(core.config.content.contentReloadOnStallTimeout) / 1000.0
+        let timeout = configured > 0 ? configured : Self.defaultStallTimeout
+        stallTimer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
+            self?.attemptRecovery(reason: "the content did not report itself shown in time")
+        }
+    }
+
+    /// Cancels the stall deadline once the page says it is showing something.
+    private func cancelStallTimer() {
+        stallTimer?.invalidate()
+        stallTimer = nil
+    }
+
+    // MARK: - Layout
+
+    /// Re-lays the page out after a rotation, unless it is pinned to portrait.
+    private func handleInterfaceSizeChange() {
+        guard !isPinnedToPortrait else { return }
+        guard let backgroundView, let webView else { return }
+        webView.frame = CGRect(origin: .zero, size: backgroundView.effectiveSize)
+    }
+
+    /// Applies a size the page asked for, in the page's own coordinate space.
+    private func resize(with parameters: [String: Any]) {
+        guard let backgroundView, let webView else { return }
+
+        // The page describes where it wants to sit as a fraction of the screen,
+        // under the key matching the current orientation.
+        let isPortrait = backgroundView.effectiveSize.height >= backgroundView.effectiveSize.width
+        let key = isPortrait ? "p" : "l"
+        guard let geometry = parameters[key] as? [String: Any] else { return }
+
+        let container = backgroundView.effectiveSize
+        let x = (geometry["x"] as? NSNumber)?.doubleValue ?? 0
+        let y = (geometry["y"] as? NSNumber)?.doubleValue ?? 0
+        let width = (geometry["w"] as? NSNumber)?.doubleValue ?? Double(container.width)
+        let height = (geometry["h"] as? NSNumber)?.doubleValue ?? Double(container.height)
+
+        var frame = CGRect(x: x, y: y, width: width, height: height)
+
+        if core.config.content.webViewDisplayOption == .safeArea {
+            let insets = backgroundView.safeAreaInsets
+            frame = frame.offsetBy(dx: insets.left, dy: insets.top)
+        }
+
+        core.logger.d(Self.module, "resize", "content asked to be resized, width: [\(frame.width)], height: [\(frame.height)]")
+        webView.frame = frame
+    }
+
+    // MARK: - Actions
+
+    /// Runs whatever the page asked for.
+    private func handleAction(_ parameters: [String: Any]) {
+        // The action runs first: a closing call to action carries both its event
+        // and `close`, and returning early would throw the event away.
+        defer {
+            if let closeValue = parameters["close"] as? String, Self.isTruthy(closeValue) {
+                core.logger.d(Self.module, "handleAction", "the content asked to be closed")
+                close()
+            }
+        }
+
+        guard let action = parameters["action"] as? String else { return }
+
+        core.logger.d(Self.module, "handleAction", "a content action was received, action: [\(action)]")
+        core.logger.v(Self.module, "handleAction", "the content action detail, action: [\(action)], queryParameters: [\(parameters)]")
+
+        switch action {
+        case "event":
+            if let eventsJSON = parameters["event"] as? String {
+                recordEvents(fromJSON: eventsJSON)
+            }
+        case "link":
+            if let link = parameters["link"] as? String {
+                openExternalLink(link)
+            }
+        case "resize_me":
+            if let resizeJSON = parameters["resize_me"] as? String,
+               let geometry = CountlyJSON.object(from: Data(resizeJSON.utf8), logger: core.logger) as? [String: Any] {
+                resize(with: geometry)
+            }
+        default:
+            core.logger.d(Self.module, "handleAction", "unknown content action, it will be ignored, action: [\(action)]")
+        }
+    }
+
+    /// Records the events a content page reports.
+    private func recordEvents(fromJSON json: String) {
+        guard let events = CountlyJSON.object(from: Data(json.utf8), logger: core.logger) as? [[String: Any]] else {
+            core.logger.e(Self.module, "recordEvents", "the content events payload is nil or not an array, ignoring the action")
+            return
+        }
+
+        var skipped = 0
+        for event in events {
+            guard let key = event["key"] as? String, !key.isEmpty else {
+                core.logger.v(Self.module, "recordEvents", "skipping a content event, reason: the event key is nil or empty")
+                skipped += 1
+                continue
+            }
+
+            // The page sends segmentation under either name depending on its age.
+            let segmentation = (event["sg"] as? [String: Any]) ?? (event["segmentation"] as? [String: Any])
+            guard let segmentation else {
+                core.logger.v(Self.module, "recordEvents", "skipping a content event, reason: the event has no segmentation, key: [\(key)]")
+                skipped += 1
+                continue
+            }
+
+            // The page reporting that it is showing content is proof it did not
+            // stall, so the deadline is dropped.
+            if key == "[CLY]_content_shown" {
+                core.logger.d(Self.module, "recordEvents", "the page reported that the content is shown, cancelling the content shown deadline")
+                cancelStallTimer()
+                reportAppearance()
+            }
+
+            core.logger.d(Self.module, "recordEvents", "recording a content event, key: [\(key)]")
+            core.modules.events.recordEvent(key, segmentation: segmentation)
+        }
+
+        if skipped > 0 {
+            core.logger.d(Self.module, "recordEvents", "some content events were dropped, dropped: [\(skipped)], recorded: [\(events.count - skipped)]")
+        } else {
+            core.logger.i(Self.module, "recordEvents", "content events recorded, count: [\(events.count)]")
+        }
+
+        core.modules.events.addEventsToRequestQueue()
+        core.requestQueueStore.saveSync()
+        core.network.proceedOnQueue()
+    }
+
+    /// Hands a link to the host application, or to the browser.
+    private func openExternalLink(_ urlString: String) {
+        core.logger.d(Self.module, "openExternalLink", "an external link was requested by the content")
+
+        var url = URL(string: urlString)
+        if url == nil {
+            // A decoded link may hold characters URL rejects, such as a space that
+            // came from a `%20`.
+            let encoded = urlString.addingPercentEncoding(withAllowedCharacters: .urlFragmentAllowed)
+            url = encoded.flatMap { URL(string: $0) }
+        }
+
+        guard let url else {
+            core.logger.w(Self.module, "openExternalLink", "the external link could not be parsed as a URL and will be ignored")
+            return
+        }
+
+        if let handler = core.config.content.contentURLHandler, handler(url) {
+            core.logger.i(Self.module, "openExternalLink", "the URL was handled by the app's content URL handler, host: [\(url.host ?? "")], path: [\(url.path)]")
+            return
+        }
+
+        UIApplication.shared.open(url, options: [:]) { [weak self] success in
+            self?.core.logger.i(Self.module, "openExternalLink", "the URL was handed to the browser, host: [\(url.host ?? "")], opened: [\(success)]")
+        }
+    }
+
+    // MARK: - Action URL parsing
+
+    /// Splits the sentinel URL's query string into parameters.
+    ///
+    /// A plain split on `&` does not work: `link` carries an unescaped URL that may
+    /// have its own query string, and a decoded `event` or `resize_me` JSON may
+    /// contain an `&` inside a string. So the query is consumed from the right,
+    /// taking at each step the rightmost reserved marker whose value is valid for
+    /// its key. A marker whose value does not validate is ordinary text inside an
+    /// enclosing value and gets absorbed by it.
+    ///
+    /// The documented limitation is that a value literally containing
+    /// `&<reserved key>=<valid value>` can still be mis-split.
+    static func parseActionQuery(_ urlString: String) -> [String: Any] {
+        var result: [String: Any] = [:]
+
+        let decoded = urlString.removingPercentEncoding ?? urlString
+        guard let questionMark = decoded.firstIndex(of: "?") else { return result }
+
+        let query = Array(decoded[decoded.index(after: questionMark)...])
+        var end = query.count
+
+        while end > 0 {
+            var chosenIndex = -1
+            var chosenKey: String?
+            var chosenValue: String?
+            var searchFrom = end
+
+            while searchFrom > 0 {
+                var marker = -1
+                var markerKey: String?
+
+                for key in reservedKeys {
+                    let needle = Array("&\(key)=")
+                    if let location = lastIndex(of: needle, in: query, before: searchFrom),
+                       location > marker,
+                       location + needle.count <= end {
+                        marker = location
+                        markerKey = key
+                    }
+                }
+
+                guard marker >= 0, let markerKey else { break }
+
+                let valueStart = marker + markerKey.count + 2
+                let value = String(query[valueStart..<end])
+
+                if isReservedValue(value, validFor: markerKey) {
+                    chosenIndex = marker
+                    chosenKey = markerKey
+                    chosenValue = value
+                    break
+                }
+
+                searchFrom = marker
+            }
+
+            guard chosenIndex >= 0, let chosenKey, let chosenValue else { break }
+            result[chosenKey] = chosenValue
+            end = chosenIndex
+        }
+
+        // Whatever is left at the front is the plain identifier parameter.
+        let head = String(query[0..<end])
+        for pair in head.split(separator: "&", omittingEmptySubsequences: true) {
+            guard let equals = pair.firstIndex(of: "=") else { continue }
+            let key = String(pair[pair.startIndex..<equals])
+            let value = String(pair[pair.index(after: equals)...])
+            result[key] = value
+        }
+
+        return result
+    }
+
+    /// Rightmost occurrence of `needle` in `haystack` starting before `limit`.
+    private static func lastIndex(of needle: [Character], in haystack: [Character], before limit: Int) -> Int? {
+        guard needle.count <= limit else { return nil }
+        var index = limit - needle.count
+        while index >= 0 {
+            if Array(haystack[index..<(index + needle.count)]) == needle { return index }
+            index -= 1
+        }
+        return nil
+    }
+
+    /// Whether a value is plausible for its key, which is what tells a real
+    /// parameter from text that happens to look like one.
+    private static func isReservedValue(_ value: String, validFor key: String) -> Bool {
+        switch key {
+        case "event":
+            return CountlyJSON.object(from: Data(value.utf8), logger: nil) is [Any]
+        case "resize_me":
+            return CountlyJSON.object(from: Data(value.utf8), logger: nil) is [String: Any]
+        case "close":
+            return value == "0" || value == "1"
+        case "action":
+            return value == "event" || value == "link" || value == "resize_me"
+        case "link":
+            return hasURIScheme(value)
+        default:
+            return false
+        }
+    }
+
+    /// Whether a flag value means yes.
+    ///
+    /// Accepts the same spellings the other SDKs' pages send, not just `1`: a page
+    /// sending `close=true` would otherwise leave content on screen forever.
+    private static func isTruthy(_ value: String) -> Bool {
+        switch value.lowercased() {
+        case "1", "true", "yes": return true
+        default: return false
+        }
+    }
+
+    /// Whether the value starts with a URI scheme, which covers both `https` links
+    /// and custom-scheme deep links.
+    static func hasURIScheme(_ value: String) -> Bool {
+        guard let colon = value.firstIndex(of: ":"), colon != value.startIndex else { return false }
+
+        for (offset, character) in value[value.startIndex..<colon].enumerated() {
+            let isValid: Bool
+            if offset == 0 {
+                isValid = character.isLetter && character.isASCII
+            } else {
+                isValid = (character.isLetter || character.isNumber) && character.isASCII
+                    || character == "+" || character == "-" || character == "."
+            }
+            if !isValid { return false }
+        }
+        return true
+    }
+
+    // MARK: - Critical resource failures
+
+    /// Reports a stylesheet or script that failed to load.
+    ///
+    /// Two mechanisms, because neither sees everything: the capturing `error`
+    /// listener catches transport level failures (DNS, refused connection, a
+    /// blocked host) but not HTTP status codes, and the `PerformanceObserver`
+    /// catches a 404 or a 502, which the browser considers a successful load.
+    /// `favicon.ico` is excluded because the system requests it whether the page
+    /// references one or not.
+    private static let resourceErrorScript: WKUserScript = {
+        let source = """
+        (function () {
+          function report(tag, url) {
+            window.webkit.messageHandlers.\(ScriptMessage.resourceLoadError).postMessage({ tag: tag, url: url });
+          }
+          function isCritical(el) {
+            if (!el || !el.tagName) { return false; }
+            if (el.tagName === 'SCRIPT') { return true; }
+            // Only a stylesheet is critical. A preload hint, an icon, a manifest or
+            // an alternate can all fail without the page being any less usable, and
+            // dismissing content over a missing favicon is worse than the favicon.
+            return el.tagName === 'LINK' && (el.rel || '').toLowerCase() === 'stylesheet';
+          }
+          window.addEventListener('error', function (e) {
+            if (!isCritical(e.target)) { return; }
+            var url = e.target.src || e.target.href;
+            if (!url || url.indexOf('favicon.ico') !== -1) { return; }
+            report(e.target.tagName, url);
+          }, true);
+          // `initiatorType` is 'link' for every kind of link element, so the
+          // stylesheet URLs are resolved from the document to tell them apart.
+          function stylesheetURLs() {
+            var out = [];
+            var nodes = document.querySelectorAll('link[rel="stylesheet"]');
+            for (var i = 0; i < nodes.length; i++) { if (nodes[i].href) { out.push(nodes[i].href); } }
+            return out;
+          }
+          if (window.PerformanceObserver) {
+            var observer = new PerformanceObserver(function (list) {
+              // Re-read per batch rather than cached: this observer is installed at
+              // document start, when the document has no link elements yet.
+              var stylesheets = stylesheetURLs();
+              list.getEntries().forEach(function (entry) {
+                if (!entry.responseStatus || entry.responseStatus < 400) { return; }
+                if (entry.name && entry.name.indexOf('favicon.ico') !== -1) { return; }
+                if (entry.initiatorType === 'script') { report('SCRIPT', entry.name); }
+                else if (entry.initiatorType === 'link' && stylesheets.indexOf(entry.name) !== -1) { report('LINK', entry.name); }
+              });
+            });
+            observer.observe({ type: 'resource', buffered: true });
+          }
+        })();
+        """
+        // Main frame only: a failed asset in some third party iframe is not a
+        // reason to reload the page the SDK is presenting, and injecting into every
+        // subframe reports the same failure several times.
+        return WKUserScript(source: source, injectionTime: .atDocumentStart, forMainFrameOnly: true)
+    }()
+
+    /// Asks the page to re-request every stylesheet and script with `HEAD` and
+    /// report the status codes.
+    ///
+    /// A fallback for the systems where `PerformanceResourceTiming` carries no
+    /// status code, which is where the observer above is inert and an HTTP error is
+    /// invisible: the browser counts a 404 as a successful load. The script itself
+    /// checks for that and answers immediately where the observer suffices, so on a
+    /// current system this costs one evaluation and no requests.
+    ///
+    /// The result comes back through a message handler rather than the evaluation
+    /// callback because `evaluateJavaScript` cannot return a promise.
+    private func verifyResourceStatuses() {
+        // Never for a widget: `didFinish` marks a widget as appeared on the very
+        // next line, and a failure after that is non fatal by design, so every
+        // request this makes would be answered into a decision nothing acts on.
+        guard !isFeedbackWidget, !isClosed, let webView else { return }
+
+        let source = """
+        (function () {
+          // The observer already reports a 4xx for everything, including resources
+          // served from the in-session cache, wherever PerformanceResourceTiming
+          // carries a status. Only where it does not, which is iOS before 16.4, is
+          // there a gap worth a second request per asset.
+          if (typeof PerformanceResourceTiming !== 'undefined' &&
+              'responseStatus' in PerformanceResourceTiming.prototype) {
+            window.webkit.messageHandlers.\(ScriptMessage.resourceVerifyResult).postMessage({ results: [] });
+            return;
+          }
+          var urls = [];
+          document.querySelectorAll('link[rel="stylesheet"]').forEach(function (l) { if (l.href) { urls.push({ tag: 'LINK', url: l.href }); } });
+          document.querySelectorAll('script[src]').forEach(function (s) { urls.push({ tag: 'SCRIPT', url: s.src }); });
+          if (urls.length === 0) {
+            window.webkit.messageHandlers.\(ScriptMessage.resourceVerifyResult).postMessage({ results: [] });
+            return;
+          }
+          Promise.all(urls.map(function (r) {
+            return fetch(r.url, { method: 'HEAD' })
+              .then(function (response) { return { tag: r.tag, url: r.url, status: response.status }; })
+              .catch(function () { return { tag: r.tag, url: r.url, status: 0 }; });
+          })).then(function (results) {
+            window.webkit.messageHandlers.\(ScriptMessage.resourceVerifyResult).postMessage({ results: results });
+          });
+        })();
+        """
+
+        webView.evaluateJavaScript(source) { [weak self] _, error in
+            guard let self, let error else { return }
+            self.core.logger.d(Self.module, "verifyResourceStatuses", "the resource verification script could not be injected, continuing without verification, error: [\(error.localizedDescription)]")
+        }
+    }
+
+    /// Receives both injected scripts' messages.
+    fileprivate func handleScriptMessage(name: String, body: Any) {
+        switch name {
+        case ScriptMessage.resourceLoadError:
+            guard let payload = body as? [String: Any] else { return }
+            let tag = payload["tag"] as? String ?? "?"
+            attemptRecovery(reason: "\(tag) failed to load")
+
+        case ScriptMessage.resourceVerifyResult:
+            guard let payload = body as? [String: Any],
+                  let results = payload["results"] as? [[String: Any]] else { return }
+
+            // Only a status the server actually returned counts. A rejected fetch
+            // reports 0, and cross origin assets without CORS headers reject
+            // exactly like an unreachable host does, so treating 0 as a failure
+            // would dismiss every page served off a plain CDN.
+            let failure = results.first { result in
+                ((result["status"] as? NSNumber)?.intValue ?? 0) >= 400
+            }
+
+            guard let failure else {
+                core.logger.d(Self.module, "handleScriptMessage", "every stylesheet and script verified good, resourceCount: [\(results.count)]")
+                cancelPendingReload(rearmDeadline: true)
+                return
+            }
+
+            let tag = failure["tag"] as? String ?? "?"
+            let status = (failure["status"] as? NSNumber)?.intValue ?? 0
+            attemptRecovery(reason: "\(tag) verified as failed with status \(status)")
+
+        default:
+            break
+        }
+    }
+
+    /// Reloads a page that has not managed to show itself, or gives up on it.
+    ///
+    /// The single answer to "this page never became visible", whichever detector
+    /// noticed: the deadline passing, a stylesheet or script failing to load, or
+    /// one verifying as a 4xx. They share one retry budget, one coalescing flag and
+    /// one backoff, because they are one problem and reloading twice for two
+    /// symptoms of it wipes the load that was about to succeed.
+    ///
+    /// Once the page is visible nothing here fires: the injected listeners stay live
+    /// for the whole page life, so a lazily loaded resource failing afterwards would
+    /// otherwise flash the page away, re-fire its on-load event, or dismiss content
+    /// the user is part way through.
+    private func attemptRecovery(reason: String) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.attemptRecovery(reason: reason) }
+            return
+        }
+
+        guard !isClosed else { return }
+
+        if hasAppeared {
+            core.logger.d(Self.module, "attemptRecovery", "a failure arrived after the page was already visible, treating it as non fatal, reason: [\(reason)]")
+            return
+        }
+
+        // Reload on stall is a content zone setting and has nothing to say about a
+        // widget, so a widget always takes the retry path. It must never take the
+        // "leave it alone" path either: the page carries its own close control, so
+        // a widget whose script failed has no close button, no deadline and no
+        // native dismiss, and would sit full screen over the application swallowing
+        // every touch until the process is killed.
+        guard isFeedbackWidget || core.config.content.enableContentReloadOnStall else {
+            core.logger.d(Self.module, "attemptRecovery", "reload on stall is disabled, the page is being dismissed, reason: [\(reason)]")
+            close()
+            return
+        }
+
+        guard pendingReload == nil else {
+            core.logger.d(Self.module, "attemptRecovery", "a reload is already scheduled for this load, the failure is ignored, reason: [\(reason)]")
+            return
+        }
+
+        guard resourceRetryCount < Self.maxResourceRetries else {
+            core.logger.w(Self.module, "attemptRecovery", "the reload attempts are exhausted, the page is being dismissed, attempt: [\(resourceRetryCount)], reason: [\(reason)]")
+            close()
+            return
+        }
+
+        resourceRetryCount += 1
+        cancelStallTimer()
+
+        let delay = Self.resourceRetryBaseDelay * TimeInterval(resourceRetryCount)
+        core.logger.d(Self.module, "attemptRecovery", "scheduling a reload, attempt: [\(resourceRetryCount)], maxAttempts: [\(Self.maxResourceRetries)], delay: [\(delay)], reason: [\(reason)]")
+
+        let reload = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingReload = nil
+
+            guard !self.isClosed, !self.hasAppeared else { return }
+            self.webView?.reload()
+            // Re-armed, so a reload that stalls in turn still has a deadline. Without
+            // this the recovery attempt itself would leave the overlay with none.
+            self.armStallTimerIfNeeded()
+        }
+        pendingReload = reload
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: reload)
+    }
+
+    /// Cancels a scheduled reload and re-arms the deadline instead.
+    ///
+    /// Called whenever the page proves it is making progress. Without it a page
+    /// slower than the stall deadline is destroyed by the reload that deadline
+    /// scheduled, moments before it would have shown itself, and its on-load
+    /// reporting fires again on the replacement.
+    private func cancelPendingReload(rearmDeadline: Bool = false) {
+        guard let pending = pendingReload else { return }
+        pending.cancel()
+        pendingReload = nil
+
+        core.logger.d(Self.module, "cancelPendingReload", "the page made progress, the scheduled reload is cancelled")
+        if rearmDeadline { armStallTimerIfNeeded() }
+    }
+
+    /// Turns off pinch and double-tap zoom while leaving the page's own viewport
+    /// width and initial scale alone.
+    private static let disableZoomScript: WKUserScript = {
+        let source = """
+        var meta = document.querySelector('meta[name=viewport]');
+        if (!meta) { meta = document.createElement('meta'); meta.name = 'viewport'; document.head.appendChild(meta); }
+        var content = meta.getAttribute('content') || 'width=device-width, initial-scale=1.0';
+        if (content.indexOf('user-scalable') === -1) { content += ', user-scalable=no'; }
+        if (content.indexOf('maximum-scale') === -1) { content += ', maximum-scale=1.0'; }
+        meta.setAttribute('content', content);
+        """
+        return WKUserScript(source: source, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+    }()
+}
+
+// MARK: - Navigation
+
+extension WebViewManager: WKNavigationDelegate {
+
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard let url = navigationAction.request.url?.absoluteString else {
+            core.logger.d(Self.module, "decidePolicyFor", "the navigation action carries no URL, allowing it")
+            decisionHandler(.allow)
+            return
+        }
+
+        // An explicitly external link never loads inside the widget.
+        if url.contains(Self.externalLinkMarker) {
+            core.logger.d(Self.module, "decidePolicyFor", "the navigation action is marked as external, it will be opened outside the web view")
+            openExternalLink(url)
+            decisionHandler(.cancel)
+            return
+        }
+
+        if url.hasPrefix(Self.actionURLPrefix) {
+            let parameters = Self.parseActionQuery(url)
+            core.logger.d(Self.module, "decidePolicyFor", "action event URL parsed, parameterCount: [\(parameters.count)]")
+            handleAction(parameters)
+            decisionHandler(.cancel)
+            return
+        }
+
+        decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        core.logger.d(Self.module, "didFinish", "the page finished loading")
+
+        // The load completing is progress, whatever the deadline thought. The
+        // deadline is re-armed rather than dropped, because content still has to
+        // report itself shown and a page that loads but never renders is exactly
+        // what it exists to catch.
+        cancelPendingReload(rearmDeadline: true)
+        verifyResourceStatuses()
+
+        // A feedback widget renders itself as soon as it loads and never reports a
+        // shown event, so loading is the only signal it has appeared.
+        if isFeedbackWidget {
+            reportAppearance()
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        core.logger.d(Self.module, "didFail", "the page failed to load, error: [\(error.localizedDescription)]")
+        close()
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        core.logger.d(Self.module, "didFailProvisionalNavigation", "the page failed to start loading, error: [\(error.localizedDescription)]")
+        close()
+    }
+}
+
+/// Hosts the overlay content and reports interface size changes.
+final class WebViewController: UIViewController {
+
+    /// Called when the interface size changes, which is the reliable rotation
+    /// signal: the device orientation notification also fires for face up and face
+    /// down, which do not change the layout.
+    var sizeChangeHandler: (() -> Void)?
+
+    var contentView: UIView? {
+        didSet {
+            oldValue?.removeFromSuperview()
+            if let contentView {
+                contentView.frame = view.bounds
+                view.addSubview(contentView)
+            }
+        }
+    }
+
+    override func loadView() {
+        view = PassThroughBackgroundView(frame: ScreenReader.screenBounds)
+        view.backgroundColor = .clear
+    }
+
+    override func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
+        super.viewWillTransition(to: size, with: coordinator)
+        coordinator.animate(alongsideTransition: nil) { [weak self] _ in
+            self?.sizeChangeHandler?()
+        }
+    }
+}
+
+/// Forwards `WKScriptMessage`s to a `WebViewManager` without retaining it.
+///
+/// `WKUserContentController` holds its message handlers strongly, and the manager
+/// owns the web view that owns the controller, so registering the manager itself
+/// would make a cycle that nothing ever breaks.
+private final class ScriptMessageProxy: NSObject, WKScriptMessageHandler {
+
+    private weak var target: WebViewManager?
+
+    init(target: WebViewManager) {
+        self.target = target
+        super.init()
+    }
+
+    func userContentController(_ userContentController: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        target?.handleScriptMessage(name: message.name, body: message.body)
+    }
+}
+
+#endif

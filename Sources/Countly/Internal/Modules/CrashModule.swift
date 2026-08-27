@@ -1,0 +1,492 @@
+//
+//  CrashModule.swift
+//
+//  This code is provided under the MIT License.
+//
+//  Please visit www.count.ly for more information.
+//
+
+import Foundation
+import Darwin
+import MachO
+
+/// Captures crashes and handled errors, with the context needed to symbolicate
+/// them later.
+///
+/// A fatal crash is sent immediately and synchronously, because the process is
+/// about to die and a queued request would never leave. Everything else goes
+/// through the normal queue.
+final class CrashModule: ModuleBase {
+
+    override class var moduleName: String { "Crash" }
+
+    /// Keys of the crash payload.
+    private enum Key {
+        static let binaryImages = "_binary_images"
+        static let os = "_os"
+        static let osVersion = "_os_version"
+        static let device = "_device"
+        static let architecture = "_architecture"
+        static let resolution = "_resolution"
+        static let appVersion = "_app_version"
+        static let appBuild = "_app_build"
+        static let buildUUID = "_build_uuid"
+        static let executableName = "_executable_name"
+        static let name = "_name"
+        static let type = "_type"
+        static let error = "_error"
+        static let nonfatal = "_nonfatal"
+        static let ramCurrent = "_ram_current"
+        static let ramTotal = "_ram_total"
+        static let diskCurrent = "_disk_current"
+        static let diskTotal = "_disk_total"
+        static let battery = "_bat"
+        static let orientation = "_orientation"
+        static let online = "_online"
+        static let root = "_root"
+        static let background = "_background"
+        static let run = "_run"
+        static let custom = "_custom"
+        static let logs = "_logs"
+        static let changedFields = "_ob"
+        static let imageLoadAddress = "la"
+        static let imageBuildUUID = "id"
+    }
+
+    private static let mebibyte: UInt64 = 1_048_576
+
+    /// Breadcrumbs kept in memory for this run.
+    private var breadcrumbs: [String] = []
+    private let breadcrumbLock = NSLock()
+
+    /// Global segmentation merged into every report.
+    private var crashSegmentation: [String: Any] = [:]
+
+    /// Whether this instance installed the process-wide handlers.
+    private var isHandlerInstalled = false
+
+    /// Filled in while resolving binary images, needed by the server for fast
+    /// symbol lookup.
+    private var buildUUID: String?
+    private var executableName: String?
+    private var architecture: String?
+
+    // MARK: - Init
+
+    func applyInitialConfig() {
+        if let segmentation = core.config.crashSegmentation {
+            setCrashSegmentation(segmentation)
+        }
+        adoptBreadcrumbsFromPreviousRun()
+    }
+
+    /// Sets the segmentation merged into every crash report.
+    func setCrashSegmentation(_ segmentation: [String: Any]) {
+        logI("setCrashSegmentation", "global crash segmentation is being set, keyCount: [\(segmentation.count)]")
+        logV("setCrashSegmentation", "global crash segmentation detail, segmentation: [\(segmentation)]")
+        crashSegmentation = core.limits.truncatedAndLimited(segmentation, "Crash segmentation")
+    }
+
+    // MARK: - Handler installation
+
+    /// Installs the uncaught exception and signal handlers.
+    ///
+    /// Idempotent, because it is reached from init, from a consent change, and
+    /// from a behavior settings response that may land on any thread.
+    func startCrashReporting() {
+        guard core.serverConfig.automaticCrashReportingEnabled else {
+            logD("startCrashReporting", "crash handlers are not installed, automatic crash reporting is disabled")
+            return
+        }
+
+        guard core.modules.consent.hasConsent(for: .crashReporting) else {
+            logV("startCrashReporting", "no crashes consent given, crash handlers are not installed")
+            return
+        }
+
+        guard !isHandlerInstalled else {
+            logD("startCrashReporting", "crash handlers are already installed, nothing to do")
+            return
+        }
+
+        logD("startCrashReporting", "installing the built in uncaught exception handler and signal handlers")
+        CrashHandlerInstaller.shared.register(self)
+        isHandlerInstalled = true
+    }
+
+    /// Stops reporting and drops the breadcrumbs.
+    ///
+    /// Reachable from the crash handler itself, so every log line here stays at
+    /// debug or lower.
+    func stopCrashReporting() {
+        // Breadcrumbs are gathered under crash consent alone, so they can exist
+        // even when no handler was ever installed and a consent withdrawal has to
+        // drop them either way.
+        clearCrashLogs()
+
+        guard isHandlerInstalled else {
+            logD("stopCrashReporting", "crash handler uninstall is a no-op, no crash handlers were installed by this instance")
+            return
+        }
+
+        logD("stopCrashReporting", "uninstalling this instance from the crash handlers")
+        CrashHandlerInstaller.shared.deregister(self)
+        isHandlerInstalled = false
+    }
+
+    // MARK: - Recording
+
+    /// Records an exception, fatal or handled.
+    func recordException(_ exception: NSException,
+                         isFatal: Bool,
+                         stackTrace: [String]?,
+                         segmentation: [String: Any]?) {
+        logI("recordException", "exception recording requested, exceptionName: [\(exception.name.rawValue)], isFatal: [\(isFatal)], stackTraceFrameCount: [\(stackTrace?.count ?? 0)], segmentationKeyCount: [\(segmentation?.count ?? 0)]")
+        logV("recordException", "exception recording detail, exception: [\(exception)], stackTrace: [\(stackTrace ?? [])], segmentation: [\(segmentation ?? [:])]")
+
+        guard core.modules.consent.hasConsent(for: .crashReporting) else {
+            logV("recordException", "no crashes consent given, exception is not recorded")
+            return
+        }
+
+        let frames = stackTrace ?? exception.callStackSymbols
+        let overrides = core.limits.sanitized(segmentation, "Exception segmentation")
+
+        handle(name: exception.name.rawValue,
+               description: exception.reason ?? exception.name.rawValue,
+               stackTrace: frames,
+               userInfo: exception.userInfo as? [String: Any] ?? [:],
+               segmentationOverride: overrides,
+               isFatal: isFatal,
+               isAutoDetected: false)
+    }
+
+    /// Records an error described by a name rather than an exception.
+    func recordError(_ errorName: String,
+                     isFatal: Bool,
+                     stackTrace: [String]?,
+                     segmentation: [String: Any]?) {
+        logI("recordError", "error recording requested, errorNameLength: [\(errorName.count)], isFatal: [\(isFatal)], stackTraceFrameCount: [\(stackTrace?.count ?? 0)], segmentationKeyCount: [\(segmentation?.count ?? 0)]")
+        logV("recordError", "error recording detail, errorName: [\(errorName)], stackTrace: [\(stackTrace ?? [])], segmentation: [\(segmentation ?? [:])]")
+
+        let exception = NSException(name: NSExceptionName("Swift Error"), reason: errorName, userInfo: nil)
+        recordException(exception, isFatal: isFatal, stackTrace: stackTrace, segmentation: segmentation)
+    }
+
+    /// Called by the process-wide handler when a crash is detected.
+    func handleAutoDetectedCrash(name: String, reason: String, stackTrace: [String]) {
+        guard core.serverConfig.crashReportingEnabled else { return }
+        guard core.serverConfig.automaticCrashReportingEnabled else { return }
+        guard core.modules.consent.hasConsent(for: .crashReporting) else { return }
+
+        handle(name: name,
+               description: reason,
+               stackTrace: stackTrace,
+               userInfo: [:],
+               segmentationOverride: nil,
+               isFatal: true,
+               isAutoDetected: true)
+    }
+
+    /// Builds the report, gives the filter callback a say, and sends it.
+    private func handle(name: String,
+                        description: String,
+                        stackTrace: [String],
+                        userInfo: [String: Any],
+                        segmentationOverride: [String: Any]?,
+                        isFatal: Bool,
+                        isAutoDetected: Bool) {
+        guard core.serverConfig.crashReportingEnabled else { return }
+
+        let stackTraceJoined = stackTrace.joined(separator: "\n")
+
+        var matchesFilter = false
+        if let filter = core.config.crashFilter {
+            matchesFilter = matches(filter, stackTraceJoined)
+                || matches(filter, description)
+                || matches(filter, name)
+        }
+
+        var custom = crashSegmentation
+        if let segmentationOverride {
+            custom.merge(segmentationOverride) { _, new in new }
+        }
+        custom.merge(userInfo) { _, new in new }
+
+        breadcrumbLock.lock()
+        let currentBreadcrumbs = breadcrumbs
+        breadcrumbLock.unlock()
+
+        let filterCallback = core.config.crashes.crashFilterCallback
+
+        let crashData = CountlyCrashData(
+            stackTrace: stackTraceJoined,
+            name: name,
+            crashDescription: description,
+            crashSegmentation: core.limits.sanitized(custom, "Exception segmentation") ?? [:],
+            breadcrumbs: currentBreadcrumbs,
+            crashMetrics: crashMetrics(),
+            fatal: isFatal,
+            // Fourteen digests over the stack trace and every collection, needed
+            // only to detect what the callback changed. Skipped when there is no
+            // callback, which is the common case.
+            trackChanges: filterCallback != nil)
+
+        let filteredByCallback = filterCallback?(crashData) ?? false
+
+        guard !matchesFilter, !filteredByCallback else {
+            logD("handle", "crash report is filtered out and will not be processed, matchesRegexFilter: [\(matchesFilter)], matchesFilterCallback: [\(filteredByCallback)]")
+            if isAutoDetected { stopCrashReporting() }
+            return
+        }
+
+        var report = crashData.crashMetrics
+        report[Key.error] = crashData.stackTrace
+        report[Key.binaryImages] = binaryImages(for: stackTrace)
+        report[Key.buildUUID] = buildUUID ?? ""
+        report[Key.executableName] = executableName ?? ""
+        report[Key.architecture] = architecture ?? ""
+        report[Key.name] = crashData.crashDescription
+        report[Key.type] = crashData.name
+        report[Key.nonfatal] = !crashData.fatal
+
+        // Tells the server which fields the host application's filter changed, so
+        // a doctored report is not mistaken for a raw one.
+        crashData.calculateChangedFields()
+        let changed = crashData.changedFieldsBitfield
+        if changed > 0 {
+            report[Key.changedFields] = changed
+        }
+
+        if !crashData.crashSegmentation.isEmpty {
+            // Capped a second time only when there was a callback that could have
+            // changed the segmentation. `CountlyCrashData` is a class, so an
+            // enriching callback would otherwise ship unbounded keys and values;
+            // without one the dictionary is still exactly what was sanitized on the
+            // way in, and re-capping it is pure rework on every recorded error.
+            report[Key.custom] = filterCallback == nil
+                ? crashData.crashSegmentation
+                : core.limits.truncatedAndLimited(crashData.crashSegmentation, "Crash segmentation")
+        }
+
+        if !crashData.breadcrumbs.isEmpty {
+            report[Key.logs] = crashData.breadcrumbs.joined(separator: "\n")
+        }
+
+        if let shouldSend = core.config.shouldSendCrashReportCallback, !shouldSend(report) {
+            logD("handle", "crash report is dropped by the shouldSendCrashReport callback")
+            if isAutoDetected { stopCrashReporting() }
+            return
+        }
+
+        logI("handle", "crash recorded, isFatal: [\(crashData.fatal)], isAutoDetected: [\(isAutoDetected)], customSegmentationKeyCount: [\(crashData.crashSegmentation.count)], breadcrumbCount: [\(crashData.breadcrumbs.count)]")
+        logV("handle", "crash detail, breadcrumbs: [\(crashData.breadcrumbs)], crashSegmentation: [\(crashData.crashSegmentation)], stackTrace: [\(crashData.stackTrace)]")
+
+        core.network.sendCrashReport(CountlyJSON.escapedString(from: report, logger: log), immediately: isAutoDetected)
+
+        // A crash handler that stays installed would re-enter on the way down.
+        if isAutoDetected {
+            stopCrashReporting()
+        }
+    }
+
+    private func matches(_ filter: NSRegularExpression, _ text: String) -> Bool {
+        filter.numberOfMatches(in: text, options: [], range: NSRange(location: 0, length: (text as NSString).length)) > 0
+    }
+
+    // MARK: - Breadcrumbs
+
+    /// Records a breadcrumb, dropping the oldest when the buffer is full.
+    func log(_ text: String) {
+        guard core.modules.consent.hasConsent(for: .crashReporting) else {
+            logV("log", "no crashes consent given, breadcrumb is not recorded")
+            return
+        }
+
+        let truncated = core.limits.truncatedValue(text, "Custom Crash log")
+        logV("log", "breadcrumb text detail, log: [\(truncated)]")
+
+        breadcrumbLock.lock()
+        defer { breadcrumbLock.unlock() }
+
+        breadcrumbs.append(truncated)
+        let limit = core.config.sdkInternalLimits.maxBreadcrumbCount
+        if breadcrumbs.count > limit {
+            logD("log", "breadcrumb buffer is full, the oldest breadcrumb is dropped, breadcrumbCount: [\(breadcrumbs.count)], limit: [\(limit)]")
+            breadcrumbs.removeFirst()
+        } else {
+            logD("log", "breadcrumb added to the in memory buffer, breadcrumbCount: [\(breadcrumbs.count)]")
+        }
+
+        // Also written to disk, so the run that crashes can still contribute its
+        // breadcrumbs: the in-memory buffer dies with the process.
+        core.crashLogStore.append(truncated)
+    }
+
+    /// Drops every breadcrumb, in memory and on disk.
+    func clearCrashLogs() {
+        breadcrumbLock.lock()
+        logD("clearCrashLogs", "breadcrumbs are being cleared, breadcrumbCount: [\(breadcrumbs.count)]")
+        breadcrumbs.removeAll()
+        breadcrumbLock.unlock()
+
+        core.crashLogStore.deleteAll()
+    }
+
+    /// Breadcrumbs left behind by a run that did not get to send them.
+    ///
+    /// Read once at init and cleared, so they are attached to the next report
+    /// rather than to every future one.
+    func adoptBreadcrumbsFromPreviousRun() {
+        guard let stored = core.crashLogStore.readAll(), !stored.isEmpty else { return }
+
+        let recovered = stored.split(separator: "\n").map(String.init)
+        guard !recovered.isEmpty else { return }
+
+        logD("adoptBreadcrumbsFromPreviousRun", "breadcrumbs from a previous run were found, breadcrumbCount: [\(recovered.count)]")
+
+        breadcrumbLock.lock()
+        breadcrumbs = Array(recovered.suffix(core.config.sdkInternalLimits.maxBreadcrumbCount))
+        breadcrumbLock.unlock()
+
+        core.crashLogStore.deleteAll()
+    }
+
+    // MARK: - Context
+
+    /// Device state at the moment of the crash.
+    private func crashMetrics() -> [String: Any] {
+        var metrics: [String: Any] = [:]
+        metrics[Key.os] = DeviceMetrics.osName
+        metrics[Key.osVersion] = DeviceMetrics.osVersion
+        metrics[Key.device] = DeviceMetrics.device
+        metrics[Key.resolution] = DeviceMetrics.resolution
+        metrics[Key.appVersion] = DeviceMetrics.appVersion
+        metrics[Key.appBuild] = DeviceMetrics.appBuild
+
+        // Subtracted with a floor: a reading that reports free space without total
+        // space would underflow, and an unsigned underflow traps in Swift, inside
+        // the crash reporter.
+        let totalRAM = DeviceMetrics.totalRAM
+        let freeRAM = DeviceMetrics.freeRAM
+        let disk = DeviceMetrics.diskSpace()
+        metrics[Key.ramCurrent] = totalRAM.subtractingReportingOverflow(freeRAM).partialValue.clampedToZero(totalRAM >= freeRAM) / Self.mebibyte
+        metrics[Key.ramTotal] = totalRAM / Self.mebibyte
+        metrics[Key.diskCurrent] = disk.total.subtractingReportingOverflow(disk.free).partialValue.clampedToZero(disk.total >= disk.free) / Self.mebibyte
+        metrics[Key.diskTotal] = disk.total / Self.mebibyte
+
+        // Only reported when the platform actually knows it, so a missing reading
+        // is not recorded as a real battery level.
+        let battery = DeviceMetrics.batteryLevel
+        if battery >= 0 {
+            metrics[Key.battery] = battery
+        }
+
+        metrics[Key.orientation] = DeviceMetrics.orientation
+        metrics[Key.online] = DeviceMetrics.connectionType != 0 ? 1 : 0
+        metrics[Key.root] = DeviceMetrics.isJailbroken
+        metrics[Key.background] = !AppState.isForeground
+        metrics[Key.run] = core.clock.timeSinceLaunch()
+
+        return metrics
+    }
+
+    /// Load addresses and UUIDs of the images the stack trace touches.
+    ///
+    /// Without these the server cannot map an address back to a symbol. The main
+    /// executable is always included, even with no frame of its own: with Xcode's
+    /// debug dylib the application's code lives in a separate image and the
+    /// executable would otherwise be filtered out, leaving the build UUID empty.
+    private func binaryImages(for stackTrace: [String]) -> [String: Any] {
+        var namesInStack = Set<String>()
+        for line in stackTrace {
+            // The backtrace format pads the image name into a fixed column.
+            let nsLine = line as NSString
+            guard nsLine.length >= 39 else { continue }
+            let name = nsLine.substring(with: NSRange(location: 4, length: 35))
+                .trimmingCharacters(in: .whitespaces)
+            namesInStack.insert(name)
+        }
+
+        var images: [String: Any] = [:]
+        var cpuType: cpu_type_t = 0
+        var cpuSubtype: cpu_subtype_t = 0
+
+        for index in 0..<_dyld_image_count() {
+            guard let namePointer = _dyld_get_image_name(index) else { continue }
+            let imageName = (String(cString: namePointer) as NSString).lastPathComponent
+
+            guard let header = _dyld_get_image_header(index) else { continue }
+
+            let isMainExecutable = header.pointee.filetype == MH_EXECUTE
+            guard isMainExecutable || namesInStack.contains(imageName) else { continue }
+
+            if header.pointee.cputype != 0 { cpuType = header.pointee.cputype }
+            if header.pointee.cpusubtype != 0, cpuSubtype == 0 || header.pointee.cpusubtype > cpuSubtype {
+                cpuSubtype = header.pointee.cpusubtype
+            }
+
+            guard let uuidString = imageUUID(header) else {
+                logV("binaryImages", "binary image UUID can not be retrieved, symbolication may fail for it, imageName: [\(imageName)]")
+                continue
+            }
+
+            if isMainExecutable {
+                buildUUID = uuidString
+                executableName = imageName
+            }
+
+            let loadAddress = String(format: "0x%llX", UInt64(UInt(bitPattern: header)))
+            images[imageName] = [Key.imageLoadAddress: loadAddress, Key.imageBuildUUID: uuidString]
+        }
+
+        architecture = Self.architectureName(cpuType: cpuType, cpuSubtype: cpuSubtype)
+        logV("binaryImages", "binary images resolved for the stack trace, matchedImageCount: [\(images.count)]")
+
+        return images
+    }
+
+    /// Walks the load commands looking for `LC_UUID`.
+    private func imageUUID(_ header: UnsafePointer<mach_header>) -> String? {
+        let is64Bit = header.pointee.magic == MH_MAGIC_64 || header.pointee.magic == MH_CIGAM_64
+        var cursor = UInt(bitPattern: header) + UInt(is64Bit ? MemoryLayout<mach_header_64>.size : MemoryLayout<mach_header>.size)
+
+        for _ in 0..<header.pointee.ncmds {
+            let command = UnsafeRawPointer(bitPattern: cursor)!.assumingMemoryBound(to: load_command.self)
+            if command.pointee.cmd == LC_UUID {
+                let uuidCommand = UnsafeRawPointer(command).assumingMemoryBound(to: uuid_command.self)
+                return UUID(uuid: uuidCommand.pointee.uuid).uuidString
+            }
+            cursor += UInt(command.pointee.cmdsize)
+        }
+        return nil
+    }
+
+    /// Human readable architecture for the crashing process.
+    static func architectureName(cpuType: cpu_type_t, cpuSubtype: cpu_subtype_t) -> String {
+        // The pointer-authentication bits describe the ABI, not the architecture.
+        let baseSubtype = cpuSubtype & ~cpu_subtype_t(bitPattern: CPU_SUBTYPE_PTRAUTH_ABI)
+
+        switch cpuType {
+        case CPU_TYPE_ARM:
+            return baseSubtype == CPU_SUBTYPE_ARM_V7 || baseSubtype == CPU_SUBTYPE_ARM_V7K ? "armv7" : "arm"
+        case CPU_TYPE_ARM64:
+            return baseSubtype == CPU_SUBTYPE_ARM64E ? "arm64e" : "arm64"
+        case CPU_TYPE_ARM64_32:
+            return "arm64_32"
+        case CPU_TYPE_X86:
+            return "i386"
+        case CPU_TYPE_X86_64:
+            return baseSubtype == CPU_SUBTYPE_X86_64_H ? "x86_64h" : "x86_64"
+        default:
+            return "unknown"
+        }
+    }
+
+    // MARK: - Lifecycle
+
+    override func halt(clearStorage: Bool) {
+        stopCrashReporting()
+        crashSegmentation.removeAll()
+    }
+}

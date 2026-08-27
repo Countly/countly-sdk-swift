@@ -1,0 +1,916 @@
+//
+//  ConnectionManager.swift
+//
+//  This code is provided under the MIT License.
+//
+//  Please visit www.count.ly for more information.
+//
+
+import Foundation
+
+/// Sends what the modules queue, one request at a time, in order.
+///
+/// Ordering is the point: the server reconstructs a session from a sequence of
+/// requests, so a later request must not overtake an earlier one. The head of the
+/// queue is only removed once the server has accepted it, which is what makes the
+/// SDK survive a crash or a dead network without losing data.
+final class ConnectionManager: NSObject {
+
+    private static let module = "ConnectionManager"
+
+    unowned let core: SDKCore
+    let builder: RequestBuilder
+
+    /// Serializes callback and runnable bookkeeping.
+    private let callbackQueue = DispatchQueue(label: "ly.count.callbackQueue")
+
+    /// Guards the single-in-flight invariant.
+    private let stateLock = NSLock()
+    private var isProcessingQueue = false
+    private var isBackingOff = false
+    private var currentTask: URLSessionTask?
+
+    /// When the current drain of the queue started, used to time it and to decide
+    /// whether the flush runnables should fire.
+    private var drainStartTime: Date?
+    private var hasAnyRequestFailed = false
+
+    /// Callbacks waiting for their request to complete, keyed by the callback ID
+    /// that travels inside the queued query string.
+    private var requestCallbacks: [String: RequestCallback] = [:]
+
+    /// Blocks that run once the queue drains with nothing having failed.
+    private var queueFlushRunnables: [() -> Void] = []
+
+    private var urlSession: URLSession?
+    private var immediateSession: URLSession?
+
+    init(core: SDKCore, builder: RequestBuilder) {
+        self.core = core
+        self.builder = builder
+        super.init()
+    }
+
+    // MARK: - Enqueueing
+
+    /// Queues a request and starts draining.
+    func enqueueAndProceed(_ queryString: String) {
+        enqueue(queryString)
+        proceedOnQueue()
+    }
+
+    /// Queues a request without starting a drain, for callers that will follow up
+    /// with several more.
+    func enqueue(_ queryString: String) {
+        core.requestQueueStore.enqueue(queryString,
+                                       appVersion: DeviceMetrics.appVersion,
+                                       trackingEnabled: core.serverConfig.trackingEnabled)
+    }
+
+    /// Queues a request and reports its outcome to `callback`.
+    ///
+    /// The callback is kept in memory and referenced from the queued string by a
+    /// generated ID. A callback therefore does not survive a process restart,
+    /// while the request it belongs to does.
+    func enqueue(_ queryString: String, callback: RequestCallback?) {
+        guard !queryString.isEmpty else {
+            core.logger.d(Self.module, "enqueue", "request is not queued, reason: query string is nil or empty, callbackProvided: [\(callback != nil)]")
+            return
+        }
+
+        guard let callback else {
+            enqueue(queryString)
+            return
+        }
+
+        let callbackID = UUID().uuidString
+        core.logger.d(Self.module, "enqueue", "queueing a request with a callback, callbackID: [\(callbackID)], queryStringLength: [\(queryString.count)]")
+
+        callbackQueue.sync { requestCallbacks[callbackID] = callback }
+        enqueue("\(queryString)&\(QS.callbackID)=\(callbackID)")
+    }
+
+    /// Registers a block to run the next time the queue drains completely with no
+    /// failures. Used by journey triggers, which need the server to have seen
+    /// everything before they ask what to show.
+    func addQueueFlushRunnable(_ runnable: @escaping () -> Void) {
+        callbackQueue.sync {
+            queueFlushRunnables.append(runnable)
+            core.logger.d(Self.module, "addQueueFlushRunnable", "adding a queue flush runnable, totalRunnableCount: [\(queueFlushRunnables.count)]")
+        }
+    }
+
+    /// Drops every registered flush runnable.
+    func clearQueueFlushRunnables() {
+        callbackQueue.sync {
+            core.logger.d(Self.module, "clearQueueFlushRunnables", "clearing all queue flush runnables, count: [\(queueFlushRunnables.count)]")
+            queueFlushRunnables.removeAll()
+        }
+    }
+
+    // MARK: - Draining
+
+    /// Sends the head of the queue, then calls itself until the queue is empty.
+    ///
+    /// Every early return here is a reason not to send right now; none of them
+    /// discard data. The processing flag is released before returning in each case
+    /// so a later trigger can pick the drain back up.
+    func proceedOnQueue() {
+        guard core.serverConfig.networkingEnabled else {
+            core.logger.d(Self.module, "proceedOnQueue", "aborting queue processing, reason: SDK networking is disabled from server config")
+            return
+        }
+
+        stateLock.lock()
+        if isProcessingQueue {
+            stateLock.unlock()
+            core.logger.d(Self.module, "proceedOnQueue", "aborting queue processing, reason: another request is already in process")
+            return
+        }
+        isProcessingQueue = true
+        stateLock.unlock()
+
+        if core.isCrashing {
+            core.logger.d(Self.module, "proceedOnQueue", "aborting queue processing, reason: application is crashing")
+            releaseProcessing()
+            return
+        }
+
+        if core.isTerminating {
+            core.logger.d(Self.module, "proceedOnQueue", "aborting queue processing, reason: application is terminating")
+            releaseProcessing()
+            return
+        }
+
+        if core.requestQueueStore.isBeingModified {
+            core.logger.d(Self.module, "proceedOnQueue", "aborting queue processing, reason: request queue is being modified")
+            releaseProcessing()
+            return
+        }
+
+        stateLock.lock()
+        let backingOff = isBackingOff
+        stateLock.unlock()
+        if backingOff {
+            core.logger.d(Self.module, "proceedOnQueue", "aborting queue processing, reason: backoff is currently active")
+            releaseProcessing()
+            return
+        }
+
+        if drainStartTime == nil {
+            drainStartTime = Date()
+            hasAnyRequestFailed = false
+            core.logger.d(Self.module, "proceedOnQueue", "queue processing is started, queuedRequestCount: [\(core.requestQueueStore.count)]")
+        }
+
+        guard let head = core.requestQueueStore.head else {
+            finishDrain()
+            return
+        }
+
+        if core.requestQueueStore.isOldRequest(head) {
+            core.logger.w(Self.module, "proceedOnQueue", "dropping the request at the head of the queue, reason: request age exceeded the configured drop age, requestSize: [\(head.count)]")
+            core.requestQueueStore.removeHead(head)
+            core.requestQueueStore.save()
+            releaseProcessing()
+            proceedOnQueue()
+            return
+        }
+
+        // A request recorded before a real device ID was known must wait: sending
+        // it now would attribute the data to the placeholder ID.
+        if head.contains("&\(QS.deviceID)=\(TemporaryDeviceID.value)") {
+            core.logger.d(Self.module, "proceedOnQueue", "aborting queue processing, reason: device ID of the request at the head of the queue is the temporary device ID")
+            releaseProcessing()
+            return
+        }
+
+        send(head: head)
+    }
+
+    private func finishDrain() {
+        let elapsed = drainStartTime.map { -$0.timeIntervalSinceNow } ?? 0
+        core.logger.d(Self.module, "proceedOnQueue", "request queue is empty, all requests are processed, totalTimeTaken: [\(String(format: "%.2f", elapsed))]")
+
+        if !hasAnyRequestFailed {
+            var runnables: [() -> Void] = []
+            callbackQueue.sync {
+                if !queueFlushRunnables.isEmpty {
+                    core.logger.d(Self.module, "proceedOnQueue", "all requests succeeded, executing queue flush runnables, count: [\(queueFlushRunnables.count)]")
+                    runnables = queueFlushRunnables
+                    queueFlushRunnables.removeAll()
+                }
+            }
+            // Run outside the lock: a runnable may queue more work.
+            for runnable in runnables { runnable() }
+            if !runnables.isEmpty {
+                core.logger.d(Self.module, "proceedOnQueue", "all queue flush runnables are executed and removed")
+            }
+        } else {
+            core.logger.d(Self.module, "proceedOnQueue", "at least one request failed, queue flush runnables will not be executed")
+        }
+
+        drainStartTime = nil
+        hasAnyRequestFailed = false
+        releaseProcessing()
+    }
+
+    private func send(head: String) {
+        var queryString = head
+        var endpoint = Endpoint.input
+
+        if let override = extractAndRemoveParameter(&queryString, parameter: QS.newEndPoint) {
+            endpoint = override
+        }
+
+        var callback: RequestCallback?
+        let callbackID = extractAndRemoveParameter(&queryString, parameter: QS.callbackID)
+        if let callbackID {
+            callbackQueue.sync { callback = requestCallbacks[callbackID] }
+        }
+
+        queryString = builder.appendRemainingRequestCount(queryString)
+
+        // Checked with a substring first: resolving it means decoding the whole
+        // query, and only a profile picture save ever carries one.
+        let pictureUpload = queryString.contains(QS.userDetails) ? pictureUploadData(for: queryString) : nil
+        if pictureUpload == nil {
+            queryString = builder.appendChecksum(queryString)
+        }
+
+        let request = buildRequest(queryString: queryString, endpoint: endpoint, pictureUpload: pictureUpload)
+        let startedAt = Date()
+
+        // The core is captured strongly for the life of the callback: it is held
+        // `unowned` on this class, and `halt()` can release it while a request is
+        // still in flight.
+        // Held from here until the completion has finished dealing with the
+        // response, which is where the head is removed and the queue written.
+        BackgroundTaskGuard.shared.begin()
+
+        let task = session().dataTask(with: request) { [weak self, core] data, response, error in
+            defer { BackgroundTaskGuard.shared.end() }
+            guard let self else { return }
+            _ = core
+            self.stateLock.lock()
+            self.currentTask = nil
+            self.stateLock.unlock()
+
+            let duration = Int(Date().timeIntervalSince(startedAt))
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+
+            if response != nil {
+                self.core.logger.d(Self.module, "proceedOnQueue", "response received, endpoint: [\(request.url?.path ?? "")], statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], duration: [\(duration)]")
+            }
+
+            if let error {
+                self.handleTransportFailure(error: error, request: request, callback: callback, callbackID: callbackID)
+                return
+            }
+
+            if self.isRequestSuccessful(response: response, data: data, endpoint: endpoint) {
+                self.handleSuccess(head: head,
+                                   queryString: queryString,
+                                   duration: duration,
+                                   request: request,
+                                   callback: callback,
+                                   callbackID: callbackID,
+                                   response: response)
+            } else {
+                self.handleServerFailure(statusCode: statusCode,
+                                         data: data,
+                                         request: request,
+                                         callback: callback,
+                                         callbackID: callbackID)
+            }
+        }
+
+        stateLock.lock()
+        currentTask = task
+        stateLock.unlock()
+
+        task.resume()
+        logRequest(request)
+    }
+
+    private func handleSuccess(head: String,
+                               queryString: String,
+                               duration: Int,
+                               request: URLRequest,
+                               callback: RequestCallback?,
+                               callbackID: String?,
+                               response: URLResponse?) {
+        core.logger.d(Self.module, "proceedOnQueue", "request completed successfully, endpoint: [\(request.url?.path ?? "")], duration: [\(duration)]")
+
+        deliver(callback, callbackID: callbackID, response: response.map { String(describing: $0) }, success: true)
+
+        core.requestQueueStore.removeHead(head)
+        core.requestQueueStore.save()
+
+        // The flag is released only after the head is gone. Releasing it earlier
+        // would let a concurrent caller re-send the request that just succeeded.
+        releaseProcessing()
+
+        if core.serverConfig.backoffMechanism, shouldBackOff(responseTimeSeconds: duration, queryString: queryString) {
+            core.logger.d(Self.module, "proceedOnQueue", "stopping queue processing, reason: backoff is triggered, lastResponseDuration: [\(duration)]")
+            drainStartTime = nil
+            hasAnyRequestFailed = false
+            startBackoffCountdown()
+        } else {
+            proceedOnQueue()
+        }
+    }
+
+    private func handleServerFailure(statusCode: Int,
+                                     data: Data?,
+                                     request: URLRequest,
+                                     callback: RequestCallback?,
+                                     callbackID: String?) {
+        core.logger.d(Self.module, "proceedOnQueue", "request failed, endpoint: [\(request.url?.path ?? "")], statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)]")
+
+        let body = data.flatMap { String(data: $0, encoding: .utf8) }
+        core.logger.v(Self.module, "proceedOnQueue", "failed request detail, fullResponseURL: [\(request.url?.absoluteString ?? "")], serverErrorResponseBody: [\(body ?? "")]")
+
+        hasAnyRequestFailed = true
+        deliver(callback, callbackID: callbackID, response: body, success: false)
+
+        core.healthTracker.logFailedNetworkRequest(statusCode: statusCode, errorResponse: body)
+        core.healthTracker.saveState()
+
+        drainStartTime = nil
+        releaseProcessing()
+    }
+
+    private func handleTransportFailure(error: Error,
+                                        request: URLRequest,
+                                        callback: RequestCallback?,
+                                        callbackID: String?) {
+        let nsError = error as NSError
+        core.logger.d(Self.module, "proceedOnQueue", "request failed with a network error, endpoint: [\(request.url?.path ?? "")], errorDomain: [\(nsError.domain)], errorCode: [\(nsError.code)], errorDescription: [\(error.localizedDescription)]")
+
+        hasAnyRequestFailed = true
+        deliver(callback, callbackID: callbackID, response: error.localizedDescription, success: false)
+
+        #if os(watchOS)
+        // The watch can be suspended without warning, so the queue is flushed to
+        // disk at every opportunity there.
+        core.requestQueueStore.save()
+        #endif
+
+        drainStartTime = nil
+        releaseProcessing()
+    }
+
+    /// The response is autoclosed because most requests carry no callback, and
+    /// describing an `HTTPURLResponse` renders every header into a string nobody
+    /// reads.
+    private func deliver(_ callback: RequestCallback?, callbackID: String?, response: @autoclosure () -> String?, success: Bool) {
+        guard let callback else { return }
+        callback(response(), success)
+        if let callbackID {
+            callbackQueue.sync { _ = requestCallbacks.removeValue(forKey: callbackID) }
+        }
+    }
+
+    private func releaseProcessing() {
+        stateLock.lock()
+        isProcessingQueue = false
+        stateLock.unlock()
+    }
+
+    // MARK: - Backoff
+
+    /// Whether the server looks overloaded enough to pause sending.
+    ///
+    /// All three conditions have to hold: the response was slow, the queue is
+    /// small enough that pausing will not overflow it, and the request was recent
+    /// enough that the delay still matters. A backlog of old data keeps draining.
+    private func shouldBackOff(responseTimeSeconds: Int, queryString: String) -> Bool {
+        var result = false
+
+        if responseTimeSeconds >= core.serverConfig.bomAcceptedTimeoutSeconds {
+            let remaining = core.requestQueueStore.count
+            let threshold = Int(Double(core.requestQueueStore.storedRequestsLimit) * core.serverConfig.bomRQPercentage)
+
+            if remaining <= threshold {
+                let millis = Double(queryString.valueForQueryStringKey(QS.timestamp) ?? "") ?? 0
+                let ageSeconds = Date().timeIntervalSince1970 - millis / 1000.0
+
+                if ageSeconds <= Double(core.serverConfig.bomRequestAge) * 3600.0 {
+                    result = true
+                    core.logger.w(Self.module, "shouldBackOff", "backoff is triggered, responseTime: [\(responseTimeSeconds)], remainingRequestCount: [\(remaining)], requestCountThreshold: [\(threshold)], requestAge: [\(String(format: "%.2f", ageSeconds))]")
+                    core.healthTracker.logBackoffRequest()
+                }
+            }
+        }
+
+        if !result {
+            core.healthTracker.logConsecutiveBackoffRequest()
+        }
+
+        core.logger.d(Self.module, "shouldBackOff", "backoff evaluation is completed, decision: [\(result)], responseTime: [\(responseTimeSeconds)]")
+        return result
+    }
+
+    private func startBackoffCountdown() {
+        let duration = core.serverConfig.bomDuration
+        core.logger.d(Self.module, "startBackoffCountdown", "backoff countdown is started, queue processing will be paused for [\(duration)] seconds")
+
+        stateLock.lock()
+        isBackingOff = true
+        stateLock.unlock()
+
+        DispatchQueue.global(qos: .default).asyncAfter(deadline: .now() + .seconds(duration)) { [weak self] in
+            guard let self else { return }
+            self.core.logger.d(Self.module, "startBackoffCountdown", "backoff countdown is finished, resuming queue processing on a background thread")
+            self.stateLock.lock()
+            self.isBackingOff = false
+            self.stateLock.unlock()
+            self.proceedOnQueue()
+        }
+    }
+
+    // MARK: - Crash reports
+
+    /// Sends a crash report, optionally bypassing the queue.
+    ///
+    /// An immediate send blocks the calling thread until the server answers,
+    /// because the process is about to die and an async send would not survive it.
+    /// If it fails the report is queued so the next launch sends it.
+    ///
+    /// Reachable from the signal handler, so every log line here stays at debug or
+    /// lower: error and warning logging touches dispatch primitives that are not
+    /// async-signal-safe.
+    func sendCrashReport(_ report: String?, immediately: Bool) {
+        guard core.serverConfig.networkingEnabled else {
+            core.logger.d(Self.module, "sendCrashReport", "crash report is dropped, reason: SDK networking is disabled from server config, crashReportLength: [\(report?.count ?? 0)]")
+            return
+        }
+
+        guard let report else {
+            core.logger.d(Self.module, "sendCrashReport", "crash report is nil, converting it to JSON may have failed due to custom objects in the crash segmentation")
+            return
+        }
+
+        let queryString = "\(builder.queryEssentials())&\(QS.crash)=\(report)"
+
+        guard immediately else {
+            enqueueAndProceed(queryString)
+            return
+        }
+
+        // Stops the event and end-session requests below from starting a drain
+        // that would race the crash report out of order.
+        core.isCrashing = true
+
+        core.modules.events.sendEventsWithSaveIfNeeded()
+
+        if core.serverConfig.automaticSessionTrackingEnabled {
+            core.modules.sessions.endSession()
+        }
+
+        if core.modules.deviceID.isTemporary {
+            core.logger.d(Self.module, "sendCrashReport", "crash report is stored to be sent later, reason: device ID is the temporary device ID, crashReportLength: [\(report.count)]")
+            enqueue(queryString)
+            core.requestQueueStore.saveSync()
+            return
+        }
+
+        core.requestQueueStore.saveSync()
+
+        let stamped = "\(queryString)&\(QS.appVersion)=\(DeviceMetrics.appVersion)"
+        guard let endpointURL = URL(string: core.config.normalizedHost + Endpoint.input) else {
+            // Queued instead of dropped: the host may be fixed on a later launch,
+            // and trapping here would crash the app while it is already crashing.
+            core.logger.d(Self.module, "sendCrashReport", "the server URL could not be built, the crash report is queued instead")
+            enqueue(queryString)
+            core.requestQueueStore.saveSync()
+            return
+        }
+
+        var request = URLRequest(url: endpointURL)
+        request.httpMethod = "POST"
+        request.httpBody = Data(builder.appendChecksum(stamped).utf8)
+
+        core.logger.i(Self.module, "sendCrashReport", "sending crash report immediately, endpoint: [\(Endpoint.input)], method: [POST], bodySize: [\(request.httpBody?.count ?? 0)]")
+
+        let semaphore = DispatchSemaphore(value: 0)
+        session().dataTask(with: request) { [weak self] data, response, error in
+            defer { semaphore.signal() }
+            guard let self else { return }
+
+            if error != nil || !self.isRequestSuccessful(response: response, data: data, endpoint: Endpoint.input) {
+                self.core.logger.d(Self.module, "sendCrashReport", "immediate crash report request failed and it is queued to be sent later, endpoint: [\(request.url?.path ?? "")], statusCode: [\((response as? HTTPURLResponse)?.statusCode ?? 0)]")
+                self.enqueue(queryString)
+                self.core.requestQueueStore.saveSync()
+            } else {
+                self.core.logger.d(Self.module, "sendCrashReport", "immediate crash report request completed successfully, endpoint: [\(request.url?.path ?? "")], responseSize: [\(data?.count ?? 0)]")
+            }
+        }.resume()
+
+        logRequest(request)
+        semaphore.wait()
+    }
+
+    // MARK: - Request construction
+
+    private func buildRequest(queryString: String, endpoint: String, pictureUpload: Data?) -> URLRequest {
+        let urlString = core.config.normalizedHost + endpoint
+        var request = URLRequest(url: URL(string: urlString) ?? URL(string: "https://invalid")!)
+
+        if let pictureUpload {
+            var body = pictureUpload
+            request.addValue("multipart/form-data; boundary=\(kUploadBoundary)", forHTTPHeaderField: "Content-Type")
+
+            for pair in queryString.components(separatedBy: "&") {
+                let parts = pair.components(separatedBy: "=")
+                guard parts.count >= 2 else { continue }
+                let key = parts[0].removingPercentEncoding ?? parts[0]
+                let value = parts.dropFirst().joined(separator: "=").removingPercentEncoding ?? ""
+                appendMultipart(&body, key: key, value: value)
+            }
+
+            if let salt = core.config.secretSalt, !salt.isEmpty {
+                let unescaped = queryString.removingPercentEncoding ?? queryString
+                appendMultipart(&body, key: QS.checksum256, value: (unescaped + salt).sha256Hex)
+            }
+
+            body.append(Data("\r\n--\(kUploadBoundary)--\r\n".utf8))
+            request.httpMethod = "POST"
+            request.httpBody = body
+            core.logger.d(Self.module, "buildRequest", "request will be sent as a multipart POST with picture data, endpoint: [\(endpoint)], uploadDataSize: [\(body.count)]")
+        } else if queryString.count > kGETRequestMaxLength || core.config.alwaysUsePOST {
+            request.httpMethod = "POST"
+            request.httpBody = Data(queryString.utf8)
+        } else {
+            request = URLRequest(url: URL(string: "\(urlString)?\(queryString)") ?? URL(string: "https://invalid")!)
+        }
+
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        return request
+    }
+
+    private func appendMultipart(_ data: inout Data, key: String, value: String) {
+        data.append(Data("\r\n--\(kUploadBoundary)\r\n".utf8))
+        data.append(Data("Content-Disposition: form-data; name=\"\(key)\";\r\n\r\n".utf8))
+        data.append(Data(value.utf8))
+    }
+
+    /// Builds the leading multipart section when the queued request carries a
+    /// local profile picture path.
+    private func pictureUploadData(for queryString: String) -> Data? {
+        #if os(iOS) || os(visionOS)
+        guard let userDetails = queryString.valueForQueryStringKey(QS.userDetails),
+              let unescaped = userDetails.removingPercentEncoding,
+              let parsed = CountlyJSON.object(from: Data(unescaped.utf8), logger: core.logger) as? [String: Any],
+              let localPath = parsed[UserProfileKey.localPicturePath] as? String,
+              !localPath.isEmpty else { return nil }
+
+        core.logger.d(Self.module, "pictureUploadData", "local picture path is extracted from the query string, pathLength: [\(localPath.count)]")
+
+        let allowed = ["gif", "png", "jpg", "jpeg"]
+        let fileExtension = (localPath as NSString).pathExtension.lowercased()
+        guard let index = allowed.firstIndex(of: fileExtension) else {
+            core.logger.w(Self.module, "pictureUploadData", "picture upload is skipped, reason: unsupported file extension, extension: [\(fileExtension)]")
+            return nil
+        }
+
+        guard let url = URL(string: localPath), let imageData = try? Data(contentsOf: url) else {
+            core.logger.w(Self.module, "pictureUploadData", "picture upload is skipped, reason: local picture data can not be read, extension: [\(fileExtension)]")
+            return nil
+        }
+
+        core.logger.d(Self.module, "pictureUploadData", "local picture data is read successfully, size: [\(imageData.count)]")
+
+        // "jpg" and "jpeg" are the same format; the server expects the latter.
+        let contentSubtype = index == 2 ? "jpeg" : allowed[index]
+
+        var body = Data()
+        body.append(Data("--\(kUploadBoundary)\r\n".utf8))
+        body.append(Data("Content-Disposition: form-data; name=\"pictureFile\"; filename=\"\((localPath as NSString).lastPathComponent)\"\r\n".utf8))
+        body.append(Data("Content-Type: image/\(contentSubtype)\r\n\r\n".utf8))
+        body.append(imageData)
+        return body
+        #else
+        return nil
+        #endif
+    }
+
+    /// Pulls one parameter out of a queued query string and removes it.
+    ///
+    /// Used for the two parameters that are instructions to the SDK rather than
+    /// data for the server: the endpoint override and the callback ID.
+    private func extractAndRemoveParameter(_ queryString: inout String, parameter: String) -> String? {
+        guard queryString.contains(parameter) else {
+            core.logger.v(Self.module, "extractAndRemoveParameter", "parameter is not present in the query string, parameter: [\(parameter)]")
+            return nil
+        }
+
+        guard let value = queryString.valueForQueryStringKey(parameter) else {
+            core.logger.w(Self.module, "extractAndRemoveParameter", "parameter is present in the query string but its value could not be extracted, parameter: [\(parameter)]")
+            return nil
+        }
+
+        queryString = queryString.replacingOccurrences(of: "&\(parameter)=\(value)", with: "")
+        core.logger.d(Self.module, "extractAndRemoveParameter", "parameter is extracted and removed from the query string, parameter: [\(parameter)], valueLength: [\(value.count)]")
+        return value
+    }
+
+    /// Decides whether a completed response counts as the request having landed.
+    ///
+    /// Only the ingest endpoint promises a `result` field, so only the ingest
+    /// endpoint is judged by it. Every other endpoint answers with application
+    /// payload of its own shape (remote config values, behavior settings, the
+    /// widget list, A/B enrolment), and demanding `result` there marks a perfectly
+    /// good response as a failure, leaving the request at the head of the queue to
+    /// be retried on every later drain.
+    ///
+    /// - Parameters:
+    ///   - endpoint: The path the request was sent to. Passed in rather than read
+    ///     back off the response: a server hosted under a sub-path answers from
+    ///     `/countly/i`, and a redirect can change the path outright, either of
+    ///     which would make a path comparison conclude "not the ingest endpoint"
+    ///     and wave through a 2xx that says `{"result": "Error"}`. That would
+    ///     delete the request from the queue.
+    ///   - quiet: Logs a rejection at debug rather than error. Used by the health
+    ///     check, whose whole purpose is to report the error count, and which must
+    ///     not add to it by being rejected.
+    private func isRequestSuccessful(response: URLResponse?,
+                                     data: Data?,
+                                     endpoint: String,
+                                     quiet: Bool = false) -> Bool {
+        guard let http = response as? HTTPURLResponse else { return false }
+
+        guard (200..<300).contains(http.statusCode) else {
+            core.logger.v(Self.module, "isRequestSuccessful", "HTTP status code is not in the 2XX series, statusCode: [\(http.statusCode)], responseSize: [\(data?.count ?? 0)]")
+            return false
+        }
+
+        guard endpoint == Endpoint.input else {
+            core.logger.v(Self.module, "isRequestSuccessful", "2XX on a non ingest endpoint is a success, the reply body is application payload and is not validated, endpoint: [\(endpoint)], responseSize: [\(data?.count ?? 0)]")
+            return true
+        }
+
+        guard let reply = CountlyJSON.object(from: data, logger: nil) as? [String: Any] else {
+            let message = "server reply is not a valid JSON, the request is considered failed, responseSize: [\(data?.count ?? 0)]"
+            if quiet {
+                core.logger.d(Self.module, "isRequestSuccessful", message)
+            } else {
+                core.logger.e(Self.module, "isRequestSuccessful", message)
+            }
+            return false
+        }
+
+        core.logger.v(Self.module, "isRequestSuccessful", "server reply detail, fullResponseURL: [\(response?.url?.absoluteString ?? "")], parsedServerReply: [\(reply)]")
+
+        guard reply["result"] != nil else {
+            let message = "server reply does not contain the result field, the request is considered failed, responseSize: [\(data?.count ?? 0)]"
+            if quiet {
+                core.logger.d(Self.module, "isRequestSuccessful", message)
+            } else {
+                core.logger.e(Self.module, "isRequestSuccessful", message)
+            }
+            return false
+        }
+
+        return true
+    }
+
+    private func logRequest(_ request: URLRequest) {
+        let bodySize = request.httpBody?.count ?? 0
+        let sentSize = (request.url?.absoluteString.count ?? 0) + bodySize
+        core.logger.i(Self.module, "logRequest", "sending request, endpoint: [\(request.url?.path ?? "")], method: [\(request.httpMethod ?? "GET")], approximateSentDataSize: [\(sentSize)], bodySize: [\(bodySize)]")
+
+        core.logger.v(Self.module, "logRequest", "request detail, method: [\(request.httpMethod ?? "GET")], URL: [\(request.url?.absoluteString ?? "")], body: [\(request.httpBody.flatMap { String(data: $0, encoding: .utf8) } ?? "Picture uploading...")]")
+    }
+
+    // MARK: - Sessions
+
+    /// The session used for queued requests. Rebuilt when the configuration
+    /// changes, for instance when custom headers are added.
+    func session() -> URLSession {
+        if let urlSession { return urlSession }
+
+        let configuration = core.config.urlSessionConfiguration
+        configuration.timeoutIntervalForRequest = core.serverConfig.requestTimeoutDuration
+        configuration.timeoutIntervalForResource = core.serverConfig.requestTimeoutDuration
+
+        let session: URLSession
+        if !core.config.pinnedCertificates.isEmpty {
+            core.logger.d(Self.module, "session", "creating the URL session with certificate pinning, pinnedCertificateCount: [\(core.config.pinnedCertificates.count)]")
+            session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+        } else {
+            session = URLSession(configuration: configuration)
+        }
+        urlSession = session
+        return session
+    }
+
+    /// Session for requests that skip the queue: behavior settings and the health
+    /// check. They carry no user data and are useless if delayed behind a backlog.
+    func instantSession() -> URLSession {
+        if let immediateSession { return immediateSession }
+
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = core.serverConfig.requestTimeoutDuration
+        configuration.timeoutIntervalForResource = core.serverConfig.requestTimeoutDuration
+        configuration.httpAdditionalHeaders = core.config.urlSessionConfiguration.httpAdditionalHeaders
+
+        let session: URLSession
+        if !core.config.pinnedCertificates.isEmpty {
+            session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+        } else {
+            session = URLSession(configuration: configuration)
+        }
+        immediateSession = session
+        return session
+    }
+
+    /// Adds headers to every request. Rebuilds the session so they take effect.
+    func addCustomNetworkRequestHeaders(_ headers: [String: String]?) {
+        guard let headers else { return }
+
+        var updated = (core.config.urlSessionConfiguration.httpAdditionalHeaders as? [String: String]) ?? [:]
+        var skipped = 0
+        for (key, value) in headers {
+            guard !key.isEmpty else {
+                skipped += 1
+                core.logger.v(Self.module, "addCustomNetworkRequestHeaders", "a custom network request header with an empty key is skipped")
+                continue
+            }
+            updated[key] = value
+        }
+
+        if skipped > 0 {
+            core.logger.w(Self.module, "addCustomNetworkRequestHeaders", "some custom network request headers are skipped, reason: empty key, skippedHeaderCount: [\(skipped)]")
+        }
+
+        core.logger.i(Self.module, "addCustomNetworkRequestHeaders", "custom network request headers are applied, totalHeaderCount: [\(updated.count)]")
+        core.config.urlSessionConfiguration.httpAdditionalHeaders = updated
+        urlSession = nil
+        immediateSession = nil
+    }
+
+    /// Drops cached sessions and pending callbacks. Called from `halt`.
+    func reset() {
+        core.logger.i(Self.module, "reset", "connection manager is being reset, pending request callbacks and queue flush runnables will be cleared")
+        callbackQueue.sync {
+            requestCallbacks.removeAll()
+            queueFlushRunnables.removeAll()
+        }
+        stateLock.lock()
+        currentTask?.cancel()
+        currentTask = nil
+        isProcessingQueue = false
+        isBackingOff = false
+        stateLock.unlock()
+        hasAnyRequestFailed = false
+        drainStartTime = nil
+        urlSession = nil
+        immediateSession = nil
+    }
+}
+
+/// Reports the outcome of one request to whoever queued it.
+public typealias RequestCallback = (_ response: String?, _ success: Bool) -> Void
+
+// MARK: - Certificate pinning
+
+extension ConnectionManager: URLSessionDelegate {
+
+    /// Whether the certificate chain itself is trustworthy.
+    private static func evaluate(_ trust: SecTrust, error: inout CFError?) -> Bool {
+        if #available(iOS 12.0, tvOS 12.0, macOS 10.14, watchOS 5.0, *) {
+            return SecTrustEvaluateWithError(trust, &error)
+        }
+        var result = SecTrustResultType.invalid
+        guard SecTrustEvaluate(trust, &result) == errSecSuccess else { return false }
+        return result == .unspecified || result == .proceed
+    }
+
+    /// The public key of a trust object, across the deployment range.
+    private static func publicKey(of trust: SecTrust) -> SecKey? {
+        if #available(iOS 14.0, tvOS 14.0, macOS 11.0, watchOS 7.0, *) {
+            return SecTrustCopyKey(trust)
+        }
+        return SecTrustCopyPublicKey(trust)
+    }
+
+    /// Accepts the server only when its public key matches one of the bundled
+    /// certificates and the chain itself validates.
+    ///
+    /// Both checks matter: a matching key with an expired chain, or a valid chain
+    /// with an unknown key, are each a reason to refuse.
+    public func urlSession(_ session: URLSession,
+                           didReceive challenge: URLAuthenticationChallenge,
+                           completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        guard let serverTrust = challenge.protectionSpace.serverTrust else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+
+        let host = challenge.protectionSpace.host
+        let policy = SecPolicyCreateSSL(true, host as CFString)
+        let serverKey = Self.publicKey(of: serverTrust)
+
+        var keysMatch = false
+        for name in core.config.pinnedCertificates {
+            guard let path = Bundle.main.path(forResource: name, ofType: nil),
+                  let localData = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let localCert = SecCertificateCreateWithData(nil, localData as CFData) else {
+                core.logger.e(Self.module, "didReceiveChallenge", "bundled certificate can not be found or read, certificate: [\(name)]")
+                continue
+            }
+
+            var localTrust: SecTrust?
+            SecTrustCreateWithCertificates(localCert, policy, &localTrust)
+            guard let localTrust, let localKey = Self.publicKey(of: localTrust) else { continue }
+
+            if let serverKey, localKey == serverKey {
+                core.logger.d(Self.module, "didReceiveChallenge", "pinned certificate and server certificate match")
+                keysMatch = true
+                break
+            }
+        }
+
+        #if DEBUG
+        if core.config.shouldIgnoreTrustCheck, let exceptions = SecTrustCopyExceptions(serverTrust) {
+            SecTrustSetExceptions(serverTrust, exceptions)
+        }
+        #endif
+
+        var error: CFError?
+        let chainIsValid = Self.evaluate(serverTrust, error: &error)
+
+        if keysMatch, chainIsValid {
+            core.logger.d(Self.module, "didReceiveChallenge", "pinned certificate check is successful, proceeding with the request, host: [\(host)]")
+            completionHandler(.useCredential, URLCredential(trust: serverTrust))
+            return
+        }
+
+        if !keysMatch {
+            core.logger.d(Self.module, "didReceiveChallenge", "pinned certificate and server certificate do not match")
+        }
+        if !chainIsValid {
+            core.logger.d(Self.module, "didReceiveChallenge", "server certificate is not valid, evaluation error: [\(error?.localizedDescription ?? "none")]")
+        }
+
+        core.logger.e(Self.module, "didReceiveChallenge", "pinned certificate check failed, cancelling the request, host: [\(host)]")
+        completionHandler(.cancelAuthenticationChallenge, nil)
+    }
+}
+
+// MARK: - Instant requests
+
+extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
+
+    var isDeviceIDTemporary: Bool {
+        core.modules.deviceID.isTemporary
+    }
+
+    /// Sends the health check outside the queue.
+    func sendHealthCheck(payload: [String: Any], completion: @escaping (Bool, Error?) -> Void) {
+        var queryString = builder.queryEssentials()
+        queryString += "&hc=\(CountlyJSON.escapedString(from: payload, logger: core.logger))"
+        queryString += "&\(QS.metrics)=\(CountlyJSON.escapedString(from: [MetricKey.appVersion: DeviceMetrics.appVersion], logger: core.logger))"
+        queryString = builder.appendChecksum(queryString)
+
+        let request = instantRequest(queryString: queryString, path: Endpoint.input)
+        core.logger.d(Self.module, "sendHealthCheck", "health check request prepared as [\(request.httpMethod ?? "GET")], queryLength: [\(queryString.count)]")
+
+        instantSession().dataTask(with: request) { [weak self] data, response, error in
+            guard let self else { return }
+            completion(self.isRequestSuccessful(response: response, data: data, endpoint: Endpoint.input, quiet: true), error)
+        }.resume()
+    }
+
+    /// Fetches behavior settings outside the queue.
+    func fetchServerConfig(completion: @escaping (Data?, Int, Error?) -> Void) {
+        var queryString = builder.queryEssentials()
+        queryString += "&\(QS.method)=\(ServerConfig.fetchMethod)"
+        queryString += "&\(QS.appVersion)=\(DeviceMetrics.appVersion)"
+        queryString = builder.appendChecksum(queryString)
+
+        let request = instantRequest(queryString: queryString, path: Endpoint.output + Endpoint.sdk)
+        core.logger.d(Self.module, "fetchServerConfig", "behavior settings request prepared as [\(request.httpMethod ?? "GET")], queryLength: [\(queryString.count)]")
+
+        instantSession().dataTask(with: request) { data, response, error in
+            completion(data, (response as? HTTPURLResponse)?.statusCode ?? 0, error)
+        }.resume()
+    }
+
+    /// Builds a GET or POST request depending on length, the same rule the queued
+    /// path uses.
+    func instantRequest(queryString: String, path: String) -> URLRequest {
+        let base = core.config.normalizedHost + path
+
+        if queryString.count > kGETRequestMaxLength || core.config.alwaysUsePOST {
+            var request = URLRequest(url: URL(string: base) ?? URL(string: "https://invalid")!)
+            request.httpMethod = "POST"
+            request.httpBody = Data(queryString.utf8)
+            return request
+        }
+
+        return URLRequest(url: URL(string: "\(base)?\(queryString)") ?? URL(string: "https://invalid")!)
+    }
+}
