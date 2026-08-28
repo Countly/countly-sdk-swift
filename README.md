@@ -1,3 +1,5 @@
+[![Build](https://github.com/Countly/countly-sdk-swift/actions/workflows/build.yml/badge.svg)](https://github.com/Countly/countly-sdk-swift/actions/workflows/build.yml)
+[![Tests](https://github.com/Countly/countly-sdk-swift/actions/workflows/test.yml/badge.svg)](https://github.com/Countly/countly-sdk-swift/actions/workflows/test.yml)
 ![Swift](https://img.shields.io/badge/Swift-5.9%2B-orange.svg?style=flat)
 ![Platforms](https://img.shields.io/badge/Platforms-iOS%20%7C%20tvOS%20%7C%20watchOS%20%7C%20macOS%20%7C%20visionOS-brightgreen.svg?style=flat)
 

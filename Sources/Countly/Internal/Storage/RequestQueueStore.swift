@@ -70,6 +70,16 @@ final class RequestQueueStore {
         return requests.first
     }
 
+    /// A copy of the whole queue, oldest first.
+    ///
+    /// Taken under the lock so a caller iterating it cannot observe a queue that a
+    /// drain or an overflow trim is rewriting underneath it.
+    var snapshot: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requests
+    }
+
     /// Appends a request, dropping older ones if the queue is over its limit.
     ///
     /// - Parameters:
@@ -315,10 +325,7 @@ final class RequestQueueStore {
         guard let data = try? Data(contentsOf: fileURL) else { return }
 
         do {
-            let unarchiver = try NSKeyedUnarchiver(forReadingFrom: data)
-            unarchiver.requiresSecureCoding = false
-            let root = unarchiver.decodeObject(forKey: NSKeyedArchiveRootObjectKey)
-            unarchiver.finishDecoding()
+            let root = try CountlyArchive.decodeRoot(from: data)
 
             if let dictionary = root as? [String: Any],
                let stored = dictionary[PersistencyKey.queuedRequests] as? [String] {

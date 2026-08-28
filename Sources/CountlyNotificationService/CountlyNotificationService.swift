@@ -110,32 +110,31 @@ public enum CountlyNotificationService {
             return
         }
 
-        // The content handler must run exactly once. Everything below can reach it
-        // from a download callback, from the deadline, or synchronously.
-        let deliver = onceDelivery(contentHandler)
+        // The content handler must run exactly once, and the content must not be
+        // written while it is being delivered. Everything below reaches the system
+        // through this gate: a download callback, the deadline, or synchronously.
+        let gate = DeliveryGate(content: content, contentHandler: contentHandler)
 
         // Whatever has been assembled by the deadline is what gets delivered.
         // Buttons but no image beats the system giving up and delivering neither.
         DispatchQueue.global().asyncAfter(deadline: .now() + Self.overallTimeout) {
             log("didReceive, the deadline passed, delivering whatever is ready")
-            deliver(content)
+            gate.deliver()
         }
 
         let buttons = countlyPayload[CountlyPushKey.buttons] as? [[String: Any]] ?? []
         if buttons.isEmpty {
-            finish(content: content,
+            finish(gate: gate,
                    attachmentURL: countlyPayload[CountlyPushKey.attachment] as? String,
-                   notificationID: notificationID,
-                   deliver: deliver)
+                   notificationID: notificationID)
             return
         }
 
         registerCategory(for: buttons, notificationID: notificationID) { categoryIdentifier in
-            content.categoryIdentifier = categoryIdentifier
-            finish(content: content,
+            gate.mutate { $0.categoryIdentifier = categoryIdentifier }
+            finish(gate: gate,
                    attachmentURL: countlyPayload[CountlyPushKey.attachment] as? String,
-                   notificationID: notificationID,
-                   deliver: deliver)
+                   notificationID: notificationID)
         }
     }
 
@@ -169,7 +168,15 @@ public enum CountlyNotificationService {
             // obvious way to stop the set growing, unregisters the category an
             // earlier notification is still sitting in Notification Center pointing
             // at, and that notification then expands with no buttons at all.
-            var categories = existing
+            //
+            // `Set.insert` keeps whatever is already there, and two categories with
+            // the same identifier but different actions are not equal, so a plain
+            // insert would leave the set holding both. Which of them
+            // `setNotificationCategories` keeps is undefined, and the identifier
+            // check below would report success either way, so the notification can
+            // expand showing the previous notification's buttons. The identifier is
+            // the key here, so anything already under it is removed first.
+            var categories = existing.filter { $0.identifier != categoryIdentifier }
             categories.insert(category)
 
             // Bounded so a chatty application does not accumulate categories without
@@ -196,7 +203,7 @@ public enum CountlyNotificationService {
                 }
 
                 log("registerCategory, the category was overwritten by a concurrent registration, writing it again")
-                var retry = confirmed
+                var retry = confirmed.filter { $0.identifier != categoryIdentifier }
                 retry.insert(category)
                 center.setNotificationCategories(retry)
                 completion(categoryIdentifier)
@@ -206,13 +213,12 @@ public enum CountlyNotificationService {
 
     // MARK: - Attachment
 
-    private static func finish(content: UNMutableNotificationContent,
+    private static func finish(gate: DeliveryGate,
                                attachmentURL: String?,
-                               notificationID: String,
-                               deliver: @escaping (UNNotificationContent) -> Void) {
+                               notificationID: String) {
         guard let attachmentURL, !attachmentURL.isEmpty, let url = URL(string: attachmentURL) else {
             log("finish, no attachment specified in the Countly payload")
-            deliver(content)
+            gate.deliver()
             return
         }
 
@@ -228,7 +234,7 @@ public enum CountlyNotificationService {
         let task = session.downloadTask(with: url) { location, response, error in
             defer {
                 session.finishTasksAndInvalidate()
-                deliver(content)
+                gate.deliver()
             }
 
             if let error {
@@ -251,7 +257,8 @@ public enum CountlyNotificationService {
                 // same name would make the move fail.
                 try? FileManager.default.removeItem(at: destination)
                 try FileManager.default.moveItem(at: location, to: destination)
-                content.attachments = [try UNNotificationAttachment(identifier: fileName, url: destination, options: nil)]
+                let attachment = try UNNotificationAttachment(identifier: fileName, url: destination, options: nil)
+                gate.mutate { $0.attachments = [attachment] }
                 log("finish, attachment added to the notification")
             } catch {
                 log("finish, attachment could not be attached: \(error.localizedDescription)")
@@ -262,18 +269,50 @@ public enum CountlyNotificationService {
 
     // MARK: - Helpers
 
-    /// Wraps the content handler so that only the first call reaches the system.
-    private static func onceDelivery(_ contentHandler: @escaping (UNNotificationContent) -> Void) -> (UNNotificationContent) -> Void {
-        let lock = NSLock()
-        var delivered = false
-        return { content in
+    /// Owns the notification content and the one delivery the system allows.
+    ///
+    /// Three things race for that content: the category registration callback, the
+    /// attachment download callback, and the deadline timer, each on a different
+    /// queue. Serializing only the *delivery* is not enough, because the deadline
+    /// can hand the content to the system while a download callback is still
+    /// assigning `content.attachments` to the same object. Every read, every write
+    /// and the delivery itself therefore go through one lock.
+    private final class DeliveryGate {
+
+        private let lock = NSLock()
+        private let content: UNMutableNotificationContent
+        private let contentHandler: (UNNotificationContent) -> Void
+        private var delivered = false
+
+        init(content: UNMutableNotificationContent,
+             contentHandler: @escaping (UNNotificationContent) -> Void) {
+            self.content = content
+            self.contentHandler = contentHandler
+        }
+
+        /// Applies a change to the content, unless it has already gone out. A
+        /// change arriving after delivery is dropped rather than applied to an
+        /// object the system is already rendering.
+        func mutate(_ change: (UNMutableNotificationContent) -> Void) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !delivered else { return }
+            change(content)
+        }
+
+        /// Hands the content to the system, at most once.
+        ///
+        /// The content is copied under the lock, so a mutation that starts after
+        /// this returns cannot touch the object the system received.
+        func deliver() {
             lock.lock()
             let alreadyDelivered = delivered
             delivered = true
+            let snapshot = alreadyDelivered ? nil : content.copy() as? UNNotificationContent
             lock.unlock()
 
-            guard !alreadyDelivered else { return }
-            contentHandler(content)
+            guard let snapshot else { return }
+            contentHandler(snapshot)
         }
     }
 

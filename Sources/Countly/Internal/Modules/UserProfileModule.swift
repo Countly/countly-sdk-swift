@@ -90,6 +90,19 @@ final class UserProfileModule: ModuleBase {
 
     // MARK: - Setting properties
 
+    /// Truncates a string value to the limit that applies to its key.
+    ///
+    /// The two picture fields carry a URL rather than a profile value, and have
+    /// their own larger limit. Anything that is not a string is returned as it is.
+    private func truncatedValue(_ value: Any, forKey key: String, _ explanation: String) -> Any {
+        guard let stringValue = value as? String else { return value }
+
+        let isPicture = key == UserProfileKey.picture || key == UserProfileKey.picturePath
+        return isPicture
+            ? core.limits.truncatedPictureValue(stringValue, explanation)
+            : core.limits.truncatedValue(stringValue, explanation)
+    }
+
     /// Sets one property, routing predefined keys to their own fields.
     func setProperty(_ key: String, value: Any?) {
         logI("setProperty", "user property will be set, key: [\(key)], valueProvided: [\(value != nil)]")
@@ -121,20 +134,15 @@ final class UserProfileModule: ModuleBase {
             var value = rawValue
 
             if value is NSNull {
-                if UserProfileKey.predefined.contains(key) {
-                    if assignPredefined(key, value: NSNull()) { anyChange = true }
-                } else {
+                guard UserProfileKey.predefined.contains(key) else {
                     logD("setProperties", "provided value is null, key: [\(key)], skipping this entry")
+                    continue
                 }
+                if assignPredefined(key, value: NSNull()) { anyChange = true }
                 continue
             }
 
-            if let stringValue = value as? String {
-                let isPicture = key == UserProfileKey.picture || key == UserProfileKey.picturePath
-                value = isPicture
-                    ? core.limits.truncatedPictureValue(stringValue, "setProperties")
-                    : core.limits.truncatedValue(stringValue, "setProperties")
-            }
+            value = truncatedValue(value, forKey: key, "setProperties")
 
             if UserProfileKey.predefined.contains(key) {
                 if assignPredefined(key, value: value) { anyChange = true }
@@ -180,13 +188,7 @@ final class UserProfileModule: ModuleBase {
             return
         }
 
-        var stored = value
-        if let stringValue = value as? String {
-            let isPicture = key == UserProfileKey.picture || key == UserProfileKey.picturePath
-            stored = isPicture
-                ? core.limits.truncatedPictureValue(stringValue, "setCustomProperty")
-                : core.limits.truncatedValue(stringValue, "setCustomProperty")
-        }
+        let stored = truncatedValue(value, forKey: key, "setCustomProperty")
 
         lock.lock()
         customProperties[core.limits.truncatedKey(key, "setCustomProperty")] = stored
@@ -370,7 +372,13 @@ final class UserProfileModule: ModuleBase {
 
         lock.lock()
         let localPath = pictureLocalPath
-        let hasPictureURL = predefinedFields[UserProfileKey.picture] != nil
+        // A remote picture URL supersedes a local file, but an explicit clear is
+        // not a URL: `setProperties(["picture": NSNull(), "picturePath": path])`
+        // means "drop whatever is on the server and upload this file", and reading
+        // the key's mere presence would suppress the upload and then discard the
+        // staged path along with everything else.
+        let hasPictureURL = !(predefinedFields[UserProfileKey.picture] is NSNull)
+            && predefinedFields[UserProfileKey.picture] != nil
         lock.unlock()
 
         // The picture upload is a multipart request of its own, and a remote
@@ -385,6 +393,10 @@ final class UserProfileModule: ModuleBase {
     }
 
     private func sendUserDetails(_ payload: String) {
+        guard !payload.isEmpty else {
+            logE("sendUserDetails", "an empty user details payload will not be sent")
+            return
+        }
         let queryString = "\(core.network.builder.queryEssentials())&\(QS.userDetails)=\(payload)"
         core.network.enqueueAndProceed(queryString)
     }
@@ -427,7 +439,18 @@ final class UserProfileModule: ModuleBase {
         logD("serializedUserDetails", "user details serialized, fields: [\(payload.keys.sorted())], customPropertyCount: [\(custom.count)]")
 
         guard !payload.isEmpty else { return nil }
-        return CountlyJSON.escapedString(from: payload, logger: log)
+
+        // `escapedString` answers with an empty string when the object cannot be
+        // represented as JSON. Sending that would put `user_details=` on the wire
+        // with nothing after it, and `save` would then clear every staged property
+        // as if the server had received them. Reporting nothing to send is what
+        // keeps the properties staged for the next attempt.
+        let escaped = CountlyJSON.escapedString(from: payload, logger: log)
+        guard !escaped.isEmpty else {
+            logE("serializedUserDetails", "user details could not be serialized and will not be sent, fields: [\(payload.keys.sorted())]")
+            return nil
+        }
+        return escaped
     }
 
     /// Custom properties trimmed to the server's configured cache limit.
@@ -473,9 +496,25 @@ final class UserProfileModule: ModuleBase {
     /// Whether the server can store this value: numbers, strings, and lists of
     /// those.
     private func isValidDataType(_ value: Any) -> Bool {
-        if value is NSNumber || value is String { return true }
-        if value is [Any] { return true }
+        if let number = value as? NSNumber { return Self.isFinite(number) }
+        if value is String { return true }
+        if let list = value as? [Any] { return list.allSatisfy(isValidDataType) }
         return false
+    }
+
+    /// Whether a number can be represented in JSON.
+    ///
+    /// `NaN` and the infinities cannot, and one of them anywhere in the profile
+    /// makes `JSONSerialization` reject the whole object. The payload would then
+    /// serialize to an empty string, the SDK would send `user_details=` with
+    /// nothing in it, and the staged properties would be cleared as if they had
+    /// been delivered. Rejecting the one bad value at the door costs the caller
+    /// that value and nothing else.
+    private static func isFinite(_ number: NSNumber) -> Bool {
+        // Only the floating point representations can be non-finite; asking an
+        // integer for its double value is a conversion, not a check.
+        guard CFNumberIsFloatType(number) else { return true }
+        return number.doubleValue.isFinite
     }
 
     // MARK: - Lifecycle

@@ -81,6 +81,7 @@ final class SDKCore {
         self.keyValueStore = KeyValueStore(namespace: namespace, logger: logger)
         self.requestQueueStore = RequestQueueStore(namespace: namespace, logger: logger)
         self.crashLogStore = CrashLogStore(namespace: namespace, logger: logger)
+        crashLogStore.maxBreadcrumbCount = config.sdkInternalLimits.maxBreadcrumbCount
         self.healthTracker = HealthTracker(store: keyValueStore, logger: logger)
         self.serverConfig = ServerConfig(store: keyValueStore, logger: logger)
 
@@ -96,6 +97,9 @@ final class SDKCore {
     /// Rebuilds the limit enforcer after behavior settings changed the limits.
     func refreshLimits() {
         limits = LimitsEnforcer(limits: config.sdkInternalLimits, logger: logger)
+        // The breadcrumb file caps itself, so it has to hear about a limit the
+        // server lowered as well.
+        crashLogStore.maxBreadcrumbCount = config.sdkInternalLimits.maxBreadcrumbCount
     }
 
     /// The metrics dictionary for this instance, including its custom metrics.
@@ -107,9 +111,8 @@ final class SDKCore {
     /// the limits can change under behavior settings.
     private func sanitizedCustomMetrics() -> [String: String] {
         guard !config.customMetrics.isEmpty else { return [:] }
-        let truncated = limits.truncated(config.customMetrics, "Custom metric")
-        let limited = limits.limited(truncated, "Custom metric")
-        return limited.compactMapValues { $0 as? String }
+        return limits.truncatedAndLimited(config.customMetrics, "Custom metric")
+            .compactMapValues { $0 as? String }
     }
 }
 

@@ -210,8 +210,19 @@ final class HealthTracker {
             return
         }
 
-        guard healthCheckEnabled, !healthCheckSent else {
-            logger?.d(Self.module, "sendHealthCheck", "health check send skipped, healthCheckSent: [\(healthCheckSent)], healthCheckEnabled: [\(healthCheckEnabled)]")
+        // Claimed under the queue that owns the flag, and claimed before the
+        // request rather than after it succeeds. Reading it here and setting it in
+        // the completion left a window in which a second trigger -- leaving
+        // temporary device ID mode fires one right after init does -- passed the
+        // guard too, sending the same counters twice and clearing them twice.
+        let claimed: Bool = queue.sync {
+            guard healthCheckEnabled, !healthCheckSent else { return false }
+            healthCheckSent = true
+            return true
+        }
+
+        guard claimed else {
+            logger?.d(Self.module, "sendHealthCheck", "health check send skipped, it has already been sent this launch or is disabled")
             return
         }
 
@@ -223,6 +234,7 @@ final class HealthTracker {
 
             if let error {
                 self.logger?.d(Self.module, "sendHealthCheck", "health check request failed at the transport level, it will be retried later, error: [\(error.localizedDescription)]")
+                self.queue.async { self.healthCheckSent = false }
                 return
             }
 
@@ -230,12 +242,12 @@ final class HealthTracker {
             // counters this request exists to report.
             guard wasAccepted else {
                 self.logger?.d(Self.module, "sendHealthCheck", "the server did not accept the health check, counters will not be cleared")
+                self.queue.async { self.healthCheckSent = false }
                 return
             }
 
             self.logger?.d(Self.module, "sendHealthCheck", "health check accepted by the server, counters will be cleared")
             self.clearAndSave()
-            self.queue.async { self.healthCheckSent = true }
         }
     }
 

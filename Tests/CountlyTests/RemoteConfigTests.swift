@@ -1,0 +1,462 @@
+//
+//  RemoteConfigTests.swift
+//
+//  This code is provided under the MIT License.
+//
+//  Please visit www.count.ly for more information.
+//
+
+import XCTest
+@testable import Countly
+
+/// Reading configuration back from the server, and the A/B testing built on it.
+///
+/// Remote config is the one feature where the SDK asks rather than reports, so it
+/// skips the request queue and goes out as an instant request. That makes the
+/// things worth checking different from the rest of the SDK: which URL was called,
+/// what the cache does with the answer, and whether every path that takes a
+/// completion handler actually calls it.
+final class RemoteConfigTests: CountlyBaseTestCase {
+
+    /// Only the requests this feature makes. The SDK sends a health check and a
+    /// behavior settings fetch of its own as it starts, which are not remote
+    /// config traffic and are gated separately.
+    private func remoteConfigRequests() -> [MockURLProtocol.Captured] {
+        let methods = ["method=rc", "method=fetch_remote_config", "ab_fetch_variants",
+                       "ab_fetch_experiments", "ab_enroll_variant"]
+        return MockURLProtocol.requests.filter { request in
+            methods.contains { request.query.contains($0) }
+        }
+    }
+
+    /// Waits for `completion` to be invoked, failing the test if it never is.
+    ///
+    /// A remote config call that captures a completion handler and never calls it
+    /// leaves the host application waiting for the life of the process, so "it was
+    /// called at all" is as much the assertion as what it was called with.
+    private func expectCompletion(_ description: String,
+                                  timeout: TimeInterval = 5,
+                                  _ body: (@escaping () -> Void) -> Void) {
+        let expectation = expectation(description: description)
+        var fulfilled = false
+        body {
+            guard !fulfilled else { return }
+            fulfilled = true
+            expectation.fulfill()
+        }
+        wait(for: [expectation], timeout: timeout)
+    }
+
+    // MARK: - Downloading
+
+    func testDownloadingKeysCachesEveryValueTheServerSent() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk",
+                                json: #"{"colour": "blue", "limit": 7, "on": true}"#)
+        let countly = startInstance()
+
+        expectCompletion("the download reports back") { done in
+            countly.remoteConfig.downloadKeys { result, error, _, _ in
+                XCTAssertEqual(result, .success)
+                XCTAssertNil(error)
+                done()
+            }
+        }
+
+        XCTAssertEqual(countly.remoteConfig.getValue("colour").value as? String, "blue")
+        XCTAssertEqual(TestUtils.int(countly.remoteConfig.getValue("limit").value), 7)
+        XCTAssertEqual(countly.remoteConfig.getAllValues().count, 3)
+    }
+
+    /// The request is an instant one on the read endpoint, not a queued report, so
+    /// a value the application is waiting for is not stuck behind a backlog.
+    func testTheDownloadGoesOutImmediatelyRatherThanThroughTheQueue() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: "{}")
+        let countly = startInstance()
+
+        expectCompletion("the download reports back") { done in
+            countly.remoteConfig.downloadKeys { _, _, _, _ in done() }
+        }
+
+        let requests = MockURLProtocol.requests(pathContaining: "/o/sdk")
+        XCTAssertFalse(requests.isEmpty)
+        XCTAssertTrue(requests.contains { $0.query.contains("method=rc") })
+        XCTAssertTrue(TestUtils.requests(requestQueue(of: countly), carrying: "method").isEmpty,
+                      "the fetch must not sit in the request queue")
+    }
+
+    func testAskingForSpecificKeysNamesThemInTheRequest() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"a": 1}"#)
+        let countly = startInstance()
+
+        expectCompletion("the download reports back") { done in
+            countly.remoteConfig.downloadSpecificKeys(["a", "b"]) { _, _, _, _ in done() }
+        }
+
+        guard let request = MockURLProtocol.requests(pathContaining: "/o/sdk").last else {
+            XCTFail("a request should have gone out")
+            return
+        }
+        let parsed = TestUtils.parseQuery(request.query)
+        XCTAssertEqual(TestUtils.describe(parsed["keys"] ?? ""), "[a,b]")
+        XCTAssertNil(parsed["omit_keys"])
+    }
+
+    func testOmittingKeysNamesThemInTheRequest() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"a": 1}"#)
+        let countly = startInstance()
+
+        expectCompletion("the download reports back") { done in
+            countly.remoteConfig.downloadOmittingKeys(["secret"]) { _, _, _, _ in done() }
+        }
+
+        guard let request = MockURLProtocol.requests(pathContaining: "/o/sdk").last else {
+            XCTFail("a request should have gone out")
+            return
+        }
+        let parsed = TestUtils.parseQuery(request.query)
+        XCTAssertEqual(TestUtils.describe(parsed["omit_keys"] ?? ""), "[secret]")
+        XCTAssertNil(parsed["keys"])
+    }
+
+    /// A full download replaces the cache; a partial one merges into it. Getting
+    /// that backwards either loses values the server still serves or keeps values
+    /// it has withdrawn.
+    func testAFullDownloadReplacesTheCacheAndAPartialOneMergesIntoIt() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"a": 1, "b": 2}"#)
+        let countly = startInstance()
+
+        expectCompletion("the full download reports back") { done in
+            countly.remoteConfig.downloadKeys { _, _, isFullUpdate, _ in
+                XCTAssertTrue(isFullUpdate)
+                done()
+            }
+        }
+        XCTAssertEqual(countly.remoteConfig.getAllValues().count, 2)
+
+        MockURLProtocol.reset()
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"b": 20, "c": 30}"#)
+
+        expectCompletion("the partial download reports back") { done in
+            countly.remoteConfig.downloadSpecificKeys(["b", "c"]) { _, _, isFullUpdate, _ in
+                XCTAssertFalse(isFullUpdate)
+                done()
+            }
+        }
+
+        let all = countly.remoteConfig.getAllValues()
+        XCTAssertEqual(all.count, 3, "a is still there after a partial update")
+        XCTAssertEqual(TestUtils.int(all["b"]?.value), 20)
+        XCTAssertEqual(TestUtils.int(all["c"]?.value), 30)
+    }
+
+    func testAFailedDownloadReportsAnErrorAndLeavesTheCacheAlone() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"a": 1}"#)
+        let countly = startInstance()
+
+        expectCompletion("the first download reports back") { done in
+            countly.remoteConfig.downloadKeys { _, _, _, _ in done() }
+        }
+
+        MockURLProtocol.reset()  // nothing answers, so the request fails
+
+        expectCompletion("the failed download still reports back") { done in
+            countly.remoteConfig.downloadKeys { result, error, _, _ in
+                XCTAssertEqual(result, .error)
+                XCTAssertNotNil(error)
+                done()
+            }
+        }
+
+        XCTAssertEqual(TestUtils.int(countly.remoteConfig.getValue("a").value), 1,
+                       "a failed refresh must not empty the cache")
+    }
+
+    // MARK: - Reading values
+
+    /// A key that was never downloaded reads as a nil value. The flag beside it
+    /// only means anything once there is a value, which is why it stays true.
+    func testAKeyThatWasNeverDownloadedReadsAsAbsent() {
+        let countly = startInstance()
+
+        let data = countly.remoteConfig.getValue("never-downloaded")
+
+        XCTAssertNil(data.value)
+        XCTAssertTrue(data.isCurrentUsersData)
+    }
+
+    func testClearingDiscardsEverythingCached() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"a": 1}"#)
+        let countly = startInstance()
+
+        expectCompletion("the download reports back") { done in
+            countly.remoteConfig.downloadKeys { _, _, _, _ in done() }
+        }
+        XCTAssertEqual(countly.remoteConfig.getAllValues().count, 1)
+
+        countly.remoteConfig.clearAll()
+
+        XCTAssertTrue(countly.remoteConfig.getAllValues().isEmpty)
+    }
+
+    /// The cache survives a restart, so an application that launches offline still
+    /// gets the values it had last time rather than its hardcoded fallbacks.
+    func testTheCacheSurvivesARestart() {
+        let name = uniqueInstanceName()
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"colour": "blue"}"#)
+
+        let first = start(baseConfig(instanceName: name))
+        expectCompletion("the download reports back") { done in
+            first.remoteConfig.downloadKeys { _, _, _, _ in done() }
+        }
+        first.halt()
+
+        MockURLProtocol.reset()
+        let second = start(baseConfig(instanceName: name))
+
+        XCTAssertEqual(second.remoteConfig.getValue("colour").value as? String, "blue")
+    }
+
+    // MARK: - Registered callbacks
+
+    /// A global callback hears about every download, which is how an application
+    /// re-renders itself when the configuration changes underneath it.
+    func testRegisteredCallbacksHearAboutEveryDownload() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"a": 1}"#)
+        let countly = startInstance()
+
+        let notified = expectation(description: "the registered callback fires")
+        notified.assertForOverFulfill = false
+        countly.remoteConfig.registerDownloadCallback { result, _, _, values in
+            XCTAssertEqual(result, .success)
+            XCTAssertEqual(TestUtils.int(values["a"]?.value), 1)
+            notified.fulfill()
+        }
+
+        countly.remoteConfig.downloadKeys(completion: nil)
+        wait(for: [notified], timeout: 5)
+    }
+
+    func testRemovingAllCallbacksStopsTheNotifications() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"a": 1}"#)
+        let countly = startInstance()
+
+        var fired = false
+        countly.remoteConfig.registerDownloadCallback { _, _, _, _ in fired = true }
+        countly.remoteConfig.removeAllDownloadCallbacks()
+
+        expectCompletion("the download reports back") { done in
+            countly.remoteConfig.downloadKeys { _, _, _, _ in done() }
+        }
+
+        XCTAssertFalse(fired)
+    }
+
+    // MARK: - A/B testing
+
+    func testEnrollingAndExitingUseTheirOwnMethods() {
+        let countly = startInstance()
+
+        countly.remoteConfig.enrollIntoABTests(forKeys: ["experiment-a"])
+        countly.remoteConfig.exitABTests(forKeys: ["experiment-a"])
+
+        let queued = requestQueue(of: countly).map(TestUtils.parseQuery)
+        XCTAssertTrue(queued.contains { $0["method"] as? String == "ab" })
+        XCTAssertTrue(queued.contains { $0["method"] as? String == "ab_opt_out" })
+    }
+
+    /// The response shape is an object carrying `jsonArray`, not a bare array. Any
+    /// other reading reports every successful download as a failure.
+    func testExperimentInformationIsParsedFromTheDocumentedShape() {
+        let payload = """
+        {"jsonArray": [{"id": "e1", "name": "Colour test", "description": "",
+                        "currentVariant": "blue", "variants": {}}]}
+        """
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: payload)
+        let countly = startInstance()
+
+        expectCompletion("the experiment download reports back") { done in
+            countly.remoteConfig.testingDownloadExperimentInformation { result, error in
+                XCTAssertEqual(result, .success, "error was \(String(describing: error))")
+                done()
+            }
+        }
+
+        let experiments = countly.remoteConfig.testingGetAllExperimentInfo()
+        XCTAssertEqual(experiments["e1"]?.experimentName, "Colour test")
+        XCTAssertEqual(experiments["e1"]?.currentVariant, "blue")
+    }
+
+    func testVariantsAreDownloadedAndReadBackPerKey() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk",
+                                json: #"{"colour": ["blue", "green"]}"#)
+        let countly = startInstance()
+
+        expectCompletion("the variant download reports back") { done in
+            countly.remoteConfig.testingDownloadVariantInformation { result, _ in
+                XCTAssertEqual(result, .success)
+                done()
+            }
+        }
+
+        XCTAssertEqual(countly.remoteConfig.testingGetVariants(forKey: "colour").map { "\($0)" },
+                       ["blue", "green"])
+        XCTAssertEqual(countly.remoteConfig.testingGetAllVariants().count, 1)
+    }
+
+    /// Enrolment writes state on the server, so it goes to the input endpoint
+    /// rather than the read endpoint the fetches use.
+    func testEnrollingIntoAVariantGoesToTheInputEndpoint() {
+        MockURLProtocol.respond(pathContaining: "/i", json: #"{"result": "Success"}"#)
+        let countly = startInstance()
+
+        expectCompletion("the enrolment reports back") { done in
+            countly.remoteConfig.testingEnrollIntoVariant(key: "colour", variantName: "blue") { _, _ in
+                done()
+            }
+        }
+
+        guard let request = MockURLProtocol.requests.last(where: { $0.query.contains("ab_enroll_variant") }) else {
+            XCTFail("an enrolment request should have gone out")
+            return
+        }
+        XCTAssertEqual(request.path, "/i")
+        let parsed = TestUtils.parseQuery(request.query)
+        XCTAssertEqual(parsed["key"] as? String, "colour")
+        XCTAssertEqual(parsed["variant"] as? String, "blue")
+    }
+
+    func testEnrollingWithAnEmptyKeyOrVariantIsRefused() {
+        let countly = startInstance()
+
+        expectCompletion("the empty key reports back") { done in
+            countly.remoteConfig.testingEnrollIntoVariant(key: "", variantName: "blue") { result, _ in
+                XCTAssertEqual(result, .error)
+                done()
+            }
+        }
+
+        XCTAssertTrue(MockURLProtocol.requests.filter { $0.query.contains("ab_enroll_variant") }.isEmpty)
+    }
+
+    // MARK: - Gates
+
+    /// Enrolment is the one testing call that writes state, so an ungated one
+    /// would enrol a user who declined remote config.
+    func testNothingIsFetchedOrEnrolledWithoutRemoteConfigConsent() {
+        let countly = startInstance { $0.requiresConsent = true }
+
+        for (label, call) in [
+            ("download", { (done: @escaping () -> Void) in
+                countly.remoteConfig.downloadKeys { result, _, _, _ in
+                    XCTAssertEqual(result, .error)
+                    done()
+                }
+            }),
+            ("variants", { done in
+                countly.remoteConfig.testingDownloadVariantInformation { result, _ in
+                    XCTAssertEqual(result, .error)
+                    done()
+                }
+            }),
+            ("experiments", { done in
+                countly.remoteConfig.testingDownloadExperimentInformation { result, _ in
+                    XCTAssertEqual(result, .error)
+                    done()
+                }
+            }),
+            ("enrolment", { done in
+                countly.remoteConfig.testingEnrollIntoVariant(key: "k", variantName: "v") { result, _ in
+                    XCTAssertEqual(result, .error)
+                    done()
+                }
+            }),
+        ] {
+            expectCompletion("the \(label) reports back", call)
+        }
+
+        XCTAssertTrue(remoteConfigRequests().isEmpty,
+                      "no remote config traffic should have reached the network without consent")
+    }
+
+    /// In temporary mode the SDK does not know who the user is, so it must not ask
+    /// the server anything about them or write anything against them.
+    func testNothingReachesTheNetworkInTemporaryDeviceIDMode() {
+        let countly = startInstance { $0.temporaryDeviceIDMode = true }
+
+        expectCompletion("the download reports back") { done in
+            countly.remoteConfig.downloadKeys { result, _, _, _ in
+                XCTAssertEqual(result, .error)
+                done()
+            }
+        }
+        expectCompletion("the enrolment reports back") { done in
+            countly.remoteConfig.testingEnrollIntoVariant(key: "k", variantName: "v") { result, _ in
+                XCTAssertEqual(result, .error)
+                done()
+            }
+        }
+
+        XCTAssertTrue(remoteConfigRequests().isEmpty)
+    }
+
+    /// The server's networking kill switch has to reach the instant requests too,
+    /// or the one path that bypasses the queue also bypasses the switch.
+    func testNothingReachesTheNetworkWhileTheServerHasNetworkingOff() {
+        let countly = startInstance {
+            $0.sdkBehaviorSettings = ServerConfigBuilder().networking(false).json()
+        }
+
+        expectCompletion("the download reports back") { done in
+            countly.remoteConfig.downloadKeys { result, _, _, _ in
+                XCTAssertEqual(result, .error)
+                done()
+            }
+        }
+        expectCompletion("the variant download reports back") { done in
+            countly.remoteConfig.testingDownloadVariantInformation { result, _ in
+                XCTAssertEqual(result, .error)
+                done()
+            }
+        }
+
+        XCTAssertTrue(remoteConfigRequests().isEmpty)
+    }
+
+    // MARK: - Automatic download
+
+    func testAutomaticTriggersDownloadTheConfigAsTheSDKStarts() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"colour": "blue"}"#)
+
+        let countly = startInstance { $0.enableRemoteConfigAutomaticTriggers = true }
+
+        TestUtils.waitUntil("the automatic download lands") {
+            countly.remoteConfig.getValue("colour").value != nil
+        }
+    }
+
+    func testWithoutAutomaticTriggersNothingIsDownloadedAtStart() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"colour": "blue"}"#)
+
+        _ = startInstance { $0.enableRemoteConfigAutomaticTriggers = false }
+        TestUtils.pump(0.3)
+
+        XCTAssertTrue(MockURLProtocol.requests.filter { $0.query.contains("method=rc") }.isEmpty)
+    }
+
+    /// A/B enrolment on download is opt in, and it travels as `oi=1` on the fetch
+    /// rather than as a request of its own.
+    func testEnrollingOnDownloadIsAskedForOnTheFetchItself() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: "{}")
+        let countly = startInstance { $0.enrollABOnRCDownload = true }
+
+        expectCompletion("the download reports back") { done in
+            countly.remoteConfig.downloadKeys { _, _, _, _ in done() }
+        }
+
+        guard let request = MockURLProtocol.requests.last(where: { $0.query.contains("method=rc") }) else {
+            XCTFail("a fetch should have gone out")
+            return
+        }
+        XCTAssertEqual(TestUtils.parseQuery(request.query)["oi"] as? String, "1")
+    }
+}

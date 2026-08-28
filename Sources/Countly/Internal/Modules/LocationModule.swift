@@ -77,9 +77,9 @@ final class LocationModule: ModuleBase {
             locationCoordinate = nil
         }
 
-        self.city = (city?.isEmpty ?? true) ? nil : city
-        self.isoCountryCode = (isoCountryCode?.isEmpty ?? true) ? nil : isoCountryCode
-        self.ipAddress = (ipAddress?.isEmpty ?? true) ? nil : ipAddress
+        self.city = Self.nilIfEmpty(city)
+        self.isoCountryCode = Self.nilIfEmpty(isoCountryCode)
+        self.ipAddress = Self.nilIfEmpty(ipAddress)
 
         logD("updateLocation", "stored location fields updated, coordinate: [\(locationCoordinate != nil)], city: [\(self.city != nil)], countryCode: [\(self.isoCountryCode != nil)], IP: [\(self.ipAddress != nil)]")
         logV("updateLocation", "stored location field detail, location: [\(locationCoordinate ?? "")], city: [\(self.city ?? "")], countryCode: [\(self.isoCountryCode ?? "")], IP: [\(self.ipAddress ?? "")]")
@@ -95,6 +95,14 @@ final class LocationModule: ModuleBase {
         if locationCoordinate != nil || self.city != nil || self.isoCountryCode != nil || self.ipAddress != nil {
             isLocationInfoDisabled = false
         }
+    }
+
+    /// An empty string means the host application supplied nothing, and is stored
+    /// as nothing: an empty field on the wire would read as a value the server
+    /// should keep.
+    private static func nilIfEmpty(_ value: String?) -> String? {
+        guard let value, !value.isEmpty else { return nil }
+        return value
     }
 
     /// Reports whatever is stored, if consent and behavior settings allow it.

@@ -55,21 +55,22 @@ final class CrashModule: ModuleBase {
 
     private static let mebibyte: UInt64 = 1_048_576
 
-    /// Breadcrumbs kept in memory for this run.
-    private var breadcrumbs: [String] = []
-    private let breadcrumbLock = NSLock()
+    /// Guards everything mutable in this module.
+    ///
+    /// One lock rather than one per field: `setCrashSegmentation` and a consent
+    /// change are both public entry points reachable from any thread, and a crash
+    /// arriving in between reads the segmentation and the handler flag together.
+    private let stateLock = NSRecursiveLock()
 
-    /// Global segmentation merged into every report.
+    /// Breadcrumbs kept in memory for this run. Guarded by `stateLock`.
+    private var breadcrumbs: [String] = []
+
+    /// Global segmentation merged into every report. Guarded by `stateLock`.
     private var crashSegmentation: [String: Any] = [:]
 
-    /// Whether this instance installed the process-wide handlers.
+    /// Whether this instance installed the process-wide handlers. Guarded by
+    /// `stateLock`.
     private var isHandlerInstalled = false
-
-    /// Filled in while resolving binary images, needed by the server for fast
-    /// symbol lookup.
-    private var buildUUID: String?
-    private var executableName: String?
-    private var architecture: String?
 
     // MARK: - Init
 
@@ -84,7 +85,10 @@ final class CrashModule: ModuleBase {
     func setCrashSegmentation(_ segmentation: [String: Any]) {
         logI("setCrashSegmentation", "global crash segmentation is being set, keyCount: [\(segmentation.count)]")
         logV("setCrashSegmentation", "global crash segmentation detail, segmentation: [\(segmentation)]")
-        crashSegmentation = core.limits.truncatedAndLimited(segmentation, "Crash segmentation")
+        let sanitized = core.limits.truncatedAndLimited(segmentation, "Crash segmentation")
+        stateLock.lock()
+        crashSegmentation = sanitized
+        stateLock.unlock()
     }
 
     // MARK: - Handler installation
@@ -103,6 +107,9 @@ final class CrashModule: ModuleBase {
             logV("startCrashReporting", "no crashes consent given, crash handlers are not installed")
             return
         }
+
+        stateLock.lock()
+        defer { stateLock.unlock() }
 
         guard !isHandlerInstalled else {
             logD("startCrashReporting", "crash handlers are already installed, nothing to do")
@@ -123,6 +130,9 @@ final class CrashModule: ModuleBase {
         // even when no handler was ever installed and a consent withdrawal has to
         // drop them either way.
         clearCrashLogs()
+
+        stateLock.lock()
+        defer { stateLock.unlock() }
 
         guard isHandlerInstalled else {
             logD("stopCrashReporting", "crash handler uninstall is a no-op, no crash handlers were installed by this instance")
@@ -198,6 +208,9 @@ final class CrashModule: ModuleBase {
                         isAutoDetected: Bool) {
         guard core.serverConfig.crashReportingEnabled else { return }
 
+        // Limited before anything reads it, so the regular expression filter, the
+        // filter callback and the wire report all see the same trace.
+        let stackTrace = core.limits.truncatedStackTrace(stackTrace, "Crash stack trace")
         let stackTraceJoined = stackTrace.joined(separator: "\n")
 
         var matchesFilter = false
@@ -207,15 +220,15 @@ final class CrashModule: ModuleBase {
                 || matches(filter, name)
         }
 
+        stateLock.lock()
         var custom = crashSegmentation
+        let currentBreadcrumbs = breadcrumbs
+        stateLock.unlock()
+
         if let segmentationOverride {
             custom.merge(segmentationOverride) { _, new in new }
         }
         custom.merge(userInfo) { _, new in new }
-
-        breadcrumbLock.lock()
-        let currentBreadcrumbs = breadcrumbs
-        breadcrumbLock.unlock()
 
         let filterCallback = core.config.crashes.crashFilterCallback
 
@@ -240,38 +253,9 @@ final class CrashModule: ModuleBase {
             return
         }
 
-        var report = crashData.crashMetrics
-        report[Key.error] = crashData.stackTrace
-        report[Key.binaryImages] = binaryImages(for: stackTrace)
-        report[Key.buildUUID] = buildUUID ?? ""
-        report[Key.executableName] = executableName ?? ""
-        report[Key.architecture] = architecture ?? ""
-        report[Key.name] = crashData.crashDescription
-        report[Key.type] = crashData.name
-        report[Key.nonfatal] = !crashData.fatal
-
-        // Tells the server which fields the host application's filter changed, so
-        // a doctored report is not mistaken for a raw one.
-        crashData.calculateChangedFields()
-        let changed = crashData.changedFieldsBitfield
-        if changed > 0 {
-            report[Key.changedFields] = changed
-        }
-
-        if !crashData.crashSegmentation.isEmpty {
-            // Capped a second time only when there was a callback that could have
-            // changed the segmentation. `CountlyCrashData` is a class, so an
-            // enriching callback would otherwise ship unbounded keys and values;
-            // without one the dictionary is still exactly what was sanitized on the
-            // way in, and re-capping it is pure rework on every recorded error.
-            report[Key.custom] = filterCallback == nil
-                ? crashData.crashSegmentation
-                : core.limits.truncatedAndLimited(crashData.crashSegmentation, "Crash segmentation")
-        }
-
-        if !crashData.breadcrumbs.isEmpty {
-            report[Key.logs] = crashData.breadcrumbs.joined(separator: "\n")
-        }
+        let report = wireReport(for: crashData,
+                                stackTrace: stackTrace,
+                                hadFilterCallback: filterCallback != nil)
 
         if let shouldSend = core.config.shouldSendCrashReportCallback, !shouldSend(report) {
             logD("handle", "crash report is dropped by the shouldSendCrashReport callback")
@@ -290,6 +274,51 @@ final class CrashModule: ModuleBase {
         }
     }
 
+    /// Turns the assembled crash data into the payload the server reads.
+    ///
+    /// - Parameter hadFilterCallback: whether the host application was given the
+    ///   report to change, which decides whether the segmentation has to be capped
+    ///   a second time.
+    private func wireReport(for crashData: CountlyCrashData,
+                            stackTrace: [String],
+                            hadFilterCallback: Bool) -> [String: Any] {
+        var report = crashData.crashMetrics
+        report[Key.error] = crashData.stackTrace
+        let symbolication = binaryImages(for: stackTrace)
+        report[Key.binaryImages] = symbolication.images
+        report[Key.buildUUID] = symbolication.buildUUID ?? ""
+        report[Key.executableName] = symbolication.executableName ?? ""
+        report[Key.architecture] = symbolication.architecture
+        report[Key.name] = crashData.crashDescription
+        report[Key.type] = crashData.name
+        report[Key.nonfatal] = !crashData.fatal
+
+        // Tells the server which fields the host application's filter changed, so
+        // a doctored report is not mistaken for a raw one.
+        crashData.calculateChangedFields()
+        let changed = crashData.changedFieldsBitfield
+        if changed > 0 {
+            report[Key.changedFields] = changed
+        }
+
+        if !crashData.crashSegmentation.isEmpty {
+            // Capped a second time only when there was a callback that could have
+            // changed the segmentation. `CountlyCrashData` is a class, so an
+            // enriching callback would otherwise ship unbounded keys and values;
+            // without one the dictionary is still exactly what was sanitized on the
+            // way in, and re-capping it is pure rework on every recorded error.
+            report[Key.custom] = hadFilterCallback
+                ? core.limits.truncatedAndLimited(crashData.crashSegmentation, "Crash segmentation")
+                : crashData.crashSegmentation
+        }
+
+        if !crashData.breadcrumbs.isEmpty {
+            report[Key.logs] = crashData.breadcrumbs.joined(separator: "\n")
+        }
+
+        return report
+    }
+
     private func matches(_ filter: NSRegularExpression, _ text: String) -> Bool {
         filter.numberOfMatches(in: text, options: [], range: NSRange(location: 0, length: (text as NSString).length)) > 0
     }
@@ -306,8 +335,8 @@ final class CrashModule: ModuleBase {
         let truncated = core.limits.truncatedValue(text, "Custom Crash log")
         logV("log", "breadcrumb text detail, log: [\(truncated)]")
 
-        breadcrumbLock.lock()
-        defer { breadcrumbLock.unlock() }
+        stateLock.lock()
+        defer { stateLock.unlock() }
 
         breadcrumbs.append(truncated)
         let limit = core.config.sdkInternalLimits.maxBreadcrumbCount
@@ -325,10 +354,10 @@ final class CrashModule: ModuleBase {
 
     /// Drops every breadcrumb, in memory and on disk.
     func clearCrashLogs() {
-        breadcrumbLock.lock()
+        stateLock.lock()
         logD("clearCrashLogs", "breadcrumbs are being cleared, breadcrumbCount: [\(breadcrumbs.count)]")
         breadcrumbs.removeAll()
-        breadcrumbLock.unlock()
+        stateLock.unlock()
 
         core.crashLogStore.deleteAll()
     }
@@ -345,9 +374,9 @@ final class CrashModule: ModuleBase {
 
         logD("adoptBreadcrumbsFromPreviousRun", "breadcrumbs from a previous run were found, breadcrumbCount: [\(recovered.count)]")
 
-        breadcrumbLock.lock()
+        stateLock.lock()
         breadcrumbs = Array(recovered.suffix(core.config.sdkInternalLimits.maxBreadcrumbCount))
-        breadcrumbLock.unlock()
+        stateLock.unlock()
 
         core.crashLogStore.deleteAll()
     }
@@ -397,7 +426,15 @@ final class CrashModule: ModuleBase {
     /// executable is always included, even with no frame of its own: with Xcode's
     /// debug dylib the application's code lives in a separate image and the
     /// executable would otherwise be filtered out, leaving the build UUID empty.
-    private func binaryImages(for stackTrace: [String]) -> [String: Any] {
+    ///
+    /// The build UUID, the executable name and the architecture are returned with
+    /// the images rather than stored on the module: they describe one report, and
+    /// keeping them as shared state would let two concurrent crashes hand each
+    /// other's symbolication fields to the server.
+    private func binaryImages(for stackTrace: [String]) -> (images: [String: Any],
+                                                            buildUUID: String?,
+                                                            executableName: String?,
+                                                            architecture: String) {
         var namesInStack = Set<String>()
         for line in stackTrace {
             // The backtrace format pads the image name into a fixed column.
@@ -411,6 +448,8 @@ final class CrashModule: ModuleBase {
         var images: [String: Any] = [:]
         var cpuType: cpu_type_t = 0
         var cpuSubtype: cpu_subtype_t = 0
+        var mainBuildUUID: String?
+        var mainExecutableName: String?
 
         for index in 0..<_dyld_image_count() {
             guard let namePointer = _dyld_get_image_name(index) else { continue }
@@ -432,18 +471,20 @@ final class CrashModule: ModuleBase {
             }
 
             if isMainExecutable {
-                buildUUID = uuidString
-                executableName = imageName
+                mainBuildUUID = uuidString
+                mainExecutableName = imageName
             }
 
             let loadAddress = String(format: "0x%llX", UInt64(UInt(bitPattern: header)))
             images[imageName] = [Key.imageLoadAddress: loadAddress, Key.imageBuildUUID: uuidString]
         }
 
-        architecture = Self.architectureName(cpuType: cpuType, cpuSubtype: cpuSubtype)
         logV("binaryImages", "binary images resolved for the stack trace, matchedImageCount: [\(images.count)]")
 
-        return images
+        return (images,
+                mainBuildUUID,
+                mainExecutableName,
+                Self.architectureName(cpuType: cpuType, cpuSubtype: cpuSubtype))
     }
 
     /// Walks the load commands looking for `LC_UUID`.
@@ -487,6 +528,8 @@ final class CrashModule: ModuleBase {
 
     override func halt(clearStorage: Bool) {
         stopCrashReporting()
+        stateLock.lock()
         crashSegmentation.removeAll()
+        stateLock.unlock()
     }
 }

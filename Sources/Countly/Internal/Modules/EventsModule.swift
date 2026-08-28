@@ -199,7 +199,11 @@ final class EventsModule: ModuleBase {
 
         let isReserved = ReservedEventKey.all.contains(key)
         let event = CountlyEvent(key: key)
-        event.id = (id?.isEmpty ?? true) ? core.clock.generateEventID() : id!
+        if let id, !id.isEmpty {
+            event.id = id
+        } else {
+            event.id = core.clock.generateEventID()
+        }
 
         // A view event points backwards at the view it replaced; everything else
         // points at the view it happened inside.
@@ -233,20 +237,13 @@ final class EventsModule: ModuleBase {
         // recording at once cannot produce two events claiming the same
         // predecessor.
         eventLock.lock()
-        let capturedPreviousID = previousEventID
+        event.previousEventID = previousEventID ?? ""
         previousEventID = event.id
 
-        var capturedPreviousName: String?
         if core.config.experimental.enablePreviousNameRecording {
-            capturedPreviousName = previousEventName
-            previousEventName = truncatedKey
-        }
-
-        event.previousEventID = capturedPreviousID ?? ""
-
-        if core.config.experimental.enablePreviousNameRecording {
-            filteredSegmentation[SegKey.previousEventName] = capturedPreviousName ?? ""
+            filteredSegmentation[SegKey.previousEventName] = previousEventName ?? ""
             filteredSegmentation[SegKey.currentViewName] = core.modules.views.currentViewName ?? ""
+            previousEventName = truncatedKey
         }
 
         event.key = truncatedKey

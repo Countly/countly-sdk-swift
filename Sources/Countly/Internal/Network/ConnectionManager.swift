@@ -42,6 +42,12 @@ final class ConnectionManager: NSObject {
     /// Blocks that run once the queue drains with nothing having failed.
     private var queueFlushRunnables: [() -> Void] = []
 
+    /// Guards the two cached sessions.
+    ///
+    /// They are built lazily from URLSession completion threads, from timers and
+    /// from the crash path, so an unguarded lazy assignment would let two threads
+    /// each build one, leak whichever loses, and race on the reference itself.
+    private let sessionLock = NSLock()
     private var urlSession: URLSession?
     private var immediateSession: URLSession?
 
@@ -131,20 +137,17 @@ final class ConnectionManager: NSObject {
         stateLock.unlock()
 
         if core.isCrashing {
-            core.logger.d(Self.module, "proceedOnQueue", "aborting queue processing, reason: application is crashing")
-            releaseProcessing()
+            abortProcessing("application is crashing")
             return
         }
 
         if core.isTerminating {
-            core.logger.d(Self.module, "proceedOnQueue", "aborting queue processing, reason: application is terminating")
-            releaseProcessing()
+            abortProcessing("application is terminating")
             return
         }
 
         if core.requestQueueStore.isBeingModified {
-            core.logger.d(Self.module, "proceedOnQueue", "aborting queue processing, reason: request queue is being modified")
-            releaseProcessing()
+            abortProcessing("request queue is being modified")
             return
         }
 
@@ -152,8 +155,7 @@ final class ConnectionManager: NSObject {
         let backingOff = isBackingOff
         stateLock.unlock()
         if backingOff {
-            core.logger.d(Self.module, "proceedOnQueue", "aborting queue processing, reason: backoff is currently active")
-            releaseProcessing()
+            abortProcessing("backoff is currently active")
             return
         }
 
@@ -180,8 +182,7 @@ final class ConnectionManager: NSObject {
         // A request recorded before a real device ID was known must wait: sending
         // it now would attribute the data to the placeholder ID.
         if head.contains("&\(QS.deviceID)=\(TemporaryDeviceID.value)") {
-            core.logger.d(Self.module, "proceedOnQueue", "aborting queue processing, reason: device ID of the request at the head of the queue is the temporary device ID")
-            releaseProcessing()
+            abortProcessing("device ID of the request at the head of the queue is the temporary device ID")
             return
         }
 
@@ -372,6 +373,13 @@ final class ConnectionManager: NSObject {
         }
     }
 
+    /// Gives up this drain, leaving the queue as it is so a later trigger picks it
+    /// back up.
+    private func abortProcessing(_ reason: String) {
+        core.logger.d(Self.module, "proceedOnQueue", "aborting queue processing, reason: \(reason)")
+        releaseProcessing()
+    }
+
     private func releaseProcessing() {
         stateLock.lock()
         isProcessingQueue = false
@@ -386,23 +394,7 @@ final class ConnectionManager: NSObject {
     /// small enough that pausing will not overflow it, and the request was recent
     /// enough that the delay still matters. A backlog of old data keeps draining.
     private func shouldBackOff(responseTimeSeconds: Int, queryString: String) -> Bool {
-        var result = false
-
-        if responseTimeSeconds >= core.serverConfig.bomAcceptedTimeoutSeconds {
-            let remaining = core.requestQueueStore.count
-            let threshold = Int(Double(core.requestQueueStore.storedRequestsLimit) * core.serverConfig.bomRQPercentage)
-
-            if remaining <= threshold {
-                let millis = Double(queryString.valueForQueryStringKey(QS.timestamp) ?? "") ?? 0
-                let ageSeconds = Date().timeIntervalSince1970 - millis / 1000.0
-
-                if ageSeconds <= Double(core.serverConfig.bomRequestAge) * 3600.0 {
-                    result = true
-                    core.logger.w(Self.module, "shouldBackOff", "backoff is triggered, responseTime: [\(responseTimeSeconds)], remainingRequestCount: [\(remaining)], requestCountThreshold: [\(threshold)], requestAge: [\(String(format: "%.2f", ageSeconds))]")
-                    core.healthTracker.logBackoffRequest()
-                }
-            }
-        }
+        let result = isServerOverloaded(responseTimeSeconds: responseTimeSeconds, queryString: queryString)
 
         if !result {
             core.healthTracker.logConsecutiveBackoffRequest()
@@ -410,6 +402,22 @@ final class ConnectionManager: NSObject {
 
         core.logger.d(Self.module, "shouldBackOff", "backoff evaluation is completed, decision: [\(result)], responseTime: [\(responseTimeSeconds)]")
         return result
+    }
+
+    /// The three conditions themselves, each of which is a reason to keep sending.
+    private func isServerOverloaded(responseTimeSeconds: Int, queryString: String) -> Bool {
+        guard responseTimeSeconds >= core.serverConfig.bomAcceptedTimeoutSeconds else { return false }
+
+        let remaining = core.requestQueueStore.count
+        let threshold = Int(Double(core.requestQueueStore.storedRequestsLimit) * core.serverConfig.bomRQPercentage)
+        guard remaining <= threshold else { return false }
+
+        let ageSeconds = queryString.requestAgeSeconds
+        guard ageSeconds <= Double(core.serverConfig.bomRequestAge) * 3600.0 else { return false }
+
+        core.logger.w(Self.module, "shouldBackOff", "backoff is triggered, responseTime: [\(responseTimeSeconds)], remainingRequestCount: [\(remaining)], requestCountThreshold: [\(threshold)], requestAge: [\(String(format: "%.2f", ageSeconds))]")
+        core.healthTracker.logBackoffRequest()
+        return true
     }
 
     private func startBackoffCountdown() {
@@ -514,9 +522,18 @@ final class ConnectionManager: NSObject {
 
     // MARK: - Request construction
 
+    /// A URL for a string the configuration produced.
+    ///
+    /// A host the SDK cannot parse yields an unreachable URL rather than a trap:
+    /// the request then fails like any other and stays in the queue, which is what
+    /// a later launch with a corrected host needs.
+    private static func requestURL(_ string: String) -> URL {
+        URL(string: string) ?? URL(string: "https://invalid")!
+    }
+
     private func buildRequest(queryString: String, endpoint: String, pictureUpload: Data?) -> URLRequest {
         let urlString = core.config.normalizedHost + endpoint
-        var request = URLRequest(url: URL(string: urlString) ?? URL(string: "https://invalid")!)
+        var request = URLRequest(url: Self.requestURL(urlString))
 
         if let pictureUpload {
             var body = pictureUpload
@@ -543,7 +560,7 @@ final class ConnectionManager: NSObject {
             request.httpMethod = "POST"
             request.httpBody = Data(queryString.utf8)
         } else {
-            request = URLRequest(url: URL(string: "\(urlString)?\(queryString)") ?? URL(string: "https://invalid")!)
+            request = URLRequest(url: Self.requestURL("\(urlString)?\(queryString)"))
         }
 
         request.cachePolicy = .reloadIgnoringLocalCacheData
@@ -639,6 +656,16 @@ final class ConnectionManager: NSObject {
                                      data: Data?,
                                      endpoint: String,
                                      quiet: Bool = false) -> Bool {
+        // Rejections are logged at debug for the health check and at error for
+        // everything else, which is the only thing `quiet` changes.
+        func logRejection(_ message: String) {
+            if quiet {
+                core.logger.d(Self.module, "isRequestSuccessful", message)
+            } else {
+                core.logger.e(Self.module, "isRequestSuccessful", message)
+            }
+        }
+
         guard let http = response as? HTTPURLResponse else { return false }
 
         guard (200..<300).contains(http.statusCode) else {
@@ -652,24 +679,14 @@ final class ConnectionManager: NSObject {
         }
 
         guard let reply = CountlyJSON.object(from: data, logger: nil) as? [String: Any] else {
-            let message = "server reply is not a valid JSON, the request is considered failed, responseSize: [\(data?.count ?? 0)]"
-            if quiet {
-                core.logger.d(Self.module, "isRequestSuccessful", message)
-            } else {
-                core.logger.e(Self.module, "isRequestSuccessful", message)
-            }
+            logRejection("server reply is not a valid JSON, the request is considered failed, responseSize: [\(data?.count ?? 0)]")
             return false
         }
 
         core.logger.v(Self.module, "isRequestSuccessful", "server reply detail, fullResponseURL: [\(response?.url?.absoluteString ?? "")], parsedServerReply: [\(reply)]")
 
         guard reply["result"] != nil else {
-            let message = "server reply does not contain the result field, the request is considered failed, responseSize: [\(data?.count ?? 0)]"
-            if quiet {
-                core.logger.d(Self.module, "isRequestSuccessful", message)
-            } else {
-                core.logger.e(Self.module, "isRequestSuccessful", message)
-            }
+            logRejection("server reply does not contain the result field, the request is considered failed, responseSize: [\(data?.count ?? 0)]")
             return false
         }
 
@@ -689,6 +706,9 @@ final class ConnectionManager: NSObject {
     /// The session used for queued requests. Rebuilt when the configuration
     /// changes, for instance when custom headers are added.
     func session() -> URLSession {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+
         if let urlSession { return urlSession }
 
         let configuration = core.config.urlSessionConfiguration
@@ -709,12 +729,21 @@ final class ConnectionManager: NSObject {
     /// Session for requests that skip the queue: behavior settings and the health
     /// check. They carry no user data and are useless if delayed behind a backlog.
     func instantSession() -> URLSession {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+
         if let immediateSession { return immediateSession }
 
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = core.serverConfig.requestTimeoutDuration
         configuration.timeoutIntervalForResource = core.serverConfig.requestTimeoutDuration
         configuration.httpAdditionalHeaders = core.config.urlSessionConfiguration.httpAdditionalHeaders
+        // A host that installed a URL protocol, for offline testing or for routing
+        // through its own transport, means it for every request the SDK makes. The
+        // instant session builds a configuration of its own rather than reusing the
+        // supplied one, so anything it should inherit has to be copied explicitly,
+        // which is already why the headers above are here.
+        configuration.protocolClasses = core.config.urlSessionConfiguration.protocolClasses
 
         let session: URLSession
         if !core.config.pinnedCertificates.isEmpty {
@@ -747,8 +776,31 @@ final class ConnectionManager: NSObject {
 
         core.logger.i(Self.module, "addCustomNetworkRequestHeaders", "custom network request headers are applied, totalHeaderCount: [\(updated.count)]")
         core.config.urlSessionConfiguration.httpAdditionalHeaders = updated
+        discardSessions()
+    }
+
+    /// Tears down the cached sessions.
+    ///
+    /// `URLSession` retains its delegate until it is invalidated, and with
+    /// certificate pinning configured the delegate is this connection manager,
+    /// which holds the core `unowned`. Simply dropping the reference would leave
+    /// the session alive, and a later delegate callback would read a core that had
+    /// already been released by `halt`. Every session this SDK builds is therefore
+    /// invalidated rather than abandoned.
+    private func discardSessions() {
+        sessionLock.lock()
+        let queued = urlSession
+        let instant = immediateSession
         urlSession = nil
         immediateSession = nil
+        sessionLock.unlock()
+
+        // `finishTasksAndInvalidate` would keep the delegate alive until the
+        // in-flight task completes. The queue is what guarantees delivery, not the
+        // session, so an interrupted request is re-sent from the queue on the next
+        // drain and cancelling costs nothing.
+        queued?.invalidateAndCancel()
+        instant?.invalidateAndCancel()
     }
 
     /// Drops cached sessions and pending callbacks. Called from `halt`.
@@ -766,8 +818,7 @@ final class ConnectionManager: NSObject {
         stateLock.unlock()
         hasAnyRequestFailed = false
         drainStartTime = nil
-        urlSession = nil
-        immediateSession = nil
+        discardSessions()
     }
 }
 
@@ -905,12 +956,12 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
         let base = core.config.normalizedHost + path
 
         if queryString.count > kGETRequestMaxLength || core.config.alwaysUsePOST {
-            var request = URLRequest(url: URL(string: base) ?? URL(string: "https://invalid")!)
+            var request = URLRequest(url: Self.requestURL(base))
             request.httpMethod = "POST"
             request.httpBody = Data(queryString.utf8)
             return request
         }
 
-        return URLRequest(url: URL(string: "\(base)?\(queryString)") ?? URL(string: "https://invalid")!)
+        return URLRequest(url: Self.requestURL("\(base)?\(queryString)"))
     }
 }

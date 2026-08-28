@@ -114,8 +114,19 @@ public final class RemoteConfigAPI: CountlyAPIBase {
     }
 
     /// Registers a callback notified after each download.
-    public func registerDownloadCallback(_ callback: @escaping RCDownloadCallback) {
+    /// Registers a callback that hears about every remote config download.
+    ///
+    /// - Returns: a token for `removeDownloadCallback(_:)`, or `nil` when the SDK
+    ///   has not been started. Discard it if the callback is meant to live for the
+    ///   life of the process.
+    @discardableResult
+    public func registerDownloadCallback(_ callback: @escaping RCDownloadCallback) -> RCCallbackToken? {
         core()?.modules.remoteConfig.registerDownloadCallback(callback)
+    }
+
+    /// Removes one registered download callback.
+    public func removeDownloadCallback(_ token: RCCallbackToken) {
+        core()?.modules.remoteConfig.removeDownloadCallback(token)
     }
 
     /// Drops every registered download callback.

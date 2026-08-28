@@ -1,0 +1,127 @@
+name: Build the SDK
+
+permissions:
+  checks: write
+  pull-requests: write
+
+on:
+  push:
+    branches:
+      - master
+      - staging
+  pull_request:
+    branches:
+      - master
+      - staging
+  # Also dispatchable by hand, e.g. to re-run a single Xcode row.
+  workflow_dispatch:
+
+# One concurrent macOS runner means a superseded run would otherwise sit in the queue ahead of
+# the push that replaced it, so cancel the previous run for the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The package has no external dependencies and builds from the manifest alone, so this is
+  # the fastest signal that the sources are well formed. It runs first and everything else
+  # waits on it: a syntax error should not cost fifteen matrix cells.
+  package:
+    name: Resolve and build the package
+    runs-on: macos-15
+    steps:
+      - name: Checkout SDK code
+        uses: actions/checkout@v4
+
+      - name: Set up Xcode
+        run: sudo xcode-select -switch /Applications/Xcode_16.4.app
+
+      - name: Report the toolchain
+        run: swift --version
+
+      # `-Xswiftc -warnings-as-errors` is deliberately not used: the SDK targets five platforms
+      # with availability shims, and a warning on one of them should not block the others.
+      - name: Build the package for the host platform
+        run: swift build --target Countly
+
+      - name: Build the notification service target
+        run: swift build --target CountlyNotificationService
+
+  # Every supported Apple platform, on every Xcode the SDK claims to support. `xcodebuild` is
+  # used rather than `swift build` because only it can target the device SDKs.
+  build:
+    name: ${{ matrix.env.platform }} (Xcode ${{ matrix.env.xcode }})
+    needs: package
+    runs-on: macos-${{ matrix.env.os_version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        env:
+          [
+            { os_version: 14, platform: "macOS",    sdk: "macosx14.5",    xcode: "15.4" },
+            { os_version: 14, platform: "iOS",      sdk: "iphoneos17.5",  xcode: "15.4" },
+            { os_version: 14, platform: "tvOS",     sdk: "appletvos17.5", xcode: "15.4" },
+            { os_version: 14, platform: "watchOS",  sdk: "watchos10.5",   xcode: "15.4" },
+            { os_version: 14, platform: "visionOS", sdk: "xros1.2",       xcode: "15.4" },
+            { os_version: 15, platform: "macOS",    sdk: "macosx15.5",    xcode: "16.4" },
+            { os_version: 15, platform: "iOS",      sdk: "iphoneos18.5",  xcode: "16.4" },
+            { os_version: 15, platform: "tvOS",     sdk: "appletvos18.5", xcode: "16.4" },
+            { os_version: 15, platform: "watchOS",  sdk: "watchos11.5",   xcode: "16.4" },
+            { os_version: 15, platform: "visionOS", sdk: "xros2.5",       xcode: "16.4" },
+            { os_version: 26, platform: "macOS",    sdk: "macosx26.2",    xcode: "26.2" },
+            { os_version: 26, platform: "iOS",      sdk: "iphoneos26.2",  xcode: "26.2" },
+            { os_version: 26, platform: "tvOS",     sdk: "appletvos26.2", xcode: "26.2" },
+            { os_version: 26, platform: "watchOS",  sdk: "watchos26.2",   xcode: "26.2" },
+            { os_version: 26, platform: "visionOS", sdk: "xros26.2",      xcode: "26.2" }
+          ]
+    steps:
+      - name: Checkout SDK code
+        uses: actions/checkout@v4
+
+      - name: Set up Xcode
+        run: sudo xcode-select -switch /Applications/Xcode_${{ matrix.env.xcode }}.app
+
+      # `generic/platform=` builds for the platform without resolving a concrete device, so no
+      # simulator has to be booted. CODE_SIGNING_ALLOWED=NO because the device SDKs would
+      # otherwise want a team and a provisioning profile that CI has no business holding.
+      - name: Build every target for ${{ matrix.env.sdk }}
+        run: |
+          xcodebuild build \
+            -scheme Countly-Package \
+            -sdk ${{ matrix.env.sdk }} \
+            -destination 'generic/platform=${{ matrix.env.platform }}' \
+            CODE_SIGNING_ALLOWED=NO
+
+  # The package builds cleanly, but the podspec is a second, independently maintained
+  # description of the same sources. A source file added to the package and not to the podspec
+  # only shows up as a broken CocoaPods install, which is why this is checked on every run.
+  podspec:
+    name: Validate the podspec
+    needs: package
+    runs-on: macos-15
+    steps:
+      - name: Checkout SDK code
+        uses: actions/checkout@v4
+
+      - name: Set up Xcode
+        run: sudo xcode-select -switch /Applications/Xcode_16.4.app
+
+      # `--quick` skips the build and install, which needs a full CocoaPods sandbox and is far
+      # slower than the rest of this workflow put together. It still catches a malformed
+      # manifest and a missing file pattern.
+      - name: Lint the podspec
+        run: pod lib lint Countly.podspec --quick --allow-warnings
+
+  # The SDK version travels in every request as `sdk_version`, and it is also written into the
+  # podspec and the changelog. Those three drifting apart is silent on the wire but wrong in
+  # the dashboard, so it is checked mechanically.
+  version-consistency:
+    name: SDK version is consistent
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout SDK code
+        uses: actions/checkout@v4
+
+      - name: Compare the version in the sources, the podspec and the changelog
+        run: python3 .github/scripts/check_version_consistency.py

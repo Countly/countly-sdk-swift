@@ -108,10 +108,9 @@ final class AttributionModule: ModuleBase {
         // An empty identifier is worse than a missing one: it would overwrite a
         // value the server already has.
         let nonEmpty = attribution.filter { !$0.value.isEmpty }
-        let truncated = core.limits.truncated(nonEmpty, "Indirect attribution")
-        let limited = core.limits.limited(truncated, "Indirect attribution")
+        let sanitized = core.limits.truncatedAndLimited(nonEmpty, "Indirect attribution")
 
-        indirectAttribution = limited.compactMapValues { $0 as? String }
+        indirectAttribution = sanitized.compactMapValues { $0 as? String }
         sendIndirectAttribution()
     }
 

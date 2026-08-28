@@ -73,14 +73,14 @@ final class ViewsModule: ModuleBase {
     func setGlobalViewSegmentation(_ segmentation: [String: Any]) {
         logI("setGlobalViewSegmentation", "global view segmentation will be set, keyCount: [\(segmentation.count)]")
         logV("setGlobalViewSegmentation", "global view segmentation value detail, segmentation: [\(segmentation)]")
-        globalViewSegmentation = core.limits.filterSupportedDataTypes(stripReservedKeys(segmentation, context: "setting global view segmentation"))
+        globalViewSegmentation = sanitized(segmentation, context: "setting global view segmentation")
     }
 
     /// Merges into the global view segmentation.
     func updateGlobalViewSegmentation(_ segmentation: [String: Any]) {
         logI("updateGlobalViewSegmentation", "global view segmentation will be updated, keyCount: [\(segmentation.count)]")
         logV("updateGlobalViewSegmentation", "global view segmentation update value detail, segmentation: [\(segmentation)]")
-        let filtered = core.limits.filterSupportedDataTypes(stripReservedKeys(segmentation, context: "updating global view segmentation"))
+        let filtered = sanitized(segmentation, context: "updating global view segmentation")
         globalViewSegmentation.merge(filtered) { _, new in new }
     }
 
@@ -218,7 +218,7 @@ final class ViewsModule: ModuleBase {
             return
         }
 
-        let filtered = core.limits.filterSupportedDataTypes(stripReservedKeys(segmentation, context: "adding segmentation to a view"))
+        let filtered = sanitized(segmentation, context: "adding segmentation to a view")
         logD("addSegmentationToViewWithID", "segmentation will be added to view, viewID: [\(viewID)], name: [\(viewData.viewName)], keyCount: [\(filtered.count)]")
         viewData.segmentation.merge(filtered) { _, new in new }
     }
@@ -276,10 +276,10 @@ final class ViewsModule: ModuleBase {
 
         var segmentation = globalViewSegmentation
         if let customSegmentation {
-            let filtered = core.limits.filterSupportedDataTypes(stripReservedKeys(customSegmentation, context: "the segmentation of the view being started"))
+            let filtered = sanitized(customSegmentation, context: "the segmentation of the view being started")
             segmentation.merge(filtered) { _, new in new }
         }
-        segmentation = core.limits.limited(core.limits.truncated(segmentation, "View segmentation"), "View segmentation")
+        segmentation = core.limits.truncatedAndLimited(segmentation, "View segmentation")
 
         segmentation[SegKey.name] = truncatedName
         segmentation[SegKey.segment] = DeviceMetrics.osName
@@ -292,24 +292,25 @@ final class ViewsModule: ModuleBase {
             segmentation[SegKey.start] = 1
         }
 
+        let viewID = core.clock.generateEventID()
         previousViewID = currentViewID
-        currentViewID = core.clock.generateEventID()
+        currentViewID = viewID
         previousViewName = currentViewName
         currentViewName = truncatedName
 
-        let viewData = CountlyViewData(viewID: currentViewID!, viewName: truncatedName, startTime: core.clock.now())
+        let viewData = CountlyViewData(viewID: viewID, viewName: truncatedName, startTime: core.clock.now())
         viewData.startSegmentation = customSegmentation ?? [:]
         viewData.isAutoStoppedView = isAutoStoppedView
-        viewDataDictionary[currentViewID!] = viewData
+        viewDataDictionary[viewID] = viewData
 
         core.modules.events.recordReservedEvent(ReservedEventKey.view,
                                                 segmentation: segmentation,
-                                                id: currentViewID)
+                                                id: viewID)
 
-        logD("startViewInternal", "view started, name: [\(truncatedName)], viewID: [\(currentViewID ?? "")], previousViewID: [\(previousViewID ?? "")], segmentationKeyCount: [\(segmentation.count)], isAutoStoppedView: [\(isAutoStoppedView)]")
-        logV("startViewInternal", "started view segmentation value detail, viewID: [\(currentViewID ?? "")], segmentation: [\(segmentation)]")
+        logD("startViewInternal", "view started, name: [\(truncatedName)], viewID: [\(viewID)], previousViewID: [\(previousViewID ?? "")], segmentationKeyCount: [\(segmentation.count)], isAutoStoppedView: [\(isAutoStoppedView)]")
+        logV("startViewInternal", "started view segmentation value detail, viewID: [\(viewID)], segmentation: [\(segmentation)]")
 
-        return currentViewID
+        return viewID
     }
 
     /// Records the view event and, unless the view is only being paused, forgets
@@ -326,11 +327,11 @@ final class ViewsModule: ModuleBase {
         segmentation.merge(globalViewSegmentation) { _, global in global }
 
         if let customSegmentation {
-            let filtered = core.limits.filterSupportedDataTypes(stripReservedKeys(customSegmentation, context: "the segmentation of the view being stopped"))
+            let filtered = sanitized(customSegmentation, context: "the segmentation of the view being stopped")
             segmentation.merge(filtered) { _, new in new }
         }
 
-        segmentation = core.limits.limited(core.limits.truncated(segmentation, "View segmentation"), "View segmentation")
+        segmentation = core.limits.truncatedAndLimited(segmentation, "View segmentation")
         segmentation[SegKey.name] = viewData.viewName
         segmentation[SegKey.segment] = DeviceMetrics.osName
 
@@ -436,6 +437,13 @@ final class ViewsModule: ModuleBase {
             }
             viewDataDictionary.removeValue(forKey: viewData.viewID)
         }
+    }
+
+    /// Drops the keys the SDK owns and the value types the server cannot store.
+    /// Every entry point that accepts view segmentation applies both, in that
+    /// order.
+    private func sanitized(_ segmentation: [String: Any], context: String) -> [String: Any] {
+        core.limits.filterSupportedDataTypes(stripReservedKeys(segmentation, context: context))
     }
 
     private func stripReservedKeys(_ segmentation: [String: Any], context: String) -> [String: Any] {
@@ -575,9 +583,8 @@ final class ViewsModule: ModuleBase {
         // default list has 38 of them and this runs for every screen.
         let className = NSStringFromClass(type(of: viewController))
 
-        if let match = excludedNames.contains(title) ? title
-            : (excludedNames.contains(className) ? className : nil) {
-            logV(function, "view is in the automatic view tracking exclusion list, it will be ignored, name: [\(title)], exception: [\(match)]")
+        for candidate in [title, className] where excludedNames.contains(candidate) {
+            logV(function, "view is in the automatic view tracking exclusion list, it will be ignored, name: [\(title)], exception: [\(candidate)]")
             return true
         }
 

@@ -175,20 +175,50 @@ final class FeedbackModule: ModuleBase {
             let manager = WebViewManager(core: self.core)
             self.presentedWidgetManagers.append(manager)
 
+            // `self` is captured weakly in both blocks. The module holds the
+            // manager, the manager holds the blocks, and a strong `self` there
+            // would close the cycle and leak the web view, the overlay window and
+            // the module itself for the life of the process.
             manager.present(url: url,
-                            appear: {
-                                self.logI("present", "widget shown, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
+                            appear: { [weak self] in
+                                self?.logI("present", "widget shown, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
                                 callback?(.appeared)
                             },
-                            dismiss: { [weak manager] in
-                                self.logI("present", "widget dismissed, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
+                            dismiss: { [weak self, weak manager] in
                                 callback?(.closed)
+                                guard let self else { return }
+                                self.logI("present", "widget dismissed, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
                                 self.recordDismissal(for: widget)
                                 self.presentedWidgetManagers.removeAll { $0 === manager }
                             })
         }
         #else
         logW("present", "feedback widgets are only available on iOS and visionOS")
+        #endif
+    }
+
+    // MARK: - Lifecycle
+
+    /// Takes any widget still on screen down with the instance.
+    ///
+    /// A widget is presented in an overlay window above the whole application, so
+    /// one left behind by a halt would sit there with no SDK to report its result
+    /// to and no way for the user to be sure it belongs to anything.
+    override func halt(clearStorage: Bool) {
+        #if os(iOS) || os(visionOS)
+        let managers = presentedWidgetManagers
+        presentedWidgetManagers.removeAll()
+
+        guard !managers.isEmpty else { return }
+        logD("halt", "taking the presented feedback widgets off screen, widgetCount: [\(managers.count)]")
+
+        let close = {
+            for manager in managers {
+                (manager as? WebViewManager)?.close()
+            }
+        }
+
+        onMainThread(close)
         #endif
     }
 

@@ -84,7 +84,7 @@
   * "recordNetworkTrace(name, requestPayloadSize, responsePayloadSize, responseStatusCode, startTime, endTime)"
   * "startCustomTrace(name)" / "endCustomTrace(name, metrics:)" / "cancelCustomTrace(name)" / "clearAllCustomTraces()"
   * "appLoadingFinished()"
-  * App start, foreground and background traces via "CountlyConfig.apm"
+  * App start, foreground and background traces via "CountlyConfig.apm". The app start trace is measured from when the process was launched, not from when the SDK was started, so it covers the whole launch even when the SDK is started late. Override it with "CountlyConfig.apm.appStartTimestampOverride".
 
 * Added the attribution API on "countly.attribution":
   * "recordDirectAttribution(campaignType:campaignData:)" / "recordIndirectAttribution(attribution)"

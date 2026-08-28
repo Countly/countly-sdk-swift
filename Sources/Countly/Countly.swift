@@ -45,7 +45,10 @@ public enum Countly {
     /// per dashboard application. Passing `nil` or an empty name returns the
     /// default instance.
     public static func instance(named name: String?) -> CountlyInstance {
-        let key = (name?.isEmpty ?? true) ? defaultInstanceName : name!
+        var key = defaultInstanceName
+        if let name, !name.isEmpty {
+            key = name
+        }
 
         lock.lock()
         defer { lock.unlock() }

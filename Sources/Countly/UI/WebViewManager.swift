@@ -202,11 +202,7 @@ final class WebViewManager: NSObject {
             dismiss?()
         }
 
-        if Thread.isMainThread {
-            finish()
-        } else {
-            DispatchQueue.main.async(execute: finish)
-        }
+        onMainThread(finish)
     }
 
     private func reportAppearance() {
@@ -267,16 +263,17 @@ final class WebViewManager: NSObject {
         // The page describes where it wants to sit as a fraction of the screen,
         // under the key matching the current orientation.
         let isPortrait = backgroundView.effectiveSize.height >= backgroundView.effectiveSize.width
-        let key = isPortrait ? "p" : "l"
-        guard let geometry = parameters[key] as? [String: Any] else { return }
+        let preferred = isPortrait ? "p" : "l"
+        let fallback = isPortrait ? "l" : "p"
 
-        let container = backgroundView.effectiveSize
-        let x = (geometry["x"] as? NSNumber)?.doubleValue ?? 0
-        let y = (geometry["y"] as? NSNumber)?.doubleValue ?? 0
-        let width = (geometry["w"] as? NSNumber)?.doubleValue ?? Double(container.width)
-        let height = (geometry["h"] as? NSNumber)?.doubleValue ?? Double(container.height)
+        // A page that only describes one orientation still wants to be resized.
+        // Ignoring the request leaves the view at whatever frame the presentation
+        // computed, which for a banner-sized content is the whole screen, and it
+        // then covers and swallows every touch until it is closed.
+        guard let geometry = (parameters[preferred] as? [String: Any])
+                ?? (parameters[fallback] as? [String: Any]) else { return }
 
-        var frame = CGRect(x: x, y: y, width: width, height: height)
+        var frame = CGRect(contentGeometry: geometry, container: backgroundView.effectiveSize)
 
         if core.config.content.webViewDisplayOption == .safeArea {
             let insets = backgroundView.safeAreaInsets

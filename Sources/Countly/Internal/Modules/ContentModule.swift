@@ -36,8 +36,6 @@ final class ContentModule: ModuleBase {
     /// top of the application's own first screen.
     private var contentInitialDelay = 4
 
-    /// Tags the current zone was entered with.
-
     private var zoneTimer: Timer?
     private var reentryTimer: Timer?
 
@@ -60,6 +58,12 @@ final class ContentModule: ModuleBase {
     /// Set from the moment the zone is entered, before the polling timer exists.
     private var isZoneEntered = false
 
+    /// Bumped on every enter and every clear, so work scheduled by one visit to
+    /// the zone cannot land after a later exit. The initial fetch is delayed by up
+    /// to `contentInitialDelay` seconds, which is a long time for an application to
+    /// change its mind in.
+    private var zoneGeneration: UInt = 0
+
     #if os(iOS) || os(visionOS)
     private var webViewManager: WebViewManager?
     #endif
@@ -73,8 +77,7 @@ final class ContentModule: ModuleBase {
             return
         }
 
-        reentryTimer?.invalidate()
-        reentryTimer = nil
+        invalidateTimers()
 
         guard core.modules.consent.hasConsent(for: .content) else {
             logV("enterContentZone", "no consent given for content, skipping the content zone enter")
@@ -91,8 +94,9 @@ final class ContentModule: ModuleBase {
             return
         }
         isZoneEntered = true
+        zoneGeneration &+= 1
+        let generation = zoneGeneration
         stateLock.unlock()
-
 
         // The first fetch is held back on a cold launch so content does not land
         // on top of the application's own first screen.
@@ -103,6 +107,16 @@ final class ContentModule: ModuleBase {
 
         DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(delay)) { [weak self] in
             guard let self else { return }
+
+            // The zone may have been exited, or exited and re-entered, while this
+            // was waiting. Without the check the block would fetch after an
+            // explicit exit and install a repeating timer that nothing holds a
+            // reference to, which then polls for the life of the process.
+            guard self.isCurrentGeneration(generation) else {
+                self.logD("enterContentZone", "the delayed first fetch is dropped, the content zone was left while it was waiting")
+                return
+            }
+
             self.fetchContents()
             self.zoneTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
                 self?.fetchContents()
@@ -116,7 +130,6 @@ final class ContentModule: ModuleBase {
         clearContentState()
         closeShownContent()
     }
-
 
     /// Fetches one content by ID without starting the polling loop.
     func previewContent(_ contentID: String) {
@@ -192,12 +205,12 @@ final class ContentModule: ModuleBase {
             guard let self else { return }
 
             if attempt < Self.journeyFetchAttempts {
-                logD("fetchForJourney", "retrying the journey content fetch in one second, nextAttempt: [\(attempt + 1)]")
+                self.logD("fetchForJourney", "retrying the journey content fetch in one second, nextAttempt: [\(attempt + 1)]")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                     self.fetchForJourney(attempt: attempt + 1)
                 }
             } else {
-                logD("fetchForJourney", "the journey content fetch exhausted every attempt, re-entering the content zone")
+                self.logD("fetchForJourney", "the journey content fetch exhausted every attempt, re-entering the content zone")
                 DispatchQueue.main.async { self.enterContentZone() }
             }
         }
@@ -207,9 +220,24 @@ final class ContentModule: ModuleBase {
 
     /// Clears polling state without touching what is on screen.
     func clearContentState() {
-        // Timers belong to the main run loop, and `invalidate` has to be sent from
-        // the thread that scheduled them. This is reached from a queue flush
-        // runnable, which runs on a URLSession completion thread.
+        invalidateTimers()
+
+        stateLock.lock()
+        isFetchInFlight = false
+        isZoneEntered = false
+        // Anything the previous visit scheduled is now stale.
+        zoneGeneration &+= 1
+        stateLock.unlock()
+    }
+
+    /// Tears down both polling timers on the main thread.
+    ///
+    /// Timers belong to the main run loop, and `invalidate` has to be sent from
+    /// the thread that scheduled them or the timer may keep firing. Both callers
+    /// can be reached off the main thread: `clearContentState` from a queue flush
+    /// runnable, which runs on a URLSession completion thread, and
+    /// `enterContentZone` from wherever the host application calls it.
+    private func invalidateTimers() {
         let invalidate = { [weak self] in
             guard let self else { return }
             self.zoneTimer?.invalidate()
@@ -218,16 +246,14 @@ final class ContentModule: ModuleBase {
             self.reentryTimer = nil
         }
 
-        if Thread.isMainThread {
-            invalidate()
-        } else {
-            DispatchQueue.main.async(execute: invalidate)
-        }
+        onMainThread(invalidate)
+    }
 
+    /// Whether the zone visit that scheduled some work is still the current one.
+    private func isCurrentGeneration(_ generation: UInt) -> Bool {
         stateLock.lock()
-        isFetchInFlight = false
-        isZoneEntered = false
-        stateLock.unlock()
+        defer { stateLock.unlock() }
+        return isZoneEntered && zoneGeneration == generation
     }
 
     private func isShown() -> Bool {
@@ -448,14 +474,10 @@ final class ContentModule: ModuleBase {
                 return
             }
 
-            let isLandscape = self.core.config.content.disableRotation ? false : self.windowSize().width > self.windowSize().height
+            let windowSize = self.windowSize()
+            let isLandscape = self.core.config.content.disableRotation ? false : windowSize.width > windowSize.height
             let coordinates = (placement[isLandscape ? "l" : "p"] as? [String: Any]) ?? [:]
-
-            let frame = CGRect(
-                x: (coordinates["x"] as? NSNumber)?.doubleValue ?? 0,
-                y: (coordinates["y"] as? NSNumber)?.doubleValue ?? 0,
-                width: (coordinates["w"] as? NSNumber)?.doubleValue ?? Double(self.windowSize().width),
-                height: (coordinates["h"] as? NSNumber)?.doubleValue ?? Double(self.windowSize().height))
+            let frame = CGRect(contentGeometry: coordinates, container: windowSize)
 
             // The theme is resolved here, on the main thread, where reading the
             // trait collection is safe.
