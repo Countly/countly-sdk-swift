@@ -37,7 +37,6 @@ final class ContentModule: ModuleBase {
     private var contentInitialDelay = 4
 
     /// Tags the current zone was entered with.
-    private var currentTags: [String] = []
 
     private var zoneTimer: Timer?
     private var reentryTimer: Timer?
@@ -68,9 +67,9 @@ final class ContentModule: ModuleBase {
     // MARK: - Zone lifecycle
 
     /// Starts polling for content.
-    func enterContentZone(tags: [String] = []) {
+    func enterContentZone() {
         guard !isShown() else {
-            logD("enterContentZone", "a content is already shown, skipping this enter, tagCount: [\(tags.count)]")
+            logD("enterContentZone", "a content is already shown, skipping this enter")
             return
         }
 
@@ -94,14 +93,13 @@ final class ContentModule: ModuleBase {
         isZoneEntered = true
         stateLock.unlock()
 
-        currentTags = tags
 
         // The first fetch is held back on a cold launch so content does not land
         // on top of the application's own first screen.
         let delay = core.clock.timeSinceLaunch() < contentInitialDelay ? contentInitialDelay : 0
         let interval = TimeInterval(core.config.content.zoneTimerInterval)
 
-        logD("enterContentZone", "content zone entered, tagCount: [\(tags.count)], initialDelay: [\(delay)], zoneTimerInterval: [\(interval)]")
+        logD("enterContentZone", "content zone entered, initialDelay: [\(delay)], zoneTimerInterval: [\(interval)]")
 
         DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(delay)) { [weak self] in
             guard let self else { return }
@@ -119,13 +117,6 @@ final class ContentModule: ModuleBase {
         closeShownContent()
     }
 
-    /// Restarts the zone when the tags changed.
-    func changeContent(tags: [String]) {
-        guard tags != currentTags else { return }
-        logD("changeContent", "the tags changed, restarting the content zone, newTagCount: [\(tags.count)], oldTagCount: [\(currentTags.count)]")
-        exitContentZone()
-        enterContentZone(tags: tags)
-    }
 
     /// Fetches one content by ID without starting the polling loop.
     func previewContent(_ contentID: String) {
@@ -225,7 +216,6 @@ final class ContentModule: ModuleBase {
             self.zoneTimer = nil
             self.reentryTimer?.invalidate()
             self.reentryTimer = nil
-            self.currentTags = []
         }
 
         if Thread.isMainThread {

@@ -283,8 +283,8 @@ public final class FeedbackAPI: CountlyAPIBase {
 public final class ContentAPI: CountlyAPIBase {
 
     /// Starts polling the server for content to show.
-    public func enterContentZone(tags: [String] = []) {
-        core()?.modules.content.enterContentZone(tags: tags)
+    public func enterContentZone() {
+        core()?.modules.content.enterContentZone()
     }
 
     /// Stops polling and takes any displayed content off screen.
@@ -295,11 +295,6 @@ public final class ContentAPI: CountlyAPIBase {
     /// Asks the server again as soon as everything queued has been accepted.
     public func refreshContentZone() {
         core()?.modules.content.refreshContentZone()
-    }
-
-    /// Restarts the zone with a different set of tags.
-    public func changeContent(tags: [String]) {
-        core()?.modules.content.changeContent(tags: tags)
     }
 
     /// Fetches and shows one content by ID, without starting the polling loop.
