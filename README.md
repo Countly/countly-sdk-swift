@@ -1,44 +1,68 @@
-# Countly SDK for Swift
+![Swift](https://img.shields.io/badge/Swift-5.9%2B-orange.svg?style=flat)
+![Platforms](https://img.shields.io/badge/Platforms-iOS%20%7C%20tvOS%20%7C%20watchOS%20%7C%20macOS%20%7C%20visionOS-brightgreen.svg?style=flat)
 
-Countly product analytics for iOS, iPadOS, tvOS, watchOS, macOS and visionOS,
-written in Swift.
+# Countly Swift SDK
 
-## What is different from countly-sdk-ios
+This repository contains the Countly Swift SDK, which can be integrated into iOS, iPadOS, tvOS, watchOS, macOS and visionOS applications written in Swift. The Countly Swift SDK is intended to be used with [Countly Lite](https://countly.com/lite), [Countly Flex](https://countly.com/flex), [Countly Enterprise](https://countly.com/enterprise).
 
-Same wire protocol, same server, same features. Two things changed:
+## What is Countly?
 
-**Several SDKs can run side by side.** Every instance owns its storage, device
-ID, request queue, timers, log level and lifecycle observation. Two instances
-cannot see each other's data, so one application can report to two app keys, two
-servers, or two tenants at once.
+[Countly](https://countly.com) is a product analytics solution and innovation enabler that helps teams track product performance and customer journey and behavior across [mobile](https://countly.com/mobile-analytics), [web](https://countly.com/web-analytics), and [desktop](https://countly.com/desktop-analytics) applications. [Ensuring privacy by design](https://countly.com/privacy-by-design), Countly allows you to innovate and enhance your products to provide personalized and customized customer experiences, and meet key business and revenue goals.
 
-**The API is grouped by feature.** `Countly.shared.events.recordEvent(...)`
-rather than a flat surface of sixty methods. Operations that do not belong to a
-single feature stay on the instance.
+Track, measure, and take action - all without leaving Countly.
+
+* **Questions or feature requests?** [Join the Countly Community on Discord](https://discord.gg/countly)
+* **Looking for the Countly Server?** [Countly Server repository](https://github.com/Countly/countly-server)
+* **Looking for other Countly SDKs?** [An overview of all Countly SDKs for mobile, web and desktop](https://support.count.ly/hc/en-us/articles/360037236571-Downloading-and-Installing-SDKs#h_01H9QCP8G5Y9PZJGERZ4XWYDY9)
+
+## Integrating Countly SDK in your projects
+
+This SDK supports the following features:
+* [Analytics](https://support.count.ly/hc/en-us/articles/4431589003545-Analytics)
+* [Push Notifications](https://support.count.ly/hc/en-us/articles/4405405459225-Push-Notifications)
+* [User Profiles](https://support.count.ly/hc/en-us/articles/4403281285913-User-Profiles)
+* [Crash Reports](https://support.count.ly/hc/en-us/articles/4404213566105-Crashes-Errors)
+* [A/B Testing](https://support.count.ly/hc/en-us/articles/4416496362393-A-B-Testing-)
+* [Performance Monitoring](https://support.count.ly/hc/en-us/articles/4734457847705-Performance)
+* [Feedback Widgets](https://support.count.ly/hc/en-us/articles/4652903481753-Feedback-Surveys-NPS-and-Ratings-)
 
 ## Installation
 
-Swift Package Manager:
+### Swift Package Manager
 
 ```swift
 .package(url: "https://github.com/Countly/countly-sdk-swift.git", from: "26.8.0")
 ```
 
-## Getting started
+### CocoaPods
+
+```ruby
+pod 'CountlySwift', '~> 26.8'
+```
+
+Rich push notifications need the notification service extension subspec in your extension target:
+
+```ruby
+target 'YourNotificationServiceExtension' do
+  pod 'CountlySwift/NotificationService', '~> 26.8'
+end
+```
+
+## Minimal integration
 
 ```swift
 import Countly
 
-let config = CountlyConfig(appKey: "YOUR_APP_KEY", host: "https://your.server")
-config.enableDebug = true
+let config = CountlyConfig()
+config.appKey = "YOUR_APP_KEY"
+config.host = "https://your.server.ly"
 
 Countly.shared.start(with: config)
 ```
 
-That is the whole integration. Sessions, device metrics and the device ID are
-handled from here.
+That is the whole integration. Sessions, device metrics and the device ID are handled from there.
 
-### Recording
+Recording is grouped by feature rather than spread across one flat surface:
 
 ```swift
 Countly.shared.events.recordEvent("purchase", segmentation: ["item": "hat"], count: 1, sum: 9.99)
@@ -50,79 +74,30 @@ Countly.shared.userProfile.setProperties(["name": "Ada", "email": "ada@example.c
 Countly.shared.userProfile.save()
 ```
 
-### Consent
-
-With `config.requiresConsent = true` nothing is collected until you say so:
+With `config.requiresConsent = true` nothing is collected until consent is given:
 
 ```swift
 Countly.shared.consent.giveConsent(for: [.sessions, .events, .viewTracking])
 ```
 
-Without it, every feature reports itself as consented and the calls above are
-no-ops.
+## Multiple instances
 
-## Several instances
+Several instances can run side by side. Each one owns its storage, device ID, request queue, timers, log level and lifecycle observation, so one application can report to two app keys, two servers, or two tenants at once without them seeing each other's data.
 
 ```swift
 let analytics = Countly.instance(named: "analytics")
 analytics.start(with: analyticsConfig)
-
-let crashes = Countly.instance(named: "crashes")
-crashes.start(with: crashConfig)
 ```
 
-`Countly.instance(named:)` creates the handle but never starts it: initialization
-is always an explicit `start(with:)`, so holding a reference cannot begin
-collecting data by accident.
-
-A natural choice of name is the app key, which gives one isolated instance per
-dashboard application.
-
-### Where the data goes
-
-The default instance reads and writes the same paths and user defaults keys
-earlier Countly SDKs used, so an application migrating from `countly-sdk-ios`
-keeps its device ID and its queued requests. Named instances get their own
-namespace derived from the name.
-
-Some things stay process-wide, because the platform only offers one of each: the
-crash handlers, the view controller swizzle, the APNs registration and the
-notification centre delegate. All of them fan out to every instance that asked
-for them.
+`Countly.instance(named:)` creates the handle but never starts it, so holding a reference cannot begin collecting data by accident. `Countly.shared` is the default instance, and it reads and writes the same storage a previous `countly-sdk-ios` integration used, so an application moving to this SDK keeps its device ID and its queued requests.
 
 ## Push notifications
 
-Nothing to wire up. Add `.pushNotifications` to `config.features` and the SDK
-takes over the two application delegate registration callbacks and the
-`UNUserNotificationCenter` delegate, always calling your own implementations
-afterwards. The device token is reported, a tapped notification records its
-action event, and any URL attached to the notification or to the tapped button is
-opened.
+Add `.pushNotifications` to `config.features` and the SDK takes over the two application delegate registration callbacks and the `UNUserNotificationCenter` delegate, always calling your own implementations afterwards. The device token is reported, a tapped notification records its action event, and any attached URL is opened.
 
-Set `config.disableAutomaticPushHandling = true` to keep the SDK out of both
-delegates, and then forward the callbacks yourself:
+Set `config.disableAutomaticPushHandling = true` to keep the SDK out of both delegates and forward the callbacks yourself.
 
-```swift
-func application(_ app: UIApplication,
-                 didRegisterForRemoteNotificationsWithDeviceToken token: Data) {
-    Countly.didRegisterForRemoteNotifications(deviceToken: token)
-}
-
-func application(_ app: UIApplication,
-                 didFailToRegisterForRemoteNotificationsWithError error: Error) {
-    Countly.didFailToRegisterForRemoteNotifications(error: error)
-}
-
-// and, from your UNUserNotificationCenterDelegate:
-Countly.shared.push.recordAction(for: response.notification.request.content.userInfo,
-                                 clickedButtonIndex: 0)
-```
-
-### Rich notifications
-
-Action buttons and media attachments need a notification service extension. Add
-one to your project, link the `CountlyNotificationService` product, and forward
-the one callback:
+Action buttons and media attachments need a notification service extension:
 
 ```swift
 import UserNotifications
@@ -136,25 +111,32 @@ class NotificationService: UNNotificationServiceExtension {
 }
 ```
 
-## Parity testing
-
-`Tools/parity/` holds a local capture server and a comparison script, used to
-prove this SDK sends the same traffic as `countly-sdk-ios` for the same flows.
-
-```bash
-python3 Tools/parity/capture_server.py --out captures/objc.jsonl --port 8080
-# drive the sample app against http://localhost:8080, then repeat with this SDK
-python3 Tools/parity/compare_captures.py captures/objc.jsonl captures/swift.jsonl
-```
-
-The comparison normalizes away what legitimately differs between two runs
-(timestamps, device ID, checksums, SDK name and version) and reports everything
-else.
-
 ## Requirements
 
 iOS 12, tvOS 12, watchOS 4, macOS 10.14, visionOS 1. Swift 5.9.
 
-## License
+## Security
 
-MIT. See `LICENSE`.
+Security is very important to us. If you discover any issue regarding security, please disclose the information responsibly by sending an email to security@count.ly and **not by creating a GitHub issue**.
+
+## Badges
+
+If you like Countly, [why not use one of our badges](https://countly.com/brand-assets) and give a link back to us so others know about this wonderful platform?
+
+<a href="https://count.ly/f/badge" rel="nofollow"><img style="width:145px;height:60px" src="https://countly.com/badges/dark.svg?v2" alt="Countly - Product Analytics" /></a>
+
+```JS
+<a href="https://count.ly/f/badge" rel="nofollow"><img style="width:145px;height:60px" src="https://countly.com/badges/dark.svg" alt="Countly - Product Analytics" /></a>
+```
+
+<a href="https://count.ly/f/badge" rel="nofollow"><img style="width:145px;height:60px" src="https://countly.com/badges/light.svg?v2" alt="Countly - Product Analytics" /></a>
+
+```JS
+<a href="https://count.ly/f/badge" rel="nofollow"><img style="width:145px;height:60px" src="https://countly.com/badges/light.svg" alt="Countly - Product Analytics" /></a>
+```
+
+## How can I help you with your efforts?
+
+Glad you asked! For community support, feature requests, and engaging with the Countly Community, please join us at [our Discord Server](https://discord.gg/countly). We're excited to have you there!
+
+Also, we are on [Twitter](https://twitter.com/gocountly) and [LinkedIn](https://www.linkedin.com/company/countly) if you would like to keep up with Countly related updates.
