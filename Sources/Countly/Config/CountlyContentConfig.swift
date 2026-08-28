@@ -9,7 +9,6 @@
 import Foundation
 
 /// How a content presentation ended.
-@objc(CLYContentStatus)
 public enum ContentStatus: Int, Sendable {
     /// The user reached the end of the content flow.
     case completed
@@ -18,7 +17,6 @@ public enum ContentStatus: Int, Sendable {
 }
 
 /// How the content and feedback web views are laid out.
-@objc(CLYWebViewDisplayOption)
 public enum WebViewDisplayOption: Int, Sendable {
     /// Full screen, ignoring safe area insets.
     case immersive

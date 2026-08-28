@@ -213,16 +213,16 @@ final class UserProfileModule: ModuleBase {
     func increment(_ key: String) { incrementBy(key, value: 1) }
 
     /// Adds an amount to a numeric property.
-    func incrementBy(_ key: String, value: NSNumber) { modify(.increment, key: key, value: value) }
+    func incrementBy(_ key: String, value: Double) { modify(.increment, key: key, value: value) }
 
     /// Multiplies a numeric property.
-    func multiply(_ key: String, value: NSNumber) { modify(.multiply, key: key, value: value) }
+    func multiply(_ key: String, value: Double) { modify(.multiply, key: key, value: value) }
 
     /// Keeps the larger of the stored and the given value.
-    func max(_ key: String, value: NSNumber) { modify(.max, key: key, value: value) }
+    func max(_ key: String, value: Double) { modify(.max, key: key, value: value) }
 
     /// Keeps the smaller of the stored and the given value.
-    func min(_ key: String, value: NSNumber) { modify(.min, key: key, value: value) }
+    func min(_ key: String, value: Double) { modify(.min, key: key, value: value) }
 
     /// Appends to a list property, duplicates allowed.
     func push(_ key: String, value: Any) { modify(.push, key: key, value: value) }

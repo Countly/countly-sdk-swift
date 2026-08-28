@@ -5,6 +5,8 @@
 
 This repository contains the Countly Swift SDK, which can be integrated into iOS, iPadOS, tvOS, watchOS, macOS and visionOS applications written in Swift. The Countly Swift SDK is intended to be used with [Countly Lite](https://countly.com/lite), [Countly Flex](https://countly.com/flex), [Countly Enterprise](https://countly.com/enterprise).
 
+Its interface is Swift only. For an application written in Objective-C, use the [Countly iOS SDK](https://github.com/Countly/countly-sdk-ios).
+
 ## What is Countly?
 
 [Countly](https://countly.com) is a product analytics solution and innovation enabler that helps teams track product performance and customer journey and behavior across [mobile](https://countly.com/mobile-analytics), [web](https://countly.com/web-analytics), and [desktop](https://countly.com/desktop-analytics) applications. [Ensuring privacy by design](https://countly.com/privacy-by-design), Countly allows you to innovate and enhance your products to provide personalized and customized customer experiences, and meet key business and revenue goals.
