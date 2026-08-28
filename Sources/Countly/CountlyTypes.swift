@@ -15,7 +15,6 @@ import Foundation
 /// The SDK prints nothing unless `CountlyConfig.enableDebug` is set or a
 /// `CountlyLoggerDelegate` is attached. A line is emitted only when its level is
 /// less than or equal to the configured `internalLogLevel`.
-@objc(CLYLogLevel)
 public enum CountlyLogLevel: Int, CaseIterable, Sendable {
     case none = 0
     case error = 1
@@ -42,9 +41,8 @@ public enum CountlyLogLevel: Int, CaseIterable, Sendable {
 /// Lines arrive already prefixed with `[Countly] [<Level>] `. The delegate is
 /// called on whichever thread produced the log, so implementations must be
 /// thread safe and must not block.
-@objc(CLYLoggerDelegate)
 public protocol CountlyLoggerDelegate: AnyObject {
-    @objc func internalLog(_ log: String, level: CountlyLogLevel)
+    func internalLog(_ log: String, level: CountlyLogLevel)
 }
 
 // MARK: - Consent
@@ -52,7 +50,6 @@ public protocol CountlyLoggerDelegate: AnyObject {
 /// A feature that can be individually consented to.
 ///
 /// Raw values are the wire names the server expects in the `consent=` payload.
-@objc(CLYConsent)
 public enum ConsentFeature: Int, CaseIterable, Sendable {
     case sessions
     case events
@@ -102,7 +99,6 @@ public enum ConsentFeature: Int, CaseIterable, Sendable {
 /// Objective-C SDK spelled `1` as "IDFV" and used a separate `2` for the
 /// platforms it called "NSUUID", but both branches produced a `UUID()` and
 /// `identifierForVendor` was never read, so the distinction described nothing.
-@objc(CLYDeviceIDType)
 public enum DeviceIDType: Int, Sendable {
     /// Supplied by the host application.
     case developerSupplied = 0
@@ -118,7 +114,6 @@ public enum DeviceIDType: Int, Sendable {
 // MARK: - Features enabled at init
 
 /// Optional features that have to be switched on explicitly at init time.
-@objc(CLYFeature)
 public enum CountlyFeature: Int, CaseIterable, Sendable {
     case pushNotifications
     case crashReporting
@@ -127,7 +122,6 @@ public enum CountlyFeature: Int, CaseIterable, Sendable {
 // MARK: - Push
 
 /// Which APNs environment the token should be reported against.
-@objc(CLYPushTestMode)
 public enum PushTestMode: Int, Sendable {
     /// Development / debug builds signed with a development certificate.
     case development
@@ -173,7 +167,6 @@ public enum AttributionKey {
 // MARK: - Request results
 
 /// Outcome of a networked SDK call that reports back to the host application.
-@objc(CLYRequestResult)
 public enum RequestResult: Int, Sendable {
     /// The request never reached the server.
     case networkIssue

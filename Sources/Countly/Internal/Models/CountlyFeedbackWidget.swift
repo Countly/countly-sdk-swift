@@ -9,7 +9,6 @@
 import Foundation
 
 /// Kind of feedback widget.
-@objc(CLYFeedbackWidgetType)
 public enum FeedbackWidgetType: Int, Sendable {
     case survey
     case nps
@@ -44,7 +43,6 @@ public enum FeedbackWidgetType: Int, Sendable {
 }
 
 /// Whether a widget just appeared or was dismissed.
-@objc(CLYWidgetState)
 public enum WidgetState: Int, Sendable {
     case appeared
     case closed

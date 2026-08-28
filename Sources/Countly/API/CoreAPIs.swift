@@ -214,22 +214,22 @@ public final class UserProfileAPI: CountlyAPIBase {
     }
 
     /// Adds an amount to a numeric property.
-    public func incrementBy(_ key: String, value: NSNumber) {
+    public func incrementBy(_ key: String, value: Double) {
         core()?.modules.userProfile.incrementBy(key, value: value)
     }
 
     /// Multiplies a numeric property.
-    public func multiply(_ key: String, value: NSNumber) {
+    public func multiply(_ key: String, value: Double) {
         core()?.modules.userProfile.multiply(key, value: value)
     }
 
     /// Keeps the larger of the stored and the given value.
-    public func max(_ key: String, value: NSNumber) {
+    public func max(_ key: String, value: Double) {
         core()?.modules.userProfile.max(key, value: value)
     }
 
     /// Keeps the smaller of the stored and the given value.
-    public func min(_ key: String, value: NSNumber) {
+    public func min(_ key: String, value: Double) {
         core()?.modules.userProfile.min(key, value: value)
     }
 
