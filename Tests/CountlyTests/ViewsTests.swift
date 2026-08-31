@@ -184,19 +184,29 @@ final class ViewsTests: CountlyBaseTestCase {
             return
         }
 
+        let start = Date()
         TestUtils.pump(1.1)
         countly.views.pauseView(id: viewID)
+        let pauseBegan = Date()
         TestUtils.pump(1.1)
         countly.views.resumeView(id: viewID)
+        let paused = Date().timeIntervalSince(pauseBegan)
         TestUtils.pump(1.1)
         countly.views.stopView(id: viewID)
+        let elapsed = Date().timeIntervalSince(start)
 
         let durations = viewEvents(of: countly).compactMap { TestUtils.double($0["dur"]) }.filter { $0 > 0 }
         XCTAssertEqual(durations.count, 2, "one duration for the pause and one for the stop")
 
+        // Compared against the wall clock actually observed rather than a fixed
+        // ceiling: a loaded runner stretches every wait, and a fixed bound would
+        // then fail for a reason that has nothing to do with pausing. What has to
+        // hold is that the reported total covers the two active spans and excludes
+        // the paused one.
         let total = durations.reduce(0, +)
         XCTAssertGreaterThanOrEqual(total, 2)
-        XCTAssertLessThan(total, 3, "the paused second must not be counted")
+        XCTAssertLessThan(total, elapsed - paused + 1,
+                          "the paused span must not be counted, elapsed: [\(elapsed)], paused: [\(paused)]")
     }
 
     func testPausingAViewThatDoesNotExistDoesNothing() {

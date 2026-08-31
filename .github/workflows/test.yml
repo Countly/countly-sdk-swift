@@ -1,6 +1,12 @@
 name: Test the SDK
 
+# `contents: read` is what lets actions/checkout clone. Declaring any permissions
+# block replaces the default token scopes outright rather than adding to them, so
+# leaving it out drops read access to the repository itself: on a private repo the
+# clone then fails with "Repository not found", which is how GitHub reports an
+# unauthorised read.
 permissions:
+  contents: read
   checks: write
   pull-requests: write
 

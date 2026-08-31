@@ -64,7 +64,14 @@ jobs:
   # folder, and any manifest a future contributor adds.
   dependency-review:
     name: Review dependency changes
-    if: github.event_name == 'pull_request'
+    # Dependency review reads the dependency graph, which on a private repository needs GitHub
+    # Advanced Security; without it the action refuses outright. Gated rather than deleted so it
+    # starts working the day this repository is public, and skipped rather than failed so it does
+    # not sit red on every pull request until then.
+    #
+    # The no-dependencies job above is the one that actually covers this SDK, and it needs
+    # nothing but a checkout.
+    if: github.event_name == 'pull_request' && github.event.repository.private == false
     runs-on: ubuntu-latest
     permissions:
       contents: read
