@@ -18,6 +18,13 @@ import XCTest
 /// completion handler actually calls it.
 final class RemoteConfigTests: CountlyBaseTestCase {
 
+    /// Every test here asserts on what reached the transport, so the whole suite
+    /// needs a transport it can see.
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try skipUnlessNetworkIsInterceptable()
+    }
+
     /// Only the requests this feature makes. The SDK sends a health check and a
     /// behavior settings fetch of its own as it starts, which are not remote
     /// config traffic and are gated separately.

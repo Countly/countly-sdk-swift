@@ -98,6 +98,32 @@ class CountlyBaseTestCase: XCTestCase {
         return Self.counter
     }
 
+    // MARK: - Platform capabilities
+
+    /// Whether `MockURLProtocol` actually intercepts what the SDK sends.
+    ///
+    /// watchOS does not honour custom `URLProtocol` subclasses: `URLSession` there
+    /// ignores `protocolClasses` and goes to the network regardless. A suite that
+    /// asserts on what reached the mock would not fail on watchOS so much as
+    /// measure the runner's DNS, so those tests are skipped rather than left to
+    /// produce a result that means nothing.
+    ///
+    /// Everything that asserts on the request queue instead of on the transport
+    /// runs on every platform, which is the large majority of the suite.
+    static var canInterceptNetwork: Bool {
+        #if os(watchOS)
+        return false
+        #else
+        return true
+        #endif
+    }
+
+    /// Skips the calling test where the transport cannot be intercepted.
+    func skipUnlessNetworkIsInterceptable() throws {
+        try XCTSkipUnless(Self.canInterceptNetwork,
+                          "watchOS ignores custom URLProtocol subclasses, so nothing reaches the mock transport")
+    }
+
     // MARK: - Reaching inside
 
     /// The instance's core. Every internal assertion goes through this.

@@ -34,7 +34,8 @@ final class FeedbackTests: CountlyBaseTestCase {
 
     // MARK: - Discovering widgets
 
-    func testTheWidgetListIsFetchedAndParsedIntoItsThreeTypes() {
+    func testTheWidgetListIsFetchedAndParsedIntoItsThreeTypes() throws {
+        try skipUnlessNetworkIsInterceptable()
         MockURLProtocol.respond(pathContaining: "/o/sdk", json: Self.widgetList)
         let countly = startInstance()
 
@@ -56,7 +57,8 @@ final class FeedbackTests: CountlyBaseTestCase {
     /// The fetch is an instant request on the read endpoint: a widget nobody is
     /// waiting for is not worth queueing, and one somebody is waiting for cannot
     /// afford to be.
-    func testTheWidgetListIsFetchedImmediatelyRatherThanThroughTheQueue() {
+    func testTheWidgetListIsFetchedImmediatelyRatherThanThroughTheQueue() throws {
+        try skipUnlessNetworkIsInterceptable()
         MockURLProtocol.respond(pathContaining: "/o/sdk", json: Self.widgetList)
         let countly = startInstance()
 
@@ -72,7 +74,8 @@ final class FeedbackTests: CountlyBaseTestCase {
         XCTAssertTrue(TestUtils.requests(requestQueue(of: countly), carrying: "method").isEmpty)
     }
 
-    func testAResponseWithoutAResultFieldIsReportedAsAnError() {
+    func testAResponseWithoutAResultFieldIsReportedAsAnError() throws {
+        try skipUnlessNetworkIsInterceptable()
         MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"something": "else"}"#)
         let countly = startInstance()
 
@@ -164,7 +167,8 @@ final class FeedbackTests: CountlyBaseTestCase {
 
     /// Answering a widget records a reserved event named after the widget's type,
     /// which is how the dashboard separates surveys from NPS responses.
-    func testAnsweringAWidgetRecordsAnEventNamedAfterItsType() {
+    func testAnsweringAWidgetRecordsAnEventNamedAfterItsType() throws {
+        try skipUnlessNetworkIsInterceptable()
         MockURLProtocol.respond(pathContaining: "/o/sdk", json: Self.widgetList)
         let countly = startInstance { $0.eventSendThreshold = 1 }
 
@@ -187,7 +191,8 @@ final class FeedbackTests: CountlyBaseTestCase {
     /// A nil result means the widget was closed without being answered, which is
     /// itself worth reporting: it is the difference between a widget nobody saw
     /// and one everybody dismissed.
-    func testClosingAWidgetWithoutAnsweringIsReportedAsAClose() {
+    func testClosingAWidgetWithoutAnsweringIsReportedAsAClose() throws {
+        try skipUnlessNetworkIsInterceptable()
         MockURLProtocol.respond(pathContaining: "/o/sdk", json: Self.widgetList)
         let countly = startInstance { $0.eventSendThreshold = 1 }
 

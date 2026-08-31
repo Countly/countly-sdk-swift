@@ -17,6 +17,13 @@ import XCTest
 /// loosely and data is dropped on the floor.
 final class NetworkingTests: CountlyBaseTestCase {
 
+    /// Every test here asserts on what reached the transport, so the whole suite
+    /// needs a transport it can see.
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try skipUnlessNetworkIsInterceptable()
+    }
+
     /// The request carrying the named event, waiting for it to reach the wire.
     ///
     /// The SDK sends a health check and a behavior settings fetch of its own as it

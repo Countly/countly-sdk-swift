@@ -315,7 +315,8 @@ final class ServerConfigTests: CountlyBaseTestCase {
 
     /// The fetch is an instant request on the read endpoint, because a build that
     /// has been switched off must not have to drain its queue before it hears so.
-    func testTheSettingsAreFetchedImmediatelyRatherThanThroughTheQueue() {
+    func testTheSettingsAreFetchedImmediatelyRatherThanThroughTheQueue() throws {
+        try skipUnlessNetworkIsInterceptable()
         MockURLProtocol.respond(pathContaining: "/o/sdk",
                                 json: ServerConfigBuilder().customEventTracking(false).json())
 
@@ -330,7 +331,8 @@ final class ServerConfigTests: CountlyBaseTestCase {
         XCTAssertFalse(fetches.isEmpty)
     }
 
-    func testUpdatesCanBeSwitchedOffByTheApplication() {
+    func testUpdatesCanBeSwitchedOffByTheApplication() throws {
+        try skipUnlessNetworkIsInterceptable()
         MockURLProtocol.respond(pathContaining: "/o/sdk",
                                 json: ServerConfigBuilder().customEventTracking(false).json())
 

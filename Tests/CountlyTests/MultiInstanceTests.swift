@@ -236,7 +236,8 @@ final class MultiInstanceTests: CountlyBaseTestCase {
 
     // MARK: - Overriding the configuration at runtime
 
-    func testChangingTheHostAffectsWhereTheNextRequestGoes() {
+    func testChangingTheHostAffectsWhereTheNextRequestGoes() throws {
+        try skipUnlessNetworkIsInterceptable()
         MockURLProtocol.respondToEverything(json: #"{"result": "Success"}"#)
         let countly = startInstance { $0.eventSendThreshold = 1 }
 

@@ -116,7 +116,7 @@ jobs:
       # slower than the rest of this workflow put together. It still catches a malformed
       # manifest and a missing file pattern.
       - name: Lint the podspec
-        run: pod lib lint Countly.podspec --quick --allow-warnings
+        run: pod lib lint CountlySwift.podspec --quick --allow-warnings
 
   # The SDK version travels in every request as `sdk_version`, and it is also written into the
   # podspec and the changelog. Those three drifting apart is silent on the wire but wrong in

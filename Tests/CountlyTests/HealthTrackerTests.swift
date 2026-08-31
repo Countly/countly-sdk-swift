@@ -18,9 +18,17 @@ import XCTest
 /// number the dashboard then reports as fact.
 final class HealthTrackerTests: CountlyBaseTestCase {
 
+    /// Every test here asserts on what reached the transport, so the whole suite
+    /// needs a transport it can see.
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try skipUnlessNetworkIsInterceptable()
+    }
+
     /// The `hc` object of the most recent health check, waiting for at least
     /// `count` of them to have been sent.
-    private func healthCheck(after count: Int = 1, timeout: TimeInterval = 5) -> [String: Any]? {
+    private func healthCheck(after count: Int = 1,
+                             timeout: TimeInterval = TestUtils.asyncTimeout) -> [String: Any]? {
         TestUtils.waitUntil("\(count) health check(s) sent", timeout: timeout) {
             self.healthChecks.count >= count
         }
@@ -44,8 +52,30 @@ final class HealthTrackerTests: CountlyBaseTestCase {
         TestUtils.waitUntil("the start-up health check has been attempted") {
             !self.healthChecks.isEmpty
         }
-        TestUtils.pump(0.2)
         return countly
+    }
+
+    /// Sends a health check and returns its payload, retrying until one actually
+    /// goes out.
+    ///
+    /// The once-per-launch claim is released asynchronously, on the tracker's own
+    /// serial queue, when the start-up check fails. A single send racing that
+    /// release is a no-op, and how long the release takes is the simulator's
+    /// business, so this retries rather than waiting a fixed interval and hoping.
+    private func sendAndRead(_ tracker: HealthTracker,
+                             file: StaticString = #filePath,
+                             line: UInt = #line) -> [String: Any]? {
+        MockURLProtocol.respondToEverything(json: #"{"result": "Success"}"#)
+
+        let sent = healthChecks.count
+        TestUtils.waitUntil("a health check carrying the recorded counters is sent",
+                            file: file, line: line) {
+            tracker.sendHealthCheck(isDeviceIDTemporary: false, networkingEnabled: true)
+            return self.healthChecks.count > sent
+        }
+
+        guard let request = healthChecks.last else { return nil }
+        return TestUtils.parseQuery(request.query)["hc"] as? [String: Any]
     }
 
     // MARK: - The payload
@@ -113,10 +143,7 @@ final class HealthTrackerTests: CountlyBaseTestCase {
         core(of: countly).logger.w("Test", "test", "a warning")
 
         // Read through a send, which is the only thing that snapshots the counters.
-        MockURLProtocol.respondToEverything(json: #"{"result": "Success"}"#)
-        tracker.sendHealthCheck(isDeviceIDTemporary: false, networkingEnabled: true)
-
-        guard let payload = healthCheck(after: 2) else {
+        guard let payload = sendAndRead(tracker) else {
             XCTFail("the health check should have been sent")
             return
         }
@@ -130,10 +157,7 @@ final class HealthTrackerTests: CountlyBaseTestCase {
 
         tracker.logFailedNetworkRequest(statusCode: 503, errorResponse: "service unavailable")
 
-        MockURLProtocol.respondToEverything(json: #"{"result": "Success"}"#)
-        tracker.sendHealthCheck(isDeviceIDTemporary: false, networkingEnabled: true)
-
-        guard let payload = healthCheck(after: 2) else {
+        guard let payload = sendAndRead(tracker) else {
             XCTFail("the health check should have been sent")
             return
         }
@@ -149,10 +173,7 @@ final class HealthTrackerTests: CountlyBaseTestCase {
         tracker.logFailedNetworkRequest(statusCode: 500,
                                         errorResponse: String(repeating: "x", count: 5_000))
 
-        MockURLProtocol.respondToEverything(json: #"{"result": "Success"}"#)
-        tracker.sendHealthCheck(isDeviceIDTemporary: false, networkingEnabled: true)
-
-        guard let payload = healthCheck(after: 2) else {
+        guard let payload = sendAndRead(tracker) else {
             XCTFail("the health check should have been sent")
             return
         }
@@ -173,10 +194,7 @@ final class HealthTrackerTests: CountlyBaseTestCase {
         // running count into a remembered peak.
         tracker.logConsecutiveBackoffRequest()
 
-        MockURLProtocol.respondToEverything(json: #"{"result": "Success"}"#)
-        tracker.sendHealthCheck(isDeviceIDTemporary: false, networkingEnabled: true)
-
-        guard let payload = healthCheck(after: 2) else {
+        guard let payload = sendAndRead(tracker) else {
             XCTFail("the health check should have been sent")
             return
         }

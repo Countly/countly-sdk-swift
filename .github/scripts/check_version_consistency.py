@@ -14,7 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 SOURCE = ROOT / "Sources/Countly/Internal/CountlyConsts.swift"
-PODSPEC = ROOT / "Countly.podspec"
+PODSPEC = ROOT / "CountlySwift.podspec"
 CHANGELOG = ROOT / "CHANGELOG.md"
 
 
@@ -50,7 +50,7 @@ def main():
 
     found = {
         "Sources/Countly/Internal/CountlyConsts.swift": source,
-        "Countly.podspec": podspec,
+        "CountlySwift.podspec": podspec,
         "CHANGELOG.md": changelog,
     }
 
