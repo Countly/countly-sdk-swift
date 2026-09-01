@@ -600,4 +600,79 @@ final class RemoteConfigTests: CountlyBaseTestCase {
         }
         XCTAssertEqual(TestUtils.parseQuery(request.query)["oi"] as? String, "1")
     }
+
+    // MARK: - Migrating a cache written by the Objective-C SDK
+
+    /// An application replacing the Objective-C Countly SDK with this one keeps the
+    /// same `UserDefaults`, so the remote config cache it finds on the first launch
+    /// was written by the old SDK in the old shape: archived `CountlyRCData`
+    /// objects rather than plain dictionaries.
+    ///
+    /// Failing to read them is silent. Nothing errors, the cache simply comes back
+    /// empty, and every value the application asked for falls back to its default
+    /// until the next successful fetch. On a launch with no network that is the
+    /// whole session, which is exactly when a cache was supposed to help.
+    ///
+    /// The stand-in below is archived under the old class's Objective-C name, which
+    /// is what `@objc(CountlyRCData)` on `LegacyArchivedRCData` exists to match.
+    func testACacheWrittenByThePreviousObjectiveCSDKIsStillReadable() throws {
+        let name = uniqueInstanceName()
+        let namespace = StorageNamespace(instanceName: name)
+
+        let legacy = LegacyRCStandIn(value: "dark", isCurrentUsersData: true)
+        let stale = LegacyRCStandIn(value: 42, isCurrentUsersData: false)
+
+        let archiver = NSKeyedArchiver(requiringSecureCoding: false)
+        // The name the previous SDK wrote, not this one's Swift type name.
+        archiver.setClassName("CountlyRCData", for: LegacyRCStandIn.self)
+        archiver.encode(["theme": legacy, "seats": stale], forKey: NSKeyedArchiveRootObjectKey)
+        archiver.finishEncoding()
+
+        UserDefaults.standard.set(archiver.encodedData,
+                                  forKey: namespace.key(PersistencyKey.remoteConfig))
+        defer { UserDefaults.standard.removeObject(forKey: namespace.key(PersistencyKey.remoteConfig)) }
+
+        let countly = start(baseConfig(instanceName: name))
+
+        XCTAssertEqual(countly.remoteConfig.getValue("theme").value as? String, "dark",
+                       "a value cached by the previous SDK was lost on migration")
+
+        // The stale marker has to survive too, or a value belonging to a previous
+        // user is silently presented as the current user's.
+        XCTAssertEqual(TestUtils.int(countly.remoteConfig.getValue("seats").value), 42)
+        XCTAssertFalse(countly.remoteConfig.getValue("seats").isCurrentUsersData,
+                       "the stale marker was dropped, so another user's value now reads as this one's")
+    }
+
+}
+
+/// Stands in for the Objective-C SDK's `CountlyRCData` when writing a legacy
+/// archive. It cannot be the real type: `LegacyArchivedRCData` has only
+/// `init?(coder:)`, by design, because nothing in the SDK should ever create one.
+// An explicit Objective-C name because `NSCoding` needs a stable one. It is not
+// the legacy name: that is applied per archive with `setClassName`, so this type
+// cannot collide with the real `@objc(CountlyRCData)`.
+@objc(CountlyTestLegacyRCStandIn)
+private final class LegacyRCStandIn: NSObject, NSCoding {
+
+    let value: Any?
+    let isCurrentUsersData: Bool
+
+    init(value: Any?, isCurrentUsersData: Bool) {
+        self.value = value
+        self.isCurrentUsersData = isCurrentUsersData
+        super.init()
+    }
+
+    init?(coder: NSCoder) {
+        value = coder.decodeObject(forKey: "value")
+        isCurrentUsersData = coder.decodeBool(forKey: "isCurrentUsersData")
+        super.init()
+    }
+
+    // The key names are the ones the previous SDK encoded under.
+    func encode(with coder: NSCoder) {
+        coder.encode(value, forKey: "value")
+        coder.encode(isCurrentUsersData, forKey: "isCurrentUsersData")
+    }
 }
