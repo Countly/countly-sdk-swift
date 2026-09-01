@@ -1,0 +1,85 @@
+name: "Dependency Security Scan"
+
+# Runs on pushes and pull requests so a bad dependency is caught immediately, and on a
+# schedule because a dependency can become vulnerable without this repo changing at all.
+on:
+  push:
+    branches:
+      - master
+      - staging
+  pull_request:
+    branches:
+      - master
+      - staging
+  schedule:
+    # Mondays 06:00 UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # One threshold for both jobs. They look at the same dependencies; if these drift apart,
+  # one job fails a pull request the other has passed.
+  SEVERITY_THRESHOLD: high
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The SDK ships with no third party dependencies on purpose: an analytics SDK that drags a
+  # transitive graph into every integrating application inherits every vulnerability in it.
+  # This job is what keeps that true. If a dependency is ever added deliberately, this fails
+  # once, and the fix is to extend it into a real OSV scan of Package.resolved rather than to
+  # delete it.
+  no-dependencies:
+    name: The package declares no third party dependencies
+    runs-on: macos-15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Xcode
+        run: sudo xcode-select -switch /Applications/Xcode_16.4.app
+
+      - name: Dump the resolved dependency graph
+        run: swift package show-dependencies --format json | tee dependencies.json
+
+      - name: Check the graph against Package.resolved and OSV
+        run: python3 .github/scripts/check_dependencies.py dependencies.json
+
+      - name: Upload the dependency graph
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolved-dependencies
+          path: |
+            dependencies.json
+            osv-report.md
+          if-no-files-found: ignore
+
+  # Covers everything the SDK does not declare itself: the GitHub Actions pinned in this
+  # folder, and any manifest a future contributor adds.
+  dependency-review:
+    name: Review dependency changes
+    # Dependency review reads the dependency graph, which on a private repository needs GitHub
+    # Advanced Security; without it the action refuses outright. Gated rather than deleted so it
+    # starts working the day this repository is public, and skipped rather than failed so it does
+    # not sit red on every pull request until then.
+    #
+    # The no-dependencies job above is the one that actually covers this SDK, and it needs
+    # nothing but a checkout.
+    if: github.event_name == 'pull_request' && github.event.repository.private == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fail the pull request on newly introduced vulnerable dependencies
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: ${{ env.SEVERITY_THRESHOLD }}
+          comment-summary-in-pr: on-failure

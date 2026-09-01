@@ -53,7 +53,14 @@ final class RemoteConfigModule: ModuleBase {
     private var localCachedExperiments: [String: CountlyExperimentInformation] = [:]
 
     /// Callbacks notified after each download.
-    private var downloadCallbacks: [RCDownloadCallback] = []
+    /// Registered download callbacks, keyed by the token handed back to whoever
+    /// registered them.
+    ///
+    /// Keyed rather than a plain array because a Swift closure has no identity to
+    /// compare against, which is how the reference SDKs find the one to remove.
+    /// The token is that identity.
+    private var downloadCallbacks: [RCCallbackToken: RCDownloadCallback] = [:]
+    private var nextCallbackToken: UInt64 = 0
 
     /// Whether the SDK downloads on its own at init and after a user change.
     var isAutomaticTriggersEnabled = false
@@ -72,7 +79,9 @@ final class RemoteConfigModule: ModuleBase {
         isAutomaticTriggersEnabled = core.config.enableRemoteConfigAutomaticTriggers
         isValueCachingEnabled = core.config.enableRemoteConfigValueCaching
         enrollABOnRCDownload = core.config.enrollABOnRCDownload
-        downloadCallbacks = core.config.remoteConfigGlobalCallbacks
+        for callback in core.config.remoteConfigGlobalCallbacks {
+            _ = registerDownloadCallback(callback)
+        }
 
         loadCache()
     }
@@ -241,8 +250,8 @@ final class RemoteConfigModule: ModuleBase {
             var result = RequestResult.success
 
             if error == nil {
-                logD("downloadValues", "remote config value download is successful, valueCount: [\(remoteConfig?.count ?? 0)]")
-                logV("downloadValues", "remote config value download payload detail, remoteConfig: [\(remoteConfig ?? [:])]")
+                self.logD("downloadValues", "remote config value download is successful, valueCount: [\(remoteConfig?.count ?? 0)]")
+                self.logV("downloadValues", "remote config value download payload detail, remoteConfig: [\(remoteConfig ?? [:])]")
 
                 self.lock.lock()
                 if isFullUpdate {
@@ -256,7 +265,7 @@ final class RemoteConfigModule: ModuleBase {
                 self.lock.unlock()
             } else {
                 result = .error
-                logD("downloadValues", "remote config value download failed, error: [\(error?.localizedDescription ?? "")]")
+                self.logD("downloadValues", "remote config value download failed, error: [\(error?.localizedDescription ?? "")]")
             }
 
             completion?(result, error, isFullUpdate, downloaded)
@@ -264,7 +273,7 @@ final class RemoteConfigModule: ModuleBase {
             // Snapshotted so a callback that registers another one does not mutate
             // the array being iterated.
             self.stateLock.lock()
-            let callbacks = self.downloadCallbacks
+            let callbacks = Array(self.downloadCallbacks.values)
             self.stateLock.unlock()
 
             self.logD("downloadValues", "registered download callbacks will be notified, callbackCount: [\(callbacks.count)]")
@@ -292,13 +301,21 @@ final class RemoteConfigModule: ModuleBase {
                        omitKeys: [String]?,
                        isLegacy: Bool,
                        completion: @escaping ([String: Any]?, Error?) -> Void) {
+        // Both guards report back rather than returning silently. `downloadValues`
+        // checks the same two conditions before calling in, but the behavior
+        // settings that own `networkingEnabled` are applied from the network
+        // thread, so either can have flipped in between. A completion that is
+        // captured and never called leaves the caller waiting for the life of the
+        // process.
         guard core.serverConfig.networkingEnabled else {
             logD("fetch", "remote config fetch is aborted, reason: networking is disabled from server config")
+            completion(nil, CountlyError.remoteConfigGeneralAPIError.asNSError)
             return
         }
 
         guard !core.modules.deviceID.isTemporary else {
             logD("fetch", "remote config fetch is aborted, reason: device ID is in temporary mode")
+            completion(nil, CountlyError.remoteConfigGeneralAPIError.asNSError)
             return
         }
 
@@ -325,12 +342,16 @@ final class RemoteConfigModule: ModuleBase {
 
             // Callbacks reach the host application on the main thread, because a
             // remote config value usually drives what is on screen.
-            DispatchQueue.main.async {
+            // Weak again: the `guard let self` above makes it a strong local, and
+            // a hop that captured that local would keep this module alive past the
+            // core it holds `unowned`. The caller's completion still runs either
+            // way, which is what it is waiting for.
+            DispatchQueue.main.async { [weak self] in
                 if let resolvedError {
-                    self.logD("fetch", "remote config request failed, statusCode: [\(statusCode)], error: [\(resolvedError.localizedDescription)]")
+                    self?.logD("fetch", "remote config request failed, statusCode: [\(statusCode)], error: [\(resolvedError.localizedDescription)]")
                     completion(nil, resolvedError)
                 } else {
-                    self.logD("fetch", "remote config request successfully completed, statusCode: [\(statusCode)], valueCount: [\(parsed?.count ?? 0)]")
+                    self?.logD("fetch", "remote config request successfully completed, statusCode: [\(statusCode)], valueCount: [\(parsed?.count ?? 0)]")
                     completion(parsed, nil)
                 }
             }
@@ -363,19 +384,38 @@ final class RemoteConfigModule: ModuleBase {
         return core.network.instantRequest(queryString: queryString, path: Endpoint.output + Endpoint.sdk)
     }
 
+    /// The preconditions every remote config network call shares.
+    ///
+    /// `action` names what is being skipped, so a caller reads the same log line
+    /// it did when each of these guards was written out at its call site.
+    private func isRemoteConfigCallAllowed(_ function: String,
+                                           _ action: String,
+                                           requiresNetworking: Bool) -> Bool {
+        guard core.modules.consent.hasConsent(for: .remoteConfig) else {
+            logV(function, "no consent for remote config, \(action) will be skipped")
+            return false
+        }
+
+        if requiresNetworking {
+            guard core.serverConfig.networkingEnabled else {
+                logD(function, "networking is disabled by the server config, \(action) will be skipped")
+                return false
+            }
+        }
+
+        guard !core.modules.deviceID.isTemporary else {
+            logD(function, "device ID is in temporary mode, \(action) will be skipped")
+            return false
+        }
+
+        return true
+    }
+
     // MARK: - A/B tests
 
     /// Puts the device into the A/B tests of the given keys.
     func enrollIntoABTests(forKeys keys: [String]) {
-        guard core.modules.consent.hasConsent(for: .remoteConfig) else {
-            logV("enrollIntoABTests", "no consent for remote config, AB test enrollment will be skipped")
-            return
-        }
-
-        guard !core.modules.deviceID.isTemporary else {
-            logD("enrollIntoABTests", "device ID is in temporary mode, AB test enrollment will be skipped")
-            return
-        }
+        guard isRemoteConfigCallAllowed("enrollIntoABTests", "AB test enrollment", requiresNetworking: false) else { return }
 
         logD("enrollIntoABTests", "AB test enrollment request will be sent, keyCount: [\(keys.count)]")
         sendABRequest(method: QS.abOptIn, keys: keys, overrideEndpoint: true)
@@ -383,15 +423,7 @@ final class RemoteConfigModule: ModuleBase {
 
     /// Takes the device out of the A/B tests of the given keys.
     func exitABTests(forKeys keys: [String]) {
-        guard core.modules.consent.hasConsent(for: .remoteConfig) else {
-            logV("exitABTests", "no consent for remote config, AB test exit will be skipped")
-            return
-        }
-
-        guard !core.modules.deviceID.isTemporary else {
-            logD("exitABTests", "device ID is in temporary mode, AB test exit will be skipped")
-            return
-        }
+        guard isRemoteConfigCallAllowed("exitABTests", "AB test exit", requiresNetworking: false) else { return }
 
         logD("exitABTests", "AB test exit request will be sent, keyCount: [\(keys.count)]")
         sendABRequest(method: QS.abOptOut, keys: keys, overrideEndpoint: false)
@@ -409,6 +441,18 @@ final class RemoteConfigModule: ModuleBase {
     }
 
     // MARK: - Variants and experiments, for testing
+
+    /// Query string shared by the three testing calls: the essentials, the method,
+    /// any call specific parameters, the app version, then the checksum.
+    ///
+    /// The order is fixed here rather than at each call site because it is the
+    /// order the checksum is computed over.
+    private func testingQueryString(method: String, parameters: String = "") -> String {
+        var queryString = "\(core.network.builder.queryEssentials())&\(QS.method)=\(method)"
+        queryString += parameters
+        queryString += "&\(QS.appVersion)=\(DeviceMetrics.appVersion)"
+        return core.network.builder.appendChecksum(queryString)
+    }
 
     /// Every variant from the last testing download.
     func testingGetAllVariants() -> [String: Any] {
@@ -434,15 +478,12 @@ final class RemoteConfigModule: ModuleBase {
 
     /// Downloads which variants exist, so a tester can pick one.
     func testingDownloadVariantInformation(completion: @escaping RCVariantCallback) {
-        guard core.modules.consent.hasConsent(for: .remoteConfig) else {
-            logV("testingDownloadVariantInformation", "no consent for remote config, variants download will be skipped")
+        guard isRemoteConfigCallAllowed("testingDownloadVariantInformation", "variants download", requiresNetworking: true) else {
             completion(.error, CountlyError.remoteConfigGeneralAPIError.asNSError)
             return
         }
 
-        var queryString = "\(core.network.builder.queryEssentials())&\(QS.method)=\(Key.fetchVariant)"
-        queryString += "&\(QS.appVersion)=\(DeviceMetrics.appVersion)"
-        queryString = core.network.builder.appendChecksum(queryString)
+        let queryString = testingQueryString(method: Key.fetchVariant)
         let request = core.network.instantRequest(queryString: queryString, path: Endpoint.output + Endpoint.sdk)
 
         logD("testingDownloadVariantInformation", "variants download is starting")
@@ -469,21 +510,12 @@ final class RemoteConfigModule: ModuleBase {
 
     /// Downloads the experiments this device is part of.
     func testingDownloadExperimentInformation(completion: @escaping RCVariantCallback) {
-        guard core.modules.consent.hasConsent(for: .remoteConfig) else {
-            logV("testingDownloadExperimentInformation", "no consent for remote config, experiment download will be skipped")
+        guard isRemoteConfigCallAllowed("testingDownloadExperimentInformation", "experiment download", requiresNetworking: true) else {
             completion(.error, CountlyError.remoteConfigGeneralAPIError.asNSError)
             return
         }
 
-        guard !core.modules.deviceID.isTemporary else {
-            logD("testingDownloadExperimentInformation", "device ID is in temporary mode, experiment download will be skipped")
-            completion(.error, CountlyError.remoteConfigGeneralAPIError.asNSError)
-            return
-        }
-
-        var queryString = "\(core.network.builder.queryEssentials())&\(QS.method)=\(Key.fetchExperiments)"
-        queryString += "&\(QS.appVersion)=\(DeviceMetrics.appVersion)"
-        queryString = core.network.builder.appendChecksum(queryString)
+        let queryString = testingQueryString(method: Key.fetchExperiments)
         let request = core.network.instantRequest(queryString: queryString, path: Endpoint.output + Endpoint.sdk)
 
         core.network.instantSession().dataTask(with: request) { [weak self] data, response, error in
@@ -539,10 +571,18 @@ final class RemoteConfigModule: ModuleBase {
             return
         }
 
-        var queryString = "\(core.network.builder.queryEssentials())&\(QS.method)=\(Key.enrollVariant)"
-        queryString += "&\(Key.key)=\(key.urlEscaped)&\(Key.variant)=\(variantName.urlEscaped)"
-        queryString += "&\(QS.appVersion)=\(DeviceMetrics.appVersion)"
-        queryString = core.network.builder.appendChecksum(queryString)
+        // This is the only one of the three testing calls that writes state on the
+        // server, so it is the one where an ungated call does lasting damage: it
+        // would enrol a device whose user declined remote config, and in temporary
+        // mode it would enrol the placeholder ID.
+        guard isRemoteConfigCallAllowed("testingEnrollIntoVariant", "variant enrollment", requiresNetworking: true) else {
+            completion(.error, CountlyError.remoteConfigGeneralAPIError.asNSError)
+            return
+        }
+
+        let queryString = testingQueryString(
+            method: Key.enrollVariant,
+            parameters: "&\(Key.key)=\(key.urlEscaped)&\(Key.variant)=\(variantName.urlEscaped)")
         // Enrollment writes state, so it goes to the input endpoint rather than
         // the read endpoint the fetches use.
         let request = core.network.instantRequest(queryString: queryString, path: Endpoint.input)
@@ -571,12 +611,30 @@ final class RemoteConfigModule: ModuleBase {
     // MARK: - Callbacks
 
     /// Registers a callback notified after each download.
-    func registerDownloadCallback(_ callback: @escaping RCDownloadCallback) {
+    @discardableResult
+    func registerDownloadCallback(_ callback: @escaping RCDownloadCallback) -> RCCallbackToken {
         stateLock.lock()
-        downloadCallbacks.append(callback)
+        nextCallbackToken &+= 1
+        let token = RCCallbackToken(value: nextCallbackToken)
+        downloadCallbacks[token] = callback
         let count = downloadCallbacks.count
         stateLock.unlock()
         logD("registerDownloadCallback", "download callback is registered, callbackCount: [\(count)]")
+        return token
+    }
+
+    /// Removes one registered callback.
+    func removeDownloadCallback(_ token: RCCallbackToken) {
+        stateLock.lock()
+        let removed = downloadCallbacks.removeValue(forKey: token) != nil
+        let count = downloadCallbacks.count
+        stateLock.unlock()
+
+        if removed {
+            logD("removeDownloadCallback", "download callback is removed, remainingCallbackCount: [\(count)]")
+        } else {
+            logW("removeDownloadCallback", "nothing was removed, the token does not belong to a registered download callback")
+        }
     }
 
     /// Drops every registered download callback.

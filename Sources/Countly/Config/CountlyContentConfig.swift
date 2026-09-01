@@ -44,11 +44,21 @@ public final class CountlyContentConfig {
 
     /// How often the SDK asks the server for content while a content zone is
     /// entered, in seconds. Default 30.
+    ///
+    /// Anything at or below the minimum is ignored and the previous value kept,
+    /// which is what the other Countly SDKs do. Polling every second or two is
+    /// never what an integration means, and the cost of taking it literally is
+    /// paid by the server rather than by whoever set it.
     public var zoneTimerInterval: Int = 30 {
         didSet {
-            if zoneTimerInterval < 1 { zoneTimerInterval = 30 }
+            if zoneTimerInterval <= Self.minimumZoneTimerInterval {
+                zoneTimerInterval = oldValue
+            }
         }
     }
+
+    /// The shortest polling interval the SDK accepts, in seconds.
+    static let minimumZoneTimerInterval = 15
 
     /// Layout of the content and feedback web views. Default `.immersive`.
     public var webViewDisplayOption: WebViewDisplayOption = .immersive

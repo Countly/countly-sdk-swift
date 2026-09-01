@@ -139,10 +139,7 @@ final class KeyValueStore {
     private func unarchiveDictionary(_ key: String) -> [String: Any] {
         guard let data = defaults.data(forKey: namespace.key(key)) else { return [:] }
         do {
-            let unarchiver = try NSKeyedUnarchiver(forReadingFrom: data)
-            unarchiver.requiresSecureCoding = false
-            let value = unarchiver.decodeObject(forKey: NSKeyedArchiveRootObjectKey)
-            unarchiver.finishDecoding()
+            let value = try CountlyArchive.decodeRoot(from: data)
             return value as? [String: Any] ?? [:]
         } catch {
             logger?.d(Self.module, "unarchive", "stored value could not be read back and will be treated as empty, key: [\(key)], error: [\(error.localizedDescription)]")

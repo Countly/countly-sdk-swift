@@ -98,6 +98,80 @@ extension Data {
     }
 }
 
+// MARK: - Dispatch
+
+/// Runs `work` on the main thread, immediately when the caller is already there.
+///
+/// Not an unconditional `DispatchQueue.main.async`: the callers tear down main
+/// thread state they own, and deferring that to the next run loop turn when
+/// already on the main thread would let the caller return while its timers are
+/// still armed and its window is still on screen.
+func onMainThread(_ work: @escaping () -> Void) {
+    if Thread.isMainThread {
+        work()
+    } else {
+        DispatchQueue.main.async(execute: work)
+    }
+}
+
+// MARK: - Geometry
+
+extension CGRect {
+
+    /// The frame a content page describes as `{x, y, w, h}` in the container's
+    /// coordinate space.
+    ///
+    /// A dimension the page leaves out falls back to the container's own, so a page
+    /// that only pins its origin still covers the space it was given rather than
+    /// collapsing to nothing.
+    init(contentGeometry: [String: Any], container: CGSize) {
+        self.init(x: (contentGeometry["x"] as? NSNumber)?.doubleValue ?? 0,
+                  y: (contentGeometry["y"] as? NSNumber)?.doubleValue ?? 0,
+                  width: (contentGeometry["w"] as? NSNumber)?.doubleValue ?? Double(container.width),
+                  height: (contentGeometry["h"] as? NSNumber)?.doubleValue ?? Double(container.height))
+    }
+}
+
+/// Resolving a local picture path the host application supplied.
+///
+/// The documented form is a filesystem path, and integrations also pass a
+/// `file://` URL because that is what most iOS APIs hand back. Both have to work,
+/// and both have to be resolved the same way everywhere: the SDK checks the file
+/// is readable when the property is set and reads it again when the request is
+/// built, and if those two disagree the picture silently never uploads.
+enum LocalPicturePath {
+
+    /// The file URL for a path or a file URL string, or `nil` when it is neither.
+    static func fileURL(for path: String) -> URL? {
+        guard !path.isEmpty else { return nil }
+
+        // A string that already carries a scheme is a URL; anything else is a
+        // plain path. `URL(string:)` accepts a plain path and produces a
+        // scheme-less URL that nothing can read, so the order matters.
+        if let url = URL(string: path), url.scheme != nil {
+            return url.isFileURL ? url : nil
+        }
+        return URL(fileURLWithPath: path)
+    }
+
+    /// Whether the file behind this path can actually be read.
+    static func isReadable(_ path: String) -> Bool {
+        guard let url = fileURL(for: path) else { return false }
+        return FileManager.default.isReadableFile(atPath: url.path)
+    }
+
+    /// The file's bytes, or `nil` when it cannot be read.
+    static func data(at path: String) -> Data? {
+        guard let url = fileURL(for: path) else { return nil }
+        return try? Data(contentsOf: url)
+    }
+
+    /// The lowercased extension, used to pick the content type.
+    static func fileExtension(of path: String) -> String {
+        (fileURL(for: path)?.pathExtension ?? (path as NSString).pathExtension).lowercased()
+    }
+}
+
 // MARK: - JSON
 
 enum CountlyJSON {
@@ -139,6 +213,28 @@ enum CountlyJSON {
     }
 }
 
+// MARK: - Archiving
+
+enum CountlyArchive {
+
+    /// Reads back the root object of a keyed archive the SDK wrote.
+    ///
+    /// Secure coding is switched off deliberately: the archives hold plain
+    /// property list values written by this SDK into its own storage, and the
+    /// decoder cannot be given a class list for `Any`. Kept in one place so the
+    /// two stores that read archives cannot drift on it.
+    ///
+    /// Throws whatever `NSKeyedUnarchiver` throws, so each caller reports a
+    /// corrupt store in its own terms.
+    static func decodeRoot(from data: Data) throws -> Any? {
+        let unarchiver = try NSKeyedUnarchiver(forReadingFrom: data)
+        unarchiver.requiresSecureCoding = false
+        let root = unarchiver.decodeObject(forKey: NSKeyedArchiveRootObjectKey)
+        unarchiver.finishDecoding()
+        return root
+    }
+}
+
 // MARK: - Segmentation sanitation
 
 /// Applies the SDK internal limits to keys, values and segmentation dictionaries.
@@ -164,6 +260,35 @@ struct LimitsEnforcer {
         logger?.d(Self.module, "truncatedValue", "value exceeds the SDK value length limit and will be truncated, target: [\(explanation)], valueLength: [\(value.countlyLength)], truncatedTo: [\(limits.maxValueSize)]")
         logger?.v(Self.module, "truncatedValue", "truncated value detail, target: [\(explanation)], fullValue: [\(value)]")
         return value.countlyPrefix(limits.maxValueSize)
+    }
+
+    /// Applies the two stack trace limits: each frame is truncated to
+    /// `maxStackTraceLineLength`, and at most `maxStackTraceLinesPerThread` frames
+    /// are kept.
+    ///
+    /// The reference SDK accepts both settings and logs that they are placeholders
+    /// it does not apply. Android applies them, and a configuration knob that
+    /// promises behavior the SDK does not perform is worse than no knob, so this
+    /// SDK applies them too.
+    ///
+    /// The frames nearest the crash are the ones that explain it, so the cap keeps
+    /// the top of the trace and drops the tail, which is where Android cuts as
+    /// well.
+    func truncatedStackTrace(_ frames: [String], _ explanation: String) -> [String] {
+        let lineLimit = max(1, limits.maxStackTraceLineLength)
+        let frameLimit = max(1, limits.maxStackTraceLinesPerThread)
+
+        var kept = frames
+        if kept.count > frameLimit {
+            logger?.d(Self.module, "truncatedStackTrace", "stack trace exceeds the SDK stack trace line count limit and will be shortened, target: [\(explanation)], lineCount: [\(kept.count)], truncatedTo: [\(frameLimit)]")
+            kept = Array(kept.prefix(frameLimit))
+        }
+
+        return kept.map { line in
+            guard line.countlyLength > lineLimit else { return line }
+            logger?.d(Self.module, "truncatedStackTrace", "stack trace line exceeds the SDK stack trace line length limit and will be truncated, target: [\(explanation)], lineLength: [\(line.countlyLength)], truncatedTo: [\(lineLimit)]")
+            return line.countlyPrefix(lineLimit)
+        }
     }
 
     /// Truncates a user profile picture URL, which has its own larger limit.

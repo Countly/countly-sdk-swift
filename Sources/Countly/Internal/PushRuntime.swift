@@ -396,13 +396,18 @@ extension PushRuntime: UNUserNotificationCenterDelegate {
         let userInfo = response.notification.request.content.userInfo
         guard let payload = countlyPayload(in: userInfo) else { return }
 
-        var buttonIndex = 0
-        var url = payload[CountlyPushKey.defaultURL] as? String
+        // Swiping a notification away is the user saying no. Reporting it as a body
+        // tap would inflate the click-through of every campaign, and following the
+        // notification's URL would put a web page in front of someone who just
+        // dismissed it. The reference matches neither branch for this identifier
+        // and so records a tap with no URL; this SDK records nothing at all.
+        guard response.actionIdentifier != UNNotificationDismissActionIdentifier else {
+            return
+        }
 
-        // An identifier the SDK did not register is still a user acting on a Countly
-        // notification, so it is reported as a body tap rather than dropped. It
-        // reaches here when another SDK's category is attached to a notification
-        // carrying a Countly payload.
+        var buttonIndex = 0
+        var url: String?
+
         if response.actionIdentifier.hasPrefix(CountlyPushKey.actionIdentifierPrefix) {
             let suffix = response.actionIdentifier.dropFirst(CountlyPushKey.actionIdentifierPrefix.count)
             if let index = Int(suffix), index > 0 {
@@ -410,6 +415,14 @@ extension PushRuntime: UNUserNotificationCenterDelegate {
                 let buttons = payload[CountlyPushKey.buttons] as? [[String: Any]] ?? []
                 url = index <= buttons.count ? buttons[index - 1][CountlyPushKey.actionButtonURL] as? String : nil
             }
+        } else {
+            // The body was tapped, which is what the default identifier means, and
+            // that is the only case the notification's own URL belongs to. An
+            // identifier the SDK did not register is still a user acting on a
+            // Countly notification, so it is reported as a body tap rather than
+            // dropped; it reaches here when another SDK's category is attached to a
+            // notification carrying a Countly payload.
+            url = payload[CountlyPushKey.defaultURL] as? String
         }
 
         for module in subscribers.current() {

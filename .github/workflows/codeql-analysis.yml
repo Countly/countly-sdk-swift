@@ -1,0 +1,61 @@
+name: "CodeQL"
+
+on:
+  push:
+    branches: [ master, staging ]
+  pull_request:
+    # The branches below must be a subset of the branches above
+    branches: [ master, staging ]
+  schedule:
+    - cron: '18 18 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze
+    # Code scanning needs Code Security, which on a private repository means GitHub Advanced
+    # Security. Without it the analysis itself succeeds and then the upload fails, which costs
+    # ~19 minutes of macOS runner time to produce a red check nobody can act on from here.
+    #
+    # Skipping is deliberate rather than deleting the workflow: the day this repository is made
+    # public, or GHAS is enabled on it, this starts running on its own with no edit. A skipped
+    # job reports as skipped, not as a failure.
+    if: github.event.repository.private == false
+    # Swift analysis needs a macOS runner with an Xcode toolchain; CodeQL cannot extract Swift
+    # on ubuntu.
+    runs-on: macos-15
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'swift' ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Xcode
+        run: sudo xcode-select -switch /Applications/Xcode_16.4.app
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+
+      # Autobuild resolves the package and builds it, which is what the Swift extractor needs
+      # to see in order to produce a database.
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"

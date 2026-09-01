@@ -1,0 +1,170 @@
+name: Test the SDK
+
+# `contents: read` is what lets actions/checkout clone. Declaring any permissions
+# block replaces the default token scopes outright rather than adding to them, so
+# leaving it out drops read access to the repository itself: on a private repo the
+# clone then fails with "Repository not found", which is how GitHub reports an
+# unauthorised read.
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+
+on:
+  push:
+    branches:
+      - master
+      - staging
+  pull_request:
+    branches:
+      - master
+      - staging
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # macOS is the cheap pass: `swift test` runs on the runner itself with no simulator to boot,
+  # so it is the one that gates the pull request. It is also where the whole suite has to be
+  # green, because the simulator cells below are advisory.
+  macos:
+    name: swift test (macOS)
+    runs-on: macos-15
+    steps:
+      - name: Checkout SDK code
+        uses: actions/checkout@v4
+
+      - name: Set up Xcode
+        run: sudo xcode-select -switch /Applications/Xcode_16.4.app
+
+      # `--parallel` is deliberately not used. Several suites assert on the process wide
+      # crash handler installation and on UserDefaults, which are shared across test cases
+      # even though each case builds its own SDK instance.
+      - name: Run the test suite
+        run: swift test --enable-code-coverage
+
+      # llvm-cov needs the binary and the profdata that `swift test` leaves in .build, and
+      # their names depend on the toolchain, so they are resolved rather than hardcoded.
+      - name: Report code coverage
+        if: always()
+        run: |
+          set -euo pipefail
+          binary=$(swift build --show-bin-path)/CountlyPackageTests.xctest/Contents/MacOS/CountlyPackageTests
+          profdata=$(swift build --show-bin-path)/codecov/default.profdata
+          if [ ! -f "$binary" ] || [ ! -f "$profdata" ]; then
+            echo "::warning::coverage inputs are missing, skipping the report"
+            exit 0
+          fi
+          xcrun llvm-cov report "$binary" \
+            -instr-profile "$profdata" \
+            -ignore-filename-regex='(Tests|\.build)/' \
+            | tee coverage.txt
+          {
+            echo '### Code coverage'
+            echo
+            echo '```'
+            tail -n 1 coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-macos
+          path: coverage.txt
+          if-no-files-found: ignore
+
+  # The other four platforms need a simulator, which is slow to boot and, on watchOS and
+  # visionOS, occasionally missing a runtime on the runner image. `continue-on-error` makes
+  # these advisory: a red cell is reported and worth looking at, but the macOS job above is
+  # what decides whether the pull request is green.
+  #
+  # Only the newest Xcode row is covered. The account has a single concurrent macOS runner, so
+  # every matrix cell runs strictly after the previous one, and widening this to the other
+  # rows would put a pull request into the hours.
+  simulators:
+    name: xcodebuild test (${{ matrix.platform }})
+    needs: macos
+    runs-on: macos-15
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [iOS, tvOS, watchOS, visionOS]
+    steps:
+      - name: Checkout SDK code
+        uses: actions/checkout@v4
+
+      - name: Set up Xcode
+        run: sudo xcode-select -switch /Applications/Xcode_16.4.app
+
+      # Resolved before anything expensive so a runner image missing the runtime fails fast.
+      # `xcodebuild -showdestinations` only reports placeholder simulator entries on the runner
+      # images, so this goes through simctl: take the newest installed runtime for the
+      # platform, and create a device when the image ships a runtime without any.
+      - name: Resolve the test destination
+        id: destination
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, subprocess, sys
+
+          PLATFORM = os.environ["PLATFORM"]
+          # simctl calls visionOS runtimes "xrOS".
+          simctl_platform = "xrOS" if PLATFORM == "visionOS" else PLATFORM
+
+          def version(text):
+              return tuple(int(c) if c.isdigit() else 0 for c in text.split("."))
+
+          listing = subprocess.run(["xcrun", "simctl", "list", "-j"], capture_output=True, text=True)
+          if listing.returncode != 0:
+              sys.exit("::error::xcrun simctl list failed: %s" % listing.stderr.strip())
+          listing = json.loads(listing.stdout)
+
+          runtimes = [
+              r for r in listing["runtimes"]
+              if r.get("isAvailable") and r.get("platform") == simctl_platform
+          ]
+          if not runtimes:
+              sys.exit("::error::No %s simulator runtime is installed on this runner." % PLATFORM)
+
+          runtime = max(runtimes, key=lambda r: version(r.get("version", "0")))
+
+          usable = [d for d in listing["devices"].get(runtime["identifier"], []) if d.get("isAvailable")]
+          if usable:
+              udid = usable[0]["udid"]
+          else:
+              types = runtime.get("supportedDeviceTypes") or []
+              if not types:
+                  sys.exit("::error::No device type supports %s %s." % (PLATFORM, runtime.get("version")))
+              udid = subprocess.run(
+                  ["xcrun", "simctl", "create", "cly-ci", types[0]["identifier"], runtime["identifier"]],
+                  capture_output=True, text=True, check=True).stdout.strip()
+              print("Created a %s '%s' on %s" % (PLATFORM, types[0]["name"], runtime.get("version")))
+
+          destination = "platform=%s Simulator,id=%s" % (PLATFORM, udid)
+          print("Testing on %s (runtime %s)" % (destination, runtime.get("version")))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write("destination=%s\n" % destination)
+          PYEOF
+
+      - name: Run the test suite
+        run: |
+          xcodebuild test \
+            -scheme Countly-Package \
+            -destination '${{ steps.destination.outputs.destination }}' \
+            -resultBundlePath TestResults.xcresult \
+            CODE_SIGNING_ALLOWED=NO
+
+      # Only on failure: a green run's result bundle is tens of megabytes nobody opens.
+      - name: Upload the test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.platform }}
+          path: TestResults.xcresult
+          if-no-files-found: ignore

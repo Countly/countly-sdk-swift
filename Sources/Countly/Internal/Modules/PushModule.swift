@@ -240,7 +240,11 @@ final class PushModule: ModuleBase {
     }
 
     private func recordActionEvent(notificationID: String?, buttonIndex: Int) {
-        guard let notificationID else {
+        // An empty ID is as unusable as a missing one: the event would reach the
+        // dashboard as a click nothing can be attributed to. The automatic path
+        // and the notification service extension both refuse it, and this is the
+        // manual entry point onto the same event, so it refuses it too.
+        guard let notificationID, !notificationID.isEmpty else {
             logW("recordActionEvent", "notification action event is dropped, the notification has no Countly notification ID")
             return
         }

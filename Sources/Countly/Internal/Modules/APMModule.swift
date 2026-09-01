@@ -54,7 +54,7 @@ final class APMModule: ModuleBase {
     private var activationObservers: [NSObjectProtocol] = []
 
     /// Process start time used for the app start trace, overridable by config.
-    private var appStartTimestamp: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    private var appStartTimestamp: Int64 = DeviceMetrics.processStartTimestampMs()
 
     // MARK: - Init
 
