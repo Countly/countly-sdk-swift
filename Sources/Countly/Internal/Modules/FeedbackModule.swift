@@ -181,12 +181,12 @@ final class FeedbackModule: ModuleBase {
             return
         }
 
-        #if os(iOS) || os(visionOS)
+        #if os(iOS) || os(visionOS) || os(macOS)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
 
             // Built on the main thread: the URL carries the resolved theme, and
-            // resolving it reads the key window's trait collection.
+            // resolving it reads interface state that is only safe to touch there.
             let url = self.widgetURL(for: widget)
 
             // Retained for the lifetime of the presentation. Nothing else holds
@@ -213,7 +213,7 @@ final class FeedbackModule: ModuleBase {
                             })
         }
         #else
-        logW("present", "feedback widgets are only available on iOS and visionOS")
+        logW("present", "feedback widgets are not available on this platform, the widget will not be presented, widgetID: [\(widget.id)]")
         #endif
     }
 
@@ -225,7 +225,7 @@ final class FeedbackModule: ModuleBase {
     /// one left behind by a halt would sit there with no SDK to report its result
     /// to and no way for the user to be sure it belongs to anything.
     override func halt(clearStorage: Bool) {
-        #if os(iOS) || os(visionOS)
+        #if os(iOS) || os(visionOS) || os(macOS)
         let managers = presentedWidgetManagers
         presentedWidgetManagers.removeAll()
 

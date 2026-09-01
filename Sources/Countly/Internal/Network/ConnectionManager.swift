@@ -682,11 +682,14 @@ final class ConnectionManager: NSObject {
         // Rejections are logged at debug for the health check and at error for
         // everything else, which is the only thing `quiet` changes. The two
         // wordings differ because a log message has to name one line of code.
-        func logRejection(_ message: String) {
+        func logRejection(_ reason: String) {
+            // Composed outside the literal so the message keeps the house shape,
+            // where everything after the prose is a `key: [value]` pair.
+            let line = (quiet ? "an unqueued request is judged as failed, " : "a queued request is judged as failed, ") + reason
             if quiet {
-                core.logger.d(Self.module, "isRequestSuccessful", "an unqueued request is judged as failed, \(message)")
+                core.logger.d(Self.module, "isRequestSuccessful", line)
             } else {
-                core.logger.e(Self.module, "isRequestSuccessful", "a queued request is judged as failed, \(message)")
+                core.logger.e(Self.module, "isRequestSuccessful", line)
             }
         }
 

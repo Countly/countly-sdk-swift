@@ -173,12 +173,26 @@ enum DeviceMetrics {
     ///
     /// Read from the key window, because in-app messages render in that window and
     /// its style is the theme they will be shown against.
+    ///
+    /// On macOS the overlay is a panel of its own rather than a window belonging to
+    /// the application, so the application's effective appearance is what a widget
+    /// is shown against.
     static var themeMode: String? {
         #if os(iOS) || os(tvOS)
         let traits = ScreenReader.keyWindow?.traitCollection ?? UIScreen.main.traitCollection
         switch traits.userInterfaceStyle {
         case .dark: return "d"
         case .light: return "l"
+        default: return nil
+        }
+        #elseif os(macOS)
+        // `bestMatch` rather than a name comparison: an appearance can be one of
+        // several dark variants, including the high contrast ones, and only the
+        // match resolves those to the two the widget understands.
+        let appearance = NSApplication.shared.effectiveAppearance
+        switch appearance.bestMatch(from: [.aqua, .darkAqua]) {
+        case .some(.darkAqua): return "d"
+        case .some(.aqua): return "l"
         default: return nil
         }
         #else
