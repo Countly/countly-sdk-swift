@@ -42,11 +42,46 @@ jobs:
       # `--parallel` is deliberately not used. Several suites assert on the process wide
       # crash handler installation and on UserDefaults, which are shared across test cases
       # even though each case builds its own SDK instance.
+      #
+      # `--xunit-output` is SwiftPM's own JUnit writer, so the macOS results need no
+      # conversion step at all -- unlike the simulator jobs below, which only get an
+      # `.xcresult` bundle out of xcodebuild. It is written whether the suite passes or fails.
       - name: Run the test suite
-        run: swift test --enable-code-coverage
+        run: |
+          mkdir -p test-results
+          swift test --enable-code-coverage --xunit-output test-results/macOS.xml
+
+      # Guards against the report being quietly empty: SwiftPM exits zero on an empty test
+      # selection, and a JUnit file with no `<testcase>` in it reads downstream as a clean run.
+      - name: Check that the macOS results are not empty
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -s test-results/macOS.xml ]; then
+            echo "::error::swift test did not write test-results/macOS.xml"
+            exit 1
+          fi
+          count=$(grep -c '<testcase' test-results/macOS.xml || true)
+          echo "macOS: $count test cases recorded."
+          if [ "$count" -eq 0 ]; then
+            echo "::error::the macOS JUnit report contains no test cases"
+            exit 1
+          fi
+
+      - name: Upload the macOS test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-macOS
+          path: test-results/macOS.xml
+          if-no-files-found: warn
 
       # llvm-cov needs the binary and the profdata that `swift test` leaves in .build, and
       # their names depend on the toolchain, so they are resolved rather than hardcoded.
+      #
+      # `report` is the human readable table that lands in the job log; `export -summary-only`
+      # is the same data as JSON, which is what the per file table in the pull request comment
+      # is built from. Parsing llvm-cov's fixed width text would be the brittle way to do it.
       - name: Report code coverage
         if: always()
         run: |
@@ -61,20 +96,24 @@ jobs:
             -instr-profile "$profdata" \
             -ignore-filename-regex='(Tests|\.build)/' \
             | tee coverage.txt
-          {
-            echo '### Code coverage'
-            echo
-            echo '```'
-            tail -n 1 coverage.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          xcrun llvm-cov export "$binary" \
+            -instr-profile "$profdata" \
+            -ignore-filename-regex='(Tests|\.build)/' \
+            -summary-only -format=text > llvm-cov-export.json
+          mkdir -p coverage
+          python3 .github/scripts/coverage_summary.py \
+            --platform macOS \
+            --llvm-cov-export llvm-cov-export.json \
+            --output coverage/macOS.json
 
       - name: Upload the coverage report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-macos
-          path: coverage.txt
+          name: coverage-macOS
+          path: |
+            coverage/macOS.json
+            coverage.txt
           if-no-files-found: ignore
 
   # The other four platforms need a simulator, which is slow to boot and, on watchOS and
