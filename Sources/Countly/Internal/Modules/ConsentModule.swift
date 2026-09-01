@@ -20,7 +20,16 @@ final class ConsentModule: ModuleBase {
 
     /// Whether consent gates anything at all. Can be turned on by behavior
     /// settings after init, never off.
-    var requiresConsent: Bool = false
+    ///
+    /// Logged on every change: behavior settings can turn this on for an
+    /// integration that never asked for it, and from then on every feature is
+    /// gated. That is the first thing to check when a feature collects nothing.
+    var requiresConsent: Bool = false {
+        didSet {
+            guard requiresConsent != oldValue else { return }
+            logI("requiresConsent", "consent requirement changed, requiresConsent: [\(requiresConsent)], grantedFeatureCount: [\(granted.count)]")
+        }
+    }
 
     /// Raw per-feature state. Only meaningful while `requiresConsent` is on.
     private var granted: Set<ConsentFeature> = []
@@ -44,6 +53,12 @@ final class ConsentModule: ModuleBase {
         .feedback, .remoteConfig, .content, .metrics,
     ]
 
+    /// Feature names in a stable order, so a before and after state can be
+    /// compared by eye in the log.
+    private static func describe<S: Sequence>(_ features: S) -> String where S.Element == ConsentFeature {
+        features.map(\.wireName).sorted().joined(separator: ", ")
+    }
+
     // MARK: - Queries
 
     /// Whether the SDK may act on a feature right now.
@@ -63,15 +78,16 @@ final class ConsentModule: ModuleBase {
 
     /// Grants consent for every feature.
     func giveAllConsents() {
+        logI("giveAllConsents", "consent is given for every feature, featureCount: [\(ConsentFeature.allCases.count)]")
         giveConsent(for: ConsentFeature.allCases)
     }
 
     /// Grants consent for the named features and reports the new state.
     func giveConsent(for features: [ConsentFeature]) {
-        logI("giveConsent", "giving consent for features, featureCount: [\(features.count)], features: [\(features.map(\.wireName))]")
+        logI("giveConsent", "giving consent for features, featureCount: [\(features.count)], features: [\(Self.describe(features))]")
 
         guard requiresConsent else {
-            logV("giveConsent", "requiresConsent is not enabled, giving consent for features will be ignored")
+            logD("giveConsent", "consent is not required by the configuration, giving consent for features will be ignored")
             return
         }
 
@@ -80,17 +96,21 @@ final class ConsentModule: ModuleBase {
             return
         }
 
+        let stateBeforeChange = Self.describe(granted)
         let requested = Set(features)
         for feature in Self.grantOrder where requested.contains(feature) && !granted.contains(feature) {
             granted.insert(feature)
             applySideEffect(of: feature, granted: true)
         }
 
+        logD("giveConsent", "consent state after giving consent, grantedBefore: [\(stateBeforeChange)], grantedAfter: [\(Self.describe(granted))]")
+
         sendConsents()
     }
 
     /// Withdraws consent for every feature.
     func cancelAllConsents() {
+        logI("cancelAllConsents", "consent is cancelled for every feature, featureCount: [\(ConsentFeature.allCases.count)]")
         cancelConsent(for: ConsentFeature.allCases)
     }
 
@@ -99,18 +119,20 @@ final class ConsentModule: ModuleBase {
     /// Used when the device ID changes without merge: the new user starts with no
     /// consent, and a consent request for the old user would be misattributed.
     func cancelAllConsentsWithoutSending() {
+        logI("cancelAllConsentsWithoutSending", "consent is cancelled for every feature without informing the server, featureCount: [\(ConsentFeature.allCases.count)]")
         cancelConsent(for: ConsentFeature.allCases, skipSendingRequest: true)
     }
 
     /// Withdraws consent for the named features and reports the new state.
     func cancelConsent(for features: [ConsentFeature], skipSendingRequest: Bool = false) {
-        logI("cancelConsent", "cancelling consent for features, featureCount: [\(features.count)], features: [\(features.map(\.wireName))], skipSendingConsentsRequest: [\(skipSendingRequest)]")
+        logI("cancelConsent", "cancelling consent for features, featureCount: [\(features.count)], features: [\(Self.describe(features))], skipSendingConsentsRequest: [\(skipSendingRequest)]")
 
         guard requiresConsent else {
-            logV("cancelConsent", "requiresConsent is not enabled, cancelling consent for features will be ignored")
+            logD("cancelConsent", "consent is not required by the configuration, cancelling consent for features will be ignored")
             return
         }
 
+        let stateBeforeChange = Self.describe(granted)
         let requested = Set(features)
         for feature in Self.revokeOrder where requested.contains(feature) && granted.contains(feature) {
             // The side effect runs before the flag is cleared for sessions, so the
@@ -123,6 +145,8 @@ final class ConsentModule: ModuleBase {
                 applySideEffect(of: feature, granted: false)
             }
         }
+
+        logD("cancelConsent", "consent state after cancelling consent, grantedBefore: [\(stateBeforeChange)], grantedAfter: [\(Self.describe(granted))]")
 
         if !skipSendingRequest {
             sendConsents()
@@ -139,7 +163,8 @@ final class ConsentModule: ModuleBase {
             payload[feature.wireName] = requiresConsent ? granted.contains(feature) : true
         }
 
-        logD("sendConsents", "consents state will be sent to the server, featureCount: [\(payload.count)]")
+        let sentAsGranted = payload.filter { $0.value }.keys.sorted().joined(separator: ", ")
+        logD("sendConsents", "consents state will be sent to the server, requiresConsent: [\(requiresConsent)], featureCount: [\(payload.count)], grantedInRequest: [\(sentAsGranted)]")
 
         let queryString = "\(core.network.builder.queryEssentials())&\(QS.consent)=\(CountlyJSON.escapedString(from: payload, logger: log))"
         core.network.enqueueAndProceed(queryString)
@@ -157,7 +182,7 @@ final class ConsentModule: ModuleBase {
         switch feature {
         case .sessions:
             if isGranted {
-                logD("consentDidChange", "consent granted, feature: [\(feature.wireName)], begin session will be requested unless manual session handling is enabled")
+                logD("consentDidChange", "consent granted, feature: [\(feature.wireName)], a begin session is requested only with automatic session tracking, automaticSessionTrackingEnabled: [\(core.serverConfig.automaticSessionTrackingEnabled)]")
                 if core.serverConfig.automaticSessionTrackingEnabled {
                     modules?.sessions.beginSession()
                 }
@@ -276,6 +301,7 @@ final class ConsentModule: ModuleBase {
     // MARK: - Lifecycle
 
     override func halt(clearStorage: Bool) {
+        logD("halt", "consent module is halted, granted consents will be cleared, grantedFeatureCount: [\(granted.count)]")
         granted.removeAll()
     }
 }

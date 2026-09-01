@@ -129,7 +129,7 @@ final class WebViewManager: NSObject {
 
         // Host and path only: the query string carries the app key and device ID.
         core.logger.i(Self.module, "present", "web view presentation requested, host: [\(url.host ?? "")], path: [\(url.path)], isFeedbackWidget: [\(isFeedbackWidget)], pinnedToPortrait: [\(isPinnedToPortrait)]")
-        core.logger.d(Self.module, "present", "web view presentation detail, url: [\(url.absoluteString)], appearCallbackProvided: [\(appear != nil)], dismissCallbackProvided: [\(dismiss != nil)]")
+        core.logger.v(Self.module, "present", "web view presentation detail, url: [\(url.absoluteString)], appearCallbackProvided: [\(appear != nil)], dismissCallbackProvided: [\(dismiss != nil)]")
 
         appearBlock = appear
         dismissBlock = dismiss
@@ -317,7 +317,7 @@ final class WebViewManager: NSObject {
 
         guard placed != webView.frame else { return }
 
-        core.logger.d(Self.module, "applySafeAreaPlacement", "the page is placed clear of the safe area, baseFrame: [\(base.logValue)], offset: [\(offset.logValue)], frame: [\(placed.logValue)]")
+        core.logger.d(Self.module, "applySafeAreaPlacement", "the page is placed clear of the safe area, baseFrame: [\(base.logValue)], offset: [\(offset.logValue)], frame: [\(placed.logValue)], safeAreaInsets: [\(ContentGeometry.safeAreaDescription)]")
         webView.frame = placed
     }
 
@@ -349,10 +349,11 @@ final class WebViewManager: NSObject {
         guard let geometry = (parameters[preferred] as? [String: Any])
                 ?? (parameters[fallback] as? [String: Any]) else { return }
 
+        let usedFallback = parameters[preferred] == nil
         let frame = CGRect(contentGeometry: geometry, container: backgroundView.effectiveSize)
 
-        core.logger.d(Self.module, "resize", "the page asked to be resized, orientation: [\(isPortrait ? "portrait" : "landscape")], frame: [\(frame.logValue)]")
-        core.logger.d(Self.module, "resize", "resize payload detail, resizeGeometry: [\(parameters)]")
+        core.logger.d(Self.module, "resize", "the page asked to be resized, orientation: [\(isPortrait ? "portrait" : "landscape")], orientationKey: [\(usedFallback ? fallback : preferred)], usedFallbackOrientation: [\(usedFallback)], x: [\(frame.origin.x.logValue)], y: [\(frame.origin.y.logValue)], width: [\(frame.width.logValue)], height: [\(frame.height.logValue)]")
+        core.logger.d(Self.module, "resize", "resize container detail, containerSize: [\(backgroundView.effectiveSize.logValue)], resizeGeometry: [\(parameters)]")
 
         baseWebViewFrame = frame
         applySafeAreaPlacement()
@@ -901,7 +902,7 @@ extension WebViewManager: WKNavigationDelegate {
         // Host and path only, and no header names: both a response header and a URL
         // query string can carry an identifier.
         core.logger.d(Self.module, "decidePolicyForResponse", "navigation response received, host: [\(response.url?.host ?? "")], path: [\(response.url?.path ?? "")], mimeType: [\(response.mimeType ?? "")], statusCode: [\(statusCode)], headerCount: [\(headers.count)]")
-        core.logger.d(Self.module, "decidePolicyForResponse", "navigation response detail, url: [\(response.url?.absoluteString ?? "")], statusCode: [\(statusCode)], headers: [\(headers)]")
+        core.logger.v(Self.module, "decidePolicyForResponse", "navigation response detail, url: [\(response.url?.absoluteString ?? "")], statusCode: [\(statusCode)], headers: [\(headers)]")
 
         // An error page is not content. Rendering it puts the server's 404 body over
         // the application with no close control on it, so the navigation is refused
@@ -921,12 +922,12 @@ extension WebViewManager: WKNavigationDelegate {
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         loadStartedAt = Date()
         core.logger.d(Self.module, "didStartProvisionalNavigation", "the navigation started, host: [\(webView.url?.host ?? "")], path: [\(webView.url?.path ?? "")], reloadOnStall: [\(core.config.content.enableContentReloadOnStall)]")
-        core.logger.d(Self.module, "didStartProvisionalNavigation", "started navigation detail, url: [\(webView.url?.absoluteString ?? "")]")
+        core.logger.v(Self.module, "didStartProvisionalNavigation", "started navigation detail, url: [\(webView.url?.absoluteString ?? "")]")
     }
 
     func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) {
         core.logger.d(Self.module, "didReceiveServerRedirect", "a server redirect was received for the provisional navigation, host: [\(webView.url?.host ?? "")], path: [\(webView.url?.path ?? "")]")
-        core.logger.d(Self.module, "didReceiveServerRedirect", "server redirect detail, url: [\(webView.url?.absoluteString ?? "")]")
+        core.logger.v(Self.module, "didReceiveServerRedirect", "server redirect detail, url: [\(webView.url?.absoluteString ?? "")]")
     }
 
     func webView(_ webView: WKWebView,
@@ -938,13 +939,13 @@ extension WebViewManager: WKNavigationDelegate {
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         core.logger.e(Self.module, "webContentProcessDidTerminate", "the web content process terminated, host: [\(webView.url?.host ?? "")], path: [\(webView.url?.path ?? "")]")
-        core.logger.d(Self.module, "webContentProcessDidTerminate", "terminated web content process detail, url: [\(webView.url?.absoluteString ?? "")]")
+        core.logger.v(Self.module, "webContentProcessDidTerminate", "terminated web content process detail, url: [\(webView.url?.absoluteString ?? "")]")
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         let duration = loadStartedAt.map { Date().timeIntervalSince($0) } ?? 0
         core.logger.d(Self.module, "didFinish", "the page finished loading, host: [\(webView.url?.host ?? "")], path: [\(webView.url?.path ?? "")], duration: [\(duration.logSeconds)]")
-        core.logger.d(Self.module, "didFinish", "finished navigation detail, url: [\(webView.url?.absoluteString ?? "")]")
+        core.logger.v(Self.module, "didFinish", "finished navigation detail, url: [\(webView.url?.absoluteString ?? "")]")
 
         // The load completing is progress, whatever the deadline thought. The
         // deadline is re-armed rather than dropped, because content still has to

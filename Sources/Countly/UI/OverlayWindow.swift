@@ -103,7 +103,10 @@ import AppKit
 final class OverlayWindow: NSPanel {
 
     init() {
-        super.init(contentRect: ScreenReader.screenBounds,
+        // `overlayFrame` rather than `screenBounds`: this rect positions the panel
+        // on the desktop, so it has to carry the active screen's origin or the panel
+        // lands on whichever display owns the global origin.
+        super.init(contentRect: ScreenReader.overlayFrame,
                    styleMask: [.borderless, .nonactivatingPanel],
                    backing: .buffered,
                    defer: false)

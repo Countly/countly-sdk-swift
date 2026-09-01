@@ -192,6 +192,18 @@ public final class CountlyInstance {
 
         logger.i(Self.module, "start", "initializing, appKey: [\(config.appKey)], serverUrl: [\(config.normalizedHost)], instanceName: [\(name)], sdkName: [\(SDKIdentity.name)], sdkVersion: [\(SDKIdentity.version)], device: [\(DeviceMetrics.device)], osName: [\(DeviceMetrics.osName ?? "")], osVersion: [\(DeviceMetrics.osVersion ?? "")]")
 
+        // Logged after the stored behavior settings were merged in, so these are
+        // the values the SDK will actually run with rather than the ones the
+        // developer passed. A value the server overrode is the usual reason an
+        // integration does not behave the way its config reads.
+        logger.i(Self.module, "start", "tracking configuration in effect, requiresConsent: [\(config.requiresConsent)], enableAllConsents: [\(config.enableAllConsents)], initialConsentCount: [\(config.consents.count)], manualSessionHandling: [\(config.manualSessionHandling)], hybridSessionMode: [\(config.enableManualSessionControlHybridMode)], automaticViewTracking: [\(config.enableAutomaticViewTracking)], viewTrackingExclusionCount: [\(config.automaticViewTrackingExclusionList.count)], orientationTracking: [\(config.enableOrientationTracking)], updateSessionPeriod: [\(config.updateSessionPeriod.logSeconds)], eventSendThreshold: [\(config.eventSendThreshold)], enableDebug: [\(config.enableDebug)], internalLogLevel: [\(config.internalLogLevel.label)]")
+
+        logger.i(Self.module, "start", "networking configuration in effect, storedRequestsLimit: [\(config.storedRequestsLimit)], requestDropAgeHours: [\(config.requestDropAgeHours)], requestTimeoutDuration: [\(config.requestTimeoutDuration.logSeconds)], alwaysUsePOST: [\(config.alwaysUsePOST)], customNetworkRequestHeaderCount: [\(config.customNetworkRequestHeaders?.count ?? 0)], pinnedCertificateCount: [\(config.pinnedCertificates.count)], secretSaltConfigured: [\(config.secretSalt?.isEmpty == false)], customMetricCount: [\(config.customMetrics.count)], temporaryDeviceIDMode: [\(config.temporaryDeviceIDMode)], deviceIDProvided: [\(config.deviceID != nil)], resetStoredDeviceID: [\(config.resetStoredDeviceID)], behaviorSettingsUpdatesDisabled: [\(config.disableSDKBehaviorSettingsUpdates)], backoffMechanismDisabled: [\(config.disableBackoffMechanism)], features: [\(config.features.map { "\($0)" }.joined(separator: ", "))]")
+
+        logger.d(Self.module, "start", "behavior settings in effect, trackingEnabled: [\(core.serverConfig.trackingEnabled)], networkingEnabled: [\(core.serverConfig.networkingEnabled)], sessionTracking: [\(core.serverConfig.sessionTrackingEnabled)], automaticSessionTracking: [\(core.serverConfig.automaticSessionTrackingEnabled)], viewTracking: [\(core.serverConfig.viewTrackingEnabled)], automaticViewTracking: [\(core.serverConfig.automaticViewTrackingEnabled)], crashReporting: [\(core.serverConfig.crashReportingEnabled)], automaticCrashReporting: [\(core.serverConfig.automaticCrashReportingEnabled)], locationTracking: [\(core.serverConfig.locationTrackingEnabled)], customEventTracking: [\(core.serverConfig.customEventTrackingEnabled)], backoffMechanism: [\(core.serverConfig.backoffMechanism)], consentRequired: [\(core.serverConfig.consentRequired)]")
+
+        logger.d(Self.module, "start", "SDK internal limits in effect, maxKeyLength: [\(config.sdkInternalLimits.maxKeyLength)], maxValueSize: [\(config.sdkInternalLimits.maxValueSize)], maxValueSizePicture: [\(config.sdkInternalLimits.maxValueSizePicture)], maxSegmentationValues: [\(config.sdkInternalLimits.maxSegmentationValues)], maxBreadcrumbCount: [\(config.sdkInternalLimits.maxBreadcrumbCount)], maxStackTraceLineLength: [\(config.sdkInternalLimits.maxStackTraceLineLength)], maxStackTraceLinesPerThread: [\(config.sdkInternalLimits.maxStackTraceLinesPerThread)]")
+
         // The device ID must exist before any request is built.
         modules.deviceID.initialize(with: config)
 
@@ -355,7 +367,7 @@ public final class CountlyInstance {
             core.logger.w(Self.module, "setNewHost", "omitting the call, the provided host is empty")
             return
         }
-        core.logger.i(Self.module, "setNewHost", "the server host is being changed")
+        core.logger.i(Self.module, "setNewHost", "the server host is being changed, host: [\(host)], previousHost: [\(core.config.host)], queuedRequestCount: [\(core.requestQueueStore.count)]")
         core.config.host = host
     }
 
@@ -371,7 +383,7 @@ public final class CountlyInstance {
             return
         }
 
-        core.logger.i(Self.module, "setNewAppKey", "the app key is being changed")
+        core.logger.i(Self.module, "setNewAppKey", "the app key is being changed, appKey: [\(appKey)], previousAppKey: [\(core.config.appKey)], queuedRequestCount: [\(core.requestQueueStore.count)]")
         core.modules.events.sendEventsWithSaveIfNeeded()
         core.modules.sessions.suspend()
         core.config.appKey = appKey
@@ -381,7 +393,7 @@ public final class CountlyInstance {
     /// Replaces the session configuration used for every request.
     public func setNewURLSessionConfiguration(_ configuration: URLSessionConfiguration) {
         guard let core = requireCore() else { return }
-        core.logger.i(Self.module, "setNewURLSessionConfiguration", "a custom URL session configuration is being applied")
+        core.logger.i(Self.module, "setNewURLSessionConfiguration", "a custom URL session configuration is being applied and the cached sessions will be rebuilt, customHeaderCount: [\(configuration.httpAdditionalHeaders?.count ?? 0)]")
         core.config.urlSessionConfiguration = configuration
         core.network.reset()
     }
@@ -389,6 +401,7 @@ public final class CountlyInstance {
     /// Adds headers to every request the SDK makes.
     public func addCustomNetworkRequestHeaders(_ headers: [String: String]?) {
         guard let core = requireCore() else { return }
+        core.logger.i(Self.module, "addCustomNetworkRequestHeaders", "custom network request headers are being set through the public API, providedHeaderCount: [\(headers?.count ?? 0)]")
         core.network.addCustomNetworkRequestHeaders(headers)
     }
 
@@ -398,7 +411,10 @@ public final class CountlyInstance {
 
         core.logger.i(Self.module, "recordMetrics", "recording metrics, overrideMetricCount: [\(metricsOverride?.count ?? 0)]")
 
-        guard core.modules.consent.hasConsent(for: .metrics) else { return }
+        guard core.modules.consent.hasConsent(for: .metrics) else {
+            core.logger.d(Self.module, "recordMetrics", "the metrics request is not queued, reason: no consent is given for metrics")
+            return
+        }
 
         var metrics = core.metricsDictionary()
         if let metricsOverride, !metricsOverride.isEmpty {
@@ -417,9 +433,15 @@ public final class CountlyInstance {
     /// ID or the timestamp would be attributed to the wrong user or moment.
     public func addDirectRequest(_ parameters: [String: String]?) {
         guard let core = requireCore() else { return }
-        guard let parameters, !parameters.isEmpty else { return }
+        guard let parameters, !parameters.isEmpty else {
+            core.logger.w(Self.module, "addDirectRequest", "omitting the call, the provided parameters are nil or empty")
+            return
+        }
 
-        guard core.modules.consent.hasAnyConsent else { return }
+        guard core.modules.consent.hasAnyConsent else {
+            core.logger.d(Self.module, "addDirectRequest", "the direct request is not queued, reason: no consent is given for any feature")
+            return
+        }
 
         var filtered = parameters
         for key in RequestBuilder.reservedKeys where filtered[key] != nil {
@@ -441,12 +463,14 @@ public final class CountlyInstance {
     /// Suspends tracking: flushes what is pending and closes the session.
     public func suspend() {
         guard let core = requireCore() else { return }
+        core.logger.i(Self.module, "suspend", "the public suspend call is received, pending data will be flushed and the session closed")
         core.modules.sessions.suspend()
     }
 
     /// Resumes tracking after a suspend.
     public func resume() {
         guard let core = requireCore() else { return }
+        core.logger.i(Self.module, "resume", "the public resume call is received, session handling will be restarted")
         core.modules.sessions.resume()
     }
 
@@ -458,9 +482,13 @@ public final class CountlyInstance {
         lifecycleLock.lock()
         defer { lifecycleLock.unlock() }
 
-        guard let core, core.hasStarted else { return }
+        guard let core, core.hasStarted else {
+            // Printed rather than logged for the same reason `requireCore` prints.
+            Logger.print("[Warning] [\(Self.module)] halt, the SDK is not running, the call is ignored")
+            return
+        }
 
-        core.logger.i(Self.module, "halt", "the SDK is being halted, clearStorage: [\(clearStorage)]")
+        core.logger.i(Self.module, "halt", "the SDK is being halted, clearStorage: [\(clearStorage)], queuedRequestCount: [\(core.requestQueueStore.count)]")
 
         lifecycleObserver?.deregister()
         lifecycleObserver = nil
@@ -486,6 +514,8 @@ public final class CountlyInstance {
         core.hasStarted = false
         core.hasFinishedInit = false
         self.core = nil
+
+        core.logger.d(Self.module, "halt", "the SDK is halted, every module is torn down and the network is reset")
     }
 }
 
@@ -494,7 +524,14 @@ public final class CountlyInstance {
 extension CountlyInstance: ServerConfigDelegate {
 
     func serverConfigDidChange(_ serverConfig: ServerConfig, consentBecameRequired: Bool) {
-        guard let core, core.hasStarted else { return }
+        guard let core else { return }
+
+        guard core.hasStarted else {
+            core.logger.d(Self.module, "serverConfigDidChange", "behavior settings changed while the SDK is not running, they are stored but not applied to it")
+            return
+        }
+
+        core.logger.d(Self.module, "serverConfigDidChange", "behavior settings are being applied to the running SDK, consentBecameRequired: [\(consentBecameRequired)], trackingEnabled: [\(serverConfig.trackingEnabled)], networkingEnabled: [\(serverConfig.networkingEnabled)], storedRequestsLimit: [\(core.config.storedRequestsLimit)], requestDropAgeHours: [\(core.config.requestDropAgeHours)], requiresConsent: [\(core.config.requiresConsent)], enableDebug: [\(core.config.enableDebug)]")
 
         core.logger.enableDebug = core.config.enableDebug
         core.refreshLimits()
@@ -556,9 +593,10 @@ extension CountlyInstance: ServerConfigDelegate {
         }
 
         if core.serverConfig.crashReportingEnabled, core.serverConfig.automaticCrashReportingEnabled {
+            core.logger.d(Self.module, "applyAutomaticTrackingState", "behavior settings enable automatic crash reporting, the crash handler will be started")
             core.modules.crashes.startCrashReporting()
         } else {
-            core.logger.d(Self.module, "applyAutomaticTrackingState", "automatic crash reporting is disabled by behavior settings, the crash handler will not be started")
+            core.logger.d(Self.module, "applyAutomaticTrackingState", "automatic crash reporting is disabled by behavior settings, the crash handler will not be started, crashReporting: [\(core.serverConfig.crashReportingEnabled)], automaticCrashReporting: [\(core.serverConfig.automaticCrashReportingEnabled)]")
         }
     }
 }

@@ -38,6 +38,13 @@ final class FeedbackModule: ModuleBase {
     /// dismissal callback.
     private var presentedWidgetManagers: [AnyObject] = []
 
+    /// One line per widget, enough to tell why a given one was or was not picked.
+    /// Widget names and tags are authored in the dashboard, not by the end user.
+    private static func describe(_ widgets: [CountlyFeedbackWidget]) -> String {
+        widgets.map { "\($0.id)/\($0.type.wireName)/\($0.name)/tags=\($0.tags.joined(separator: "+"))" }
+            .joined(separator: ", ")
+    }
+
     // MARK: - Widget list
 
     /// Fetches the widgets the server offers for this application.
@@ -54,18 +61,19 @@ final class FeedbackModule: ModuleBase {
         }
 
         guard core.modules.consent.hasConsent(for: .feedback) else {
-            logV("getAvailableFeedbackWidgets", "no feedback consent given, feedback widget list is not fetched")
+            logD("getAvailableFeedbackWidgets", "no feedback consent given, feedback widget list is not fetched")
             completion(nil, nil)
             return
         }
 
         guard !core.modules.deviceID.isTemporary else {
-            logW("getAvailableFeedbackWidgets", "feedback widget list fetch is dropped, device ID is temporary")
+            logD("getAvailableFeedbackWidgets", "feedback widget list fetch is dropped, device ID is temporary")
             completion(nil, nil)
             return
         }
 
         let request = widgetListRequest()
+        logD("getAvailableFeedbackWidgets", "feedback widget list request is started, path: [\(request.url?.path ?? "")]")
 
         core.network.instantSession().dataTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
@@ -74,7 +82,8 @@ final class FeedbackModule: ModuleBase {
             guard error == nil,
                   statusCode == 200,
                   let payload = CountlyJSON.object(from: data, logger: self.log) as? [String: Any] else {
-                self.logW("getAvailableFeedbackWidgets", "feedback widget list fetch failed, statusCode: [\(statusCode)]")
+                let nsError = error as NSError?
+                self.logD("getAvailableFeedbackWidgets", "feedback widget list fetch failed, statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], error: [\(nsError?.localizedDescription ?? "")], domain: [\(nsError?.domain ?? "")], code: [\(nsError?.code ?? 0)]")
                 DispatchQueue.main.async {
                     completion(nil, error ?? CountlyError.feedbacksGeneralAPIError.asNSError)
                 }
@@ -83,12 +92,21 @@ final class FeedbackModule: ModuleBase {
 
             guard let rawWidgets = payload["result"] as? [[String: Any]] else {
                 self.logE("getAvailableFeedbackWidgets", "feedback widget list response has no result field, ignoring the response")
+                self.logD("getAvailableFeedbackWidgets", "widget list response shape detail, responseSize: [\(data?.count ?? 0)], responseFields: [\(payload.keys.sorted().joined(separator: ", "))]")
                 DispatchQueue.main.async { completion(nil, CountlyError.feedbacksGeneralAPIError.asNSError) }
                 return
             }
 
             let widgets = rawWidgets.compactMap { CountlyFeedbackWidget(dictionary: $0, module: self) }
             self.logI("getAvailableFeedbackWidgets", "feedback widget list fetched, widgetCount: [\(widgets.count)]")
+            self.logD("getAvailableFeedbackWidgets", "available feedback widget detail, widgets: [\(Self.describe(widgets))]")
+
+            // A widget with no id, or one of a type this SDK version does not
+            // know, is dropped by the model initialiser and would otherwise just
+            // be missing from the list with no explanation.
+            if widgets.count != rawWidgets.count {
+                self.logD("getAvailableFeedbackWidgets", "some widget entries could not be read and were dropped from the list, receivedWidgetCount: [\(rawWidgets.count)], usableWidgetCount: [\(widgets.count)]")
+            }
 
             DispatchQueue.main.async { completion(widgets, nil) }
         }.resume()
@@ -113,6 +131,8 @@ final class FeedbackModule: ModuleBase {
 
     /// Presents the first widget of a type, or the one matching a name, ID or tag.
     func present(type: FeedbackWidgetType, nameIDOrTag: String?, callback: WidgetCallback?) {
+        logI("present", "presenting a widget by type is requested, widgetType: [\(type.wireName)], nameIDorTag: [\(nameIDOrTag ?? "")]")
+
         getAvailableFeedbackWidgets { [weak self] widgets, error in
             guard let self else { return }
 
@@ -122,7 +142,7 @@ final class FeedbackModule: ModuleBase {
             }
 
             let candidates = (widgets ?? []).filter { $0.type == type }
-            self.logD("present", "widget list filtered by type, widgetType: [\(type.wireName)], matchingWidgetCount: [\(candidates.count)]")
+            self.logD("present", "widget list filtered by type, widgetType: [\(type.wireName)], matchingWidgetCount: [\(candidates.count)], availableWidgetCount: [\(widgets?.count ?? 0)]")
 
             var chosen: CountlyFeedbackWidget?
 
@@ -157,7 +177,7 @@ final class FeedbackModule: ModuleBase {
         logI("present", "widget presentation requested, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
 
         guard core.modules.consent.hasConsent(for: .feedback) else {
-            logV("present", "no feedback consent given, widget will not be presented")
+            logD("present", "no feedback consent given, widget will not be presented")
             return
         }
 
@@ -250,14 +270,23 @@ final class FeedbackModule: ModuleBase {
         urlString += "&custom=\(CountlyJSON.escapedString(from: custom, logger: log))"
 
         let finalURL = DeviceMetrics.urlStringByAppendingThemeMode(urlString)
-        logD("widgetURL", "widget URL generated, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
-        return URL(string: finalURL)
+        logD("widgetURL", "widget URL generated, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)], widgetVersion: [\(widget.widgetVersion ?? "")], rendersOwnCloseControl: [\(widget.widgetVersion != nil)]")
+        // The query string carries the device ID and the application key.
+        logV("widgetURL", "widget URL detail, url: [\(finalURL)]")
+
+        let url = URL(string: finalURL)
+        if url == nil {
+            logE("widgetURL", "the widget URL could not be parsed, the widget cannot be shown, widgetID: [\(widget.id)]")
+        }
+        return url
     }
 
     // MARK: - Widget data
 
     /// Fetches one widget's definition.
     func fetchWidgetData(for widget: CountlyFeedbackWidget, completion: @escaping ([String: Any]?, Error?) -> Void) {
+        logI("fetchWidgetData", "widget data fetch requested, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
+
         var queryString = [
             "\(QS.sdkName)=\(SDKIdentity.name)",
             "\(QS.sdkVersion)=\(SDKIdentity.version)",
@@ -272,6 +301,7 @@ final class FeedbackModule: ModuleBase {
 
         let path = "\(Endpoint.output)\(Endpoint.surveys)/\(widget.type.wireName)\(Endpoint.widget)"
         let request = core.network.instantRequest(queryString: queryString, path: path)
+        logD("fetchWidgetData", "widget data request is started, widgetID: [\(widget.id)], path: [\(path)]")
 
         core.network.instantSession().dataTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
@@ -280,13 +310,15 @@ final class FeedbackModule: ModuleBase {
             guard error == nil,
                   statusCode == 200,
                   let widgetData = CountlyJSON.object(from: data, logger: self.log) as? [String: Any] else {
+                let nsError = error as NSError?
+                self.logD("fetchWidgetData", "widget data request failed, widgetID: [\(widget.id)], statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], error: [\(nsError?.localizedDescription ?? "")], domain: [\(nsError?.domain ?? "")], code: [\(nsError?.code ?? 0)]")
                 DispatchQueue.main.async {
                     completion(nil, error ?? CountlyError.feedbackWidgetNotAvailable.asNSError)
                 }
                 return
             }
 
-            self.logD("fetchWidgetData", "widget data fetched, widgetID: [\(widget.id)], fieldCount: [\(widgetData.count)]")
+            self.logD("fetchWidgetData", "widget data fetched, widgetID: [\(widget.id)], fieldCount: [\(widgetData.count)], fields: [\(widgetData.keys.sorted().joined(separator: ", "))]")
             DispatchQueue.main.async { completion(widgetData, nil) }
         }.resume()
     }
@@ -295,23 +327,29 @@ final class FeedbackModule: ModuleBase {
 
     /// Records the answers of a widget, or its dismissal when `result` is `nil`.
     func recordResult(_ result: [String: Any]?, for widget: CountlyFeedbackWidget) {
-        logI("recordResult", "widget result recording requested, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)], answeredFieldCount: [\(result?.count ?? 0)]")
-        logV("recordResult", "widget result recording detail, widgetID: [\(widget.id)], result: [\(result ?? [:])]")
+        logI("recordResult", "widget result recording requested, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)], answeredFieldCount: [\(result?.count ?? 0)], isDismissalOnly: [\(result == nil)]")
 
         guard let result else {
             recordDismissal(for: widget)
             return
         }
+
+        // Field names describe the widget, the values behind them are what the
+        // end user answered.
+        logD("recordResult", "widget result field detail, widgetID: [\(widget.id)], answeredFields: [\(result.keys.sorted().joined(separator: ", "))]")
+        logV("recordResult", "widget result recording detail, widgetID: [\(widget.id)], result: [\(result)]")
+
         recordWidgetEvent(segmentation: result, for: widget)
     }
 
     private func recordDismissal(for widget: CountlyFeedbackWidget) {
+        logD("recordDismissal", "the widget was closed without an answer, a dismissal will be recorded, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
         recordWidgetEvent(segmentation: [Key.closed: 1], for: widget)
     }
 
     private func recordWidgetEvent(segmentation: [String: Any], for widget: CountlyFeedbackWidget) {
         guard core.modules.consent.hasConsent(for: .feedback) else {
-            logV("recordWidgetEvent", "no feedback consent given, widget result event is not recorded")
+            logD("recordWidgetEvent", "no feedback consent given, widget result event is not recorded")
             return
         }
 
@@ -339,7 +377,7 @@ final class FeedbackModule: ModuleBase {
         logI("recordRatingWidget", "rating widget result recording requested, widgetID: [\(widgetID)], emailProvided: [\(!(email ?? "").isEmpty)], commentProvided: [\(!(comment ?? "").isEmpty)], userCanBeContacted: [\(userCanBeContacted)]")
 
         guard core.modules.consent.hasConsent(for: .feedback) else {
-            logV("recordRatingWidget", "no feedback consent given, rating widget result is not recorded")
+            logD("recordRatingWidget", "no feedback consent given, rating widget result is not recorded")
             return
         }
 
@@ -356,6 +394,10 @@ final class FeedbackModule: ModuleBase {
         segmentation[Key.email] = email
         segmentation[Key.comment] = comment
         segmentation[Key.contactMe] = userCanBeContacted
+
+        // The rating, the comment and the email are what the end user typed.
+        logV("recordRatingWidget", "rating widget result detail, widgetID: [\(widgetID)], rating: [\(rating)], email: [\(email ?? "")], comment: [\(comment ?? "")]")
+        logD("recordRatingWidget", "rating widget result is submitted as a reserved event, widgetID: [\(widgetID)], eventKey: [\(ReservedEventKey.ratingWidget)], segmentationFieldCount: [\(segmentation.count)]")
 
         core.modules.events.recordReservedEvent(ReservedEventKey.ratingWidget, segmentation: segmentation)
     }

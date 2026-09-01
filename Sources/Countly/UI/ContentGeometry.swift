@@ -36,6 +36,11 @@ enum ContentGeometry {
         .zero
     }
 
+    /// What the size above was derived from, for the log line that reports it.
+    static var windowBounds: CGSize { ScreenReader.screenBounds.size }
+
+    static var safeAreaDescription: String { "none" }
+
 #else
 
     /// A top inset at least this large is a hardware cutout rather than an ordinary
@@ -45,6 +50,18 @@ enum ContentGeometry {
     private static var window: UIWindow? { ScreenReader.keyWindow }
 
     private static var safeAreaInsets: UIEdgeInsets { window?.safeAreaInsets ?? .zero }
+
+    /// What the reported size was derived from.
+    ///
+    /// Logged next to the result, because a content page laid out against the wrong
+    /// size is the failure this type exists to prevent, and the number alone does
+    /// not say whether the window or the insets were what went wrong.
+    static var windowBounds: CGSize { window?.bounds.size ?? ScreenReader.screenBounds.size }
+
+    static var safeAreaDescription: String {
+        let insets = safeAreaInsets
+        return "top=\(insets.top.logValue) left=\(insets.left.logValue) bottom=\(insets.bottom.logValue) right=\(insets.right.logValue)"
+    }
 
     static func windowSize(displayOption: WebViewDisplayOption) -> CGSize {
         // Falls back to the screen when there is no window to read, which is the

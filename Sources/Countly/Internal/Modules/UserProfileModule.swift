@@ -106,9 +106,12 @@ final class UserProfileModule: ModuleBase {
     /// Sets one property, routing predefined keys to their own fields.
     func setProperty(_ key: String, value: Any?) {
         logI("setProperty", "user property will be set, key: [\(key)], valueProvided: [\(value != nil)]")
-        logV("setProperty", "single user property value detail, key: [\(key)], value: [\(String(describing: value))]")
+        logV("setProperty", "single user property value detail, key: [\(key)], value: [\(value ?? "nil")]")
 
-        guard let value else { return }
+        guard let value else {
+            logW("setProperty", "omitting the call, a nil value can not be set, use the unset call to clear a property, key: [\(key)]")
+            return
+        }
         setProperties([key: value])
     }
 
@@ -127,7 +130,8 @@ final class UserProfileModule: ModuleBase {
         logI("setProperties", "user properties will be applied, keys: [\(data.keys.sorted())], count: [\(data.count)]")
         logV("setProperties", "user properties value detail, data: [\(data)]")
 
-        var anyChange = false
+        var appliedCount = 0
+        var skippedCount = 0
 
         lock.lock()
         for (key, rawValue) in data {
@@ -136,36 +140,49 @@ final class UserProfileModule: ModuleBase {
             if value is NSNull {
                 guard UserProfileKey.predefined.contains(key) else {
                     logD("setProperties", "provided value is null, key: [\(key)], skipping this entry")
+                    skippedCount += 1
                     continue
                 }
-                if assignPredefined(key, value: NSNull()) { anyChange = true }
+                if assignPredefined(key, value: NSNull()) {
+                    appliedCount += 1
+                } else {
+                    skippedCount += 1
+                }
                 continue
             }
 
             value = truncatedValue(value, forKey: key, "setProperties")
 
             if UserProfileKey.predefined.contains(key) {
-                if assignPredefined(key, value: value) { anyChange = true }
+                if assignPredefined(key, value: value) {
+                    appliedCount += 1
+                } else {
+                    skippedCount += 1
+                }
                 continue
             }
 
             guard core.serverConfig.shouldRecordUserProperty(key) else {
                 logD("setProperties", "key is filtered out by server config user property filter while setting properties, key: [\(key)], omitting entry")
+                skippedCount += 1
                 continue
             }
 
             guard isValidDataType(value) else {
                 logD("setProperties", "provided value type is not supported, key: [\(key)], type: [\(type(of: value))], omitting entry")
+                skippedCount += 1
                 continue
             }
 
             customProperties[core.limits.truncatedKey(key, "setProperties")] = value
-            anyChange = true
+            appliedCount += 1
         }
         lock.unlock()
 
-        logD("setProperties", "user properties processing finished, anyChange: [\(anyChange)]")
-        if anyChange { userPropertiesChanged() }
+        logD("setProperties", "user properties processing finished, appliedCount: [\(appliedCount)], skippedCount: [\(skippedCount)], unsyncedChangesPending: [\(hasUnsyncedChanges)]")
+
+        guard appliedCount > 0 else { return }
+        userPropertiesChanged()
     }
 
     /// Sets a custom property without routing predefined keys.
@@ -173,8 +190,11 @@ final class UserProfileModule: ModuleBase {
     /// Separate from `setProperty` because it stages the value without flushing
     /// pending events, which is what a caller batching many properties wants.
     func setCustomProperty(_ key: String, value: Any?) {
+        logI("setCustomProperty", "custom user property will be set, key: [\(key)], valueProvided: [\(value != nil)]")
+        logV("setCustomProperty", "custom user property value detail, key: [\(key)], value: [\(value ?? "nil")]")
+
         guard let value else {
-            logE("setCustomProperty", "call will be ignored as value is nil, key: [\(key)]")
+            logW("setCustomProperty", "call will be ignored as value is nil, key: [\(key)]")
             return
         }
 
@@ -201,9 +221,14 @@ final class UserProfileModule: ModuleBase {
     /// Clears a custom property on the server.
     func unsetCustomProperty(_ key: String) {
         logI("unsetCustomProperty", "custom user property will be unset, key: [\(key)]")
+
         lock.lock()
-        customProperties[core.limits.truncatedKey(key, "unsetCustomProperty")] = NSNull()
+        let truncatedKey = core.limits.truncatedKey(key, "unsetCustomProperty")
+        customProperties[truncatedKey] = NSNull()
+        let total = customProperties.count
         lock.unlock()
+
+        logD("unsetCustomProperty", "custom user property is staged for clearing on the server, key: [\(truncatedKey)], totalCustomProperties: [\(total)]")
     }
 
     // MARK: - Modifiers
@@ -271,7 +296,11 @@ final class UserProfileModule: ModuleBase {
                 accumulated.append(stored)
             }
             customModifications[truncatedKey] = [modifier.rawValue: accumulated]
+            logD("modify", "the operand is merged into the modification already staged for the key, modifier: [\(modifier.rawValue)], key: [\(truncatedKey)], accumulatedOperandCount: [\(accumulated.count)]")
         } else {
+            if let replaced = customModifications[truncatedKey], !replaced.isEmpty {
+                logD("modify", "the modification already staged for the key is replaced and will not reach the server, key: [\(truncatedKey)], replacedModifiers: [\(replaced.keys.sorted())], modifier: [\(modifier.rawValue)]")
+            }
             customModifications[truncatedKey] = [modifier.rawValue: stored]
         }
 
@@ -362,12 +391,16 @@ final class UserProfileModule: ModuleBase {
 
         // Events first: an event recorded before a profile change belongs to the
         // profile as it was.
+        logD("save", "the recorded events are sent before the user details request so they keep the profile they were recorded under, pendingEventCount: [\(core.modules.events.pendingEventCount)]")
         core.modules.events.sendEvents()
+
+        var queuedRequestCount = 0
 
         if let payload = serializedUserDetails() {
             logD("save", "serialized user details request will be sent, payloadLength: [\(payload.count)]")
             logV("save", "serialized user details payload detail, payload: [\(payload)]")
             sendUserDetails(payload)
+            queuedRequestCount += 1
         }
 
         lock.lock()
@@ -385,8 +418,14 @@ final class UserProfileModule: ModuleBase {
         // picture URL supersedes a local file.
         if let localPath, !hasPictureURL {
             logD("save", "local picture path will be sent in a separate request, pathLength: [\(localPath.count)]")
+            logV("save", "local picture path value detail, picturePath: [\(localPath)]")
             sendUserDetails(CountlyJSON.escapedString(from: [UserProfileKey.localPicturePath: localPath], logger: log))
+            queuedRequestCount += 1
+        } else if localPath != nil {
+            logD("save", "the staged local picture path is dropped because a remote picture URL was set alongside it")
         }
+
+        logD("save", "user details save finished, queuedRequestCount: [\(queuedRequestCount)]")
 
         clearUserDetails()
         return true
@@ -394,7 +433,9 @@ final class UserProfileModule: ModuleBase {
 
     private func sendUserDetails(_ payload: String) {
         guard !payload.isEmpty else {
-            logE("sendUserDetails", "an empty user details payload will not be sent")
+            // The serializer reports the failure that produced this, so raising a
+            // second error here would count the same incident twice on the wire.
+            logD("sendUserDetails", "an empty user details payload will not be sent")
             return
         }
         let queryString = "\(core.network.builder.queryEssentials())&\(QS.userDetails)=\(payload)"
@@ -436,9 +477,12 @@ final class UserProfileModule: ModuleBase {
             payload[UserProfileKey.custom] = custom
         }
 
-        logD("serializedUserDetails", "user details serialized, fields: [\(payload.keys.sorted())], customPropertyCount: [\(custom.count)]")
+        logD("serializedUserDetails", "user details serialized, fields: [\(payload.keys.sorted())], customKeys: [\(custom.keys.sorted())]")
 
-        guard !payload.isEmpty else { return nil }
+        guard !payload.isEmpty else {
+            logD("serializedUserDetails", "nothing is staged in the user details payload, no request will be built")
+            return nil
+        }
 
         // `escapedString` answers with an empty string when the object cannot be
         // represented as JSON. Sending that would put `user_details=` on the wire
@@ -447,7 +491,9 @@ final class UserProfileModule: ModuleBase {
         // keeps the properties staged for the next attempt.
         let escaped = CountlyJSON.escapedString(from: payload, logger: log)
         guard !escaped.isEmpty else {
-            logE("serializedUserDetails", "user details could not be serialized and will not be sent, fields: [\(payload.keys.sorted())]")
+            // The serializer already reports this as an error, so this line only
+            // names the fields that stay staged for the next attempt.
+            logD("serializedUserDetails", "user details could not be serialized and will not be sent, fields: [\(payload.keys.sorted())]")
             return nil
         }
         return escaped
@@ -461,7 +507,8 @@ final class UserProfileModule: ModuleBase {
         // Sorted so the same overflowing profile trims the same way twice, rather
         // than dropping whichever keys the dictionary happened to order last.
         let kept = Set(customProperties.keys.sorted().prefix(limit))
-        logD("cappedCustomProperties", "custom user properties exceed the server cache limit and will be trimmed, propertyCount: [\(customProperties.count)], limit: [\(limit)]")
+        let dropped = customProperties.keys.filter { !kept.contains($0) }.sorted()
+        logD("cappedCustomProperties", "custom user properties exceed the server cache limit and will be trimmed, propertyCount: [\(customProperties.count)], limit: [\(limit)], droppedKeys: [\(dropped)]")
         return customProperties.filter { kept.contains($0.key) }
     }
 
@@ -490,6 +537,7 @@ final class UserProfileModule: ModuleBase {
             logD("userPropertiesChanged", "SDK is not started yet, pending events will not be flushed")
             return
         }
+        logD("userPropertiesChanged", "user properties changed, the recorded events are flushed first so they keep the previous profile, pendingEventCount: [\(core.modules.events.pendingEventCount)]")
         core.modules.events.sendEvents()
     }
 

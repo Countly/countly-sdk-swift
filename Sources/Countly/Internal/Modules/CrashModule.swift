@@ -75,6 +75,8 @@ final class CrashModule: ModuleBase {
     // MARK: - Init
 
     func applyInitialConfig() {
+        logD("applyInitialConfig", "crash module starting, crashSegmentationInConfig: [\(core.config.crashSegmentation != nil)], crashFilterRegexSet: [\(core.config.crashFilter != nil)], crashFilterCallbackSet: [\(core.config.crashes.crashFilterCallback != nil)], shouldSendCrashReportCallbackSet: [\(core.config.shouldSendCrashReportCallback != nil)], maxBreadcrumbCount: [\(core.config.sdkInternalLimits.maxBreadcrumbCount)]")
+
         if let segmentation = core.config.crashSegmentation {
             setCrashSegmentation(segmentation)
         }
@@ -84,8 +86,14 @@ final class CrashModule: ModuleBase {
     /// Sets the segmentation merged into every crash report.
     func setCrashSegmentation(_ segmentation: [String: Any]) {
         logI("setCrashSegmentation", "global crash segmentation is being set, keyCount: [\(segmentation.count)]")
+        logD("setCrashSegmentation", "global crash segmentation keys, keys: [\(segmentation.keys.sorted().joined(separator: ", "))]")
         logV("setCrashSegmentation", "global crash segmentation detail, segmentation: [\(segmentation)]")
+
         let sanitized = core.limits.truncatedAndLimited(segmentation, "Crash segmentation")
+        if sanitized.count < segmentation.count {
+            logD("setCrashSegmentation", "some global crash segmentation keys were dropped by the SDK limits, keptKeyCount: [\(sanitized.count)], requestedKeyCount: [\(segmentation.count)]")
+        }
+
         stateLock.lock()
         crashSegmentation = sanitized
         stateLock.unlock()
@@ -152,6 +160,9 @@ final class CrashModule: ModuleBase {
                          stackTrace: [String]?,
                          segmentation: [String: Any]?) {
         logI("recordException", "exception recording requested, exceptionName: [\(exception.name.rawValue)], isFatal: [\(isFatal)], stackTraceFrameCount: [\(stackTrace?.count ?? 0)], segmentationKeyCount: [\(segmentation?.count ?? 0)]")
+        if let segmentation, !segmentation.isEmpty {
+            logD("recordException", "exception recording segmentation keys, keys: [\(segmentation.keys.sorted().joined(separator: ", "))]")
+        }
         logV("recordException", "exception recording detail, exception: [\(exception)], stackTrace: [\(stackTrace ?? [])], segmentation: [\(segmentation ?? [:])]")
 
         guard core.modules.consent.hasConsent(for: .crashReporting) else {
@@ -160,6 +171,8 @@ final class CrashModule: ModuleBase {
         }
 
         let frames = stackTrace ?? exception.callStackSymbols
+        logD("recordException", "stack trace resolved for the exception, suppliedByCaller: [\(stackTrace != nil)], frameCount: [\(frames.count)]")
+
         let overrides = core.limits.sanitized(segmentation, "Exception segmentation")
 
         handle(name: exception.name.rawValue,
@@ -185,9 +198,25 @@ final class CrashModule: ModuleBase {
 
     /// Called by the process-wide handler when a crash is detected.
     func handleAutoDetectedCrash(name: String, reason: String, stackTrace: [String]) {
-        guard core.serverConfig.crashReportingEnabled else { return }
-        guard core.serverConfig.automaticCrashReportingEnabled else { return }
-        guard core.modules.consent.hasConsent(for: .crashReporting) else { return }
+        // Reached from the signal handler, so nothing here may log at error or
+        // warning: those bump the health tracker, whose dispatch primitives are
+        // not async signal safe and can deadlock the process mid crash.
+        logD("handleAutoDetectedCrash", "an automatically detected crash arrived, crashName: [\(name)], stackTraceFrameCount: [\(stackTrace.count)]")
+
+        guard core.serverConfig.crashReportingEnabled else {
+            logD("handleAutoDetectedCrash", "the detected crash is not reported, crash reporting is disabled by server config")
+            return
+        }
+
+        guard core.serverConfig.automaticCrashReportingEnabled else {
+            logD("handleAutoDetectedCrash", "the detected crash is not reported, automatic crash reporting is disabled by server config")
+            return
+        }
+
+        guard core.modules.consent.hasConsent(for: .crashReporting) else {
+            logD("handleAutoDetectedCrash", "the detected crash is not reported, no crashes consent is given")
+            return
+        }
 
         handle(name: name,
                description: reason,
@@ -206,7 +235,10 @@ final class CrashModule: ModuleBase {
                         segmentationOverride: [String: Any]?,
                         isFatal: Bool,
                         isAutoDetected: Bool) {
-        guard core.serverConfig.crashReportingEnabled else { return }
+        guard core.serverConfig.crashReportingEnabled else {
+            logD("handle", "crash report is dropped before it is built, crash reporting is disabled by server config, isFatal: [\(isFatal)], isAutoDetected: [\(isAutoDetected)]")
+            return
+        }
 
         // Limited before anything reads it, so the regular expression filter, the
         // filter callback and the wire report all see the same trace.
@@ -215,9 +247,14 @@ final class CrashModule: ModuleBase {
 
         var matchesFilter = false
         if let filter = core.config.crashFilter {
-            matchesFilter = matches(filter, stackTraceJoined)
-                || matches(filter, description)
-                || matches(filter, name)
+            let matchedStackTrace = matches(filter, stackTraceJoined)
+            let matchedDescription = matches(filter, description)
+            let matchedName = matches(filter, name)
+            matchesFilter = matchedStackTrace || matchedDescription || matchedName
+
+            if matchesFilter {
+                logD("handle", "the crash filter regular expression matched, matchedStackTrace: [\(matchedStackTrace)], matchedDescription: [\(matchedDescription)], matchedName: [\(matchedName)]")
+            }
         }
 
         stateLock.lock()
@@ -248,7 +285,7 @@ final class CrashModule: ModuleBase {
         let filteredByCallback = filterCallback?(crashData) ?? false
 
         guard !matchesFilter, !filteredByCallback else {
-            logD("handle", "crash report is filtered out and will not be processed, matchesRegexFilter: [\(matchesFilter)], matchesFilterCallback: [\(filteredByCallback)]")
+            logD("handle", "crash report is filtered out and will not be processed, crashName: [\(name)], isFatal: [\(isFatal)], matchesRegexFilter: [\(matchesFilter)], matchesFilterCallback: [\(filteredByCallback)]")
             if isAutoDetected { stopCrashReporting() }
             return
         }
@@ -258,15 +295,26 @@ final class CrashModule: ModuleBase {
                                 hadFilterCallback: filterCallback != nil)
 
         if let shouldSend = core.config.shouldSendCrashReportCallback, !shouldSend(report) {
-            logD("handle", "crash report is dropped by the shouldSendCrashReport callback")
+            logD("handle", "crash report is dropped by the shouldSendCrashReport callback, crashName: [\(name)], isFatal: [\(isFatal)], reportFieldCount: [\(report.count)]")
             if isAutoDetected { stopCrashReporting() }
             return
         }
 
-        logI("handle", "crash recorded, isFatal: [\(crashData.fatal)], isAutoDetected: [\(isAutoDetected)], customSegmentationKeyCount: [\(crashData.crashSegmentation.count)], breadcrumbCount: [\(crashData.breadcrumbs.count)]")
+        // An automatically detected crash is sent synchronously because the process
+        // is about to die; everything else joins the queue.
+        logI("handle", "crash recorded, crashName: [\(name)], isFatal: [\(crashData.fatal)], isAutoDetected: [\(isAutoDetected)], delivery: [\(isAutoDetected ? "immediate" : "queued")], customSegmentationKeyCount: [\(crashData.crashSegmentation.count)], breadcrumbCount: [\(crashData.breadcrumbs.count)], stackTraceFrameCount: [\(stackTrace.count)]")
         logV("handle", "crash detail, breadcrumbs: [\(crashData.breadcrumbs)], crashSegmentation: [\(crashData.crashSegmentation)], stackTrace: [\(crashData.stackTrace)]")
 
-        core.network.sendCrashReport(CountlyJSON.escapedString(from: report, logger: log), immediately: isAutoDetected)
+        // `CountlyJSON` reports a serialization failure at error level, and an
+        // automatically detected crash comes off the signal handler where error
+        // logging is not safe. That path therefore serializes without a logger and
+        // reports the failure itself at debug.
+        let payload = CountlyJSON.string(from: report, logger: isAutoDetected ? nil : log)
+        if payload == nil {
+            logD("handle", "the crash report could not be serialized to JSON and will reach the server empty, crashName: [\(name)], isAutoDetected: [\(isAutoDetected)]")
+        }
+
+        core.network.sendCrashReport(payload?.urlEscaped ?? "", immediately: isAutoDetected)
 
         // A crash handler that stays installed would re-enter on the way down.
         if isAutoDetected {
@@ -298,6 +346,7 @@ final class CrashModule: ModuleBase {
         crashData.calculateChangedFields()
         let changed = crashData.changedFieldsBitfield
         if changed > 0 {
+            logD("wireReport", "the crash filter callback changed the report, the server is told which fields, changedFieldsBitfield: [\(changed)]")
             report[Key.changedFields] = changed
         }
 
@@ -327,6 +376,8 @@ final class CrashModule: ModuleBase {
 
     /// Records a breadcrumb, dropping the oldest when the buffer is full.
     func log(_ text: String) {
+        logI("log", "crash breadcrumb recording requested, textLength: [\(text.count)]")
+
         guard core.modules.consent.hasConsent(for: .crashReporting) else {
             logV("log", "no crashes consent given, breadcrumb is not recorded")
             return
@@ -367,15 +418,26 @@ final class CrashModule: ModuleBase {
     /// Read once at init and cleared, so they are attached to the next report
     /// rather than to every future one.
     func adoptBreadcrumbsFromPreviousRun() {
-        guard let stored = core.crashLogStore.readAll(), !stored.isEmpty else { return }
+        guard let stored = core.crashLogStore.readAll(), !stored.isEmpty else {
+            logD("adoptBreadcrumbsFromPreviousRun", "no breadcrumbs were left behind by a previous run")
+            return
+        }
 
         let recovered = stored.split(separator: "\n").map(String.init)
-        guard !recovered.isEmpty else { return }
+        guard !recovered.isEmpty else {
+            logD("adoptBreadcrumbsFromPreviousRun", "the stored breadcrumbs from a previous run held no usable lines, storedLength: [\(stored.count)]")
+            return
+        }
 
         logD("adoptBreadcrumbsFromPreviousRun", "breadcrumbs from a previous run were found, breadcrumbCount: [\(recovered.count)]")
 
+        let limit = core.config.sdkInternalLimits.maxBreadcrumbCount
+        if recovered.count > limit {
+            logD("adoptBreadcrumbsFromPreviousRun", "the recovered breadcrumbs exceed the buffer limit, the oldest ones are dropped, breadcrumbCount: [\(recovered.count)], limit: [\(limit)]")
+        }
+
         stateLock.lock()
-        breadcrumbs = Array(recovered.suffix(core.config.sdkInternalLimits.maxBreadcrumbCount))
+        breadcrumbs = Array(recovered.suffix(limit))
         stateLock.unlock()
 
         core.crashLogStore.deleteAll()
@@ -399,10 +461,14 @@ final class CrashModule: ModuleBase {
         let totalRAM = DeviceMetrics.totalRAM
         let freeRAM = DeviceMetrics.freeRAM
         let disk = DeviceMetrics.diskSpace()
-        metrics[Key.ramCurrent] = totalRAM.subtractingReportingOverflow(freeRAM).partialValue.clampedToZero(totalRAM >= freeRAM) / Self.mebibyte
-        metrics[Key.ramTotal] = totalRAM / Self.mebibyte
-        metrics[Key.diskCurrent] = disk.total.subtractingReportingOverflow(disk.free).partialValue.clampedToZero(disk.total >= disk.free) / Self.mebibyte
-        metrics[Key.diskTotal] = disk.total / Self.mebibyte
+        let usedRAMMB = totalRAM.subtractingReportingOverflow(freeRAM).partialValue.clampedToZero(totalRAM >= freeRAM) / Self.mebibyte
+        let totalRAMMB = totalRAM / Self.mebibyte
+        let usedDiskMB = disk.total.subtractingReportingOverflow(disk.free).partialValue.clampedToZero(disk.total >= disk.free) / Self.mebibyte
+        let totalDiskMB = disk.total / Self.mebibyte
+        metrics[Key.ramCurrent] = usedRAMMB
+        metrics[Key.ramTotal] = totalRAMMB
+        metrics[Key.diskCurrent] = usedDiskMB
+        metrics[Key.diskTotal] = totalDiskMB
 
         // Only reported when the platform actually knows it, so a missing reading
         // is not recorded as a real battery level.
@@ -416,6 +482,8 @@ final class CrashModule: ModuleBase {
         metrics[Key.root] = DeviceMetrics.isJailbroken
         metrics[Key.background] = !AppState.isForeground
         metrics[Key.run] = core.clock.timeSinceLaunch()
+
+        logD("crashMetrics", "device state captured for the crash report, ramUsedMB: [\(usedRAMMB)], ramTotalMB: [\(totalRAMMB)], diskUsedMB: [\(usedDiskMB)], diskTotalMB: [\(totalDiskMB)], batteryReported: [\(battery >= 0)], online: [\(DeviceMetrics.connectionType != 0)], inBackground: [\(!AppState.isForeground)], secondsSinceLaunch: [\(core.clock.timeSinceLaunch())]")
 
         return metrics
     }
@@ -466,7 +534,7 @@ final class CrashModule: ModuleBase {
             }
 
             guard let uuidString = imageUUID(header) else {
-                logV("binaryImages", "binary image UUID can not be retrieved, symbolication may fail for it, imageName: [\(imageName)]")
+                logD("binaryImages", "binary image UUID can not be retrieved, symbolication may fail for it, imageName: [\(imageName)]")
                 continue
             }
 
@@ -479,7 +547,7 @@ final class CrashModule: ModuleBase {
             images[imageName] = [Key.imageLoadAddress: loadAddress, Key.imageBuildUUID: uuidString]
         }
 
-        logV("binaryImages", "binary images resolved for the stack trace, matchedImageCount: [\(images.count)]")
+        logD("binaryImages", "binary images resolved for the stack trace, matchedImageCount: [\(images.count)], stackTraceImageNameCount: [\(namesInStack.count)], mainExecutableResolved: [\(mainBuildUUID != nil)]")
 
         return (images,
                 mainBuildUUID,
@@ -527,6 +595,7 @@ final class CrashModule: ModuleBase {
     // MARK: - Lifecycle
 
     override func halt(clearStorage: Bool) {
+        logD("halt", "crash module halting, the handlers are uninstalled and the global crash segmentation is dropped")
         stopCrashReporting()
         stateLock.lock()
         crashSegmentation.removeAll()

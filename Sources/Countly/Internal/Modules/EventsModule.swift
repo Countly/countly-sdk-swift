@@ -36,6 +36,23 @@ final class EventsModule: ModuleBase {
     /// How many events accumulate before they are sent.
     private var sendThreshold: Int { max(1, core.config.eventSendThreshold) }
 
+    /// Events sitting in memory and not yet moved into the request queue. Read by
+    /// the user profile module, which has to report the queue depth it is about to
+    /// flush.
+    var pendingEventCount: Int {
+        eventLock.lock()
+        defer { eventLock.unlock() }
+        return recordedEvents.count
+    }
+
+    /// Keys of the timers started and not yet ended or cancelled. Only read from
+    /// log messages, which are built lazily.
+    private var startedTimedEventKeys: [String] {
+        eventLock.lock()
+        defer { eventLock.unlock() }
+        return startedEvents.keys.sorted()
+    }
+
     // MARK: - Public recording
 
     /// Records an event after applying consent, behavior settings and the SDK
@@ -46,16 +63,17 @@ final class EventsModule: ModuleBase {
                      sum: Double = 0,
                      duration: TimeInterval = 0) {
         logI("recordEvent", "recording an event, key: [\(key)], segmentationKeyCount: [\(segmentation?.count ?? 0)], count: [\(count)], sum: [\(sum.logValue)], duration: [\(duration.logSeconds)]")
+        logD("recordEvent", "event segmentation keys, key: [\(key)], segmentationKeys: [\(segmentation?.keys.sorted() ?? [])]")
         logV("recordEvent", "event segmentation detail, key: [\(key)], segmentation: [\(segmentation ?? [:])]")
 
         if let reservedConsent = consentForReservedEvent(key) {
             guard reservedConsent else {
-                logV("recordEvent", "no consent given for the reserved event, it will not be recorded, key: [\(key)]")
+                logD("recordEvent", "no consent given for the reserved event, it will not be recorded, key: [\(key)]")
                 return
             }
-            logV("recordEvent", "specific consent is given for the reserved event, it will be recorded, key: [\(key)]")
+            logD("recordEvent", "specific consent is given for the reserved event, it will be recorded, key: [\(key)]")
         } else if !core.modules.consent.hasConsent(for: .events) {
-            logV("recordEvent", "no consent given for events, the event will not be recorded, key: [\(key)]")
+            logD("recordEvent", "no consent given for events, the event will not be recorded, key: [\(key)]")
             return
         }
 
@@ -71,6 +89,12 @@ final class EventsModule: ModuleBase {
 
         let filtered = core.serverConfig.filterSegmentation(segmentation, eventKey: key)
         let sanitized = core.limits.sanitized(filtered, "Event segmentation")
+
+        let providedKeyCount = segmentation?.count ?? 0
+        let acceptedKeyCount = sanitized?.count ?? 0
+        if providedKeyCount != acceptedKeyCount {
+            logD("recordEvent", "some segmentation entries were removed by the server config filter or the segmentation limits, key: [\(key)], providedKeyCount: [\(providedKeyCount)], acceptedKeyCount: [\(acceptedKeyCount)], acceptedKeys: [\(sanitized?.keys.sorted() ?? [])]")
+        }
 
         record(key: key,
                segmentation: sanitized,
@@ -92,6 +116,9 @@ final class EventsModule: ModuleBase {
                              duration: TimeInterval = 0,
                              id: String? = nil,
                              timestamp: TimeInterval? = nil) {
+        logD("recordReservedEvent", "recording a reserved event, key: [\(key)], segmentationKeys: [\(segmentation?.keys.sorted() ?? [])], count: [\(count)], sum: [\(sum.logValue)], duration: [\(duration.logSeconds)], idProvided: [\(id != nil)], timestampProvided: [\(timestamp != nil)]")
+        logV("recordReservedEvent", "reserved event segmentation detail, key: [\(key)], segmentation: [\(segmentation ?? [:])]")
+
         record(key: key,
                segmentation: segmentation,
                count: count,
@@ -109,7 +136,7 @@ final class EventsModule: ModuleBase {
         logI("startEvent", "starting a timed event, key: [\(key)]")
 
         guard core.modules.consent.hasConsent(for: .events) else {
-            logV("startEvent", "no consent given for events, the timed event will not be started, key: [\(key)]")
+            logD("startEvent", "no consent given for events, the timed event will not be started, key: [\(key)]")
             return
         }
 
@@ -130,15 +157,17 @@ final class EventsModule: ModuleBase {
     /// Ends a timer and records the event.
     func endEvent(_ key: String, segmentation: [String: Any]? = nil, count: Int = 1, sum: Double = 0) {
         logI("endEvent", "ending a timed event, key: [\(key)], segmentationKeyCount: [\(segmentation?.count ?? 0)], count: [\(count)], sum: [\(sum.logValue)]")
+        logD("endEvent", "timed event end segmentation keys, key: [\(key)], segmentationKeys: [\(segmentation?.keys.sorted() ?? [])]")
         logV("endEvent", "timed event end segmentation detail, key: [\(key)], segmentation: [\(segmentation ?? [:])]")
 
         guard core.modules.consent.hasConsent(for: .events) else {
-            logV("endEvent", "no consent given for events, the timed event will not be ended, key: [\(key)]")
+            logD("endEvent", "no consent given for events, the timed event will not be ended, key: [\(key)]")
             return
         }
 
         guard let event = takeTimedEvent(key) else {
             logW("endEvent", "omitting the call, the timed event was not started or was already ended, key: [\(key)]")
+            logD("endEvent", "no timed event matched the key that was ended, these are the ones still running, key: [\(key)], startedTimedEventKeys: [\(startedTimedEventKeys)]")
             return
         }
 
@@ -146,6 +175,7 @@ final class EventsModule: ModuleBase {
         // ahead of the wall clock under a burst, so mixing the two can produce a
         // negative duration.
         let duration = core.clock.now() - event.timestamp
+        logD("endEvent", "the timed event is ended and its duration measured, key: [\(key)], duration: [\(duration.logSeconds)], remainingTimedEventKeys: [\(startedTimedEventKeys)]")
         recordEvent(key, segmentation: segmentation, count: count, sum: sum, duration: duration)
     }
 
@@ -154,7 +184,7 @@ final class EventsModule: ModuleBase {
         logI("cancelEvent", "cancelling a timed event, key: [\(key)]")
 
         guard core.modules.consent.hasConsent(for: .events) else {
-            logV("cancelEvent", "no consent given for events, the timed event will not be cancelled, key: [\(key)]")
+            logD("cancelEvent", "no consent given for events, the timed event will not be cancelled, key: [\(key)]")
             return
         }
 
@@ -163,14 +193,14 @@ final class EventsModule: ModuleBase {
             return
         }
 
-        logD("cancelEvent", "the timed event is cancelled, key: [\(key)]")
+        logD("cancelEvent", "the timed event is cancelled, key: [\(key)], remainingTimedEventKeys: [\(startedTimedEventKeys)]")
     }
 
     /// Drops every running timer. Used when the user changes.
     func clearAllTimedEvents() {
         eventLock.lock()
         defer { eventLock.unlock() }
-        logD("clearAllTimedEvents", "clearing all started timed events, startedTimedEventCount: [\(startedEvents.count)]")
+        logD("clearAllTimedEvents", "clearing all started timed events, droppedTimedEventKeys: [\(startedEvents.keys.sorted())]")
         startedEvents.removeAll()
     }
 
@@ -213,6 +243,10 @@ final class EventsModule: ModuleBase {
             event.currentViewID = core.modules.views.currentViewID ?? ""
         }
 
+        if count < 1 {
+            logD("record", "the provided event count is below one and will be clamped, key: [\(key)], providedCount: [\(count)]")
+        }
+
         event.count = max(count, 1)
         event.sum = sum
         event.timestamp = timestamp
@@ -230,7 +264,6 @@ final class EventsModule: ModuleBase {
             return
         }
 
-        logV("record", "adding the event id and name properties, it is not a reserved event, key: [\(key)]")
         let truncatedKey = core.limits.truncatedKey(key, "Event key")
 
         // The chain update and the enqueue happen under one lock so two threads
@@ -249,8 +282,14 @@ final class EventsModule: ModuleBase {
         event.key = truncatedKey
         event.segmentation = processSegmentation(&filteredSegmentation, eventKey: truncatedKey)
 
-        let callback: RequestCallback? = core.serverConfig.isJourneyTriggerEvent(truncatedKey) ? journeyTriggerCallback() : nil
-        enqueue(event, callback: callback)
+        logD("record", "the event is chained to the previous non reserved event, key: [\(truncatedKey)], eventID: [\(event.id)], previousEventID: [\(event.previousEventID ?? "")]")
+
+        let isJourneyTrigger = core.serverConfig.isJourneyTriggerEvent(truncatedKey)
+        if isJourneyTrigger {
+            logD("record", "the event key is a journey trigger, the batch will be sent immediately, key: [\(truncatedKey)]")
+        }
+
+        enqueue(event, callback: isJourneyTrigger ? journeyTriggerCallback() : nil)
         eventLock.unlock()
     }
 
@@ -296,6 +335,7 @@ final class EventsModule: ModuleBase {
         guard key == ReservedEventKey.view,
               let viewName = segmentation?[SegKey.name] as? String,
               core.serverConfig.isJourneyTriggerView(viewName) else { return nil }
+        logD("journeyTriggerCallbackForReserved", "the view name is a journey trigger, the batch will be sent immediately, viewName: [\(viewName)]")
         return journeyTriggerCallback()
     }
 
@@ -320,6 +360,7 @@ final class EventsModule: ModuleBase {
         // Unsent user properties have to reach the server before the event does,
         // or the event is attributed to a stale profile.
         if core.modules.userProfile.hasUnsyncedChanges {
+            logD("enqueue", "unsynced user properties will be saved before this event is queued, so the event is attributed to the new profile, eventKey: [\(event.key)]")
             core.modules.userProfile.save()
         }
 
@@ -329,9 +370,11 @@ final class EventsModule: ModuleBase {
 
         logD("enqueue", "event is added to the in memory event queue, pendingEventCount: [\(pending)], eventSendThreshold: [\(sendThreshold)], callbackProvided: [\(callback != nil)]")
 
-        if callback != nil || pending >= sendThreshold {
-            sendEvents(callback: callback)
-        }
+        guard callback != nil || pending >= sendThreshold else { return }
+
+        let reason = callback != nil ? "a request callback is attached" : "the send threshold is reached"
+        logD("enqueue", "the in memory event queue will be sent, reason: [\(reason)], pendingEventCount: [\(pending)]")
+        sendEvents(callback: callback)
     }
 
     /// Serializes the batch and clears it.
@@ -342,13 +385,22 @@ final class EventsModule: ModuleBase {
         eventLock.lock()
         defer { eventLock.unlock() }
 
-        guard !recordedEvents.isEmpty else { return nil }
+        guard !recordedEvents.isEmpty else {
+            logD("serializeRecordedEvents", "the in memory event queue is empty, no event request will be created")
+            return nil
+        }
 
         let payload = recordedEvents.map(\.dictionaryRepresentation)
         logD("serializeRecordedEvents", "serializing the recorded events for the next request, eventCount: [\(payload.count)]")
         recordedEvents.removeAll()
 
-        return CountlyJSON.escapedString(from: payload, logger: log)
+        let escaped = CountlyJSON.escapedString(from: payload, logger: log)
+        if escaped.isEmpty {
+            // The serializer reports the failure itself, so this only records what
+            // was lost with it.
+            logD("serializeRecordedEvents", "the recorded events could not be serialized and are gone from the in memory queue, eventCount: [\(payload.count)]")
+        }
+        return escaped
     }
 
     /// Moves the batch into the request queue without starting a drain.
@@ -362,6 +414,7 @@ final class EventsModule: ModuleBase {
 
     /// Sends whatever has been recorded so far.
     func sendEvents(callback: RequestCallback? = nil) {
+        logD("sendEvents", "the recorded events will be moved to the request queue and the queue drained, pendingEventCount: [\(pendingEventCount)], callbackProvided: [\(callback != nil)]")
         addEventsToRequestQueue(callback: callback)
         core.network.proceedOnQueue()
     }
@@ -376,8 +429,10 @@ final class EventsModule: ModuleBase {
     /// and strands them again. An application that sets a user property without
     /// user details consent never sends another event.
     func sendEventsWithSaveIfNeeded() {
-        if core.modules.userProfile.hasUnsyncedChanges, core.modules.userProfile.save() {
-            return
+        if core.modules.userProfile.hasUnsyncedChanges {
+            logD("sendEventsWithSaveIfNeeded", "unsynced user properties are pending, the user details save will carry the events out, pendingEventCount: [\(pendingEventCount)]")
+            if core.modules.userProfile.save() { return }
+            logD("sendEventsWithSaveIfNeeded", "the user details save declined, the recorded events will be sent on their own")
         }
         sendEvents()
     }
@@ -387,7 +442,7 @@ final class EventsModule: ModuleBase {
         eventLock.lock()
         defer { eventLock.unlock() }
         if !recordedEvents.isEmpty {
-            logD("flushEvents", "in memory event queue is being flushed, [\(recordedEvents.count)] recorded event(s) will be dropped")
+            logD("flushEvents", "the in memory event queue is dropped without being sent, droppedEventCount: [\(recordedEvents.count)]")
         }
         recordedEvents.removeAll()
     }

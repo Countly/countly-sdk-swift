@@ -63,6 +63,7 @@ final class SessionsModule: ModuleBase {
         RunLoop.main.add(timer, forMode: .common)
         updateTimer = timer
         scheduledUpdatePeriod = period
+        logD("startUpdateTimer", "session update timer scheduled, updatePeriodSeconds: [\(period.logSeconds)]")
     }
 
     /// Rebuilds the timer when the behavior settings change its interval.
@@ -72,14 +73,20 @@ final class SessionsModule: ModuleBase {
     /// server that lowers the interval to reduce data loss, or raises it to reduce
     /// traffic, expects the change to take effect now.
     func applyUpdatePeriodIfChanged() {
-        guard updateTimer != nil else { return }
+        guard updateTimer != nil else {
+            logD("applyUpdatePeriodIfChanged", "the session update timer is not running, the new update period will be picked up when it starts, updatePeriodSeconds: [\(core.config.updateSessionPeriod.logSeconds)]")
+            return
+        }
         guard core.config.updateSessionPeriod != scheduledUpdatePeriod else { return }
 
-        logD("applyUpdatePeriodIfChanged", "session update period changed from [\(scheduledUpdatePeriod)] to [\(core.config.updateSessionPeriod)], the timer is being rebuilt")
+        logD("applyUpdatePeriodIfChanged", "behavior settings changed the session update period, the timer will be rebuilt, previousPeriodSeconds: [\(scheduledUpdatePeriod.logSeconds)], newPeriodSeconds: [\(core.config.updateSessionPeriod.logSeconds)]")
         startUpdateTimer()
     }
 
     func stopUpdateTimer() {
+        guard updateTimer != nil else { return }
+
+        logD("stopUpdateTimer", "session update timer invalidated, scheduledPeriodSeconds: [\(scheduledUpdatePeriod.logSeconds)]")
         updateTimer?.invalidate()
         updateTimer = nil
     }
@@ -90,10 +97,15 @@ final class SessionsModule: ModuleBase {
     /// and closed the session, and a tick landing afterwards would reopen work the
     /// SDK just finished.
     private func onUpdateTimer() {
-        guard !isSuspended else { return }
+        guard !isSuspended else {
+            logD("onUpdateTimer", "the SDK is suspended, this session update tick will be skipped entirely")
+            return
+        }
 
         if core.serverConfig.automaticSessionTrackingEnabled || core.config.enableManualSessionControlHybridMode {
             updateSession()
+        } else {
+            logD("onUpdateTimer", "sessions are driven manually and hybrid mode is off, this tick will only flush events")
         }
 
         core.modules.events.sendEventsWithSaveIfNeeded()
@@ -103,22 +115,32 @@ final class SessionsModule: ModuleBase {
 
     /// Opens a session.
     func beginSession() {
-        guard core.modules.consent.hasConsent(for: .sessions) else { return }
-        guard core.serverConfig.sessionTrackingEnabled else { return }
+        logI("beginSession", "session begin requested, isSessionStarted: [\(isSessionStarted)], automaticSessionTracking: [\(core.serverConfig.automaticSessionTrackingEnabled)]")
+
+        guard core.modules.consent.hasConsent(for: .sessions) else {
+            logV("beginSession", "no consent for sessions, no session will be started")
+            return
+        }
+
+        guard core.serverConfig.sessionTrackingEnabled else {
+            logD("beginSession", "session tracking is disabled by behavior settings, no session will be started")
+            return
+        }
 
         guard !isSessionStarted else {
-            logW("beginSession", "a session is already running, this beginSession will be ignored")
+            logW("beginSession", "a session is already running, this session begin will be ignored")
             return
         }
 
         // A session begun while the application is in the background would report
         // time the user never spent in the app.
         if core.serverConfig.automaticSessionTrackingEnabled, !AppState.isForeground {
-            logD("beginSession", "app is in the background, beginSession will be ignored")
+            logD("beginSession", "app is in the background, the automatic session will not be started")
             return
         }
 
         if core.modules.userProfile.hasUnsyncedChanges {
+            logD("beginSession", "unsynced user profile changes will be sent before the session begins")
             core.modules.userProfile.save()
         }
 
@@ -130,10 +152,16 @@ final class SessionsModule: ModuleBase {
         queryString += "&\(QS.sessionBegin)=1"
         queryString += "&\(QS.metrics)=\(CountlyJSON.escapedString(from: core.metricsDictionary(), logger: log))"
 
-        if core.serverConfig.locationTrackingEnabled,
-           let locationQuery = core.network.builder.locationQueryString() {
+        if !core.serverConfig.locationTrackingEnabled {
+            logD("beginSession", "location tracking is disabled by behavior settings, the begin session request will carry no location")
+        } else if let locationQuery = core.network.builder.locationQueryString() {
             queryString += locationQuery
+            logD("beginSession", "location information will be sent with the begin session request")
+        } else {
+            logD("beginSession", "no location information is set, the begin session request will carry none")
         }
+
+        logD("beginSession", "session opened, the begin session request will be queued, isForeground: [\(AppState.isForeground)]")
 
         core.network.enqueue(queryString)
         core.modules.views.recordOrientation()
@@ -142,37 +170,61 @@ final class SessionsModule: ModuleBase {
 
     /// Reports the time elapsed since the last update.
     func updateSession() {
-        guard core.modules.consent.hasConsent(for: .sessions) else { return }
-        guard core.serverConfig.sessionTrackingEnabled else { return }
+        logI("updateSession", "session update requested, isSessionStarted: [\(isSessionStarted)]")
+
+        guard core.modules.consent.hasConsent(for: .sessions) else {
+            logV("updateSession", "no consent for sessions, the session duration will not be updated")
+            return
+        }
+
+        guard core.serverConfig.sessionTrackingEnabled else {
+            logD("updateSession", "session tracking is disabled by behavior settings, the session duration will not be updated")
+            return
+        }
 
         guard isSessionStarted else {
-            logD("updateSession", "no session is running, this updateSession will be ignored")
+            logD("updateSession", "no session is running, this session update will be ignored")
             return
         }
 
         if core.modules.userProfile.hasUnsyncedChanges {
+            logD("updateSession", "unsynced user profile changes will be sent before the session update")
             core.modules.userProfile.save()
         }
 
-        let queryString = "\(core.network.builder.queryEssentials())&\(QS.sessionDuration)=\(sessionLengthInSeconds())"
-        core.network.enqueueAndProceed(queryString)
+        let duration = sessionLengthInSeconds()
+        logD("updateSession", "session duration update will be queued, durationSeconds: [\(duration)], carriedRemainderSeconds: [\(unsentSessionLength.logSeconds)]")
+
+        core.network.enqueueAndProceed("\(core.network.builder.queryEssentials())&\(QS.sessionDuration)=\(duration)")
     }
 
     /// Closes the session, reporting the remaining duration.
     func endSession() {
-        guard core.modules.consent.hasConsent(for: .sessions) else { return }
-        guard core.serverConfig.sessionTrackingEnabled else { return }
+        logI("endSession", "session end requested, isSessionStarted: [\(isSessionStarted)]")
+
+        guard core.modules.consent.hasConsent(for: .sessions) else {
+            logV("endSession", "no consent for sessions, the session will not be ended")
+            return
+        }
+
+        guard core.serverConfig.sessionTrackingEnabled else {
+            logD("endSession", "session tracking is disabled by behavior settings, the session will not be ended")
+            return
+        }
 
         guard isSessionStarted else {
-            logD("endSession", "no session is running, this endSession will be ignored")
+            logD("endSession", "no session is running, this session end will be ignored")
             return
         }
 
         isSessionStarted = false
 
+        let duration = sessionLengthInSeconds()
         var queryString = core.network.builder.queryEssentials()
         queryString += "&\(QS.sessionEnd)=1"
-        queryString += "&\(QS.sessionDuration)=\(sessionLengthInSeconds())"
+        queryString += "&\(QS.sessionDuration)=\(duration)"
+
+        logD("endSession", "session closed, the end session request will be queued, durationSeconds: [\(duration)]")
 
         core.network.enqueueAndProceed(queryString)
         core.modules.views.resetFirstView()
@@ -224,6 +276,8 @@ final class SessionsModule: ModuleBase {
 
         if core.serverConfig.automaticSessionTrackingEnabled {
             endSession()
+        } else {
+            logD("suspend", "sessions are driven manually, the running session will be left open across the background")
         }
 
         core.requestQueueStore.save()
@@ -257,6 +311,8 @@ final class SessionsModule: ModuleBase {
 
         if core.serverConfig.automaticSessionTrackingEnabled {
             beginSession()
+        } else {
+            logD("resume", "sessions are driven manually, no session will be started on resume, hybridMode: [\(core.config.enableManualSessionControlHybridMode)]")
         }
 
         core.modules.views.applicationWillEnterForeground()
@@ -266,16 +322,19 @@ final class SessionsModule: ModuleBase {
     // MARK: - Lifecycle
 
     override func didEnterForeground() {
+        logD("didEnterForeground", "app entered foreground, behavior settings will be refreshed and the SDK resumed")
         core.serverConfig.fetchIfTimeIsUp(config: core.config)
         resume()
     }
 
     override func didEnterBackground() {
+        logD("didEnterBackground", "app entered background, the health check state will be saved and the SDK suspended")
         core.healthTracker.saveState()
         suspend()
     }
 
     override func halt(clearStorage: Bool) {
+        logD("halt", "sessions module is halting, the session state will be dropped without an end session request, isSessionStarted: [\(isSessionStarted)], unsentSessionLengthSeconds: [\(unsentSessionLength.logSeconds)]")
         stopUpdateTimer()
         isSessionStarted = false
         isSuspended = false

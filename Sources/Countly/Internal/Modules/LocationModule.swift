@@ -32,8 +32,10 @@ final class LocationModule: ModuleBase {
 
     func applyInitialConfig() {
         if core.config.disableLocation {
+            logD("applyInitialConfig", "location is switched off in the initial config, nothing will be reported and the server is told to stop inferring a location")
             disableLocation()
         } else {
+            logD("applyInitialConfig", "location is taken from the initial config, it rides along on the first session request rather than a request of its own")
             updateLocation(core.config.location,
                            city: core.config.city,
                            isoCountryCode: core.config.isoCountryCode,
@@ -49,7 +51,7 @@ final class LocationModule: ModuleBase {
                         isoCountryCode: String?,
                         ipAddress: String?) {
         logI("recordLocation", "location recording requested, coordinateProvided: [\(CLLocationCoordinate2DIsValid(coordinate))], cityProvided: [\(!(city ?? "").isEmpty)], countryCodeProvided: [\(!(isoCountryCode ?? "").isEmpty)], IPProvided: [\(!(ipAddress ?? "").isEmpty)]")
-        logV("recordLocation", "location recording detail, latitude: [\(coordinate.latitude)], longitude: [\(coordinate.longitude)], city: [\(city ?? "")], countryCode: [\(isoCountryCode ?? "")], IP: [\(ipAddress ?? "")]")
+        logV("recordLocation", "location recording detail, latitude: [\(coordinate.latitude.logValue)], longitude: [\(coordinate.longitude.logValue)], city: [\(city ?? "")], countryCode: [\(isoCountryCode ?? "")], IP: [\(ipAddress ?? "")]")
 
         guard core.modules.consent.hasConsent(for: .location) else {
             logV("recordLocation", "no location consent given, location is not recorded")
@@ -74,6 +76,9 @@ final class LocationModule: ModuleBase {
         if CLLocationCoordinate2DIsValid(coordinate) {
             locationCoordinate = String(format: "%f,%f", coordinate.latitude, coordinate.longitude)
         } else {
+            // The public API defaults to an invalid coordinate to mean "not
+            // supplied", so this is the ordinary city-only call and not a mistake.
+            logD("updateLocation", "no usable coordinate was supplied, any previously stored coordinate is cleared")
             locationCoordinate = nil
         }
 
@@ -81,7 +86,7 @@ final class LocationModule: ModuleBase {
         self.isoCountryCode = Self.nilIfEmpty(isoCountryCode)
         self.ipAddress = Self.nilIfEmpty(ipAddress)
 
-        logD("updateLocation", "stored location fields updated, coordinate: [\(locationCoordinate != nil)], city: [\(self.city != nil)], countryCode: [\(self.isoCountryCode != nil)], IP: [\(self.ipAddress != nil)]")
+        logD("updateLocation", "stored location fields updated, coordinateStored: [\(locationCoordinate != nil)], cityStored: [\(self.city != nil)], countryCodeStored: [\(self.isoCountryCode != nil)], IPStored: [\(self.ipAddress != nil)]")
         logV("updateLocation", "stored location field detail, location: [\(locationCoordinate ?? "")], city: [\(self.city ?? "")], countryCode: [\(self.isoCountryCode ?? "")], IP: [\(self.ipAddress ?? "")]")
 
         // The server resolves a city only together with its country, so one
@@ -93,6 +98,9 @@ final class LocationModule: ModuleBase {
         }
 
         if locationCoordinate != nil || self.city != nil || self.isoCountryCode != nil || self.ipAddress != nil {
+            if isLocationInfoDisabled {
+                logD("updateLocation", "a location field was supplied, location reporting is switched back on for this device")
+            }
             isLocationInfoDisabled = false
         }
     }
@@ -132,14 +140,12 @@ final class LocationModule: ModuleBase {
         }
 
         disableLocation()
-        logI("disableLocationInfo", "location info is cleared and location tracking is disabled for this device")
-
         sendLocationRequest()
     }
 
     /// Clears the stored fields without sending anything.
     func disableLocation() {
-        logD("disableLocation", "clearing all stored location fields")
+        logD("disableLocation", "clearing all stored location fields, coordinateWasStored: [\(locationCoordinate != nil)], cityWasStored: [\(city != nil)], countryCodeWasStored: [\(isoCountryCode != nil)], IPWasStored: [\(ipAddress != nil)]")
 
         isLocationInfoDisabled = true
         locationCoordinate = nil
@@ -157,7 +163,12 @@ final class LocationModule: ModuleBase {
     /// signal that tells the server to stop inferring location from the request
     /// IP, and gating it on the consent that was just withdrawn would swallow it.
     func sendLocationRequest() {
-        guard let locationQuery = core.network.builder.locationQueryString() else { return }
+        guard let locationQuery = core.network.builder.locationQueryString() else {
+            logD("sendLocationRequest", "no location request is queued, nothing is stored to send and location is not disabled, so the next session request carries the location instead")
+            return
+        }
+
+        logD("sendLocationRequest", "location request is being queued, locationInfoDisabled: [\(isLocationInfoDisabled)], coordinateSent: [\(locationCoordinate != nil)], citySent: [\(city != nil)], countryCodeSent: [\(isoCountryCode != nil)], IPSent: [\(ipAddress != nil)]")
         core.network.enqueueAndProceed(core.network.builder.queryEssentials() + locationQuery)
     }
 }

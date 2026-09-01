@@ -393,7 +393,8 @@ final class ContentModule: ModuleBase {
             }
 
             self.logD("fetchContents", "the content details response parsed, statusCode: [\((response as? HTTPURLResponse)?.statusCode ?? 0)], responseSize: [\(data?.count ?? 0)]")
-            self.logD("fetchContents", "content details response detail, url: [\(response?.url?.absoluteString ?? "")], response: [\(payload)]")
+            self.logD("fetchContents", "content details response detail, response: [\(payload)]")
+            self.logV("fetchContents", "content details response URL detail, url: [\(response?.url?.absoluteString ?? "")]")
 
             guard let html = payload["html"] as? String else {
                 self.logD("fetchContents", "the content details response carries no content")
@@ -426,12 +427,12 @@ final class ContentModule: ModuleBase {
         queryString = core.network.builder.appendChecksum(queryString)
         let request = core.network.instantRequest(queryString: queryString, path: Self.endpoint)
 
-        // Both halves of the request are printed, because which one carries the
-        // query depends on its length and on `alwaysUsePOST`, and a content fetch
-        // that the server answers with nothing is usually a question about what was
-        // asked for.
-        logD("fetchRequest",
-             "the content fetch request built, method: [\(request.httpMethod ?? "GET")], url: [\(request.url?.absoluteString ?? "")], body: [\(request.httpBody.map { String(decoding: $0, as: UTF8.self) } ?? "")]")
+        // A content fetch the server answers with nothing is usually a question
+        // about what was asked for, and which half of the request carries the query
+        // depends on its length and on `alwaysUsePOST`, so both are reported.
+        let body = request.httpBody.map { String(decoding: $0, as: UTF8.self) } ?? ""
+        logD("fetchRequest", "content fetch request built, method: [\(request.httpMethod ?? "GET")], path: [\(request.url?.path ?? "")], bodySize: [\(body.count)]")
+        logV("fetchRequest", "content fetch request detail, url: [\(request.url?.absoluteString ?? "")], body: [\(body)]")
 
         return request
     }
@@ -457,7 +458,7 @@ final class ContentModule: ModuleBase {
         // in whatever order the hash landed in.
         let json = CountlyJSON.string(from: payload, logger: log) ?? "{}"
 
-        logD("resolutionJSON", "resolution reported to the server, portraitWidth: [\(shortSide.logValue)], portraitHeight: [\(longSide.logValue)], isLandscape: [\(isLandscape)]")
+        logD("resolutionJSON", "resolution reported to the server, portraitWidth: [\(shortSide.logValue)], portraitHeight: [\(longSide.logValue)], landscapeWidth: [\(longSide.logValue)], landscapeHeight: [\(shortSide.logValue)], isLandscape: [\(isLandscape)]")
         logD("resolutionJSON", "resolution payload detail, resolution: [\(json)]")
         return json
         #else
@@ -471,7 +472,14 @@ final class ContentModule: ModuleBase {
     /// The same rule places what comes back, so the page is laid out at the size it
     /// is actually going to be given. See `ContentGeometry`.
     private func windowSize() -> CGSize {
-        ContentGeometry.windowSize(displayOption: core.config.content.webViewDisplayOption)
+        let displayOption = core.config.content.webViewDisplayOption
+        let size = ContentGeometry.windowSize(displayOption: displayOption)
+
+        // Every part of the sum, not just its result. A page laid out against the
+        // wrong size is the failure this path causes, and the result on its own
+        // does not say whether the window or the insets were what went wrong.
+        logD("windowSize", "content area resolved, windowBounds: [\(ContentGeometry.windowBounds.logValue)], safeAreaInsets: [\(ContentGeometry.safeAreaDescription)], displayOption: [\(displayOption)], contentSize: [\(size.logValue)]")
+        return size
     }
     #endif
 
@@ -481,7 +489,7 @@ final class ContentModule: ModuleBase {
         #if os(iOS) || os(visionOS) || os(macOS)
         guard let url = URL(string: urlString), url.scheme != nil, url.host != nil else {
             logE("showContent", "the content URL is not valid, urlLength: [\(urlString.count)]")
-            logD("showContent", "invalid content URL detail, url: [\(urlString)]")
+            logV("showContent", "invalid content URL detail, url: [\(urlString)]")
             return
         }
 
@@ -513,7 +521,9 @@ final class ContentModule: ModuleBase {
             let themedURL = URL(string: DeviceMetrics.urlStringByAppendingThemeMode(urlString)) ?? url
 
             self.logI("showContent", "showing a content, host: [\(themedURL.host ?? "")], path: [\(themedURL.path)], frame: [\(frame.logValue)], isLandscape: [\(isLandscape)], rotationDisabled: [\(self.core.config.content.disableRotation)]")
-            self.logD("showContent", "shown content detail, url: [\(themedURL.absoluteString)], windowSize: [\(windowSize.logValue)], placementCoordinates: [\(placement)]")
+            self.logD("showContent", "shown content placement detail, orientationKey: [\(isLandscape ? "l" : "p")], x: [\(frame.origin.x.logValue)], y: [\(frame.origin.y.logValue)], width: [\(frame.width.logValue)], height: [\(frame.height.logValue)], windowSize: [\(windowSize.logValue)]")
+            self.logD("showContent", "shown content placement payload detail, placementCoordinates: [\(placement)]")
+            self.logV("showContent", "shown content URL detail, url: [\(themedURL.absoluteString)]")
 
             let manager = WebViewManager(core: self.core)
             self.webViewManager = manager

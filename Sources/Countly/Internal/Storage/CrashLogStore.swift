@@ -36,7 +36,11 @@ final class CrashLogStore {
     ///
     /// Updated when behavior settings change the limit, which is why it is a
     /// variable rather than an init parameter.
-    var maxBreadcrumbCount: Int = DefaultLimits.maxBreadcrumbCount
+    var maxBreadcrumbCount: Int = DefaultLimits.maxBreadcrumbCount {
+        didSet {
+            logger?.d(Self.module, "maxBreadcrumbCount", "breadcrumb file limit is set, previousLimit: [\(oldValue)], limit: [\(maxBreadcrumbCount)]")
+        }
+    }
 
     /// Lines written since the file was last trimmed. Counted rather than
     /// recomputed, so the common append does not read the whole file back.
@@ -53,6 +57,7 @@ final class CrashLogStore {
         // A breadcrumb containing a newline would read back as several, so the
         // line separator is escaped rather than carried through.
         let line = log.replacingOccurrences(of: "\n", with: "\\n") + "\n"
+        logger?.v(Self.module, "append", "breadcrumb accepted for the custom crash log file, breadcrumb: [\(log)]")
 
         writeQueue.async { [weak self] in
             self?.appendOnQueue(line)
@@ -62,9 +67,18 @@ final class CrashLogStore {
     /// Everything recorded so far, or `nil` when nothing has been.
     func readAll() -> String? {
         writeQueue.sync {
-            guard let data = try? Data(contentsOf: fileURL) else { return nil }
-            logger?.d(Self.module, "readAll", "custom crash logs are read from the custom crash log file, dataSize: [\(data.count)]")
-            return String(data: data, encoding: .utf8)
+            guard let data = try? Data(contentsOf: fileURL) else {
+                logger?.d(Self.module, "readAll", "no custom crash log file to read, no breadcrumb was recorded or the file was already consumed")
+                return nil
+            }
+
+            guard let text = String(data: data, encoding: .utf8) else {
+                logger?.d(Self.module, "readAll", "custom crash log file is not valid utf8 and is treated as empty, dataSize: [\(data.count)]")
+                return nil
+            }
+
+            logger?.d(Self.module, "readAll", "custom crash logs are read from the custom crash log file, dataSize: [\(data.count)], lineCountSinceLastTrim: [\(lineCount)]")
+            return text
         }
     }
 
@@ -75,13 +89,18 @@ final class CrashLogStore {
     /// can be lost to a delete that had not run yet.
     func deleteAll() {
         writeQueue.sync {
+            let discardedLineCount = lineCount
             lineCount = 0
             let url = fileURL
-            guard FileManager.default.fileExists(atPath: url.path) else { return }
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                logger?.d(Self.module, "deleteAll", "no custom crash log file to delete")
+                return
+            }
 
-            logger?.d(Self.module, "deleteAll", "custom crash log file is detected and it is being deleted")
+            logger?.d(Self.module, "deleteAll", "custom crash log file is detected and it is being deleted, lineCountSinceLastTrim: [\(discardedLineCount)]")
             do {
                 try FileManager.default.removeItem(at: url)
+                logger?.d(Self.module, "deleteAll", "custom crash log file is deleted")
             } catch {
                 logger?.w(Self.module, "deleteAll", "custom crash log file can not be deleted, error: [\(error.localizedDescription)]")
             }
@@ -91,7 +110,10 @@ final class CrashLogStore {
     // MARK: - On the write queue
 
     private func appendOnQueue(_ line: String) {
-        guard let data = line.data(using: .utf8) else { return }
+        guard let data = line.data(using: .utf8) else {
+            logger?.d(Self.module, "append", "breadcrumb is dropped, it can not be encoded as utf8, lineLength: [\(line.count)]")
+            return
+        }
         let url = fileURL
 
         // `FileHandle.write(_:)` raises an uncatchable Objective-C exception when
@@ -106,9 +128,10 @@ final class CrashLogStore {
                 try handle.seekToEnd()
                 try handle.write(contentsOf: data)
                 lineCount += 1
-                logger?.v(Self.module, "append", "a line is appended to the custom crash log file, lineLength: [\(line.count)]")
+                logger?.d(Self.module, "append", "a line is appended to the end of the existing custom crash log file, lineLength: [\(line.count)], byteCount: [\(data.count)], lineCountSinceLastTrim: [\(lineCount)]")
             } catch {
-                logger?.w(Self.module, "append", "breadcrumb can not be appended to the custom crash log file, error: [\(error.localizedDescription)]")
+                let nsError = error as NSError
+                logger?.w(Self.module, "append", "breadcrumb can not be appended to the custom crash log file, byteCount: [\(data.count)], errorDomain: [\(nsError.domain)], errorCode: [\(nsError.code)], error: [\(error.localizedDescription)]")
                 return
             }
         } else {
@@ -116,9 +139,10 @@ final class CrashLogStore {
             do {
                 try (existing + data).write(to: url, options: .atomic)
                 lineCount += 1
-                logger?.v(Self.module, "append", "a line is appended to the custom crash log file, lineLength: [\(line.count)]")
+                logger?.d(Self.module, "append", "a line is appended by rewriting the whole custom crash log file, lineLength: [\(line.count)], existingByteCount: [\(existing.count)], lineCountSinceLastTrim: [\(lineCount)]")
             } catch {
-                logger?.w(Self.module, "append", "custom crash log file can not be written, error: [\(error.localizedDescription)]")
+                let nsError = error as NSError
+                logger?.w(Self.module, "append", "custom crash log file can not be written, byteCount: [\(existing.count + data.count)], errorDomain: [\(nsError.domain)], errorCode: [\(nsError.code)], error: [\(error.localizedDescription)]")
                 return
             }
         }
@@ -137,19 +161,25 @@ final class CrashLogStore {
 
         let url = fileURL
         guard let data = try? Data(contentsOf: url),
-              let text = String(data: data, encoding: .utf8) else { return }
+              let text = String(data: data, encoding: .utf8) else {
+            logger?.d(Self.module, "trim", "custom crash log file can not be read back for trimming, it is left as it is, lineCountSinceLastTrim: [\(lineCount)], limit: [\(limit)]")
+            return
+        }
 
-        let kept = text.split(separator: "\n", omittingEmptySubsequences: false)
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
             .filter { !$0.isEmpty }
-            .suffix(limit)
+        let kept = lines.suffix(limit)
+
+        logger?.d(Self.module, "trim", "custom crash log file grew past twice the breadcrumb limit and will be trimmed, fileLineCount: [\(lines.count)], droppedLineCount: [\(lines.count - kept.count)], limit: [\(limit)]")
 
         let rewritten = kept.joined(separator: "\n") + "\n"
         do {
             try Data(rewritten.utf8).write(to: url, options: .atomic)
-            logger?.d(Self.module, "trim", "custom crash log file is trimmed to the breadcrumb limit, keptLineCount: [\(kept.count)], limit: [\(limit)]")
+            logger?.d(Self.module, "trim", "custom crash log file is trimmed to the breadcrumb limit, keptLineCount: [\(kept.count)], byteCount: [\(rewritten.utf8.count)]")
             lineCount = kept.count
         } catch {
-            logger?.w(Self.module, "trim", "custom crash log file can not be trimmed, error: [\(error.localizedDescription)]")
+            let nsError = error as NSError
+            logger?.w(Self.module, "trim", "custom crash log file can not be trimmed, keptLineCount: [\(kept.count)], errorDomain: [\(nsError.domain)], errorCode: [\(nsError.code)], error: [\(error.localizedDescription)]")
         }
     }
 
