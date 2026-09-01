@@ -422,3 +422,35 @@ enum ScreenReader {
     }
 }
 #endif
+
+#if os(macOS)
+/// Screen lookups for the overlay, mirroring the UIKit reader above.
+///
+/// A macOS application has no single "key window" the SDK should present over, and
+/// content is shown in a panel of its own, so what matters here is the screen the
+/// user is actually looking at rather than any window of the host's.
+enum ScreenReader {
+
+    /// The screen carrying the application's key window, or the main screen.
+    static var activeScreen: NSScreen? {
+        NSApplication.shared.keyWindow?.screen ?? NSScreen.main
+    }
+
+    /// Backing scale of the screen content will be shown on.
+    static var screenScale: CGFloat {
+        activeScreen?.backingScaleFactor ?? 2.0
+    }
+
+    /// The area content may occupy: the screen minus the menu bar and the Dock,
+    /// which is what `visibleFrame` reports.
+    ///
+    /// Origin is dropped to zero because the overlay panel is positioned by the
+    /// window server, and the geometry a content page sends is relative to the
+    /// overlay rather than to the desktop.
+    static var screenBounds: CGRect {
+        guard let screen = activeScreen else { return .zero }
+        return CGRect(origin: .zero, size: screen.visibleFrame.size)
+    }
+}
+#endif
+

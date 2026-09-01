@@ -237,8 +237,8 @@ final class ContentTests: CountlyBaseTestCase {
     /// which is the path that matters here: a content that cannot load must not be
     /// left as an invisible rectangle over the application.
     func testAContentInTheResponseIsPresentedAndTornDownWhenItCannotLoad() throws {
-        #if !(os(iOS) || os(visionOS))
-        throw XCTSkip("content is presented in a web view, which only exists on iOS and visionOS")
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("content is presented in a web view, which tvOS and watchOS have no WebKit for")
         #else
         MockURLProtocol.respond(pathContaining: "/o/sdk/content", json: """
         {"html": "https://example.invalid/content.html",
@@ -263,8 +263,8 @@ final class ContentTests: CountlyBaseTestCase {
     /// A response whose `html` is not a usable address is not presented, and must
     /// not leave the zone believing something is on screen.
     func testAContentWithAnUnusableAddressIsNotPresented() throws {
-        #if !(os(iOS) || os(visionOS))
-        throw XCTSkip("content is presented in a web view, which only exists on iOS and visionOS")
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("content is presented in a web view, which tvOS and watchOS have no WebKit for")
         #else
         MockURLProtocol.respond(pathContaining: "/o/sdk/content",
                                 json: #"{"html": "", "geo": {}}"#)
@@ -285,8 +285,8 @@ final class ContentTests: CountlyBaseTestCase {
     /// A preview shows the content whether or not the user qualifies for it, which
     /// is what makes it a preview.
     func testAPreviewPresentsTheContentItAskedFor() throws {
-        #if !(os(iOS) || os(visionOS))
-        throw XCTSkip("content is presented in a web view, which only exists on iOS and visionOS")
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("content is presented in a web view, which tvOS and watchOS have no WebKit for")
         #else
         MockURLProtocol.respond(pathContaining: "/o/sdk/content", json: """
         {"html": "https://example.invalid/preview.html", "geo": {}}
@@ -302,8 +302,8 @@ final class ContentTests: CountlyBaseTestCase {
     /// While a content is on screen the zone stops asking for another one, because
     /// there is only one slot and a second answer would be thrown away.
     func testNothingIsFetchedWhileAContentIsOnScreen() throws {
-        #if !(os(iOS) || os(visionOS))
-        throw XCTSkip("content is presented in a web view, which only exists on iOS and visionOS")
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("content is presented in a web view, which tvOS and watchOS have no WebKit for")
         #else
         MockURLProtocol.respond(pathContaining: "/o/sdk/content", json: """
         {"html": "https://example.invalid/content.html", "geo": {}}

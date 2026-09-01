@@ -8,7 +8,7 @@
 
 // The action parser lives in the web view manager, which is only compiled where
 // there is a web view to manage.
-#if os(iOS) || os(visionOS)
+#if os(iOS) || os(visionOS) || os(macOS)
 
 import XCTest
 @testable import Countly

@@ -6,7 +6,7 @@
 //  Please visit www.count.ly for more information.
 //
 
-#if os(iOS) || os(visionOS)
+#if os(iOS) || os(visionOS) || os(macOS)
 
 import XCTest
 import WebKit
@@ -463,9 +463,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
 
         XCTAssertFalse(dismissed)
     }
-
-    // MARK: - Layout
-
+    #if os(iOS) || os(visionOS)
     /// A page pinned to portrait keeps its layout when the interface rotates, which
     /// is what `disableRotation` is for.
     func testAPagePinnedToPortraitIgnoresAnInterfaceSizeChange() {
@@ -485,6 +483,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
 
         XCTAssertEqual(onMain { self.page(of: manager)?.frame }, before)
     }
+    #endif
 
     // MARK: - Reading the queue
 
@@ -496,6 +495,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
     }
 }
 
+#if os(iOS) || os(visionOS)
 /// The minimum a `viewWillTransition` needs, since the real one only exists during
 /// an actual rotation.
 private final class DummyTransitionCoordinator: NSObject, UIViewControllerTransitionCoordinator {
@@ -533,7 +533,9 @@ private final class DummyTransitionCoordinator: NSObject, UIViewControllerTransi
     // protocol on the platforms that have it.
     func notifyWhenInteractionEnds(_ handler: @escaping (UIViewControllerTransitionCoordinatorContext) -> Void) {}
     #endif
+
     func notifyWhenInteractionChanges(_ handler: @escaping (UIViewControllerTransitionCoordinatorContext) -> Void) {}
 }
+#endif
 
 #endif

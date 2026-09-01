@@ -8,7 +8,9 @@
 
 import Foundation
 
-#if os(iOS) || os(visionOS)
+#if os(macOS)
+import AppKit
+#elseif os(iOS) || os(visionOS)
 import UIKit
 #endif
 
@@ -64,7 +66,7 @@ final class ContentModule: ModuleBase {
     /// change its mind in.
     private var zoneGeneration: UInt = 0
 
-    #if os(iOS) || os(visionOS)
+    #if os(iOS) || os(visionOS) || os(macOS)
     private var webViewManager: WebViewManager?
     #endif
 
@@ -295,7 +297,7 @@ final class ContentModule: ModuleBase {
     /// The slot is released as part of the teardown rather than before it, so a
     /// fetch cannot present a second web view mid-dismissal.
     private func closeShownContent() {
-        #if os(iOS) || os(visionOS)
+        #if os(iOS) || os(visionOS) || os(macOS)
         if Thread.isMainThread {
             tearDownShownContent()
             return
@@ -313,7 +315,7 @@ final class ContentModule: ModuleBase {
         #endif
     }
 
-    #if os(iOS) || os(visionOS)
+    #if os(iOS) || os(visionOS) || os(macOS)
     private func tearDownShownContent() {
         if let manager = webViewManager {
             logI("tearDownShownContent", "closing the currently shown content")
@@ -378,18 +380,20 @@ final class ContentModule: ModuleBase {
             }
 
             if let error {
-                self.logD("fetchContents", "fetching the content details failed, it will be retried on the next content zone tick, error: [\(error.localizedDescription)]")
+                let nsError = error as NSError
+                self.logD("fetchContents", "fetching the content details failed, it will be retried on the next content zone tick, error: [\(nsError.localizedDescription)], domain: [\(nsError.domain)], code: [\(nsError.code)]")
                 failure?()
                 return
             }
 
             guard let payload = CountlyJSON.object(from: data, logger: self.log) as? [String: Any] else {
-                self.logD("fetchContents", "failed to parse the content details JSON or the response was empty, it will be retried on the next content zone tick")
+                self.logD("fetchContents", "failed to parse the content details JSON or the response was empty, it will be retried on the next content zone tick, responseLength: [\(data?.count ?? 0)]")
                 failure?()
                 return
             }
 
-            self.logV("fetchContents", "the content details response parsed, url: [\(response?.url?.absoluteString ?? "")], jsonResponse: [\(payload)]")
+            self.logD("fetchContents", "the content details response parsed, statusCode: [\((response as? HTTPURLResponse)?.statusCode ?? 0)], responseLength: [\(data?.count ?? 0)]")
+            self.logD("fetchContents", "the content details response detail, url: [\(response?.url?.absoluteString ?? "")], jsonResponse: [\(payload)]")
 
             guard let html = payload["html"] as? String else {
                 self.logD("fetchContents", "the content details response carries no content")
@@ -420,7 +424,16 @@ final class ContentModule: ModuleBase {
         }
 
         queryString = core.network.builder.appendChecksum(queryString)
-        return core.network.instantRequest(queryString: queryString, path: Self.endpoint)
+        let request = core.network.instantRequest(queryString: queryString, path: Self.endpoint)
+
+        // Both halves of the request are printed, because which one carries the
+        // query depends on its length and on `alwaysUsePOST`, and a content fetch
+        // that the server answers with nothing is usually a question about what was
+        // asked for.
+        logD("fetchRequest",
+             "the content fetch request built, method: [\(request.httpMethod ?? "GET")], url: [\(request.url?.absoluteString ?? "")], body: [\(request.httpBody.map { String(decoding: $0, as: UTF8.self) } ?? "")]")
+
+        return request
     }
 
     /// The screen dimensions the server places content against.
@@ -428,7 +441,7 @@ final class ContentModule: ModuleBase {
     /// Both orientations are reported so the server can prepare a layout for each,
     /// whichever the device is in now.
     private func resolutionJSON() -> String {
-        #if os(iOS) || os(visionOS)
+        #if os(iOS) || os(visionOS) || os(macOS)
         let size = windowSize()
         let isLandscape = size.width > size.height
         let shortSide = isLandscape ? size.height : size.width
@@ -440,24 +453,30 @@ final class ContentModule: ModuleBase {
         ]
 
         logD("resolutionJSON", "resolution reported to the server, portraitWidth: [\(shortSide)], portraitHeight: [\(longSide)], isLandscape: [\(isLandscape)]")
+        logD("resolutionJSON", "the resolution payload detail, resolutionDict: [\(payload)]")
         return CountlyJSON.string(from: payload, logger: log) ?? "{}"
         #else
         return "{}"
         #endif
     }
 
-    #if os(iOS) || os(visionOS)
+    #if os(iOS) || os(visionOS) || os(macOS)
+    /// The area a content page may occupy, with any hardware cutout taken out.
+    ///
+    /// The same rule places what comes back, so the page is laid out at the size it
+    /// is actually going to be given. See `ContentGeometry`.
     private func windowSize() -> CGSize {
-        ScreenReader.screenBounds.size
+        ContentGeometry.windowSize(displayOption: core.config.content.webViewDisplayOption)
     }
     #endif
 
     // MARK: - Presentation
 
     private func showContent(urlString: String, placement: [String: Any]) {
-        #if os(iOS) || os(visionOS)
+        #if os(iOS) || os(visionOS) || os(macOS)
         guard let url = URL(string: urlString), url.scheme != nil, url.host != nil else {
             logE("showContent", "the content URL is not valid, urlLength: [\(urlString.count)]")
+            logD("showContent", "the invalid content URL detail, url: [\(urlString)]")
             return
         }
 
@@ -488,7 +507,8 @@ final class ContentModule: ModuleBase {
             // trait collection is safe.
             let themedURL = URL(string: DeviceMetrics.urlStringByAppendingThemeMode(urlString)) ?? url
 
-            self.logI("showContent", "showing a content, host: [\(themedURL.host ?? "")], path: [\(themedURL.path)], isLandscape: [\(isLandscape)]")
+            self.logI("showContent", "showing a content, host: [\(themedURL.host ?? "")], path: [\(themedURL.path)], frame: [\(frame)], isLandscape: [\(isLandscape)], rotationDisabled: [\(self.core.config.content.disableRotation)]")
+            self.logD("showContent", "the content being shown detail, url: [\(themedURL.absoluteString)], windowSize: [\(windowSize)], placementCoordinates: [\(placement)]")
 
             let manager = WebViewManager(core: self.core)
             self.webViewManager = manager

@@ -21,7 +21,7 @@ Pod::Spec.new do |s|
     core.ios.frameworks = ['Foundation', 'UIKit', 'UserNotifications', 'CoreLocation', 'WebKit', 'CoreTelephony']
     core.tvos.frameworks = ['Foundation', 'UIKit', 'CoreLocation']
     core.watchos.frameworks = ['Foundation', 'WatchKit', 'CoreLocation']
-    core.osx.frameworks = ['Foundation', 'AppKit', 'IOKit', 'UserNotifications', 'CoreLocation']
+    core.osx.frameworks = ['Foundation', 'AppKit', 'IOKit', 'UserNotifications', 'CoreLocation', 'WebKit']
     core.visionos.frameworks = ['Foundation', 'UIKit', 'UserNotifications', 'CoreLocation', 'WebKit']
   end
 
