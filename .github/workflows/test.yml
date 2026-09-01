@@ -146,7 +146,14 @@ jobs:
   # rows would put a pull request into the hours.
   simulators:
     name: xcodebuild test (${{ matrix.platform }})
+    # `needs` here is for sequencing, not for gating. The account has one concurrent
+    # macOS runner, so this keeps the simulator cells behind the macOS job rather than
+    # fighting it for the runner. Without `if: always()` a plain `needs` also stops them
+    # running whenever macOS is red, which is backwards: these cells are the diagnostics,
+    # so a failure is exactly when their result is worth having. One flaky macOS test was
+    # otherwise enough to lose the signal from all four other platforms at once.
     needs: macos
+    if: always()
     runs-on: macos-15
     continue-on-error: true
     strategy:
@@ -302,9 +309,10 @@ jobs:
   report:
     name: Report the results on the pull request
     needs: [macos, simulators]
-    # `always()` is load bearing twice over. Without it a failing macOS job would skip this and
-    # produce no report, which is exactly the run where the report matters most; and
-    # `simulators` is skipped outright when `macos` fails, which would otherwise skip this too.
+    # `always()` is load bearing: without it a failing macOS job would skip this and produce no
+    # report, which is exactly the run where the report matters most. It used to be needed for a
+    # second reason too, that `simulators` was skipped outright whenever `macos` failed. That is
+    # fixed at the cause now, on the `simulators` job itself, rather than worked around here.
     if: always()
     runs-on: ubuntu-latest
     permissions:
