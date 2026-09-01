@@ -105,7 +105,7 @@ final class ContentModule: ModuleBase {
         let delay = core.clock.timeSinceLaunch() < contentInitialDelay ? contentInitialDelay : 0
         let interval = TimeInterval(core.config.content.zoneTimerInterval)
 
-        logD("enterContentZone", "content zone entered, initialDelay: [\(delay)], zoneTimerInterval: [\(interval)]")
+        logD("enterContentZone", "content zone entered, initialDelay: [\(delay)], zoneTimerInterval: [\(interval.logValue)]")
 
         DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(delay)) { [weak self] in
             guard let self else { return }
@@ -387,13 +387,13 @@ final class ContentModule: ModuleBase {
             }
 
             guard let payload = CountlyJSON.object(from: data, logger: self.log) as? [String: Any] else {
-                self.logD("fetchContents", "failed to parse the content details JSON or the response was empty, it will be retried on the next content zone tick, responseLength: [\(data?.count ?? 0)]")
+                self.logD("fetchContents", "failed to parse the content details JSON or the response was empty, it will be retried on the next content zone tick, responseSize: [\(data?.count ?? 0)]")
                 failure?()
                 return
             }
 
-            self.logD("fetchContents", "the content details response parsed, statusCode: [\((response as? HTTPURLResponse)?.statusCode ?? 0)], responseLength: [\(data?.count ?? 0)]")
-            self.logD("fetchContents", "the content details response detail, url: [\(response?.url?.absoluteString ?? "")], jsonResponse: [\(payload)]")
+            self.logD("fetchContents", "the content details response parsed, statusCode: [\((response as? HTTPURLResponse)?.statusCode ?? 0)], responseSize: [\(data?.count ?? 0)]")
+            self.logD("fetchContents", "content details response detail, url: [\(response?.url?.absoluteString ?? "")], response: [\(payload)]")
 
             guard let html = payload["html"] as? String else {
                 self.logD("fetchContents", "the content details response carries no content")
@@ -452,9 +452,14 @@ final class ContentModule: ModuleBase {
             "landscape": ["height": shortSide, "width": longSide],
         ]
 
-        logD("resolutionJSON", "resolution reported to the server, portraitWidth: [\(shortSide)], portraitHeight: [\(longSide)], isLandscape: [\(isLandscape)]")
-        logD("resolutionJSON", "the resolution payload detail, resolutionDict: [\(payload)]")
-        return CountlyJSON.string(from: payload, logger: log) ?? "{}"
+        // The serialized form rather than the dictionary: this is what goes on the
+        // wire, and a printed dictionary shows its numbers as `874.0` and its keys
+        // in whatever order the hash landed in.
+        let json = CountlyJSON.string(from: payload, logger: log) ?? "{}"
+
+        logD("resolutionJSON", "resolution reported to the server, portraitWidth: [\(shortSide.logValue)], portraitHeight: [\(longSide.logValue)], isLandscape: [\(isLandscape)]")
+        logD("resolutionJSON", "resolution payload detail, resolution: [\(json)]")
+        return json
         #else
         return "{}"
         #endif
@@ -476,7 +481,7 @@ final class ContentModule: ModuleBase {
         #if os(iOS) || os(visionOS) || os(macOS)
         guard let url = URL(string: urlString), url.scheme != nil, url.host != nil else {
             logE("showContent", "the content URL is not valid, urlLength: [\(urlString.count)]")
-            logD("showContent", "the invalid content URL detail, url: [\(urlString)]")
+            logD("showContent", "invalid content URL detail, url: [\(urlString)]")
             return
         }
 
@@ -507,8 +512,8 @@ final class ContentModule: ModuleBase {
             // trait collection is safe.
             let themedURL = URL(string: DeviceMetrics.urlStringByAppendingThemeMode(urlString)) ?? url
 
-            self.logI("showContent", "showing a content, host: [\(themedURL.host ?? "")], path: [\(themedURL.path)], frame: [\(frame)], isLandscape: [\(isLandscape)], rotationDisabled: [\(self.core.config.content.disableRotation)]")
-            self.logD("showContent", "the content being shown detail, url: [\(themedURL.absoluteString)], windowSize: [\(windowSize)], placementCoordinates: [\(placement)]")
+            self.logI("showContent", "showing a content, host: [\(themedURL.host ?? "")], path: [\(themedURL.path)], frame: [\(frame.logValue)], isLandscape: [\(isLandscape)], rotationDisabled: [\(self.core.config.content.disableRotation)]")
+            self.logD("showContent", "shown content detail, url: [\(themedURL.absoluteString)], windowSize: [\(windowSize.logValue)], placementCoordinates: [\(placement)]")
 
             let manager = WebViewManager(core: self.core)
             self.webViewManager = manager

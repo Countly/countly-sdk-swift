@@ -36,6 +36,23 @@ final class RemoteConfigTests: CountlyBaseTestCase {
         }
     }
 
+    /// Answers the remote config download but leaves the A/B enrolment unanswered.
+    ///
+    /// Enrolment requests go to `/o/sdk` as well, so a handler that answers the
+    /// whole path answers those too, and the request queue then drains the
+    /// enrolment out of itself in the background. A test that reads the queue
+    /// afterwards is racing that drain: on a fast machine it wins, on a loaded CI
+    /// runner it does not. Leaving the enrolment to the mock's default connection
+    /// failure keeps it at the head of the queue, which is exactly what the queue
+    /// assertions are written against.
+    private func respondToDownloadOnly(json: String) {
+        MockURLProtocol.respond { request in
+            guard request.path.contains("/o/sdk") else { return nil }
+            guard !request.query.contains("method=ab") else { return nil }
+            return (200, Data(json.utf8))
+        }
+    }
+
     /// Waits for `completion` to be invoked, failing the test if it never is.
     ///
     /// A remote config call that captures a completion handler and never calls it
@@ -263,7 +280,7 @@ final class RemoteConfigTests: CountlyBaseTestCase {
     /// Reading a value is what makes the device part of the experiment, so the
     /// enrollment is tied to the read rather than to the download.
     func testReadingAValueAndEnrollingAsksToBeEnrolled() {
-        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"colour": "blue"}"#)
+        respondToDownloadOnly(json: #"{"colour": "blue"}"#)
         let countly = startInstance()
 
         expectCompletion("the download reports back") { done in
@@ -273,11 +290,14 @@ final class RemoteConfigTests: CountlyBaseTestCase {
         let before = requestQueue(of: countly).count
         XCTAssertEqual(countly.remoteConfig.getValueAndEnroll("colour").value as? String, "blue")
 
-        let enrolments = requestQueue(of: countly)
+        // One snapshot answers both questions: reading the queue twice would let it
+        // change between the two reads.
+        let queued = requestQueue(of: countly)
+        let enrolments = queued
             .map(TestUtils.parseQuery)
             .filter { $0["method"] as? String == "ab" }
         XCTAssertEqual(enrolments.count, 1)
-        XCTAssertGreaterThan(requestQueue(of: countly).count, before)
+        XCTAssertGreaterThan(queued.count, before)
     }
 
     /// A key with no value is not an experiment the device is in, so reading it
@@ -292,7 +312,7 @@ final class RemoteConfigTests: CountlyBaseTestCase {
     }
 
     func testReadingEveryValueAndEnrollingCoversThemAllAtOnce() {
-        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"a": 1, "b": 2}"#)
+        respondToDownloadOnly(json: #"{"a": 1, "b": 2}"#)
         let countly = startInstance()
 
         expectCompletion("the download reports back") { done in

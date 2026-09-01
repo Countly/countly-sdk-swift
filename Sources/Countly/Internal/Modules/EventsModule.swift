@@ -45,7 +45,7 @@ final class EventsModule: ModuleBase {
                      count: Int = 1,
                      sum: Double = 0,
                      duration: TimeInterval = 0) {
-        logI("recordEvent", "recording an event, key: [\(key)], segmentationKeyCount: [\(segmentation?.count ?? 0)], count: [\(count)], sum: [\(sum)], duration: [\(duration)]")
+        logI("recordEvent", "recording an event, key: [\(key)], segmentationKeyCount: [\(segmentation?.count ?? 0)], count: [\(count)], sum: [\(sum.logValue)], duration: [\(duration.logSeconds)]")
         logV("recordEvent", "event segmentation detail, key: [\(key)], segmentation: [\(segmentation ?? [:])]")
 
         if let reservedConsent = consentForReservedEvent(key) {
@@ -129,7 +129,7 @@ final class EventsModule: ModuleBase {
 
     /// Ends a timer and records the event.
     func endEvent(_ key: String, segmentation: [String: Any]? = nil, count: Int = 1, sum: Double = 0) {
-        logI("endEvent", "ending a timed event, key: [\(key)], segmentationKeyCount: [\(segmentation?.count ?? 0)], count: [\(count)], sum: [\(sum)]")
+        logI("endEvent", "ending a timed event, key: [\(key)], segmentationKeyCount: [\(segmentation?.count ?? 0)], count: [\(count)], sum: [\(sum.logValue)]")
         logV("endEvent", "timed event end segmentation detail, key: [\(key)], segmentation: [\(segmentation ?? [:])]")
 
         guard core.modules.consent.hasConsent(for: .events) else {

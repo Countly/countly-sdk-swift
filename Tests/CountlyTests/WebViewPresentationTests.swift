@@ -326,6 +326,21 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         XCTAssertEqual(after?.width, 120)
     }
 
+    /// The frame the page is given already clears the safe area, so a scroll view
+    /// insetting for it a second time makes a page that exactly fills its slot
+    /// taller than the slot: it scrolls, and its buttons are cut off at the bottom.
+    #if !os(macOS)
+    func testTheScrollViewDoesNotInsetForTheSafeAreaASecondTime() {
+        let countly = startInstance()
+
+        let manager = present(countly)
+        waitForLoad(manager)
+
+        let behavior = onMain { self.page(of: manager)?.scrollView.contentInsetAdjustmentBehavior }
+        XCTAssertEqual(behavior, .never)
+    }
+    #endif
+
     func testAMalformedResizeRequestIsIgnored() {
         let countly = startInstance()
 

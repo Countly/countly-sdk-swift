@@ -191,7 +191,7 @@ final class ConnectionManager: NSObject {
 
     private func finishDrain() {
         let elapsed = drainStartTime.map { -$0.timeIntervalSinceNow } ?? 0
-        core.logger.d(Self.module, "proceedOnQueue", "request queue is empty, all requests are processed, totalTimeTaken: [\(String(format: "%.2f", elapsed))]")
+        core.logger.d(Self.module, "proceedOnQueue", "request queue is empty, all requests are processed, totalTimeTaken: [\(elapsed.logSeconds)]")
 
         if !hasAnyRequestFailed {
             var runnables: [() -> Void] = []
@@ -415,7 +415,7 @@ final class ConnectionManager: NSObject {
         let ageSeconds = queryString.requestAgeSeconds
         guard ageSeconds <= Double(core.serverConfig.bomRequestAge) * 3600.0 else { return false }
 
-        core.logger.w(Self.module, "shouldBackOff", "backoff is triggered, responseTime: [\(responseTimeSeconds)], remainingRequestCount: [\(remaining)], requestCountThreshold: [\(threshold)], requestAge: [\(String(format: "%.2f", ageSeconds))]")
+        core.logger.w(Self.module, "shouldBackOff", "backoff is triggered, responseTime: [\(responseTimeSeconds)], remainingRequestCount: [\(remaining)], requestCountThreshold: [\(threshold)], requestAge: [\(ageSeconds.logSeconds)]")
         core.healthTracker.logBackoffRequest()
         return true
     }

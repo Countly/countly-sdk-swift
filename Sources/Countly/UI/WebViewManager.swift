@@ -123,8 +123,8 @@ final class WebViewManager: NSObject {
         isPinnedToPortrait = !isFeedbackWidget && core.config.content.disableRotation
 
         // Host and path only: the query string carries the app key and device ID.
-        core.logger.i(Self.module, "present", "web view presentation requested, host: [\(url.host ?? "")], path: [\(url.path)], isFeedbackWidget: [\(isFeedbackWidget)], pinnedToPortrait: [\(isPinnedToPortrait)], appearCallbackProvided: [\(appear != nil)], dismissCallbackProvided: [\(dismiss != nil)]")
-        core.logger.d(Self.module, "present", "web view presentation URL detail, url: [\(url.absoluteString)]")
+        core.logger.i(Self.module, "present", "web view presentation requested, host: [\(url.host ?? "")], path: [\(url.path)], isFeedbackWidget: [\(isFeedbackWidget)], pinnedToPortrait: [\(isPinnedToPortrait)]")
+        core.logger.d(Self.module, "present", "web view presentation detail, url: [\(url.absoluteString)], appearCallbackProvided: [\(appear != nil)], dismissCallbackProvided: [\(dismiss != nil)]")
 
         appearBlock = appear
         dismissBlock = dismiss
@@ -176,7 +176,7 @@ final class WebViewManager: NSObject {
 
         let targetFrame = frame ?? background.bounds
         baseWebViewFrame = targetFrame
-        core.logger.d(Self.module, "present", "frames computed, webViewFrame: [\(targetFrame)], backgroundFrame: [\(background.bounds)]")
+        core.logger.d(Self.module, "present", "the presentation frames were computed, webViewFrame: [\(targetFrame.logValue)], backgroundFrame: [\(background.bounds.logValue)]")
 
         let web = WKWebView(frame: targetFrame, configuration: configuration)
         web.navigationDelegate = self
@@ -312,7 +312,7 @@ final class WebViewManager: NSObject {
 
         guard placed != webView.frame else { return }
 
-        core.logger.d(Self.module, "applySafeAreaPlacement", "the page is placed clear of the safe area, baseFrame: [\(base)], offset: [\(offset)], frame: [\(placed)]")
+        core.logger.d(Self.module, "applySafeAreaPlacement", "the page is placed clear of the safe area, baseFrame: [\(base.logValue)], offset: [\(offset.logValue)], frame: [\(placed.logValue)]")
         webView.frame = placed
     }
 
@@ -322,7 +322,7 @@ final class WebViewManager: NSObject {
         guard let backgroundView, webView != nil else { return }
 
         let filled = CGRect(origin: .zero, size: backgroundView.effectiveSize)
-        core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed, the page is re-laid out, frame: [\(filled)]")
+        core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed and the page is re-laid out, frame: [\(filled.logValue)]")
         baseWebViewFrame = filled
         applySafeAreaPlacement()
     }
@@ -346,8 +346,8 @@ final class WebViewManager: NSObject {
 
         let frame = CGRect(contentGeometry: geometry, container: backgroundView.effectiveSize)
 
-        core.logger.d(Self.module, "resize", "the page asked to be resized, orientation: [\(isPortrait ? "portrait" : "landscape")], width: [\(frame.width)], height: [\(frame.height)]")
-        core.logger.d(Self.module, "resize", "the resize payload detail, frame: [\(frame)], resizeDict: [\(parameters)]")
+        core.logger.d(Self.module, "resize", "the page asked to be resized, orientation: [\(isPortrait ? "portrait" : "landscape")], frame: [\(frame.logValue)]")
+        core.logger.d(Self.module, "resize", "resize payload detail, resizeGeometry: [\(parameters)]")
 
         baseWebViewFrame = frame
         applySafeAreaPlacement()
@@ -369,7 +369,7 @@ final class WebViewManager: NSObject {
         guard let action = parameters["action"] as? String else { return }
 
         core.logger.d(Self.module, "handleAction", "a content action was received, action: [\(action)]")
-        core.logger.d(Self.module, "handleAction", "the content action detail, action: [\(action)], queryParameters: [\(parameters)]")
+        core.logger.d(Self.module, "handleAction", "content action detail, action: [\(action)], queryParameters: [\(parameters)]")
 
         switch action {
         case "event":
@@ -394,11 +394,11 @@ final class WebViewManager: NSObject {
     private func recordEvents(fromJSON json: String) {
         guard let events = CountlyJSON.object(from: Data(json.utf8), logger: core.logger) as? [[String: Any]] else {
             core.logger.e(Self.module, "recordEvents", "the content events payload is nil or not an array, ignoring the action")
-            core.logger.d(Self.module, "recordEvents", "the unparsable content events detail, jsonLength: [\(json.count)], json: [\(json)]")
+            core.logger.d(Self.module, "recordEvents", "unparsable content events detail, jsonLength: [\(json.count)], json: [\(json)]")
             return
         }
 
-        core.logger.d(Self.module, "recordEvents", "content events JSON parsed, json: [\(json)], events: [\(events)]")
+        core.logger.d(Self.module, "recordEvents", "content events payload detail, events: [\(events)]")
 
         var skipped = 0
         for event in events {
@@ -425,14 +425,14 @@ final class WebViewManager: NSObject {
             }
 
             core.logger.d(Self.module, "recordEvents", "recording a content event, key: [\(key)]")
-            core.logger.d(Self.module, "recordEvents", "the content event detail, key: [\(key)], segmentation: [\(segmentation)]")
+            core.logger.d(Self.module, "recordEvents", "content event detail, key: [\(key)], segmentation: [\(segmentation)]")
             core.modules.events.recordEvent(key, segmentation: segmentation)
         }
 
         if skipped > 0 {
-            core.logger.d(Self.module, "recordEvents", "some content events were dropped, dropped: [\(skipped)], recorded: [\(events.count - skipped)]")
+            core.logger.d(Self.module, "recordEvents", "some content events were dropped, droppedCount: [\(skipped)], recordedCount: [\(events.count - skipped)]")
         } else {
-            core.logger.i(Self.module, "recordEvents", "content events recorded, count: [\(events.count)]")
+            core.logger.i(Self.module, "recordEvents", "content events recorded, recordedCount: [\(events.count)]")
         }
 
         core.modules.events.addEventsToRequestQueue()
@@ -443,7 +443,7 @@ final class WebViewManager: NSObject {
     /// Hands a link to the host application, or to the browser.
     private func openExternalLink(_ urlString: String) {
         core.logger.d(Self.module, "openExternalLink", "an external link was requested by the content, linkLength: [\(urlString.count)]")
-        core.logger.d(Self.module, "openExternalLink", "the external link detail, link: [\(urlString)]")
+        core.logger.d(Self.module, "openExternalLink", "external link detail, link: [\(urlString)]")
 
         var url = URL(string: urlString)
         if url == nil {
@@ -460,18 +460,18 @@ final class WebViewManager: NSObject {
 
         if let handler = core.config.content.contentURLHandler, handler(url) {
             core.logger.i(Self.module, "openExternalLink", "the URL was handled by the app's content URL handler, host: [\(url.host ?? "")], path: [\(url.path)]")
-            core.logger.d(Self.module, "openExternalLink", "the URL handed to the app's content URL handler, url: [\(url.absoluteString)]")
+            core.logger.d(Self.module, "openExternalLink", "app content URL handler detail, url: [\(url.absoluteString)]")
             return
         }
 
         #if os(macOS)
         // AppKit answers synchronously and has no completion handler.
         let opened = NSWorkspace.shared.open(url)
-        core.logger.i(Self.module, "openExternalLink", "the URL was handed to the browser, host: [\(url.host ?? "")], opened: [\(opened)]")
+        core.logger.i(Self.module, "openExternalLink", "the URL was handed to the system browser, host: [\(url.host ?? "")], path: [\(url.path)], opened: [\(opened)]")
         #else
         UIApplication.shared.open(url, options: [:]) { [weak self] success in
             self?.core.logger.i(Self.module, "openExternalLink", "the URL was handed to the browser, host: [\(url.host ?? "")], path: [\(url.path)], opened: [\(success)]")
-            self?.core.logger.d(Self.module, "openExternalLink", "the URL handed to the browser, url: [\(url.absoluteString)], opened: [\(success)]")
+            self?.core.logger.d(Self.module, "openExternalLink", "browser link detail, url: [\(url.absoluteString)], opened: [\(success)]")
         }
         #endif
     }
@@ -807,7 +807,7 @@ final class WebViewManager: NSObject {
         cancelStallTimer()
 
         let delay = Self.resourceRetryBaseDelay * TimeInterval(resourceRetryCount)
-        core.logger.d(Self.module, "attemptRecovery", "scheduling a reload, attempt: [\(resourceRetryCount)], maxAttempts: [\(Self.maxResourceRetries)], delay: [\(delay)], reason: [\(reason)]")
+        core.logger.d(Self.module, "attemptRecovery", "scheduling a reload, attempt: [\(resourceRetryCount)], maxAttempts: [\(Self.maxResourceRetries)], delay: [\(delay.logSeconds)], reason: [\(reason)]")
 
         let reload = DispatchWorkItem { [weak self] in
             guard let self else { return }
@@ -895,14 +895,14 @@ extension WebViewManager: WKNavigationDelegate {
 
         // Host and path only, and no header names: both a response header and a URL
         // query string can carry an identifier.
-        core.logger.d(Self.module, "decidePolicyForResponse", "navigation response received, host: [\(response.url?.host ?? "")], path: [\(response.url?.path ?? "")], mimeType: [\(response.mimeType ?? "")], status: [\(statusCode)], headerCount: [\(headers.count)]")
-        core.logger.d(Self.module, "decidePolicyForResponse", "navigation response detail, url: [\(response.url?.absoluteString ?? "")], status: [\(statusCode)], headers: [\(headers)]")
+        core.logger.d(Self.module, "decidePolicyForResponse", "navigation response received, host: [\(response.url?.host ?? "")], path: [\(response.url?.path ?? "")], mimeType: [\(response.mimeType ?? "")], statusCode: [\(statusCode)], headerCount: [\(headers.count)]")
+        core.logger.d(Self.module, "decidePolicyForResponse", "navigation response detail, url: [\(response.url?.absoluteString ?? "")], statusCode: [\(statusCode)], headers: [\(headers)]")
 
         // An error page is not content. Rendering it puts the server's 404 body over
         // the application with no close control on it, so the navigation is refused
         // and the overlay taken down instead.
         if statusCode >= 400 {
-            core.logger.e(Self.module, "decidePolicyForResponse", "cancelling the navigation because of an HTTP error status, status: [\(statusCode)], path: [\(response.url?.path ?? "")], dismissing the web view, reason: [http-error]")
+            core.logger.e(Self.module, "decidePolicyForResponse", "cancelling the navigation and dismissing the web view because of an HTTP error status, statusCode: [\(statusCode)], path: [\(response.url?.path ?? "")], reason: [http-error]")
             decisionHandler(.cancel)
             // Deferred rather than closed here: this runs inside WebKit's own policy
             // callback, and tearing the web view down underneath it is not safe.
@@ -916,30 +916,30 @@ extension WebViewManager: WKNavigationDelegate {
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         loadStartedAt = Date()
         core.logger.d(Self.module, "didStartProvisionalNavigation", "the navigation started, host: [\(webView.url?.host ?? "")], path: [\(webView.url?.path ?? "")], reloadOnStall: [\(core.config.content.enableContentReloadOnStall)]")
-        core.logger.d(Self.module, "didStartProvisionalNavigation", "the navigation started URL detail, url: [\(webView.url?.absoluteString ?? "")]")
+        core.logger.d(Self.module, "didStartProvisionalNavigation", "started navigation detail, url: [\(webView.url?.absoluteString ?? "")]")
     }
 
     func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) {
         core.logger.d(Self.module, "didReceiveServerRedirect", "a server redirect was received for the provisional navigation, host: [\(webView.url?.host ?? "")], path: [\(webView.url?.path ?? "")]")
-        core.logger.d(Self.module, "didReceiveServerRedirect", "server redirect destination detail, url: [\(webView.url?.absoluteString ?? "")]")
+        core.logger.d(Self.module, "didReceiveServerRedirect", "server redirect detail, url: [\(webView.url?.absoluteString ?? "")]")
     }
 
     func webView(_ webView: WKWebView,
                  didReceive challenge: URLAuthenticationChallenge,
                  completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-        core.logger.d(Self.module, "didReceiveChallenge", "an authentication challenge was received, host: [\(challenge.protectionSpace.host)], authenticationMethod: [\(challenge.protectionSpace.authenticationMethod)], performing the default handling")
+        core.logger.d(Self.module, "didReceiveChallenge", "an authentication challenge was received and the default handling is performed, host: [\(challenge.protectionSpace.host)], authenticationMethod: [\(challenge.protectionSpace.authenticationMethod)]")
         completionHandler(.performDefaultHandling, nil)
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         core.logger.e(Self.module, "webContentProcessDidTerminate", "the web content process terminated, host: [\(webView.url?.host ?? "")], path: [\(webView.url?.path ?? "")]")
-        core.logger.d(Self.module, "webContentProcessDidTerminate", "the terminated web content process URL detail, url: [\(webView.url?.absoluteString ?? "")]")
+        core.logger.d(Self.module, "webContentProcessDidTerminate", "terminated web content process detail, url: [\(webView.url?.absoluteString ?? "")]")
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         let duration = loadStartedAt.map { Date().timeIntervalSince($0) } ?? 0
-        core.logger.d(Self.module, "didFinish", "the page finished loading, host: [\(webView.url?.host ?? "")], path: [\(webView.url?.path ?? "")], duration: [\(duration)]")
-        core.logger.d(Self.module, "didFinish", "the page that finished loading URL detail, url: [\(webView.url?.absoluteString ?? "")]")
+        core.logger.d(Self.module, "didFinish", "the page finished loading, host: [\(webView.url?.host ?? "")], path: [\(webView.url?.path ?? "")], duration: [\(duration.logSeconds)]")
+        core.logger.d(Self.module, "didFinish", "finished navigation detail, url: [\(webView.url?.absoluteString ?? "")]")
 
         // The load completing is progress, whatever the deadline thought. The
         // deadline is re-armed rather than dropped, because content still has to
@@ -957,13 +957,13 @@ extension WebViewManager: WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         let failure = error as NSError
-        core.logger.d(Self.module, "didFail", "the page failed to load after being committed, error: [\(failure.localizedDescription)], domain: [\(failure.domain)], code: [\(failure.code)], dismissing the web view, reason: [navigation-failure]")
+        core.logger.d(Self.module, "didFail", "the page failed to load after being committed and the web view is dismissed, error: [\(failure.localizedDescription)], domain: [\(failure.domain)], code: [\(failure.code)], reason: [navigation-failure]")
         close()
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         let failure = error as NSError
-        core.logger.d(Self.module, "didFailProvisionalNavigation", "the page failed to start loading, error: [\(failure.localizedDescription)], domain: [\(failure.domain)], code: [\(failure.code)], dismissing the web view, reason: [navigation-failure]")
+        core.logger.d(Self.module, "didFailProvisionalNavigation", "the page failed to start loading and the web view is dismissed, error: [\(failure.localizedDescription)], domain: [\(failure.domain)], code: [\(failure.code)], reason: [navigation-failure]")
         close()
     }
 }

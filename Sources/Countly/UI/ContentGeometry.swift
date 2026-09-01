@@ -46,18 +46,31 @@ enum ContentGeometry {
 
     private static var safeAreaInsets: UIEdgeInsets { window?.safeAreaInsets ?? .zero }
 
+    static func windowSize(displayOption: WebViewDisplayOption) -> CGSize {
+        // Falls back to the screen when there is no window to read, which is the
+        // one case where the insets are unknowable. Reporting a zero size instead
+        // would have the server lay the content out against nothing.
+        contentSize(in: window?.bounds.size ?? ScreenReader.screenBounds.size,
+                    insets: safeAreaInsets,
+                    displayOption: displayOption)
+    }
+
+    static func placementOffset(displayOption: WebViewDisplayOption) -> CGPoint {
+        placementOffset(insets: safeAreaInsets,
+                        displayOption: displayOption,
+                        isLandscapeLeft: interfaceOrientation == .landscapeLeft)
+    }
+
     /// The size a content page is laid out against.
     ///
     /// A cutout is subtracted whatever the display option says, because nothing
     /// legible fits behind one: immersive means "under the status bar", not "under
     /// the Dynamic Island". The bottom inset only goes in safe area mode, which is
     /// what asks for the home indicator to be left clear.
-    static func windowSize(displayOption: WebViewDisplayOption) -> CGSize {
-        // Falls back to the screen when there is no window to read, which is the
-        // one case where the insets are unknowable. Reporting a zero size instead
-        // would have the server lay the content out against nothing.
-        var size = window?.bounds.size ?? ScreenReader.screenBounds.size
-        let insets = safeAreaInsets
+    static func contentSize(in bounds: CGSize,
+                            insets: UIEdgeInsets,
+                            displayOption: WebViewDisplayOption) -> CGSize {
+        var size = bounds
 
         if hasTopNotch(insets) || displayOption == .safeArea {
             size.height -= insets.top
@@ -73,13 +86,14 @@ enum ContentGeometry {
         return size
     }
 
-    /// How far a placement has to move to clear the insets `windowSize` removed.
+    /// How far a placement has to move to clear the insets `contentSize` removed.
     ///
     /// Applied to the placement the server sent, never to the frame already on
     /// screen: the shifts are additive, so re-applying them walks the page off the
     /// display one rotation at a time.
-    static func placementOffset(displayOption: WebViewDisplayOption) -> CGPoint {
-        let insets = safeAreaInsets
+    static func placementOffset(insets: UIEdgeInsets,
+                                displayOption: WebViewDisplayOption,
+                                isLandscapeLeft: Bool) -> CGPoint {
         var offset = CGPoint.zero
 
         if hasTopNotch(insets) || displayOption == .safeArea {
@@ -89,7 +103,7 @@ enum ContentGeometry {
         // In landscape left the cutout sits on the trailing edge, so the content
         // already starts clear of it and shifting would only push it off the far
         // side. In portrait both insets are zero and this is a no-op.
-        if interfaceOrientation != .landscapeLeft {
+        if !isLandscapeLeft {
             offset.x = Swift.max(insets.left, insets.right)
         }
 

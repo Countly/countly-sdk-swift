@@ -20,8 +20,13 @@ Why this and not the alternatives
   where a platform lacks the feature (watchOS skips ~136, tvOS ~17) and those counts are the
   signal, not noise.
 
-The macOS job does not use this script: `swift test --xunit-output` emits JUnit directly, so
-there is nothing to convert there.
+All five platforms go through this script, macOS included. SwiftPM's own `--xunit-output` was
+the obvious shortcut for macOS and it is not usable here: it writes nothing at all unless
+`--parallel` is also passed, leaving only an empty `<path>-swift-testing.xml`. Measured on
+Swift 6.2, a run of 478 tests with 11 skipped and one failure produced a JUnit file reading
+`tests="0"` and exited zero -- the silent empty report this script exists to prevent. Passing
+`--parallel` is not an option either, because several suites assert on the process wide crash
+handler and on UserDefaults, which parallel workers race on.
 
 This script refuses to write an empty report. If the bundle contains no test cases, it exits
 non-zero with a `::error::` rather than leaving a green step and a silent gap in the table.

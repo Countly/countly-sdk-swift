@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """Normalises a platform's code coverage into one small JSON file.
 
-Two toolchains produce coverage for this package and they do not agree on a format:
+Every job runs `xcodebuild -enableCodeCoverage YES` and is read with
+`xcrun xccov view --report --json`. The llvm-cov path is kept as a second accepted input for
+anything driven by `swift test --enable-code-coverage`, which reports through
+`xcrun llvm-cov export -summary-only` instead; the two count executable lines differently, so
+mixing them in one table would put a tooling artefact next to a real difference.
 
-* the macOS job runs `swift test --enable-code-coverage`, whose output is read with
-  `xcrun llvm-cov export -summary-only`;
-* the simulator jobs run `xcodebuild -enableCodeCoverage YES`, whose result bundle is read
-  with `xcrun xccov view --report --json`.
-
-They also do not measure the same code, and the gap is not rounding. `WebViewManager`,
+The platforms do not measure the same code, and that gap is not rounding. `WebViewManager`,
 `OverlayWindow` and the notification service are compiled out on macOS, so the iOS number
 covers thousands more lines than the macOS one. Reporting a single percentage without saying
 which platform produced it is therefore actively misleading, which is why every record this
@@ -29,8 +28,9 @@ from pathlib import Path
 # `-ignore-filename-regex='(Tests|\.build)/'` the macOS llvm-cov invocation already uses, and
 # applies the same rule to the xccov side so the two numbers are comparable.
 EXCLUDED_PATH = re.compile(r"(/Tests/|/\.build/|/DerivedData/|\.xctest/)")
-# xccov reports the test bundle as a target of its own.
-EXCLUDED_TARGET = re.compile(r"(Tests?\.xctest|PackageTests)", re.IGNORECASE)
+# xccov reports the test bundle as a target of its own, named after the bundle
+# ("CountlyTests", "CountlyPackageTests", "CountlyTests.xctest" depending on the toolchain).
+EXCLUDED_TARGET = re.compile(r"Tests(\.xctest)?$", re.IGNORECASE)
 
 
 def percent(covered, total):

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Renders the pull request report: one test table across all five platforms, plus coverage.
 
-Inputs are whatever the jobs uploaded -- JUnit XML written by `swift test --xunit-output` on
-macOS and by `xcresult_to_junit.py` on the four simulator platforms, and the normalised
-coverage records written by `coverage_summary.py`.
+Inputs are whatever the jobs uploaded -- the JUnit XML written by `xcresult_to_junit.py` on
+each of the five platforms, and the normalised coverage records written by
+`coverage_summary.py`.
 
 Three things this deliberately does:
 
@@ -102,7 +102,10 @@ def format_duration(seconds):
     return "%.1fs" % seconds
 
 
-def test_section(results):
+def test_section(results, simulators_result):
+    """The per platform table. `simulators_result` is the GitHub `needs.<job>.result` string
+    for the simulator matrix, so a platform with no data can be described as skipped rather
+    than as a warning -- the simulator jobs are skipped outright when the macOS job fails."""
     lines = [
         "### Test results",
         "",
@@ -112,11 +115,18 @@ def test_section(results):
     grand = {"tests": 0, "failures": 0, "skipped": 0}
     any_failure = False
     missing = []
+    simulators_skipped = simulators_result == "skipped"
 
     for platform in PLATFORMS:
         record = results.get(platform)
         note = "" if platform == "macOS" else " *"
         if not record or record.get("error") or not record["tests"]:
+            if simulators_skipped and platform != "macOS":
+                # Not a problem to flag: the matrix never ran, because macOS gates it.
+                lines.append(
+                    "| %s%s | — | — | — | — | — | :fast_forward: |" % (platform, note)
+                )
+                continue
             reason = (record or {}).get("error") or "no results were produced"
             missing.append("%s: %s" % (platform, reason))
             lines.append(
@@ -146,6 +156,12 @@ def test_section(results):
         "what gates the pull request. A red cell here is still worth looking at."
     )
 
+    if simulators_skipped:
+        lines += [
+            "", "> [!NOTE]",
+            "> The simulator jobs did not run: they depend on the macOS job, which did not "
+            "pass.",
+        ]
     if missing:
         lines += ["", "> [!WARNING]", "> No test results for: " + "; ".join(missing) + "."]
 
@@ -222,10 +238,14 @@ def main():
     parser.add_argument("--coverage-dir", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--title", default="CI report :rocket:")
+    parser.add_argument(
+        "--simulators-result", default="",
+        help="the needs.<job>.result of the simulator matrix: success, failure, skipped, …",
+    )
     arguments = parser.parse_args()
 
     results = gather_tests(arguments.junit_dir)
-    tests, grand, any_failure = test_section(results)
+    tests, grand, any_failure = test_section(results, arguments.simulators_result)
     coverage = coverage_section(arguments.coverage_dir)
 
     body = ["## %s" % arguments.title, ""] + tests + [""] + coverage

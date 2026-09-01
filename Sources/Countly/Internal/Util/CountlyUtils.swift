@@ -132,6 +132,77 @@ extension CGRect {
     }
 }
 
+// MARK: - Log formatting
+
+/// How a number reads in a log line.
+///
+/// Interpolated straight into a message a whole number of points prints as
+/// `402.0` and a count of nothing prints as `0.0`, so a line reads as though the
+/// SDK measured something more precisely than it did. A whole value loses its
+/// decimals here.
+///
+/// Nothing is rounded. A log line is evidence, and a value quietly shortened to
+/// look tidy is evidence of something that did not happen: an event's `sum` and a
+/// coordinate both go through this. Use `logSeconds` for a duration, which is the
+/// one case where the digits past the third are noise rather than data.
+extension Double {
+
+    var logValue: String {
+        guard isFinite else { return String(self) }
+
+        // Guarded against the range where the conversion would trap. A value that
+        // large is not a measurement anyway, and falls through to print in full.
+        if self == rounded(), magnitude < 1e15 {
+            return String(Int64(self))
+        }
+
+        // Swift's own description is the shortest text that reads back as the same
+        // value, so this neither pads nor loses anything.
+        return String(self)
+    }
+
+    /// A measured length of time, to milliseconds.
+    ///
+    /// A duration comes out of subtracting two clock readings, so it arrives with
+    /// as many digits as the double holds and none of them past the third mean
+    /// anything.
+    var logSeconds: String {
+        guard isFinite else { return String(self) }
+
+        var text = String(format: "%.3f", self)
+        while text.hasSuffix("0") { text.removeLast() }
+        if text.hasSuffix(".") { text.removeLast() }
+        return text
+    }
+}
+
+extension CGFloat {
+
+    var logValue: String { Double(self).logValue }
+}
+
+/// Geometry as a log line should carry it.
+///
+/// A `CGRect` interpolated straight into a message prints as
+/// `(0.0, 59.0, 402.0, 815.0)`, which leaves the reader to work out which number
+/// is which, and a printed `CGPoint` cannot be told from a printed `CGSize`.
+/// Every geometry value in a log line goes through one of these, so a frame
+/// reads the same wherever it was printed from.
+extension CGPoint {
+
+    var logValue: String { "x=\(x.logValue) y=\(y.logValue)" }
+}
+
+extension CGSize {
+
+    var logValue: String { "w=\(width.logValue) h=\(height.logValue)" }
+}
+
+extension CGRect {
+
+    var logValue: String { "\(origin.logValue) \(size.logValue)" }
+}
+
 /// Resolving a local picture path the host application supplied.
 ///
 /// The documented form is a filesystem path, and integrations also pass a

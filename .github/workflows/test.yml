@@ -26,11 +26,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # macOS is the cheap pass: `swift test` runs on the runner itself with no simulator to boot,
-  # so it is the one that gates the pull request. It is also where the whole suite has to be
-  # green, because the simulator cells below are advisory.
+  # macOS needs no simulator to boot, so it is the fastest platform to get a verdict from and
+  # the one that gates the pull request. The whole suite has to be green here, because the
+  # simulator cells below are advisory.
+  #
+  # This runs through xcodebuild rather than `swift test`, which is a change from how the job
+  # used to work, and the reason is reporting. `swift test --xunit-output <path>` does not
+  # write <path> at all unless `--parallel` is also passed: the non parallel runner execs the
+  # xctest binary directly and never collects results, so the only file that appears is the
+  # empty `<path>-swift-testing.xml` for the Swift Testing suites this package does not use.
+  # Verified on Swift 6.2: 478 tests ran, 11 skipped, 1 failed, and the JUnit file said
+  # `tests="0"` without the command failing. That is the exact failure this reporting is
+  # supposed to make impossible -- a step that succeeds while reporting nothing.
+  #
+  # `--parallel` is not an option either: several suites assert on the process wide crash
+  # handler installation and on UserDefaults, which parallel workers share and race on.
+  #
+  # So macOS goes through xcodebuild like the other four platforms, and the result bundle is
+  # converted by the same script. One code path, and the skipped counts survive.
   macos:
-    name: swift test (macOS)
+    name: xcodebuild test (macOS)
     runs-on: macos-15
     steps:
       - name: Checkout SDK code
@@ -39,36 +54,41 @@ jobs:
       - name: Set up Xcode
         run: sudo xcode-select -switch /Applications/Xcode_16.4.app
 
-      # `--parallel` is deliberately not used. Several suites assert on the process wide
-      # crash handler installation and on UserDefaults, which are shared across test cases
-      # even though each case builds its own SDK instance.
-      #
-      # `--xunit-output` is SwiftPM's own JUnit writer, so the macOS results need no
-      # conversion step at all -- unlike the simulator jobs below, which only get an
-      # `.xcresult` bundle out of xcodebuild. It is written whether the suite passes or fails.
       - name: Run the test suite
         run: |
-          mkdir -p test-results
-          swift test --enable-code-coverage --xunit-output test-results/macOS.xml
+          xcodebuild test \
+            -scheme Countly-Package \
+            -destination 'platform=macOS' \
+            -resultBundlePath TestResults.xcresult \
+            -enableCodeCoverage YES \
+            CODE_SIGNING_ALLOWED=NO
 
-      # Guards against the report being quietly empty: SwiftPM exits zero on an empty test
-      # selection, and a JUnit file with no `<testcase>` in it reads downstream as a clean run.
-      - name: Check that the macOS results are not empty
+      # Refuses to write an empty report rather than reporting nothing quietly. See the
+      # script's docstring for why this reads the result bundle instead of scraping the log.
+      - name: Convert the results to JUnit XML
+        if: always()
+        run: |
+          python3 .github/scripts/xcresult_to_junit.py \
+            --xcresult TestResults.xcresult \
+            --platform macOS \
+            --output test-results/macOS.xml
+
+      # Reported next to the iOS figure in the pull request comment, and measured with the same
+      # tool so the gap between them is a real difference in how much code each platform
+      # compiles -- `WebViewManager`, `OverlayWindow` and the notification service are compiled
+      # out here -- rather than two tools counting lines differently.
+      - name: Summarise the macOS coverage
         if: always()
         run: |
           set -euo pipefail
-          if [ ! -s test-results/macOS.xml ]; then
-            echo "::error::swift test did not write test-results/macOS.xml"
-            exit 1
-          fi
-          count=$(grep -c '<testcase' test-results/macOS.xml || true)
-          echo "macOS: $count test cases recorded."
-          if [ "$count" -eq 0 ]; then
-            echo "::error::the macOS JUnit report contains no test cases"
-            exit 1
-          fi
+          xcrun xccov view --report --json TestResults.xcresult > xccov.json
+          xcrun xccov view --report --only-targets TestResults.xcresult | tee coverage.txt
+          python3 .github/scripts/coverage_summary.py \
+            --platform macOS \
+            --xccov xccov.json \
+            --output coverage/macOS.json
 
-      - name: Upload the macOS test results
+      - name: Upload the JUnit results
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -76,37 +96,7 @@ jobs:
           path: test-results/macOS.xml
           if-no-files-found: warn
 
-      # llvm-cov needs the binary and the profdata that `swift test` leaves in .build, and
-      # their names depend on the toolchain, so they are resolved rather than hardcoded.
-      #
-      # `report` is the human readable table that lands in the job log; `export -summary-only`
-      # is the same data as JSON, which is what the per file table in the pull request comment
-      # is built from. Parsing llvm-cov's fixed width text would be the brittle way to do it.
-      - name: Report code coverage
-        if: always()
-        run: |
-          set -euo pipefail
-          binary=$(swift build --show-bin-path)/CountlyPackageTests.xctest/Contents/MacOS/CountlyPackageTests
-          profdata=$(swift build --show-bin-path)/codecov/default.profdata
-          if [ ! -f "$binary" ] || [ ! -f "$profdata" ]; then
-            echo "::warning::coverage inputs are missing, skipping the report"
-            exit 0
-          fi
-          xcrun llvm-cov report "$binary" \
-            -instr-profile "$profdata" \
-            -ignore-filename-regex='(Tests|\.build)/' \
-            | tee coverage.txt
-          xcrun llvm-cov export "$binary" \
-            -instr-profile "$profdata" \
-            -ignore-filename-regex='(Tests|\.build)/' \
-            -summary-only -format=text > llvm-cov-export.json
-          mkdir -p coverage
-          python3 .github/scripts/coverage_summary.py \
-            --platform macOS \
-            --llvm-cov-export llvm-cov-export.json \
-            --output coverage/macOS.json
-
-      - name: Upload the coverage report
+      - name: Upload the coverage summary
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -114,6 +104,15 @@ jobs:
           path: |
             coverage/macOS.json
             coverage.txt
+          if-no-files-found: warn
+
+      # Only on failure: a green run's result bundle is tens of megabytes nobody opens.
+      - name: Upload the result bundle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-macOS
+          path: TestResults.xcresult
           if-no-files-found: ignore
 
   # The other four platforms need a simulator, which is slow to boot and, on watchOS and
@@ -279,7 +278,11 @@ jobs:
 
       # `merge-multiple` flattens junit-macOS, junit-iOS, ... into one directory. The files
       # inside are named after their platform, so nothing collides.
+      # `continue-on-error` because download-artifact fails outright when the pattern matches
+      # nothing, which happens when every test job died before it could upload. That case has
+      # to reach the report as empty rows, not as a second red job.
       - name: Download the JUnit results
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           pattern: junit-*
@@ -287,6 +290,7 @@ jobs:
           merge-multiple: true
 
       - name: Download the coverage summaries
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           pattern: coverage-*
@@ -305,7 +309,9 @@ jobs:
         with:
           check_name: "Test Results :rocket:"
           comment_title: "Test Results :rocket:"
-          comment_mode: off
+          # Quoted deliberately: unquoted `off` is parsed as the boolean false, and the action
+          # expects the string.
+          comment_mode: "off"
           # The macOS job already failed the run if it had to. This step reports.
           action_fail: false
           action_fail_on_inconclusive: false
