@@ -232,10 +232,64 @@ def coverage_section(coverage_dir):
     return lines
 
 
+def runner_health_section(health_dir):
+    """A note when a platform's runner could not schedule its processes.
+
+    Only rendered when something was actually starved. A green run should not carry
+    a paragraph about infrastructure, and a red one caused by contention should not
+    be read as a code regression -- which is the mistake this section exists to
+    stop. See `runner_health.py` for why the launch duration is the signal.
+    """
+    directory = Path(health_dir)
+    if not directory.is_dir():
+        return []
+
+    starved = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if report.get("starved"):
+            starved.append(report)
+
+    if not starved:
+        return []
+
+    lines = [
+        "### Runner health :warning:",
+        "",
+        "One or more runners could not schedule their processes promptly. A WebKit process "
+        "launch is normally well under a second.",
+        "",
+        "| Platform | Slowest launch | Processes affected |",
+        "| --- | --- | --- |",
+    ]
+    for report in starved:
+        processes = ", ".join(
+            "`%s` %.1fs" % (name, seconds)
+            for name, seconds in report.get("processes", {}).items()
+        )
+        lines.append("| %s | %.1fs | %s |" % (
+            report.get("platform", "?"),
+            report.get("slowest_launch_seconds", 0.0),
+            processes or "-",
+        ))
+    lines += [
+        "",
+        "Treat failures on the affected platforms as suspect: contention produces timeouts and "
+        "`-1009` errors that look like real defects, and it fails a different test each run. "
+        "Re-run before bisecting.",
+    ]
+    return lines
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--junit-dir", required=True)
     parser.add_argument("--coverage-dir", required=True)
+    parser.add_argument("--runner-health-dir", default="",
+                        help="directory of runner_health.py reports; advisory, may be absent")
     parser.add_argument("--output", required=True)
     parser.add_argument("--title", default="CI report :rocket:")
     parser.add_argument(
@@ -248,7 +302,10 @@ def main():
     tests, grand, any_failure = test_section(results, arguments.simulators_result)
     coverage = coverage_section(arguments.coverage_dir)
 
+    health = runner_health_section(arguments.runner_health_dir) if arguments.runner_health_dir else []
     body = ["## %s" % arguments.title, ""] + tests + [""] + coverage
+    if health:
+        body += [""] + health
     text = "\n".join(body) + "\n"
 
     output = Path(arguments.output)

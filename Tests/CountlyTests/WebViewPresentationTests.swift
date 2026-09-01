@@ -95,13 +95,13 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
                 finished = true
             }
         }
-        TestUtils.waitUntil("the navigation is attempted") { finished }
+        TestUtils.waitUntil("the navigation is attempted", timeout: TestUtils.webKitTimeout) { finished }
         // The policy decision lands on a later main-thread turn.
         TestUtils.pump(0.3)
     }
 
     private func waitForLoad(_ manager: WebViewManager) {
-        TestUtils.waitUntil("the page finishes loading") {
+        TestUtils.waitUntil("the page finishes loading", timeout: TestUtils.webKitTimeout) {
             guard let page = self.page(of: manager) else { return false }
             return !page.isLoading
         }
@@ -128,7 +128,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         appeared.assertForOverFulfill = false
         present(countly, appear: { appeared.fulfill() })
 
-        wait(for: [appeared], timeout: TestUtils.asyncTimeout)
+        wait(for: [appeared], timeout: TestUtils.webKitTimeout)
     }
 
     /// A URL that could not be built is not presented, and must not leave a window
@@ -176,7 +176,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
 
         navigate(manager, to: "https://countly_action_event?close=1")
 
-        wait(for: [dismissed], timeout: TestUtils.asyncTimeout)
+        wait(for: [dismissed], timeout: TestUtils.webKitTimeout)
     }
 
     /// A closing call to action carries both its event and the close, and the event
@@ -190,7 +190,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         let events = "[{\"key\":\"cta_tapped\",\"segmentation\":{\"id\":\"7\"}}]"
         navigate(manager, to: "https://countly_action_event?action=event&event=\(events)&close=1")
 
-        TestUtils.waitUntil("the event reaches the queue") {
+        TestUtils.waitUntil("the event reaches the queue", timeout: TestUtils.webKitTimeout) {
             !self.recordedEvents(of: countly).filter { $0["key"] as? String == "cta_tapped" }.isEmpty
         }
 
@@ -211,7 +211,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         """
         navigate(manager, to: "https://countly_action_event?action=event&event=\(events)")
 
-        TestUtils.waitUntil("both events reach the queue") {
+        TestUtils.waitUntil("both events reach the queue", timeout: TestUtils.webKitTimeout) {
             let keys = self.recordedEvents(of: countly).compactMap { $0["key"] as? String }
             return keys.contains("one") && keys.contains("two")
         }
@@ -232,7 +232,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         """.replacingOccurrences(of: "\\\n", with: "")
         navigate(manager, to: "https://countly_action_event?action=event&event=\(events)")
 
-        TestUtils.waitUntil("the usable event reaches the queue") {
+        TestUtils.waitUntil("the usable event reaches the queue", timeout: TestUtils.webKitTimeout) {
             self.recordedEvents(of: countly).contains { $0["key"] as? String == "kept" }
         }
 
@@ -259,7 +259,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         """
         navigate(manager, to: "https://countly_action_event?action=event&event=\(events)")
 
-        wait(for: [appeared], timeout: TestUtils.asyncTimeout)
+        wait(for: [appeared], timeout: TestUtils.webKitTimeout)
     }
 
     /// An events payload that is not an array is ignored rather than crashing or
@@ -401,7 +401,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         // so the deadline is content only.
         present(countly, url: "https://example.com/o/sdk/content", dismiss: { dismissed.fulfill() })
 
-        wait(for: [dismissed], timeout: TestUtils.asyncTimeout)
+        wait(for: [dismissed], timeout: TestUtils.webKitTimeout)
     }
 
     /// A feedback widget renders as soon as it loads and never sends a shown event,

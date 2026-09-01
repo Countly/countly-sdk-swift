@@ -23,6 +23,11 @@ import WebKit
 ///
 /// One manager presents one page. It is shared between content and feedback, so
 /// behavior that only applies to content is gated on `isFeedbackWidget`.
+///
+/// Deliberately internal, and worth keeping that way. `webView` is `private(set)`
+/// so the test suite can assert against the real object rather than a projection
+/// that would drift from it; that is only safe while the class itself is out of
+/// reach. Making this `public` would take the web view's whole API along with it.
 final class WebViewManager: NSObject {
 
     private static let module = "WebView"

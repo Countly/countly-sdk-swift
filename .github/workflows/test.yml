@@ -56,12 +56,25 @@ jobs:
 
       - name: Run the test suite
         run: |
+          set -o pipefail
           xcodebuild test \
             -scheme Countly-Package \
             -destination 'platform=macOS' \
             -resultBundlePath TestResults.xcresult \
             -enableCodeCoverage YES \
-            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee xcodebuild.log
+
+      # WebKit prints its process launch durations inline, and a starved runner shows
+      # them at thirty seconds where a healthy one is under a second. Recorded so a
+      # failure caused by runner contention reads as contention rather than as the
+      # diff under test. Advisory: it never fails the job.
+      - name: Check whether the runner was starved
+        if: always()
+        run: |
+          python3 .github/scripts/runner_health.py \
+            --log xcodebuild.log \
+            --platform macOS \
+            --output runner-health/macOS.json
 
       # Refuses to write an empty report rather than reporting nothing quietly. See the
       # script's docstring for why this reads the result bundle instead of scraping the log.
@@ -94,6 +107,14 @@ jobs:
         with:
           name: junit-macOS
           path: test-results/macOS.xml
+          if-no-files-found: warn
+
+      - name: Upload the runner health assessment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-health-macOS
+          path: runner-health/macOS.json
           if-no-files-found: warn
 
       - name: Upload the coverage summary
@@ -197,12 +218,23 @@ jobs:
       # macOS runner where every matrix cell is serialised behind the last.
       - name: Run the test suite
         run: |
+          set -o pipefail
           xcodebuild test \
             -scheme Countly-Package \
             -destination '${{ steps.destination.outputs.destination }}' \
             -resultBundlePath TestResults.xcresult \
             -enableCodeCoverage ${{ matrix.platform == 'iOS' && 'YES' || 'NO' }} \
-            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee xcodebuild.log
+
+      # See the macOS job for why this exists. Simulators are where it matters most:
+      # every matrix cell here is serialised behind the last on one macOS runner.
+      - name: Check whether the runner was starved
+        if: always()
+        run: |
+          python3 .github/scripts/runner_health.py \
+            --log xcodebuild.log \
+            --platform ${{ matrix.platform }} \
+            --output runner-health/${{ matrix.platform }}.json
 
       # xcodebuild writes an .xcresult bundle, and the reporting action consumes JUnit XML.
       # The converter reads the structured bundle with xcresulttool rather than scraping
@@ -233,6 +265,14 @@ jobs:
         with:
           name: junit-${{ matrix.platform }}
           path: test-results/${{ matrix.platform }}.xml
+          if-no-files-found: warn
+
+      - name: Upload the runner health assessment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-health-${{ matrix.platform }}
+          path: runner-health/${{ matrix.platform }}.json
           if-no-files-found: warn
 
       - name: Upload the coverage summary
@@ -289,6 +329,15 @@ jobs:
           path: junit
           merge-multiple: true
 
+      # Advisory only, so it downloads like the rest and is simply absent if no job wrote one.
+      - name: Download the runner health assessments
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: runner-health-*
+          path: runner-health
+          merge-multiple: true
+
       - name: Download the coverage summaries
         continue-on-error: true
         uses: actions/download-artifact@v4
@@ -326,6 +375,7 @@ jobs:
           python3 .github/scripts/ci_report.py \
             --junit-dir junit \
             --coverage-dir coverage \
+            --runner-health-dir runner-health \
             --simulators-result '${{ needs.simulators.result }}' \
             --output ci-report.md
 
