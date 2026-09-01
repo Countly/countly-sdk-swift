@@ -191,13 +191,58 @@ jobs:
               fh.write("destination=%s\n" % destination)
           PYEOF
 
+      # Coverage is instrumented on iOS only. It is the widest build -- it is the one that
+      # compiles `WebViewManager`, `OverlayWindow` and the notification service, which macOS
+      # leaves out -- so it is the number worth having next to the macOS one. Instrumenting
+      # the other three would add runner time for figures nobody reads, on a single concurrent
+      # macOS runner where every matrix cell is serialised behind the last.
       - name: Run the test suite
         run: |
           xcodebuild test \
             -scheme Countly-Package \
             -destination '${{ steps.destination.outputs.destination }}' \
             -resultBundlePath TestResults.xcresult \
+            -enableCodeCoverage ${{ matrix.platform == 'iOS' && 'YES' || 'NO' }} \
             CODE_SIGNING_ALLOWED=NO
+
+      # xcodebuild writes an .xcresult bundle, and the reporting action consumes JUnit XML.
+      # The converter reads the structured bundle with xcresulttool rather than scraping
+      # xcodebuild's console output the way xcbeautify and xcpretty do, and it exits non-zero
+      # rather than writing a report with no tests in it. See the script's own docstring.
+      - name: Convert the results to JUnit XML
+        if: always()
+        run: |
+          python3 .github/scripts/xcresult_to_junit.py \
+            --xcresult TestResults.xcresult \
+            --platform ${{ matrix.platform }} \
+            --output test-results/${{ matrix.platform }}.xml
+
+      - name: Summarise the iOS coverage
+        if: always() && matrix.platform == 'iOS'
+        run: |
+          set -euo pipefail
+          xcrun xccov view --report --json TestResults.xcresult > xccov.json
+          xcrun xccov view --report --only-targets TestResults.xcresult || true
+          python3 .github/scripts/coverage_summary.py \
+            --platform iOS \
+            --xccov xccov.json \
+            --output coverage/iOS.json
+
+      - name: Upload the JUnit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ matrix.platform }}
+          path: test-results/${{ matrix.platform }}.xml
+          if-no-files-found: warn
+
+      - name: Upload the coverage summary
+        if: always() && matrix.platform == 'iOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-iOS
+          path: coverage/iOS.json
+          if-no-files-found: warn
 
       # Only on failure: a green run's result bundle is tens of megabytes nobody opens.
       - name: Upload the test results
@@ -207,3 +252,126 @@ jobs:
           name: test-results-${{ matrix.platform }}
           path: TestResults.xcresult
           if-no-files-found: ignore
+
+  # Everything above uploads; this is the only job that reports. It is deliberately a separate
+  # job rather than a step on each platform: five jobs each posting their own comment is how a
+  # branch ends up with twenty bot comments, and a per platform comparison table cannot be
+  # written by a job that only knows about its own platform.
+  #
+  # ubuntu-latest, not macos: this job downloads artifacts and runs python, and the account has
+  # a single concurrent macOS runner that the test jobs above should not have to queue behind.
+  report:
+    name: Report the results on the pull request
+    needs: [macos, simulators]
+    # `always()` is load bearing twice over. Without it a failing macOS job would skip this and
+    # produce no report, which is exactly the run where the report matters most; and
+    # `simulators` is skipped outright when `macos` fails, which would otherwise skip this too.
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    steps:
+      # Only for the scripts under .github/scripts; nothing here builds.
+      - name: Checkout SDK code
+        uses: actions/checkout@v4
+
+      # `merge-multiple` flattens junit-macOS, junit-iOS, ... into one directory. The files
+      # inside are named after their platform, so nothing collides.
+      - name: Download the JUnit results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: junit-*
+          path: junit
+          merge-multiple: true
+
+      - name: Download the coverage summaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          path: coverage
+          merge-multiple: true
+
+      # The check run with the per test drill down and the inline annotations. `comment_mode`
+      # is off on purpose: the sticky comment below is the single comment this workflow owns,
+      # and a second bot comment would just split the same result across two places.
+      #
+      # Skipped on a fork pull request, where GITHUB_TOKEN is read only and writing a check
+      # would fail. The report still reaches the run summary, which needs no write access.
+      - name: Publish the test results as a check
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        with:
+          check_name: "Test Results :rocket:"
+          comment_title: "Test Results :rocket:"
+          comment_mode: off
+          # The macOS job already failed the run if it had to. This step reports.
+          action_fail: false
+          action_fail_on_inconclusive: false
+          files: |
+            junit/*.xml
+
+      # Writes ci-report.md and appends the same body to the run summary, so the report exists
+      # even on a fork pull request or a push with no pull request open.
+      - name: Render the report
+        if: always()
+        run: |
+          python3 .github/scripts/ci_report.py \
+            --junit-dir junit \
+            --coverage-dir coverage \
+            --simulators-result '${{ needs.simulators.result }}' \
+            --output ci-report.md
+
+      # One comment, updated in place, keyed by the HTML marker. The alternative is a new
+      # comment on every push, which nobody reads after the third one.
+      - name: Comment the report on the pull request
+        if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- countly-swift-ci-report -->';
+            let report = '';
+            try {
+              report = fs.readFileSync('ci-report.md', 'utf8');
+            } catch (e) {
+              report = 'The report step did not produce a report. See the workflow logs.';
+            }
+            const body = [
+              marker,
+              report,
+              '',
+              `[Full run log](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Upload the rendered report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-report
+          path: ci-report.md
+          if-no-files-found: warn
