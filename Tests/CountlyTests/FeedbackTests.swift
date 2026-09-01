@@ -211,6 +211,226 @@ final class FeedbackTests: CountlyBaseTestCase {
         XCTAssertEqual(TestUtils.describe(segmentation["closed"] ?? ""), "1")
     }
 
+    // MARK: - Choosing which widget to present
+
+    /// Fetches the list and hands back the widgets, so the resolution tests can
+    /// work from the same data the SDK sees.
+    private func fetchWidgets(_ countly: CountlyInstance) -> [CountlyFeedbackWidget] {
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: Self.widgetList)
+        let fetched = expectation(description: "the widget list arrives")
+        var widgets: [CountlyFeedbackWidget] = []
+        countly.feedback.getAvailableFeedbackWidgets { result, _ in
+            widgets = result ?? []
+            fetched.fulfill()
+        }
+        wait(for: [fetched], timeout: TestUtils.asyncTimeout)
+        return widgets
+    }
+
+    /// Asking for a kind rather than a specific widget is the simple call, and it
+    /// resolves to the first of that kind.
+    func testAskingForATypeWithNoNamePresentsTheFirstOfThatType() throws {
+        try skipUnlessNetworkIsInterceptable()
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: Self.widgetList)
+        let countly = startInstance { $0.eventSendThreshold = 1 }
+
+        countly.feedback.presentSurvey()
+        countly.feedback.presentNPS()
+        countly.feedback.presentRating()
+
+        // The list is fetched once per presentation attempt, which is what proves
+        // each call got as far as resolving a widget.
+        TestUtils.waitUntil("every presentation resolves a widget") {
+            MockURLProtocol.requests.filter { $0.query.contains("method=feedback") }.count >= 3
+        }
+    }
+
+    /// A name, an ID and a tag all identify a widget, because an integration may
+    /// know any one of the three.
+    func testAWidgetCanBeIdentifiedByNameByIDOrByTag() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startInstance()
+        let widgets = fetchWidgets(countly)
+
+        XCTAssertEqual(widgets.first { $0.name == "Onboarding survey" }?.id, "w1")
+        XCTAssertEqual(widgets.first { $0.id == "w2" }?.type, .nps)
+        XCTAssertEqual(widgets.first { $0.tags.contains("cart") }?.id, "w3")
+    }
+
+    /// A list the SDK cannot make sense of yields no widgets rather than a
+    /// half-parsed one.
+    func testWidgetsMissingTheirRequiredFieldsAreDropped() throws {
+        try skipUnlessNetworkIsInterceptable()
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: """
+        {"result": [
+          {"type": "survey", "name": "no id"},
+          {"_id": "w9", "name": "no type"},
+          {"_id": "w8", "type": "not-a-real-type", "name": "unknown type"},
+          {"_id": "w7", "type": "survey", "name": "fine"}
+        ]}
+        """)
+        let countly = startInstance()
+
+        let fetched = expectation(description: "the widget list arrives")
+        var widgets: [CountlyFeedbackWidget] = []
+        countly.feedback.getAvailableFeedbackWidgets { result, _ in
+            widgets = result ?? []
+            fetched.fulfill()
+        }
+        wait(for: [fetched], timeout: TestUtils.asyncTimeout)
+
+        XCTAssertEqual(widgets.map(\.id), ["w7"])
+    }
+
+    // MARK: - Widget data
+
+    /// A widget's definition is fetched separately from the list, because the list
+    /// carries only enough to choose between them.
+    func testAWidgetsDefinitionIsFetchedFromItsOwnEndpoint() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startInstance()
+        guard let widget = fetchWidgets(countly).first else {
+            XCTFail("the widget list should not be empty")
+            return
+        }
+
+        MockURLProtocol.respond(pathContaining: "/o/surveys",
+                                json: #"{"name": "Onboarding survey", "questions": []}"#)
+
+        let loaded = expectation(description: "the widget data arrives")
+        widget.getWidgetData { data, error in
+            XCTAssertNil(error)
+            XCTAssertEqual(data?["name"] as? String, "Onboarding survey")
+            loaded.fulfill()
+        }
+        wait(for: [loaded], timeout: TestUtils.asyncTimeout)
+
+        guard let request = MockURLProtocol.requests.last(where: { $0.path.contains("/o/surveys") }) else {
+            XCTFail("a widget data request should have gone out")
+            return
+        }
+        XCTAssertTrue(request.path.hasSuffix("/survey/widget"),
+                      "the path names the widget type, path was \(request.path)")
+        let parsed = TestUtils.parseQuery(request.query)
+        XCTAssertEqual(parsed["widget_id"] as? String, "w1")
+        XCTAssertEqual(parsed["shown"] as? String, "1")
+    }
+
+    func testAFailedWidgetDataFetchReportsAnError() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startInstance()
+        guard let widget = fetchWidgets(countly).first else {
+            XCTFail("the widget list should not be empty")
+            return
+        }
+
+        MockURLProtocol.reset()  // nothing answers, so the fetch fails
+
+        let reported = expectation(description: "the fetch reports back")
+        widget.getWidgetData { data, error in
+            XCTAssertNil(data)
+            XCTAssertNotNil(error)
+            reported.fulfill()
+        }
+        wait(for: [reported], timeout: TestUtils.asyncTimeout)
+    }
+
+    // MARK: - Putting a widget on screen
+
+    /// Presenting a widget builds its URL and puts it in an overlay above the whole
+    /// application. The page cannot load without a server, so it comes back down
+    /// again, which is the path worth checking: a widget that cannot load must not
+    /// be left covering the application.
+    func testPresentingAWidgetPutsItOnScreenAndTakesItDownWhenItCannotLoad() throws {
+        try skipUnlessNetworkIsInterceptable()
+        #if !(os(iOS) || os(visionOS))
+        throw XCTSkip("feedback widgets are presented in a web view, which only exists on iOS and visionOS")
+        #else
+        let countly = startInstance()
+        guard let widget = fetchWidgets(countly).first else {
+            XCTFail("the widget list should not be empty")
+            return
+        }
+
+        let closed = expectation(description: "the widget reports it closed")
+        closed.assertForOverFulfill = false
+        widget.present(callback: { state in
+            if state == .closed { closed.fulfill() }
+        })
+
+        wait(for: [closed], timeout: TestUtils.asyncTimeout)
+        #endif
+    }
+
+    /// The appear and dismiss blocks are the older shape of the same callback, and
+    /// both still have to fire.
+    func testTheAppearAndDismissBlocksAreBothCalled() throws {
+        try skipUnlessNetworkIsInterceptable()
+        #if !(os(iOS) || os(visionOS))
+        throw XCTSkip("feedback widgets are presented in a web view, which only exists on iOS and visionOS")
+        #else
+        let countly = startInstance()
+        guard let widget = fetchWidgets(countly).first else {
+            XCTFail("the widget list should not be empty")
+            return
+        }
+
+        let dismissed = expectation(description: "the widget reports it was dismissed")
+        dismissed.assertForOverFulfill = false
+        widget.present(appearBlock: nil, dismissBlock: { dismissed.fulfill() })
+
+        wait(for: [dismissed], timeout: TestUtils.asyncTimeout)
+        #endif
+    }
+
+    /// Dismissing a widget without answering it is itself worth reporting: it is
+    /// the difference between a widget nobody saw and one everybody closed.
+    func testDismissingAWidgetRecordsItAsClosed() throws {
+        try skipUnlessNetworkIsInterceptable()
+        #if !(os(iOS) || os(visionOS))
+        throw XCTSkip("feedback widgets are presented in a web view, which only exists on iOS and visionOS")
+        #else
+        let countly = startInstance { $0.eventSendThreshold = 1 }
+        guard let widget = fetchWidgets(countly).first else {
+            XCTFail("the widget list should not be empty")
+            return
+        }
+
+        let closed = expectation(description: "the widget reports it closed")
+        closed.assertForOverFulfill = false
+        widget.present(callback: { state in
+            if state == .closed { closed.fulfill() }
+        })
+        wait(for: [closed], timeout: TestUtils.asyncTimeout)
+
+        TestUtils.waitUntil("the dismissal is recorded") {
+            self.events(of: countly).contains { $0["key"] as? String == "[CLY]_survey" }
+        }
+        let survey = events(of: countly).first { $0["key"] as? String == "[CLY]_survey" }
+        XCTAssertEqual(TestUtils.describe((survey?["segmentation"] as? [String: Any])?["closed"] ?? ""), "1")
+        #endif
+    }
+
+    /// A widget cannot be presented without feedback consent, whatever the host
+    /// application asks.
+    func testAWidgetIsNotPresentedWithoutConsent() throws {
+        try skipUnlessNetworkIsInterceptable()
+        #if !(os(iOS) || os(visionOS))
+        throw XCTSkip("feedback widgets are presented in a web view, which only exists on iOS and visionOS")
+        #else
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: Self.widgetList)
+        let countly = startInstance { $0.requiresConsent = true }
+
+        // The list itself is refused without consent, so nothing can be presented.
+        let reported = expectation(description: "the fetch reports back")
+        countly.feedback.getAvailableFeedbackWidgets { widgets, _ in
+            XCTAssertNil(widgets)
+            reported.fulfill()
+        }
+        wait(for: [reported], timeout: TestUtils.asyncTimeout)
+        #endif
+    }
+
     // MARK: - Consent
 
     func testNothingIsRecordedWithoutFeedbackConsent() {

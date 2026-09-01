@@ -39,6 +39,13 @@ final class MockURLProtocol: URLProtocol {
     /// Answers one request. Returning `nil` falls through to the default failure.
     typealias Handler = (Captured) -> (status: Int, body: Data)?
 
+    /// How long the next answers take to arrive.
+    ///
+    /// The SDK measures how long a request took and backs off when the server is
+    /// evidently overloaded, so reaching that path at all needs a transport that
+    /// can be slow on purpose.
+    static var responseDelay: TimeInterval = 0
+
     private static let lock = NSLock()
     private static var handlers: [Handler] = []
     private static var captured: [Captured] = []
@@ -78,12 +85,19 @@ final class MockURLProtocol: URLProtocol {
         requests.filter { $0.path.contains(pathFragment) }
     }
 
+    /// Answers every request with `json` after `delay` seconds.
+    static func respondSlowly(after delay: TimeInterval, json: String) {
+        responseDelay = delay
+        respondToEverything(json: json)
+    }
+
     /// Drops every handler and every captured request. Called from `setUp`.
     static func reset() {
         lock.lock()
         defer { lock.unlock() }
         handlers.removeAll()
         captured.removeAll()
+        responseDelay = 0
     }
 
     /// A session configuration wired to this protocol, for a config under test.
@@ -120,6 +134,11 @@ final class MockURLProtocol: URLProtocol {
         MockURLProtocol.captured.append(captured)
         let handlers = MockURLProtocol.handlers
         MockURLProtocol.lock.unlock()
+
+        // Sleeping on the protocol's own loading thread rather than hopping, so the
+        // SDK sees one slow request rather than an out-of-order one.
+        let delay = MockURLProtocol.responseDelay
+        if delay > 0 { Thread.sleep(forTimeInterval: delay) }
 
         for handler in handlers {
             guard let (status, data) = handler(captured) else { continue }

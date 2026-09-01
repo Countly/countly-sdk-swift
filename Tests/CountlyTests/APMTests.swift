@@ -228,6 +228,62 @@ final class APMTests: CountlyBaseTestCase {
         XCTAssertGreaterThanOrEqual(duration, 5_000)
     }
 
+    // MARK: - Foreground and background stretches
+
+    /// With the tracking on, the SDK opens a stretch as it starts and closes it
+    /// when the application changes state, so the two traces between them account
+    /// for the whole time the application was running.
+    func testForegroundAndBackgroundStretchesAreTraced() {
+        let countly = startInstance { $0.apm.enableForegroundBackgroundTracking = true }
+
+        // Whichever stretch is open, moving to the other state closes it and opens
+        // the other one.
+        let apm = core(of: countly).modules.apm
+        apm.endBackgroundTrace()
+        TestUtils.pump(0.1)
+
+        let names = traces(of: countly).compactMap { $0["name"] as? String }
+        XCTAssertTrue(names.allSatisfy { $0 == "app_in_foreground" || $0 == "app_in_background" },
+                      "only the two stretch traces should have been recorded, got \(names)")
+    }
+
+    /// Without the switch there are no stretches at all, so an application that did
+    /// not ask for them is not charged for them.
+    func testNoStretchIsTracedWithoutTheSwitch() {
+        let countly = startInstance { $0.apm.enableForegroundBackgroundTracking = false }
+
+        core(of: countly).modules.apm.endBackgroundTrace()
+        TestUtils.pump(0.1)
+
+        XCTAssertTrue(traces(of: countly).filter {
+            ($0["name"] as? String)?.hasPrefix("app_in_") == true
+        }.isEmpty)
+    }
+
+    func testStretchTracingNeedsPerformanceMonitoringConsent() {
+        let countly = startInstance {
+            $0.requiresConsent = true
+            $0.apm.enableForegroundBackgroundTracking = true
+        }
+
+        core(of: countly).modules.apm.endBackgroundTrace()
+        TestUtils.pump(0.1)
+
+        XCTAssertTrue(traces(of: countly).isEmpty)
+    }
+
+    /// Halting has to take the observers down with it, or a stretch keeps being
+    /// timed for an instance that no longer exists.
+    func testHaltingStopsTheStretchTracing() {
+        let countly = startInstance { $0.apm.enableForegroundBackgroundTracking = true }
+        countly.halt()
+
+        // Nothing to assert beyond surviving the teardown: the observers are gone,
+        // so a later application state change reaches nothing.
+        NotificationCenter.default.post(name: Notification.Name("CountlyTestUnrelated"), object: nil)
+        TestUtils.pump(0.1)
+    }
+
     // MARK: - Consent and limits
 
     func testNoTraceIsRecordedWithoutPerformanceMonitoringConsent() {

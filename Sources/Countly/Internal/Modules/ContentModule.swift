@@ -204,14 +204,19 @@ final class ContentModule: ModuleBase {
         fetchContents(contentID: nil) { [weak self] in
             guard let self else { return }
 
+            // Both hops capture `self` weakly again. The `guard let self` above
+            // makes it a strong local, and a nested block that captured that local
+            // would keep this module alive past the core it holds `unowned`: the
+            // retry is a second away, and an instance halted in between would be
+            // read after it was released.
             if attempt < Self.journeyFetchAttempts {
                 self.logD("fetchForJourney", "retrying the journey content fetch in one second, nextAttempt: [\(attempt + 1)]")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                    self.fetchForJourney(attempt: attempt + 1)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                    self?.fetchForJourney(attempt: attempt + 1)
                 }
             } else {
                 self.logD("fetchForJourney", "the journey content fetch exhausted every attempt, re-entering the content zone")
-                DispatchQueue.main.async { self.enterContentZone() }
+                DispatchQueue.main.async { [weak self] in self?.enterContentZone() }
             }
         }
     }

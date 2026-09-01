@@ -132,6 +132,46 @@ extension CGRect {
     }
 }
 
+/// Resolving a local picture path the host application supplied.
+///
+/// The documented form is a filesystem path, and integrations also pass a
+/// `file://` URL because that is what most iOS APIs hand back. Both have to work,
+/// and both have to be resolved the same way everywhere: the SDK checks the file
+/// is readable when the property is set and reads it again when the request is
+/// built, and if those two disagree the picture silently never uploads.
+enum LocalPicturePath {
+
+    /// The file URL for a path or a file URL string, or `nil` when it is neither.
+    static func fileURL(for path: String) -> URL? {
+        guard !path.isEmpty else { return nil }
+
+        // A string that already carries a scheme is a URL; anything else is a
+        // plain path. `URL(string:)` accepts a plain path and produces a
+        // scheme-less URL that nothing can read, so the order matters.
+        if let url = URL(string: path), url.scheme != nil {
+            return url.isFileURL ? url : nil
+        }
+        return URL(fileURLWithPath: path)
+    }
+
+    /// Whether the file behind this path can actually be read.
+    static func isReadable(_ path: String) -> Bool {
+        guard let url = fileURL(for: path) else { return false }
+        return FileManager.default.isReadableFile(atPath: url.path)
+    }
+
+    /// The file's bytes, or `nil` when it cannot be read.
+    static func data(at path: String) -> Data? {
+        guard let url = fileURL(for: path) else { return nil }
+        return try? Data(contentsOf: url)
+    }
+
+    /// The lowercased extension, used to pick the content type.
+    static func fileExtension(of path: String) -> String {
+        (fileURL(for: path)?.pathExtension ?? (path as NSString).pathExtension).lowercased()
+    }
+}
+
 // MARK: - JSON
 
 enum CountlyJSON {

@@ -258,6 +258,120 @@ final class RemoteConfigTests: CountlyBaseTestCase {
         XCTAssertFalse(fired)
     }
 
+    // MARK: - Enrolling by reading
+
+    /// Reading a value is what makes the device part of the experiment, so the
+    /// enrollment is tied to the read rather than to the download.
+    func testReadingAValueAndEnrollingAsksToBeEnrolled() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"colour": "blue"}"#)
+        let countly = startInstance()
+
+        expectCompletion("the download reports back") { done in
+            countly.remoteConfig.downloadKeys { _, _, _, _ in done() }
+        }
+
+        let before = requestQueue(of: countly).count
+        XCTAssertEqual(countly.remoteConfig.getValueAndEnroll("colour").value as? String, "blue")
+
+        let enrolments = requestQueue(of: countly)
+            .map(TestUtils.parseQuery)
+            .filter { $0["method"] as? String == "ab" }
+        XCTAssertEqual(enrolments.count, 1)
+        XCTAssertGreaterThan(requestQueue(of: countly).count, before)
+    }
+
+    /// A key with no value is not an experiment the device is in, so reading it
+    /// enrols in nothing.
+    func testReadingAMissingValueEnrollsInNothing() {
+        let countly = startInstance()
+        let before = requestQueue(of: countly).count
+
+        XCTAssertNil(countly.remoteConfig.getValueAndEnroll("never-downloaded").value)
+
+        XCTAssertEqual(requestQueue(of: countly).count, before)
+    }
+
+    func testReadingEveryValueAndEnrollingCoversThemAllAtOnce() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"a": 1, "b": 2}"#)
+        let countly = startInstance()
+
+        expectCompletion("the download reports back") { done in
+            countly.remoteConfig.downloadKeys { _, _, _, _ in done() }
+        }
+
+        XCTAssertEqual(countly.remoteConfig.getAllValuesAndEnroll().count, 2)
+
+        let enrolments = requestQueue(of: countly)
+            .map(TestUtils.parseQuery)
+            .filter { $0["method"] as? String == "ab" }
+        XCTAssertEqual(enrolments.count, 1, "one request covers every key")
+    }
+
+    func testReadingEveryValueWithAnEmptyCacheEnrollsInNothing() {
+        let countly = startInstance()
+        let before = requestQueue(of: countly).count
+
+        XCTAssertTrue(countly.remoteConfig.getAllValuesAndEnroll().isEmpty)
+
+        XCTAssertEqual(requestQueue(of: countly).count, before)
+    }
+
+    // MARK: - Removing one callback
+
+    /// A Swift closure has no identity to compare against, so registering hands
+    /// back a token and removing takes it. Removing one leaves the others alone.
+    func testOneRegisteredCallbackCanBeRemovedWithoutTouchingTheRest() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"a": 1}"#)
+        let countly = startInstance()
+
+        var removedFired = false
+        let kept = expectation(description: "the callback that stayed fires")
+        kept.assertForOverFulfill = false
+
+        let token = countly.remoteConfig.registerDownloadCallback { _, _, _, _ in removedFired = true }
+        countly.remoteConfig.registerDownloadCallback { _, _, _, _ in kept.fulfill() }
+
+        guard let token else {
+            XCTFail("registering should have handed back a token")
+            return
+        }
+        countly.remoteConfig.removeDownloadCallback(token)
+
+        countly.remoteConfig.downloadKeys(completion: nil)
+        wait(for: [kept], timeout: TestUtils.asyncTimeout)
+
+        XCTAssertFalse(removedFired, "the removed callback must not fire")
+    }
+
+    /// Removing with a token that belongs to nothing is a no-op rather than an
+    /// error, because the caller may be tearing down twice.
+    func testRemovingACallbackTwiceIsHarmless() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"a": 1}"#)
+        let countly = startInstance()
+
+        guard let token = countly.remoteConfig.registerDownloadCallback({ _, _, _, _ in }) else {
+            XCTFail("registering should have handed back a token")
+            return
+        }
+        countly.remoteConfig.removeDownloadCallback(token)
+        countly.remoteConfig.removeDownloadCallback(token)
+    }
+
+    /// A callback supplied at init is registered like any other, so it can be
+    /// removed by name along with the rest.
+    func testAGlobalCallbackFromTheConfigIsRegisteredAtStart() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"a": 1}"#)
+
+        let notified = expectation(description: "the config callback fires")
+        notified.assertForOverFulfill = false
+        let countly = startInstance {
+            $0.remoteConfigRegisterGlobalCallback { _, _, _, _ in notified.fulfill() }
+        }
+
+        countly.remoteConfig.downloadKeys(completion: nil)
+        wait(for: [notified], timeout: TestUtils.asyncTimeout)
+    }
+
     // MARK: - A/B testing
 
     func testEnrollingAndExitingUseTheirOwnMethods() {

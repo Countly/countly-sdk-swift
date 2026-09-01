@@ -59,6 +59,25 @@ final class ServerConfigBuilder {
     @discardableResult
     func automaticViewTracking(_ enabled: Bool) -> Self { set("avt", enabled) }
 
+    // MARK: - Backoff
+
+    /// How slow an answer has to be before it counts as an overloaded server.
+    @discardableResult
+    func bomAcceptedTimeout(_ seconds: Int) -> Self { set("bom_at", seconds) }
+
+    /// How full the queue may be and still count as unpressured, as a fraction of
+    /// the queue limit.
+    @discardableResult
+    func bomRequestQueuePercentage(_ fraction: Double) -> Self { set("bom_rqp", fraction) }
+
+    /// How old a request may be and still count towards a backoff, in hours.
+    @discardableResult
+    func bomRequestAge(_ hours: Int) -> Self { set("bom_ra", hours) }
+
+    /// How long a triggered backoff pauses the queue, in seconds.
+    @discardableResult
+    func bomDuration(_ seconds: Int) -> Self { set("bom_d", seconds) }
+
     // MARK: - Sizes and limits
 
     @discardableResult

@@ -305,7 +305,7 @@ final class UserProfileModule: ModuleBase {
             let path = String(describing: value)
             // An unreadable path would produce a multipart request with no file,
             // which the server rejects, so it is dropped here instead.
-            if !path.isEmpty, !FileManager.default.isReadableFile(atPath: path) {
+            if !path.isEmpty, !LocalPicturePath.isReadable(path) {
                 logW("assignPredefined", "provided picture path file can not be opened, pathLength: [\(path.count)], value will be dropped")
                 pictureLocalPath = nil
             } else {

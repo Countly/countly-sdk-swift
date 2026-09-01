@@ -36,7 +36,10 @@ final class WebViewManager: NSObject {
 
     private var window: OverlayWindow?
     private var backgroundView: PassThroughBackgroundView?
-    private var webView: WKWebView?
+    /// Readable inside the module so the test suite can assert on where the page
+    /// actually ended up, which is the thing a resize bug shows up in. The class
+    /// itself is internal, so this widens nothing the outside can see.
+    private(set) var webView: WKWebView?
 
     private var appearBlock: (() -> Void)?
     private var dismissBlock: (() -> Void)?

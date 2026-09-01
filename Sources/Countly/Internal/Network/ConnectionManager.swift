@@ -586,13 +586,16 @@ final class ConnectionManager: NSObject {
         core.logger.d(Self.module, "pictureUploadData", "local picture path is extracted from the query string, pathLength: [\(localPath.count)]")
 
         let allowed = ["gif", "png", "jpg", "jpeg"]
-        let fileExtension = (localPath as NSString).pathExtension.lowercased()
+        let fileExtension = LocalPicturePath.fileExtension(of: localPath)
         guard let index = allowed.firstIndex(of: fileExtension) else {
             core.logger.w(Self.module, "pictureUploadData", "picture upload is skipped, reason: unsupported file extension, extension: [\(fileExtension)]")
             return nil
         }
 
-        guard let url = URL(string: localPath), let imageData = try? Data(contentsOf: url) else {
+        // Resolved the same way the readability check resolved it when the
+        // property was set. Reading it differently here is how a picture that
+        // passed validation silently fails to upload.
+        guard let imageData = LocalPicturePath.data(at: localPath) else {
             core.logger.w(Self.module, "pictureUploadData", "picture upload is skipped, reason: local picture data can not be read, extension: [\(fileExtension)]")
             return nil
         }

@@ -1,0 +1,289 @@
+//
+//  AutoViewTrackingTests.swift
+//
+//  This code is provided under the MIT License.
+//
+//  Please visit www.count.ly for more information.
+//
+
+#if os(iOS) || os(tvOS)
+
+import XCTest
+import UIKit
+@testable import Countly
+
+/// Naming screens without the application having to.
+///
+/// The SDK swizzles `viewDidAppear` and turns every screen into a view. That makes
+/// two things easy to get wrong and invisible when they are: which name a screen
+/// reports, and whether the screen the user just left is closed so it reports how
+/// long they were on it.
+///
+/// These push real view controllers through the same callback the swizzle uses.
+final class AutoViewTrackingTests: CountlyBaseTestCase {
+
+    /// A view controller with a title, which is what the SDK names a screen by.
+    private final class TitledViewController: UIViewController {
+        convenience init(named name: String) {
+            self.init(nibName: nil, bundle: nil)
+            title = name
+        }
+    }
+
+    /// A screen that names itself, overriding whatever its title says.
+    private final class SelfNamingViewController: UIViewController, CountlyAutoViewTrackingName {
+        var countlyAutoViewTrackingName: String? { "TheNameIChose" }
+    }
+
+    private final class ExcludedByClassViewController: UIViewController {}
+
+    /// Every `[CLY]_view` event the instance produced, oldest first.
+    private func viewEvents(of instance: CountlyInstance) -> [[String: Any]] {
+        requestQueue(of: instance)
+            .map(TestUtils.parseQuery)
+            .compactMap { $0["events"] as? [[String: Any]] }
+            .flatMap { $0 }
+            .filter { $0["key"] as? String == ReservedEventKey.view }
+    }
+
+    private func names(of instance: CountlyInstance) -> [String] {
+        viewEvents(of: instance).compactMap {
+            ($0["segmentation"] as? [String: Any])?[SegKey.name] as? String
+        }
+    }
+
+    /// Starts an instance with automatic tracking on and waits for it to be live.
+    private func trackingInstance(_ adjust: @escaping (CountlyConfig) -> Void = { _ in }) -> CountlyInstance {
+        let countly = startInstance {
+            $0.eventSendThreshold = 1
+            $0.enableAutomaticViewTracking = true
+            adjust($0)
+        }
+        let views = core(of: countly).modules.views
+        TestUtils.waitUntil("automatic view tracking is active") { views.isAutoViewTrackingActive }
+        return countly
+    }
+
+    /// Delivers an appearance the way the swizzled `viewDidAppear` does.
+    private func appear(_ viewController: UIViewController) {
+        if Thread.isMainThread {
+            AutoViewTracker.shared.viewControllerDidAppear(viewController)
+        } else {
+            DispatchQueue.main.sync { AutoViewTracker.shared.viewControllerDidAppear(viewController) }
+        }
+    }
+
+    // MARK: - Naming a screen
+
+    func testAScreenIsNamedByItsTitle() {
+        let countly = trackingInstance()
+
+        appear(TitledViewController(named: "Home"))
+
+        XCTAssertEqual(names(of: countly), ["Home"])
+    }
+
+    /// A screen can name itself, which is how an application gives a meaningful
+    /// name to a controller whose title is empty or is user-facing copy.
+    func testAScreenCanNameItself() {
+        let countly = trackingInstance()
+
+        appear(SelfNamingViewController())
+
+        XCTAssertEqual(names(of: countly), ["TheNameIChose"])
+    }
+
+    /// A controller with no title of any kind falls back to its class name, which
+    /// is still more useful than dropping the screen entirely: a nameless screen in
+    /// the report is a hole in the user's journey.
+    func testAScreenWithNoTitleFallsBackToItsClassName() {
+        let countly = trackingInstance()
+
+        appear(UIViewController())
+
+        XCTAssertEqual(names(of: countly), ["UIViewController"])
+    }
+
+    /// A controller that blanks its title, which applications do to shorten a back
+    /// button, must not report a nameless view: the empty string is treated as no
+    /// title rather than as a name.
+    func testABlankedTitleIsTreatedAsNoTitle() {
+        let countly = trackingInstance()
+
+        let blank = UIViewController()
+        blank.title = ""
+        appear(blank)
+
+        XCTAssertEqual(names(of: countly), ["UIViewController"])
+    }
+
+    /// A navigation title is used when the controller has no title of its own,
+    /// which is where a screen's name usually lives in a navigation stack.
+    func testANavigationTitleNamesTheScreen() {
+        let countly = trackingInstance()
+
+        let controller = UIViewController()
+        controller.navigationItem.title = "FromTheNavigationBar"
+        appear(controller)
+
+        XCTAssertEqual(names(of: countly), ["FromTheNavigationBar"])
+    }
+
+    /// A custom title view is what an application uses when the name is a label
+    /// rather than plain text, and it is read too.
+    func testATitleViewLabelNamesTheScreen() {
+        let countly = trackingInstance()
+
+        let label = UILabel()
+        label.text = "FromTheTitleView"
+        let controller = UIViewController()
+        controller.navigationItem.titleView = label
+        appear(controller)
+
+        XCTAssertEqual(names(of: countly), ["FromTheTitleView"])
+    }
+
+    // MARK: - Closing the screen the user left
+
+    /// Each screen is closed when the next one opens, so every one reports how long
+    /// the user was on it. Leaving them open would report one duration for a whole
+    /// journey instead of one per screen.
+    func testEachScreenIsClosedWhenTheNextOneOpens() {
+        let countly = trackingInstance()
+
+        appear(TitledViewController(named: "First"))
+        TestUtils.pump(1.1)
+        appear(TitledViewController(named: "Second"))
+
+        XCTAssertEqual(names(of: countly), ["First", "First", "Second"],
+                       "first opens, first closes, second opens")
+
+        let closing = viewEvents(of: countly)[1]
+        XCTAssertGreaterThanOrEqual(TestUtils.double(closing["dur"]) ?? 0, 1,
+                                    "the closed screen reports how long the user was on it")
+    }
+
+    /// The same screen appearing again, as it does when a modal above it is
+    /// dismissed, is not a new visit and must not restart the view.
+    func testTheSameScreenAppearingAgainDoesNotRestartIt() {
+        let countly = trackingInstance()
+
+        appear(TitledViewController(named: "Home"))
+        appear(TitledViewController(named: "Home"))
+
+        XCTAssertEqual(names(of: countly), ["Home"])
+    }
+
+    // MARK: - The exclusion list
+
+    func testAScreenOnTheExclusionListIsIgnoredByName() {
+        let countly = trackingInstance { $0.automaticViewTrackingExclusionList = ["Secret"] }
+
+        appear(TitledViewController(named: "Secret"))
+        appear(TitledViewController(named: "Ordinary"))
+
+        XCTAssertEqual(names(of: countly), ["Ordinary"])
+    }
+
+    /// Excluding by class name covers a screen whose title changes, and it is what
+    /// the default list uses to keep the system's own controllers out.
+    func testAScreenCanBeExcludedByItsClassName() {
+        let className = NSStringFromClass(ExcludedByClassViewController.self)
+        let countly = trackingInstance { $0.automaticViewTrackingExclusionList = [className] }
+
+        let excluded = ExcludedByClassViewController()
+        excluded.title = "Should not appear"
+        appear(excluded)
+        appear(TitledViewController(named: "Ordinary"))
+
+        XCTAssertEqual(names(of: countly), ["Ordinary"])
+    }
+
+    func testTheExclusionListCanBeExtendedAfterStart() {
+        let countly = trackingInstance()
+
+        countly.views.addAutoViewTrackingExclusionList(["LaterExcluded"])
+        appear(TitledViewController(named: "LaterExcluded"))
+        appear(TitledViewController(named: "Ordinary"))
+
+        XCTAssertEqual(names(of: countly), ["Ordinary"])
+    }
+
+    // MARK: - Gates
+
+    func testNoScreenIsTrackedWithoutViewConsent() {
+        let countly = startInstance {
+            $0.eventSendThreshold = 1
+            $0.enableAutomaticViewTracking = true
+            $0.requiresConsent = true
+        }
+
+        appear(TitledViewController(named: "Blocked"))
+        XCTAssertTrue(viewEvents(of: countly).isEmpty)
+
+        countly.consent.giveConsent(for: .viewTracking)
+        let views = core(of: countly).modules.views
+        TestUtils.waitUntil("automatic view tracking is active") { views.isAutoViewTrackingActive }
+
+        appear(TitledViewController(named: "Allowed"))
+        XCTAssertEqual(names(of: countly), ["Allowed"])
+    }
+
+    /// The behaviour settings are re-checked on every appearance, so a server
+    /// switching view tracking off takes effect on the very next screen rather than
+    /// on the next launch.
+    func testTheServerCanStopTrackingFromTheNextScreenOnwards() {
+        // The tracker is never switched on at all when the server has view tracking
+        // off, so this deliberately does not wait for it to become active.
+        let countly = startInstance {
+            $0.eventSendThreshold = 1
+            $0.enableAutomaticViewTracking = true
+            $0.sdkBehaviorSettings = ServerConfigBuilder().viewTracking(false).json()
+        }
+
+        appear(TitledViewController(named: "Suppressed"))
+
+        XCTAssertTrue(viewEvents(of: countly).isEmpty)
+    }
+
+    /// Once automatic tracking is off, appearances are ignored and the application
+    /// is free to record views itself.
+    func testAppearancesAreIgnoredOnceTrackingIsStopped() {
+        let countly = trackingInstance()
+
+        appear(TitledViewController(named: "Tracked"))
+        core(of: countly).modules.views.stopAutoViewTracking()
+        appear(TitledViewController(named: "NotTracked"))
+
+        XCTAssertFalse(names(of: countly).contains("NotTracked"))
+    }
+
+    /// A halted instance must stop hearing about screens, or the tracker keeps
+    /// naming views for an SDK that is no longer running.
+    func testAHaltedInstanceStopsHearingAboutScreens() {
+        let countly = trackingInstance()
+
+        appear(TitledViewController(named: "BeforeHalt"))
+        countly.halt()
+
+        // The swizzle outlives the last subscriber on purpose, so this has to be
+        // safe rather than merely unobserved.
+        appear(TitledViewController(named: "AfterHalt"))
+    }
+
+    // MARK: - Several instances
+
+    /// Each instance applies its own exclusion list and consent to the same
+    /// appearance, which is what makes two tenants in one application possible.
+    func testEachInstanceAppliesItsOwnExclusionList() {
+        let tracking = trackingInstance { $0.automaticViewTrackingExclusionList = ["Shared"] }
+        let other = trackingInstance()
+
+        appear(TitledViewController(named: "Shared"))
+
+        XCTAssertFalse(names(of: tracking).contains("Shared"), "excluded here")
+        XCTAssertTrue(names(of: other).contains("Shared"), "not excluded there")
+    }
+}
+
+#endif

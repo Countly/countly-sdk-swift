@@ -342,12 +342,16 @@ final class RemoteConfigModule: ModuleBase {
 
             // Callbacks reach the host application on the main thread, because a
             // remote config value usually drives what is on screen.
-            DispatchQueue.main.async {
+            // Weak again: the `guard let self` above makes it a strong local, and
+            // a hop that captured that local would keep this module alive past the
+            // core it holds `unowned`. The caller's completion still runs either
+            // way, which is what it is waiting for.
+            DispatchQueue.main.async { [weak self] in
                 if let resolvedError {
-                    self.logD("fetch", "remote config request failed, statusCode: [\(statusCode)], error: [\(resolvedError.localizedDescription)]")
+                    self?.logD("fetch", "remote config request failed, statusCode: [\(statusCode)], error: [\(resolvedError.localizedDescription)]")
                     completion(nil, resolvedError)
                 } else {
-                    self.logD("fetch", "remote config request successfully completed, statusCode: [\(statusCode)], valueCount: [\(parsed?.count ?? 0)]")
+                    self?.logD("fetch", "remote config request successfully completed, statusCode: [\(statusCode)], valueCount: [\(parsed?.count ?? 0)]")
                     completion(parsed, nil)
                 }
             }

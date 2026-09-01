@@ -98,6 +98,20 @@ jobs:
             -destination 'generic/platform=${{ matrix.env.platform }}' \
             CODE_SIGNING_ALLOWED=NO
 
+      # The test target is compiled on every platform too, without running anything.
+      #
+      # A test that touches a platform-guarded type has to carry the same guard, and nothing
+      # catches a missing one except compiling there. The suites that actually run are gated on
+      # simulator availability and are marked advisory, so a test-only compile break would
+      # otherwise be reported in a job that cannot fail the run. This is cheap, needs no
+      # simulator, and fails loudly.
+      - name: Compile the tests for ${{ matrix.env.sdk }}
+        run: |
+          xcodebuild build-for-testing \
+            -scheme Countly-Package \
+            -destination 'generic/platform=${{ matrix.env.platform }}' \
+            CODE_SIGNING_ALLOWED=NO
+
   # The package builds cleanly, but the podspec is a second, independently maintained
   # description of the same sources. A source file added to the package and not to the podspec
   # only shows up as a broken CocoaPods install, which is why this is checked on every run.
