@@ -42,7 +42,13 @@ final class PushModule: ModuleBase {
     // MARK: - Init
 
     func applyInitialConfig() {
-        guard core.config.features.contains(.pushNotifications) else { return }
+        guard core.config.features.contains(.pushNotifications) else {
+            logD("applyInitialConfig", "push is not in the config feature list, this module will stay inactive whatever consent says")
+            return
+        }
+
+        logD("applyInitialConfig", "push module starting, disableAutomaticPushHandling: [\(core.config.disableAutomaticPushHandling)], sendPushTokenAlways: [\(core.config.sendPushTokenAlways)], doNotShowAlertForNotifications: [\(core.config.doNotShowAlertForNotifications)], pushTestMode: [\(core.config.pushTestMode?.wireValue ?? 0)]")
+
         isEnabledOnInitialConfig = true
         startPushNotifications()
     }
@@ -53,25 +59,34 @@ final class PushModule: ModuleBase {
     func startPushNotifications() {
         logI("startPushNotifications", "push notifications registration requested, enabledOnInitialConfig: [\(isEnabledOnInitialConfig)]")
 
-        guard isEnabledOnInitialConfig else { return }
+        guard isEnabledOnInitialConfig else {
+            logD("startPushNotifications", "push registration is skipped, push was not switched on in the initial config")
+            return
+        }
 
         guard core.modules.consent.hasConsent(for: .pushNotifications) else {
             logV("startPushNotifications", "no push consent given, remote notification registration is skipped")
             return
         }
 
-        guard !isRegistered else { return }
+        guard !isRegistered else {
+            logD("startPushNotifications", "push registration is skipped, this instance is already registered for the process wide token")
+            return
+        }
         isRegistered = true
 
         #if os(iOS) || os(visionOS) || os(macOS)
         let automatic = !core.config.disableAutomaticPushHandling
-        if !automatic {
+        if automatic {
+            logI("startPushNotifications", "automatic push handling is on, the SDK claims the notification centre delegate and the remote notification registration callbacks")
+        } else {
             logI("startPushNotifications", "automatic push handling is disabled, the host application has to forward the device token and notification actions itself")
         }
         PushRuntime.shared.register(self, automaticHandling: automatic)
 
         #if os(macOS)
         if automatic, let launchInfo = core.config.launchNotification {
+            logD("startPushNotifications", "a launch notification was supplied in config, the click that cold started the app is replayed")
             PushRuntime.shared.replayLaunchNotification(launchInfo)
         }
         #endif
@@ -98,7 +113,10 @@ final class PushModule: ModuleBase {
     func stopPushNotifications() {
         logI("stopPushNotifications", "push notifications unregistration requested, enabledOnInitialConfig: [\(isEnabledOnInitialConfig)]")
 
-        guard isEnabledOnInitialConfig, isRegistered else { return }
+        guard isEnabledOnInitialConfig, isRegistered else {
+            logD("stopPushNotifications", "push unregistration is a no-op, enabledOnInitialConfig: [\(isEnabledOnInitialConfig)], isRegistered: [\(isRegistered)]")
+            return
+        }
         isRegistered = false
 
         #if os(iOS) || os(visionOS) || os(macOS)
@@ -124,6 +142,8 @@ final class PushModule: ModuleBase {
             ? [.badge, .sound, .alert]
             : UNAuthorizationOptions(rawValue: options)
 
+        logD("askForNotificationPermission", "asking the system for notification authorization, resolvedOptions: [\(resolved.rawValue)], defaultsUsed: [\(options == 0)]")
+
         UNUserNotificationCenter.current().requestAuthorization(options: resolved) { [weak self] granted, error in
             guard let self else { return }
 
@@ -137,6 +157,7 @@ final class PushModule: ModuleBase {
             self.sendToken()
         }
         #else
+        logD("askForNotificationPermission", "this platform has no user notification support, the completion is answered with a refusal")
         completion?(false, nil)
         #endif
     }
@@ -145,11 +166,21 @@ final class PushModule: ModuleBase {
 
     /// Called by the runtime when the process receives a token.
     func didReceive(_ token: PushDeviceToken) {
+        switch token {
+        case .value(let value):
+            logI("didReceive", "a device token arrived from the process wide push runtime, tokenLength: [\(value.count)]")
+            logV("didReceive", "device token detail, token: [\(value)]")
+        case .failed:
+            logI("didReceive", "remote notification registration failed for this process, no device token will be available")
+        }
+
         sendToken(token)
     }
 
     /// Reports the current token, if the permission state warrants it.
     func sendToken(_ overrideToken: PushDeviceToken? = nil) {
+        logI("sendToken", "push token reporting requested, tokenSuppliedByCaller: [\(overrideToken != nil)]")
+
         guard core.modules.consent.hasConsent(for: .pushNotifications) else {
             logV("sendToken", "no push consent given, push token is not sent")
             return
@@ -211,6 +242,9 @@ final class PushModule: ModuleBase {
 
     private func send(token: String) {
         let testMode = core.config.pushTestMode?.wireValue ?? 0
+        logD("send", "push token request is being queued, tokenLength: [\(token.count)], pushTestMode: [\(testMode)]")
+        logV("send", "push token request detail, token: [\(token)]")
+
         var queryString = core.network.builder.queryEssentials()
         queryString += "&\(QS.pushTokenSession)=1"
         queryString += "&\(QS.pushTokeniOS)=\(token)"
@@ -235,6 +269,9 @@ final class PushModule: ModuleBase {
 
         let countlyPayload = userInfo[CountlyPushKey.countlyPayload] as? [String: Any]
         let notificationID = countlyPayload?[CountlyPushKey.notificationID] as? String
+
+        logD("recordAction", "the tapped notification was resolved, countlyPayloadPresent: [\(countlyPayload != nil)], notificationIDPresent: [\(!(notificationID ?? "").isEmpty)], payloadKeyCount: [\(countlyPayload?.count ?? 0)]")
+        logV("recordAction", "tapped notification payload detail, userInfo: [\(userInfo)]")
 
         recordActionEvent(notificationID: notificationID, buttonIndex: buttonIndex)
     }
@@ -267,12 +304,20 @@ final class PushModule: ModuleBase {
         // The host may have taken the delegate slot since the last check. Re-asserting
         // here rather than only at registration keeps a notification tap reportable
         // for an integration that installs its own delegate after the SDK starts.
-        guard isRegistered, !core.config.disableAutomaticPushHandling else { return }
+        guard isRegistered, !core.config.disableAutomaticPushHandling else {
+            logD("didEnterForeground", "the notification centre delegate is not re-asserted, isRegistered: [\(isRegistered)], disableAutomaticPushHandling: [\(core.config.disableAutomaticPushHandling)]")
+            return
+        }
+
+        logD("didEnterForeground", "re-asserting the notification centre delegate in case the host application took the slot")
         PushRuntime.shared.assertNotificationCenterDelegate()
         #endif
     }
 
     override func halt(clearStorage: Bool) {
+        // The system keeps delivering notifications after this: only the reporting
+        // stops, so a log line here is the only trace of why they stopped landing.
+        logD("halt", "push module halting, this instance stops reporting notifications while the process stays registered with the system")
         stopPushNotifications()
         isEnabledOnInitialConfig = false
     }

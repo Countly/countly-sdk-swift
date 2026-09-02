@@ -6,7 +6,7 @@
 //  Please visit www.count.ly for more information.
 //
 
-#if os(iOS) || os(visionOS)
+#if os(iOS) || os(visionOS) || os(macOS)
 
 import XCTest
 import WebKit
@@ -95,13 +95,13 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
                 finished = true
             }
         }
-        TestUtils.waitUntil("the navigation is attempted") { finished }
+        TestUtils.waitUntil("the navigation is attempted", timeout: TestUtils.webKitTimeout) { finished }
         // The policy decision lands on a later main-thread turn.
         TestUtils.pump(0.3)
     }
 
     private func waitForLoad(_ manager: WebViewManager) {
-        TestUtils.waitUntil("the page finishes loading") {
+        TestUtils.waitUntil("the page finishes loading", timeout: TestUtils.webKitTimeout) {
             guard let page = self.page(of: manager) else { return false }
             return !page.isLoading
         }
@@ -128,7 +128,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         appeared.assertForOverFulfill = false
         present(countly, appear: { appeared.fulfill() })
 
-        wait(for: [appeared], timeout: TestUtils.asyncTimeout)
+        wait(for: [appeared], timeout: TestUtils.webKitTimeout)
     }
 
     /// A URL that could not be built is not presented, and must not leave a window
@@ -176,7 +176,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
 
         navigate(manager, to: "https://countly_action_event?close=1")
 
-        wait(for: [dismissed], timeout: TestUtils.asyncTimeout)
+        wait(for: [dismissed], timeout: TestUtils.webKitTimeout)
     }
 
     /// A closing call to action carries both its event and the close, and the event
@@ -190,7 +190,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         let events = "[{\"key\":\"cta_tapped\",\"segmentation\":{\"id\":\"7\"}}]"
         navigate(manager, to: "https://countly_action_event?action=event&event=\(events)&close=1")
 
-        TestUtils.waitUntil("the event reaches the queue") {
+        TestUtils.waitUntil("the event reaches the queue", timeout: TestUtils.webKitTimeout) {
             !self.recordedEvents(of: countly).filter { $0["key"] as? String == "cta_tapped" }.isEmpty
         }
 
@@ -211,7 +211,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         """
         navigate(manager, to: "https://countly_action_event?action=event&event=\(events)")
 
-        TestUtils.waitUntil("both events reach the queue") {
+        TestUtils.waitUntil("both events reach the queue", timeout: TestUtils.webKitTimeout) {
             let keys = self.recordedEvents(of: countly).compactMap { $0["key"] as? String }
             return keys.contains("one") && keys.contains("two")
         }
@@ -232,7 +232,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         """.replacingOccurrences(of: "\\\n", with: "")
         navigate(manager, to: "https://countly_action_event?action=event&event=\(events)")
 
-        TestUtils.waitUntil("the usable event reaches the queue") {
+        TestUtils.waitUntil("the usable event reaches the queue", timeout: TestUtils.webKitTimeout) {
             self.recordedEvents(of: countly).contains { $0["key"] as? String == "kept" }
         }
 
@@ -259,7 +259,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         """
         navigate(manager, to: "https://countly_action_event?action=event&event=\(events)")
 
-        wait(for: [appeared], timeout: TestUtils.asyncTimeout)
+        wait(for: [appeared], timeout: TestUtils.webKitTimeout)
     }
 
     /// An events payload that is not an array is ignored rather than crashing or
@@ -326,6 +326,21 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         XCTAssertEqual(after?.width, 120)
     }
 
+    /// The frame the page is given already clears the safe area, so a scroll view
+    /// insetting for it a second time makes a page that exactly fills its slot
+    /// taller than the slot: it scrolls, and its buttons are cut off at the bottom.
+    #if !os(macOS)
+    func testTheScrollViewDoesNotInsetForTheSafeAreaASecondTime() {
+        let countly = startInstance()
+
+        let manager = present(countly)
+        waitForLoad(manager)
+
+        let behavior = onMain { self.page(of: manager)?.scrollView.contentInsetAdjustmentBehavior }
+        XCTAssertEqual(behavior, .never)
+    }
+    #endif
+
     func testAMalformedResizeRequestIsIgnored() {
         let countly = startInstance()
 
@@ -342,8 +357,21 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
 
     /// A link marked external never loads inside the widget: it belongs to the
     /// browser, and loading it in place would strand the user inside the overlay.
+    ///
+    /// The host's URL handler stands in for the browser here, and not only to keep
+    /// the assertion tight. Without it the SDK reaches `NSWorkspace.open`, and the
+    /// test genuinely asks the machine to launch a browser on every run: the address
+    /// below does not resolve, so Launch Services answers `-50` over and over. A
+    /// unit test must not depend on, or disturb, what is installed on the host.
     func testALinkMarkedExternalIsNotLoadedInPlace() {
-        let countly = startInstance()
+        var handed: URL?
+        let countly = startInstance {
+            $0.content.contentURLHandler = { url in
+                handed = url
+                // Claiming the URL stops the SDK before it reaches the system opener.
+                return true
+            }
+        }
 
         let manager = present(countly)
         waitForLoad(manager)
@@ -353,6 +381,13 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         // The page is still the one that was presented, not the external address.
         let current = onMain { self.page(of: manager)?.url?.absoluteString ?? "" }
         XCTAssertFalse(current.contains("somewhere"))
+
+        // And it was handed off rather than merely dropped, which is the half the
+        // assertion above cannot see.
+        TestUtils.waitUntil("the link is handed to the host", timeout: TestUtils.webKitTimeout) {
+            handed != nil
+        }
+        XCTAssertEqual(handed?.absoluteString, "https://example.com/somewhere?cly_x_int=1")
     }
 
     /// A link action with no scheme is not a link, and must not be handed to the
@@ -386,7 +421,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         // so the deadline is content only.
         present(countly, url: "https://example.com/o/sdk/content", dismiss: { dismissed.fulfill() })
 
-        wait(for: [dismissed], timeout: TestUtils.asyncTimeout)
+        wait(for: [dismissed], timeout: TestUtils.webKitTimeout)
     }
 
     /// A feedback widget renders as soon as it loads and never sends a shown event,
@@ -463,9 +498,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
 
         XCTAssertFalse(dismissed)
     }
-
-    // MARK: - Layout
-
+    #if os(iOS) || os(visionOS)
     /// A page pinned to portrait keeps its layout when the interface rotates, which
     /// is what `disableRotation` is for.
     func testAPagePinnedToPortraitIgnoresAnInterfaceSizeChange() {
@@ -485,6 +518,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
 
         XCTAssertEqual(onMain { self.page(of: manager)?.frame }, before)
     }
+    #endif
 
     // MARK: - Reading the queue
 
@@ -494,8 +528,66 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
             .compactMap { $0["events"] as? [[String: Any]] }
             .flatMap { $0 }
     }
+
+    // MARK: - Which monitor the overlay lands on
+
+    /// The panel's rect is a position on the desktop, and the desktop spans every
+    /// display, so the origin is what decides which monitor content appears on.
+    ///
+    /// This was zeroed, on the reasoning that the geometry a content page sends is
+    /// relative to the overlay rather than to the desktop. That is true of the
+    /// page's coordinates and false of the window's: a zero origin is not "wherever
+    /// the application is", it is a specific point on whichever display owns the
+    /// global origin. On a single-monitor machine the two coincide and nothing looks
+    /// wrong, which is why it survived. With a second monitor content opened on the
+    /// primary display while the application was on the other one.
+    #if os(macOS)
+    func testTheOverlayFrameKeepsTheOriginOfTheScreenTheApplicationIsOn() throws {
+        guard let screen = ScreenReader.activeScreen else {
+            throw XCTSkip("no screen attached, so there is no placement to assert")
+        }
+
+        // Deliberately the whole rect and not just the size. Asserting the size
+        // alone is what let the origin be dropped in the first place.
+        XCTAssertEqual(ScreenReader.overlayFrame, screen.visibleFrame,
+                       "the overlay frame is the active screen's visible frame, origin included")
+    }
+
+    /// `screenBounds` stays origin-less on purpose, because its callers want a size:
+    /// the reported device metrics, and view frames whose coordinates start at zero
+    /// whatever desktop position their window has. The two must not be conflated
+    /// again, so the difference between them is asserted rather than assumed.
+    func testScreenBoundsReportsASizeWhileTheOverlayFrameReportsAPosition() throws {
+        guard let screen = ScreenReader.activeScreen else {
+            throw XCTSkip("no screen attached")
+        }
+
+        XCTAssertEqual(ScreenReader.screenBounds.origin, .zero)
+        XCTAssertEqual(ScreenReader.screenBounds.size, screen.visibleFrame.size,
+                       "the two agree on size and differ only in origin")
+        XCTAssertEqual(ScreenReader.overlayFrame.size, screen.visibleFrame.size)
+    }
+
+    /// The behaviour the two above exist to protect: a freshly built overlay sits on
+    /// the screen the application is on, not on some other one.
+    func testANewOverlayLandsOnTheScreenTheApplicationIsOn() throws {
+        guard let screen = ScreenReader.activeScreen else {
+            throw XCTSkip("no screen attached")
+        }
+        let overlay = OverlayWindow()
+        defer { overlay.close() }
+
+        // `NSWindow` may inset the frame it was asked for, so intersection is the
+        // honest assertion: whatever AppKit did with the rect, it stayed on this
+        // screen. On one monitor this always holds; on two it is the whole point.
+        XCTAssertTrue(screen.frame.intersects(overlay.frame),
+                      "the overlay opened away from the application's screen")
+    }
+    #endif
+
 }
 
+#if os(iOS) || os(visionOS)
 /// The minimum a `viewWillTransition` needs, since the real one only exists during
 /// an actual rotation.
 private final class DummyTransitionCoordinator: NSObject, UIViewControllerTransitionCoordinator {
@@ -533,7 +625,9 @@ private final class DummyTransitionCoordinator: NSObject, UIViewControllerTransi
     // protocol on the platforms that have it.
     func notifyWhenInteractionEnds(_ handler: @escaping (UIViewControllerTransitionCoordinatorContext) -> Void) {}
     #endif
+
     func notifyWhenInteractionChanges(_ handler: @escaping (UIViewControllerTransitionCoordinatorContext) -> Void) {}
 }
+#endif
 
 #endif

@@ -259,6 +259,131 @@ final class PushTests: CountlyBaseTestCase {
         XCTAssertEqual(Data([0x00, 0x0F, 0xA5, 0xFF]).hexString, "000fa5ff")
     }
 
+    // MARK: - Registering for the process-wide token
+
+    /// Registration is what subscribes an instance to the process-wide token, and
+    /// it is gated on push having been switched on in the initial config. An
+    /// instance that never asked for push must not start receiving tokens because
+    /// some other instance in the process did.
+    ///
+    /// Asserted as a delta rather than an absolute count: the runtime holds its
+    /// token for the life of the process and nothing resets it between tests, so
+    /// "this instance saw no new token" is the only claim that stays true whatever
+    /// ran first.
+    func testAnInstanceWithoutThePushFeatureNeverHearsAboutTheToken() throws {
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
+        #else
+        let countly = startInstance {
+            $0.sendPushTokenAlways = true
+            // Deliberately not `.pushNotifications`.
+            $0.features = [.crashReporting]
+            $0.disableAutomaticPushHandling = true
+        }
+        let before = tokenRequests(of: countly).count
+
+        Countly.didRegisterForRemoteNotifications(deviceToken: Data([0x01, 0x02]))
+
+        XCTAssertEqual(tokenRequests(of: countly).count, before,
+                       "an instance that did not ask for push was handed a token anyway")
+        #endif
+    }
+
+    /// Consent gates registration, not just sending. Without it the instance is not
+    /// subscribed at all, so a token arriving for the process does not reach it.
+    func testAnInstanceWithoutPushConsentDoesNotHearAboutTheTokenUntilConsentArrives() throws {
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
+        #else
+        let countly = startInstance {
+            $0.sendPushTokenAlways = true
+            $0.features = [.pushNotifications]
+            $0.requiresConsent = true
+            $0.disableAutomaticPushHandling = true
+        }
+        let before = tokenRequests(of: countly).count
+
+        Countly.didRegisterForRemoteNotifications(deviceToken: Data([0x0A, 0x0B]))
+        XCTAssertEqual(tokenRequests(of: countly).count, before,
+                       "a token reached an instance with no push consent")
+
+        // Giving consent registers the instance, which is the path
+        // `ConsentModule` takes when a feature is switched on after start.
+        countly.consent.giveConsent(for: .pushNotifications)
+        Countly.didRegisterForRemoteNotifications(deviceToken: Data([0x0A, 0x0B]))
+
+        XCTAssertGreaterThan(tokenRequests(of: countly).count, before,
+                             "consent should have subscribed the instance to the token")
+        #endif
+    }
+
+    /// Registering is idempotent. The call happens on start, again when consent
+    /// arrives, and again on any later `recordPushNotificationToken`, so a second
+    /// subscription would have the instance report the same token twice and bill
+    /// the server for a duplicate.
+    func testRegisteringMoreThanOnceStillReportsTheTokenOnce() throws {
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
+        #else
+        let countly = startInstance {
+            $0.sendPushTokenAlways = true
+            $0.features = [.pushNotifications]
+            $0.disableAutomaticPushHandling = true
+        }
+        // Already registered on start; these must all be absorbed.
+        core(of: countly).modules.push.startPushNotifications()
+        core(of: countly).modules.push.startPushNotifications()
+        let before = tokenRequests(of: countly).count
+
+        Countly.didRegisterForRemoteNotifications(deviceToken: Data([0xFE, 0xED]))
+
+        XCTAssertEqual(tokenRequests(of: countly).count, before + 1,
+                       "the instance subscribed more than once and reported the token twice")
+        #endif
+    }
+
+    /// Coming back to the foreground re-asserts the notification centre delegate,
+    /// because a host that installs its own delegate after the SDK started would
+    /// otherwise silently stop notification taps being reported.
+    ///
+    /// The re-assertion itself talks to `UNUserNotificationCenter`, which a unit
+    /// test cannot observe. What is asserted here is the guard around it: the two
+    /// configurations that must take the early return, and that neither path
+    /// disturbs the instance. That is the part that would break on a refactor.
+    func testComingBackToTheForegroundIsHarmlessWhicheverWayPushIsConfigured() throws {
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("the notification centre delegate only exists on iOS, visionOS and macOS")
+        #else
+        // Registered, but the host owns the delegate, so the SDK must not claim it.
+        //
+        // `sendPushTokenAlways` is not incidental. The runtime holds its token for
+        // the life of the process, so an instance registering here picks up a token
+        // an earlier test broadcast, and reporting it without this flag goes through
+        // `UNUserNotificationCenter.current()`, which aborts outright under `swift
+        // test`: there is no application bundle, and the framework raises
+        // `bundleProxyForCurrentProcess is nil` rather than returning an error. That
+        // is also why the permission branches of `sendToken` are uncovered and
+        // cannot be covered from a unit test.
+        let manual = startInstance {
+            $0.sendPushTokenAlways = true
+            $0.features = [.pushNotifications]
+            $0.disableAutomaticPushHandling = true
+        }
+        // Never registered, so there is nothing to re-assert.
+        let unregistered = startInstance { $0.features = [.crashReporting] }
+
+        let manualBefore = tokenRequests(of: manual).count
+        let unregisteredBefore = tokenRequests(of: unregistered).count
+
+        core(of: manual).modules.push.didEnterForeground()
+        core(of: unregistered).modules.push.didEnterForeground()
+
+        XCTAssertEqual(tokenRequests(of: manual).count, manualBefore,
+                       "re-asserting the delegate is not a reason to re-report the token")
+        XCTAssertEqual(tokenRequests(of: unregistered).count, unregisteredBefore)
+        #endif
+    }
+
     // MARK: - Opening a URL
 
     /// A URL that is missing, empty or not a URL at all is not opened, and must not

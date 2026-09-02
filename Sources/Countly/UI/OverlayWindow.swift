@@ -87,4 +87,126 @@ final class PassThroughBackgroundView: UIView {
         return CGSize(width: shorter, height: longer)
     }
 }
+
+#elseif os(macOS)
+import AppKit
+
+/// The window SDK-rendered content is presented in.
+///
+/// A borderless, transparent panel floating above the application rather than a
+/// sheet on one of its windows: content has to appear over whatever the user is
+/// doing without taking key focus away from it and without being tied to a window
+/// the application might close underneath it.
+///
+/// `NSPanel` rather than `NSWindow` because a panel can be non-activating, which is
+/// what keeps the application's own window key while content is on screen.
+final class OverlayWindow: NSPanel {
+
+    init() {
+        // `overlayFrame` rather than `screenBounds`: this rect positions the panel
+        // on the desktop, so it has to carry the active screen's origin or the panel
+        // lands on whichever display owns the global origin.
+        super.init(contentRect: ScreenReader.overlayFrame,
+                   styleMask: [.borderless, .nonactivatingPanel],
+                   backing: .buffered,
+                   defer: false)
+
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        // Above the application but below system alerts, matching where the iOS
+        // overlay sits in the window level order.
+        level = .floating
+        // Follows the user across spaces, like the content it is showing.
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        // Set on the panel as well as in the view's hit testing: a borderless
+        // panel would otherwise swallow clicks in its transparent areas.
+        ignoresMouseEvents = false
+        isReleasedWhenClosed = false
+        orderOut(nil)
+    }
+
+    /// A borderless panel is not key by default, and the content page needs to
+    /// receive typing for a survey's free-text answer.
+    override var canBecomeKey: Bool { true }
+
+    /// The application stays the main window, so its title bar does not dim while
+    /// content is up.
+    override var canBecomeMain: Bool { false }
+
+    /// AppKit's counterpart of the iOS window's `isHidden`, so the shared
+    /// presentation code reads the same on both platforms.
+    var isHidden: Bool {
+        get { !isVisible }
+        set { newValue ? orderOut(nil) : orderFrontRegardless() }
+    }
+
+    /// The view the panel presents, mirroring `rootViewController` on iOS.
+    var rootViewController: WebViewController? {
+        didSet { contentViewController = rootViewController }
+    }
+}
+
+/// Background view of the overlay that only claims the clicks its subviews want.
+///
+/// `NSView.hitTest` takes a point in the *superview's* coordinates and has no
+/// event, which is the one place the two platforms' hit testing genuinely differ.
+final class PassThroughBackgroundView: NSView {
+
+    /// When set, the view reports portrait dimensions whatever the window shape is,
+    /// which is how content pinned to portrait keeps its layout.
+    var reportPortraitSizeOnly = false
+
+    /// Top-left origin, so the geometry a content page sends means the same thing
+    /// here as it does on iOS. Without this every `resize_me` would be upside down.
+    override var isFlipped: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        for subview in subviews.reversed() {
+            if let hit = subview.hitTest(convert(local, to: superview)) { return hit }
+        }
+        return nil
+    }
+
+    /// The size content should be laid out against.
+    var effectiveSize: CGSize {
+        guard reportPortraitSizeOnly else { return bounds.size }
+        let shorter = Swift.min(bounds.width, bounds.height)
+        let longer = Swift.max(bounds.width, bounds.height)
+        return CGSize(width: shorter, height: longer)
+    }
+}
+
+/// Hosts the overlay content and reports size changes.
+///
+/// The iOS counterpart hears about rotation; a macOS window is resized instead,
+/// which is the same signal for the same purpose.
+final class WebViewController: NSViewController {
+
+    var sizeChangeHandler: (() -> Void)?
+
+    var contentView: NSView? {
+        didSet {
+            oldValue?.removeFromSuperview()
+            if let contentView {
+                contentView.frame = view.bounds
+                view.addSubview(contentView)
+            }
+        }
+    }
+
+    override func loadView() {
+        let background = PassThroughBackgroundView(frame: ScreenReader.screenBounds)
+        background.wantsLayer = true
+        background.layer?.backgroundColor = NSColor.clear.cgColor
+        background.autoresizingMask = [NSView.AutoresizingMask.width, .height]
+        view = background
+    }
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        sizeChangeHandler?()
+    }
+}
 #endif

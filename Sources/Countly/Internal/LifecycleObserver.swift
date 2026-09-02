@@ -157,6 +157,9 @@ final class LifecycleObserver {
 
     private static let module = "Lifecycle"
 
+    /// How long to wait after a rotation before reading the orientation.
+    private static let orientationSettleDelay: TimeInterval = 0.5
+
     private unowned let core: SDKCore
     private var tokens: [NSObjectProtocol] = []
 
@@ -190,29 +193,45 @@ final class LifecycleObserver {
         AppState.startObserving()
 
         #if os(iOS) || os(tvOS) || os(visionOS)
-        add(UIApplication.didEnterBackgroundNotification) { [weak self] in self?.onBackground?() }
+        add(UIApplication.didEnterBackgroundNotification, event: "didEnterBackground") { [weak self] in
+            self?.runCallback("onBackground", to: self?.onBackground)
+        }
         // Observed but not acted on: the foreground work happens on
         // `didBecomeActive`, and doing it twice would begin two sessions.
-        add(UIApplication.willEnterForegroundNotification) {}
-        addSynchronously(UIApplication.willTerminateNotification) { [weak self] in self?.onWillTerminate?() }
-        add(UIApplication.didBecomeActiveNotification) { [weak self] in self?.onForeground?() }
-        add(UIApplication.willResignActiveNotification) { [weak self] in self?.onWillResignActive?() }
+        add(UIApplication.willEnterForegroundNotification, event: "willEnterForeground") { [weak self] in
+            self?.core.logger.d(Self.module, "willEnterForeground", "no foreground work runs here, it runs on didBecomeActive so a session is not begun twice")
+        }
+        addSynchronously(UIApplication.willTerminateNotification, event: "willTerminate") { [weak self] in
+            self?.runCallback("onWillTerminate", to: self?.onWillTerminate)
+        }
+        add(UIApplication.didBecomeActiveNotification, event: "didBecomeActive") { [weak self] in
+            self?.runCallback("onForeground", to: self?.onForeground)
+        }
+        add(UIApplication.willResignActiveNotification, event: "willResignActive") { [weak self] in
+            self?.runCallback("onWillResignActive", to: self?.onWillResignActive)
+        }
         #elseif os(macOS)
-        addSynchronously(NSApplication.willTerminateNotification) { [weak self] in self?.onWillTerminate?() }
+        addSynchronously(NSApplication.willTerminateNotification, event: "willTerminate") { [weak self] in
+            self?.runCallback("onWillTerminate", to: self?.onWillTerminate)
+        }
         // The macOS counterpart of foreground: a `begin_session` dropped because
         // the application was not yet active gets another chance here.
-        add(NSApplication.didBecomeActiveNotification) { [weak self] in self?.onForeground?() }
+        add(NSApplication.didBecomeActiveNotification, event: "didBecomeActive") { [weak self] in
+            self?.runCallback("onForeground", to: self?.onForeground)
+        }
         #endif
 
         #if os(iOS)
         if core.config.enableOrientationTracking {
-            add(UIDevice.orientationDidChangeNotification) { [weak self] in
+            add(UIDevice.orientationDidChangeNotification, event: "orientationDidChange") { [weak self] in
                 self?.scheduleOrientationRecording()
             }
+        } else {
+            core.logger.d(Self.module, "register", "orientation changes are not observed, orientation tracking is switched off in config")
         }
         #endif
 
-        core.logger.d(Self.module, "register", "lifecycle observation started, observerCount: [\(tokens.count)]")
+        core.logger.d(Self.module, "register", "lifecycle observation started, observerCount: [\(tokens.count)], isForeground: [\(AppState.isForeground)], isActive: [\(AppState.isActive)]")
     }
 
     /// Stops observing. Called from `halt`.
@@ -220,14 +239,26 @@ final class LifecycleObserver {
         for token in tokens {
             NotificationCenter.default.removeObserver(token)
         }
+        let stopped = tokens.count
         tokens.removeAll()
         orientationWorkItem?.cancel()
         orientationWorkItem = nil
-        core.logger.d(Self.module, "deregister", "lifecycle observation stopped")
+        core.logger.d(Self.module, "deregister", "lifecycle observation stopped, removedObserverCount: [\(stopped)]")
     }
 
-    private func add(_ name: Notification.Name, _ handler: @escaping () -> Void) {
-        let token = NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { _ in
+    /// Runs one lifecycle callback and records that it ran.
+    ///
+    /// A callback that is missing is the difference between "the notification never
+    /// arrived" and "nothing was wired to it", which is the first thing to
+    /// establish when sessions look wrong.
+    private func runCallback(_ name: String, to handler: (() -> Void)?) {
+        core.logger.d(Self.module, "runCallback", "running a lifecycle callback, callback: [\(name)], handlerAttached: [\(handler != nil)]")
+        handler?()
+    }
+
+    private func add(_ name: Notification.Name, event: String, _ handler: @escaping () -> Void) {
+        let token = NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+            self?.core.logger.d(Self.module, "add", "lifecycle notification received, it is handled on the main queue, event: [\(event)], isForeground: [\(AppState.isForeground)], isActive: [\(AppState.isActive)]")
             handler()
         }
         tokens.append(token)
@@ -238,8 +269,9 @@ final class LifecycleObserver {
     ///
     /// Termination is the one path where this matters: an enqueued block may never
     /// get a run loop turn before the process exits, which loses the final flush.
-    private func addSynchronously(_ name: Notification.Name, _ handler: @escaping () -> Void) {
-        let token = NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { _ in
+    private func addSynchronously(_ name: Notification.Name, event: String, _ handler: @escaping () -> Void) {
+        let token = NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
+            self?.core.logger.d(Self.module, "addSynchronously", "lifecycle notification received, it is handled on the posting thread, event: [\(event)], isForeground: [\(AppState.isForeground)], isActive: [\(AppState.isActive)]")
             handler()
         }
         tokens.append(token)
@@ -253,9 +285,14 @@ final class LifecycleObserver {
     /// reading the orientation immediately returns the old one.
     private func scheduleOrientationRecording() {
         orientationWorkItem?.cancel()
-        let item = DispatchWorkItem { [weak self] in self?.onOrientationChange?() }
+
+        let item = DispatchWorkItem { [weak self] in
+            self?.runCallback("onOrientationChange", to: self?.onOrientationChange)
+        }
         orientationWorkItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: item)
+
+        core.logger.d(Self.module, "scheduleOrientationRecording", "the orientation reading is delayed until the interface has settled, delay: [\(Self.orientationSettleDelay.logSeconds)]")
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.orientationSettleDelay, execute: item)
     }
 
     deinit {

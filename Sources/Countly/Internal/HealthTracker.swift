@@ -90,7 +90,12 @@ final class HealthTracker {
     /// Records the last failed network response. Only sensible status codes are
     /// kept, so a transport level failure does not overwrite a real server error.
     func logFailedNetworkRequest(statusCode: Int, errorResponse: String?) {
-        guard statusCode > 0, statusCode < 1000, let errorResponse else { return }
+        guard statusCode > 0, statusCode < 1000, let errorResponse else {
+            // Says why a health check can report no failure at all while the
+            // requests were failing the whole time.
+            logger?.d(Self.module, "logFailedNetworkRequest", "the failed network request is not recorded, it carries no server status or no response body, statusCode: [\(statusCode)], hasErrorResponse: [\(errorResponse != nil)]")
+            return
+        }
 
         queue.async {
             self.statusCode = statusCode
@@ -178,7 +183,10 @@ final class HealthTracker {
     }
 
     private func restore() {
-        guard let state = store.healthCheckState, !state.isEmpty else { return }
+        guard let state = store.healthCheckState, !state.isEmpty else {
+            logger?.d(Self.module, "restore", "no counters were carried over from a previous launch, the health check starts from zero")
+            return
+        }
 
         countLogWarning = (state[StateKey.logWarning] as? Int) ?? 0
         countLogError = (state[StateKey.logError] as? Int) ?? 0
@@ -198,7 +206,10 @@ final class HealthTracker {
     /// but it is still withheld in temporary device ID mode and when networking is
     /// switched off by behavior settings.
     func sendHealthCheck(isDeviceIDTemporary: Bool, networkingEnabled: Bool) {
-        guard let transport else { return }
+        guard let transport else {
+            logger?.d(Self.module, "sendHealthCheck", "health check send skipped, the tracker has no transport yet")
+            return
+        }
 
         guard !isDeviceIDTemporary else {
             logger?.d(Self.module, "sendHealthCheck", "health check send skipped, sdk is in temporary device ID mode")
@@ -227,7 +238,14 @@ final class HealthTracker {
         }
 
         let payload = snapshotPayload()
-        logger?.i(Self.module, "sendHealthCheck", "sending health check request, errorCount: [\(payload[RequestKey.errorCount] ?? 0)], warningCount: [\(payload[RequestKey.warningCount] ?? 0)], statusCode: [\(payload[RequestKey.statusCode] ?? -1)], backoffRequestCount: [\(payload[RequestKey.backoffRequest] ?? 0)], consecutiveBackoffRequestCount: [\(payload[RequestKey.consecutiveBackoffRequest] ?? 0)]")
+        let requestError = (payload[RequestKey.requestError] as? String) ?? ""
+        logger?.i(Self.module, "sendHealthCheck", "sending health check request, errorCount: [\(payload[RequestKey.errorCount] ?? 0)], warningCount: [\(payload[RequestKey.warningCount] ?? 0)], statusCode: [\(payload[RequestKey.statusCode] ?? -1)], backoffRequestCount: [\(payload[RequestKey.backoffRequest] ?? 0)], consecutiveBackoffRequestCount: [\(payload[RequestKey.consecutiveBackoffRequest] ?? 0)], requestErrorLength: [\(requestError.count)]")
+
+        // The body the server sent back on the last failed request is repeated
+        // verbatim on the wire, and nobody knows what a deployment puts in it.
+        if !requestError.isEmpty {
+            logger?.v(Self.module, "sendHealthCheck", "health check request error detail, requestError: [\(requestError)]")
+        }
 
         transport.sendHealthCheck(payload: payload) { [weak self] wasAccepted, error in
             guard let self else { return }

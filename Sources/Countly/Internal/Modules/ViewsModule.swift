@@ -72,21 +72,24 @@ final class ViewsModule: ModuleBase {
     /// Replaces the global view segmentation.
     func setGlobalViewSegmentation(_ segmentation: [String: Any]) {
         logI("setGlobalViewSegmentation", "global view segmentation will be set, keyCount: [\(segmentation.count)]")
-        logV("setGlobalViewSegmentation", "global view segmentation value detail, segmentation: [\(segmentation)]")
         globalViewSegmentation = sanitized(segmentation, context: "setting global view segmentation")
+        logD("setGlobalViewSegmentation", "global view segmentation replaced, keys: [\(globalViewSegmentation.keys.sorted())], keyCount: [\(globalViewSegmentation.count)]")
+        logV("setGlobalViewSegmentation", "global view segmentation value detail, segmentation: [\(globalViewSegmentation)]")
     }
 
     /// Merges into the global view segmentation.
     func updateGlobalViewSegmentation(_ segmentation: [String: Any]) {
         logI("updateGlobalViewSegmentation", "global view segmentation will be updated, keyCount: [\(segmentation.count)]")
-        logV("updateGlobalViewSegmentation", "global view segmentation update value detail, segmentation: [\(segmentation)]")
         let filtered = sanitized(segmentation, context: "updating global view segmentation")
+        logD("updateGlobalViewSegmentation", "global view segmentation will be merged, incomingKeys: [\(filtered.keys.sorted())], overwrittenKeys: [\(filtered.keys.filter { globalViewSegmentation[$0] != nil }.sorted())], existingKeyCount: [\(globalViewSegmentation.count)]")
         globalViewSegmentation.merge(filtered) { _, new in new }
+        logV("updateGlobalViewSegmentation", "global view segmentation update value detail, segmentation: [\(globalViewSegmentation)]")
     }
 
     /// Adds names to the automatic view tracking exclusion list.
     func addAutoViewTrackingExclusionList(_ names: [String]) {
         logI("addAutoViewTrackingExclusionList", "auto view tracking exclusion list will be extended, incomingCount: [\(names.count)], currentCount: [\(automaticViewTrackingExclusionList.count)]")
+        logD("addAutoViewTrackingExclusionList", "auto view tracking exclusion entry detail, addedNames: [\(names)]")
         automaticViewTrackingExclusionList.append(contentsOf: names)
         rebuildExclusionLookups()
     }
@@ -97,6 +100,11 @@ final class ViewsModule: ModuleBase {
         excludedNames = Set(automaticViewTrackingExclusionList)
         #if os(iOS) || os(tvOS)
         excludedClasses = automaticViewTrackingExclusionList.compactMap { NSClassFromString($0) }
+        // An entry that resolves to no class only ever matches by name, so a
+        // mistyped class name shows up here as a gap between the two counts.
+        logD("rebuildExclusionLookups", "auto view tracking exclusion lookups rebuilt, nameCount: [\(excludedNames.count)], resolvedClassCount: [\(excludedClasses.count)]")
+        #else
+        logD("rebuildExclusionLookups", "auto view tracking exclusion name lookup rebuilt, nameCount: [\(excludedNames.count)]")
         #endif
     }
 
@@ -105,7 +113,7 @@ final class ViewsModule: ModuleBase {
     /// Starts a view that stays open until it is stopped.
     @discardableResult
     func startView(_ viewName: String, segmentation: [String: Any]? = nil) -> String? {
-        logI("startView", "start view requested, name: [\(viewName)], segmentationKeyCount: [\(segmentation?.count ?? 0)]")
+        logI("startView", "start view requested, name: [\(viewName)], segmentationKeyCount: [\(segmentation?.count ?? 0)], segmentationKeys: [\(segmentation?.keys.sorted() ?? [])]")
         logV("startView", "start view segmentation value detail, name: [\(viewName)], segmentation: [\(segmentation ?? [:])]")
 
         guard manualCallsAllowed("start view", "startView") else { return nil }
@@ -116,7 +124,7 @@ final class ViewsModule: ModuleBase {
     /// Starts a view that is stopped as soon as another view starts.
     @discardableResult
     func startAutoStoppedView(_ viewName: String, segmentation: [String: Any]? = nil) -> String? {
-        logI("startAutoStoppedView", "start auto stopped view requested, name: [\(viewName)], segmentationKeyCount: [\(segmentation?.count ?? 0)]")
+        logI("startAutoStoppedView", "start auto stopped view requested, name: [\(viewName)], segmentationKeyCount: [\(segmentation?.count ?? 0)], segmentationKeys: [\(segmentation?.keys.sorted() ?? [])]")
         logV("startAutoStoppedView", "start auto stopped view segmentation value detail, name: [\(viewName)], segmentation: [\(segmentation ?? [:])]")
 
         guard manualCallsAllowed("start auto stopped view", "startAutoStoppedView") else { return nil }
@@ -186,8 +194,8 @@ final class ViewsModule: ModuleBase {
             return
         }
 
-        logD("resumeView", "view resumed, viewID: [\(viewID)], name: [\(viewData.viewName)]")
         viewData.resume(at: core.clock.now())
+        logD("resumeView", "view resumed and its duration clock restarted, viewID: [\(viewID)], name: [\(viewData.viewName)]")
     }
 
     /// Stops every open view.
@@ -246,7 +254,7 @@ final class ViewsModule: ModuleBase {
     /// manual call in as well would produce two views for one screen.
     private func manualCallsAllowed(_ operation: String, _ function: String) -> Bool {
         guard isAutoViewTrackingActive else { return true }
-        log.w(Self.moduleName, function, "\(operation) is not allowed while automatic view tracking is active, the call is ignored")
+        logW(function, "manual view calls are not allowed while automatic view tracking is active, the call will be ignored, operation: [\(operation)]")
         return false
     }
 
@@ -277,6 +285,7 @@ final class ViewsModule: ModuleBase {
         var segmentation = globalViewSegmentation
         if let customSegmentation {
             let filtered = sanitized(customSegmentation, context: "the segmentation of the view being started")
+            logD("startViewInternal", "start segmentation will be merged over the global view segmentation, name: [\(truncatedName)], startKeys: [\(filtered.keys.sorted())], overriddenGlobalKeys: [\(filtered.keys.filter { globalViewSegmentation[$0] != nil }.sorted())]")
             segmentation.merge(filtered) { _, new in new }
         }
         segmentation = core.limits.truncatedAndLimited(segmentation, "View segmentation")
@@ -287,9 +296,14 @@ final class ViewsModule: ModuleBase {
 
         // Only marked once a session is actually open, so a view started before
         // the session begins does not claim to be the session's landing screen.
-        if isFirstView, core.modules.sessions.isSessionStarted {
-            isFirstView = false
-            segmentation[SegKey.start] = 1
+        if isFirstView {
+            if core.modules.sessions.isSessionStarted {
+                isFirstView = false
+                segmentation[SegKey.start] = 1
+                logD("startViewInternal", "this is the first view of the session, it will be marked as the session start view, name: [\(truncatedName)]")
+            } else {
+                logD("startViewInternal", "no session is running yet, the view will not be marked as the session start view, name: [\(truncatedName)]")
+            }
         }
 
         let viewID = core.clock.generateEventID()
@@ -307,7 +321,7 @@ final class ViewsModule: ModuleBase {
                                                 segmentation: segmentation,
                                                 id: viewID)
 
-        logD("startViewInternal", "view started, name: [\(truncatedName)], viewID: [\(viewID)], previousViewID: [\(previousViewID ?? "")], segmentationKeyCount: [\(segmentation.count)], isAutoStoppedView: [\(isAutoStoppedView)]")
+        logD("startViewInternal", "view started, name: [\(truncatedName)], viewID: [\(viewID)], previousViewID: [\(previousViewID ?? "")], segmentationKeyCount: [\(segmentation.count)], segmentationKeys: [\(segmentation.keys.sorted())], isAutoStoppedView: [\(isAutoStoppedView)]")
         logV("startViewInternal", "started view segmentation value detail, viewID: [\(viewID)], segmentation: [\(segmentation)]")
 
         return viewID
@@ -324,10 +338,14 @@ final class ViewsModule: ModuleBase {
         }
 
         var segmentation = viewData.segmentation
+        if !globalViewSegmentation.isEmpty {
+            logD("stopViewInternal", "global view segmentation takes precedence over the segmentation added to the view, viewID: [\(viewID)], globalKeys: [\(globalViewSegmentation.keys.sorted())], overriddenViewKeys: [\(segmentation.keys.filter { globalViewSegmentation[$0] != nil }.sorted())]")
+        }
         segmentation.merge(globalViewSegmentation) { _, global in global }
 
         if let customSegmentation {
             let filtered = sanitized(customSegmentation, context: "the segmentation of the view being stopped")
+            logD("stopViewInternal", "stop segmentation will be merged over the view segmentation, viewID: [\(viewID)], stopKeys: [\(filtered.keys.sorted())]")
             segmentation.merge(filtered) { _, new in new }
         }
 
@@ -341,7 +359,7 @@ final class ViewsModule: ModuleBase {
                                                 duration: TimeInterval(duration),
                                                 id: viewData.viewID)
 
-        logD("stopViewInternal", "view stopped, name: [\(viewData.viewName)], viewID: [\(viewData.viewID)], duration: [\(duration)], segmentationKeyCount: [\(segmentation.count)], autoPaused: [\(autoPaused)]")
+        logD("stopViewInternal", "view stopped, name: [\(viewData.viewName)], viewID: [\(viewData.viewID)], durationSeconds: [\(duration)], segmentationKeyCount: [\(segmentation.count)], segmentationKeys: [\(segmentation.keys.sorted())], autoPaused: [\(autoPaused)]")
         logV("stopViewInternal", "stopped view segmentation value detail, viewID: [\(viewData.viewID)], segmentation: [\(segmentation)]")
 
         if !autoPaused {
@@ -351,17 +369,17 @@ final class ViewsModule: ModuleBase {
 
     private func validateViewOperation(viewID: String, operation: String) -> Bool {
         guard !viewID.isEmpty else {
-            logE("validateViewOperation", "view ID is null or empty, \(operation) will be ignored")
+            logE("validateViewOperation", "view ID is null or empty, the view operation will be ignored, operation: [\(operation)]")
             return false
         }
 
         guard core.modules.consent.hasConsent(for: .viewTracking) else {
-            logV("validateViewOperation", "no consent for views, \(operation) will be ignored, viewID: [\(viewID)]")
+            logV("validateViewOperation", "no consent for views, the view operation will be ignored, operation: [\(operation)], viewID: [\(viewID)]")
             return false
         }
 
         guard core.serverConfig.viewTrackingEnabled else {
-            logD("validateViewOperation", "view tracking is disabled by server config, \(operation) will be ignored, viewID: [\(viewID)]")
+            logD("validateViewOperation", "view tracking is disabled by server config, the view operation will be ignored, operation: [\(operation)], viewID: [\(viewID)]")
             return false
         }
 
@@ -378,12 +396,24 @@ final class ViewsModule: ModuleBase {
     }
 
     private func stopAutoStoppedView() {
-        guard let currentView, currentView.isAutoStoppedView, !currentView.willStartAgain else { return }
+        guard let currentView, currentView.isAutoStoppedView else { return }
+
+        guard !currentView.willStartAgain else {
+            logD("stopAutoStoppedView", "the current auto stopped view is waiting to be restarted, it will not be stopped again, viewID: [\(currentView.viewID)], name: [\(currentView.viewName)]")
+            return
+        }
+
+        logD("stopAutoStoppedView", "a new view is starting, the current auto stopped view will be stopped, viewID: [\(currentView.viewID)], name: [\(currentView.viewName)]")
         stopViewInternal(viewID: currentView.viewID, customSegmentation: nil, autoPaused: false)
     }
 
     private func stopCurrentView() {
-        guard let currentView else { return }
+        guard let currentView else {
+            logD("stopCurrentView", "there is no current view, nothing will be stopped")
+            return
+        }
+
+        logD("stopCurrentView", "the current view will be stopped, viewID: [\(currentView.viewID)], name: [\(currentView.viewName)]")
         stopViewInternal(viewID: currentView.viewID, customSegmentation: nil, autoPaused: false)
     }
 
@@ -430,11 +460,13 @@ final class ViewsModule: ModuleBase {
                                           customSegmentation: viewData.startSegmentation,
                                           isAutoStoppedView: viewData.isAutoStoppedView)
 
-            logV("startStoppedViews", "view started automatically after restart, name: [\(viewData.viewName)], newViewID: [\(newID ?? "")], previousViewID: [\(viewData.viewID)]")
-
             if let newID, let newData = viewDataDictionary[newID] {
+                logD("startStoppedViews", "view started automatically after restart, name: [\(viewData.viewName)], newViewID: [\(newID)], previousViewID: [\(viewData.viewID)], carriedSegmentationKeyCount: [\(viewData.segmentation.count)]")
                 newData.segmentation = viewData.segmentation
+            } else {
+                logD("startStoppedViews", "a view marked for restart could not be started again, name: [\(viewData.viewName)], previousViewID: [\(viewData.viewID)]")
             }
+
             viewDataDictionary.removeValue(forKey: viewData.viewID)
         }
     }
@@ -448,9 +480,10 @@ final class ViewsModule: ModuleBase {
 
     private func stripReservedKeys(_ segmentation: [String: Any], context: String) -> [String: Any] {
         let result = segmentation.filter { !Self.reservedSegmentationKeys.contains($0.key) }
-        if result.count != segmentation.count {
-            logW("stripReservedKeys", "reserved keys will be dropped while \(context), droppedKeyCount: [\(segmentation.count - result.count)], keptKeyCount: [\(result.count)]")
-        }
+        guard result.count != segmentation.count else { return result }
+
+        logW("stripReservedKeys", "segmentation keys reserved by the SDK will be dropped, context: [\(context)], droppedKeyCount: [\(segmentation.count - result.count)], keptKeyCount: [\(result.count)]")
+        logD("stripReservedKeys", "dropped reserved segmentation key detail, context: [\(context)], droppedKeys: [\(segmentation.keys.filter(Self.reservedSegmentationKeys.contains).sorted())]")
         return result
     }
 
@@ -478,14 +511,17 @@ final class ViewsModule: ModuleBase {
 
         setAutoViewTrackingActive(true)
         AutoViewTracker.shared.register(self)
+        logD("startAutoViewTracking", "automatic view tracking is enabled and registered for view controller appearances, exclusionEntryCount: [\(automaticViewTrackingExclusionList.count)]")
 
         let topViewController = AutoViewTracker.topViewController()
-        let title = AutoViewTracker.title(for: topViewController)
-        logD("startAutoViewTracking", "automatic view tracking enabled, top view will be started automatically, name: [\(title ?? "")]")
+        guard let topViewController, let title = AutoViewTracker.title(for: topViewController) else {
+            logD("startAutoViewTracking", "no view controller with a resolvable title is on screen, no view will be started until the next appearance")
+            return
+        }
 
-        guard let title, let topViewController else { return }
         guard !isExcludedFromAutoTracking(topViewController, title: title, from: "startAutoViewTracking") else { return }
 
+        logD("startAutoViewTracking", "the view already on screen will be started automatically, name: [\(title)]")
         _ = startViewInternal(title, customSegmentation: nil, isAutoStoppedView: true)
         #endif
     }
@@ -527,7 +563,7 @@ final class ViewsModule: ModuleBase {
     /// Called by the process-wide tracker for every appeared view controller.
     func handleAutoTrackedViewController(_ viewController: UIViewController) {
         guard isAutoViewTrackingActive else {
-            logV("handleAutoTrackedViewController", "automatic view tracking is not active, appeared view controller will be ignored")
+            logD("handleAutoTrackedViewController", "automatic view tracking is not active, appeared view controller will be ignored")
             return
         }
 
@@ -543,13 +579,16 @@ final class ViewsModule: ModuleBase {
             return
         }
 
-        guard let title = AutoViewTracker.title(for: viewController) else { return }
+        guard let title = AutoViewTracker.title(for: viewController) else {
+            logD("handleAutoTrackedViewController", "appeared view controller has no resolvable title, no view will be started for it, class: [\(NSStringFromClass(type(of: viewController)))]")
+            return
+        }
 
         // Compared against the truncated form: that is what was stored when the
         // view started, so a long screen name would never match its own view and
         // would restart on every appearance.
         if currentView?.viewName == core.limits.truncatedKey(title, "View name") {
-            logV("handleAutoTrackedViewController", "appeared view controller is already the current view, it will not be started again, name: [\(title)]")
+            logD("handleAutoTrackedViewController", "appeared view controller is already the current view, it will not be started again, name: [\(title)]")
             return
         }
 
@@ -584,12 +623,12 @@ final class ViewsModule: ModuleBase {
         let className = NSStringFromClass(type(of: viewController))
 
         for candidate in [title, className] where excludedNames.contains(candidate) {
-            logV(function, "view is in the automatic view tracking exclusion list, it will be ignored, name: [\(title)], exception: [\(candidate)]")
+            logD(function, "view is in the automatic view tracking exclusion list, it will be ignored, name: [\(title)], class: [\(className)], matchedEntry: [\(candidate)]")
             return true
         }
 
-        if excludedClasses.contains(where: { viewController.isKind(of: $0) }) {
-            logV(function, "view is a subclass of an excluded class, it will be ignored, name: [\(title)]")
+        if let excluded = excludedClasses.first(where: { viewController.isKind(of: $0) }) {
+            logD(function, "view is a subclass of an excluded class, it will be ignored, name: [\(title)], class: [\(className)], matchedClass: [\(NSStringFromClass(excluded))]")
             return true
         }
 
@@ -605,7 +644,10 @@ final class ViewsModule: ModuleBase {
     /// actually changes, and a repeated event would inflate the numbers.
     func recordOrientation() {
         #if os(iOS)
-        guard core.config.enableOrientationTracking else { return }
+        guard core.config.enableOrientationTracking else {
+            logD("recordOrientation", "orientation tracking is disabled by the init config, orientation recording will be ignored")
+            return
+        }
 
         guard AppState.isForeground else {
             logD("recordOrientation", "app is in the background, orientation recording will be ignored")
@@ -624,7 +666,10 @@ final class ViewsModule: ModuleBase {
 
         logD("recordOrientation", "interface orientation changed, previousMode: [\(lastInterfaceOrientation ?? "")], mode: [\(mode)]")
 
-        guard core.modules.consent.hasConsent(for: .userDetails) else { return }
+        guard core.modules.consent.hasConsent(for: .userDetails) else {
+            logV("recordOrientation", "no consent for user details, the orientation event will not be recorded, mode: [\(mode)]")
+            return
+        }
 
         lastInterfaceOrientation = mode
         core.modules.events.recordReservedEvent(ReservedEventKey.orientation, segmentation: ["mode": mode])
@@ -659,11 +704,15 @@ final class ViewsModule: ModuleBase {
         if !isAutoViewTrackingActive, isManualViewRestartActive {
             logD("applicationWillEnterForeground", "app entered foreground with manual view restart active, stopped views will be started automatically")
             startStoppedViews()
+        } else {
+            logD("applicationWillEnterForeground", "app entered foreground, no views will be restarted, isAutoViewTrackingActive: [\(isAutoViewTrackingActive)], isManualViewRestartActive: [\(isManualViewRestartActive)]")
         }
         #else
         if isManualViewRestartActive {
             logD("applicationWillEnterForeground", "app entered foreground on a non UIKit platform, stopped views will be started automatically")
             startStoppedViews()
+        } else {
+            logD("applicationWillEnterForeground", "app entered foreground on a non UIKit platform with manual view restart off, no views will be restarted")
         }
         #endif
     }
@@ -676,20 +725,27 @@ final class ViewsModule: ModuleBase {
         } else if isManualViewRestartActive {
             logD("applicationDidEnterBackground", "app entered background with manual view restart active, running views will be stopped automatically")
             stopRunningViewsForRestart()
+        } else {
+            logD("applicationDidEnterBackground", "app entered background with automatic view tracking and manual view restart both off, running views will be left open, viewCount: [\(viewDataDictionary.count)]")
         }
         #else
         if isManualViewRestartActive {
             logD("applicationDidEnterBackground", "app entered background on a non UIKit platform, running views will be stopped automatically")
             stopRunningViewsForRestart()
+        } else {
+            logD("applicationDidEnterBackground", "app entered background on a non UIKit platform with manual view restart off, running views will be left open, viewCount: [\(viewDataDictionary.count)]")
         }
         #endif
     }
 
     func applicationWillTerminate() {
+        logD("applicationWillTerminate", "app is terminating, every running view will be stopped, viewCount: [\(viewDataDictionary.count)]")
         stopAllViewsInternal(segmentation: nil)
     }
 
     override func halt(clearStorage: Bool) {
+        logD("halt", "views module is halting, running views will be discarded without being reported, viewCount: [\(viewDataDictionary.count)], globalSegmentationKeyCount: [\(globalViewSegmentation.count)], clearStorage: [\(clearStorage)]")
+
         // Torn down without reporting. Routing through `stopAutoViewTracking` would
         // record a `[CLY]_view` end event for every open view, queued for an
         // instance that is going away, and written to a store that `clearStorage`

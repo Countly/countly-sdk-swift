@@ -110,20 +110,29 @@ final class KeyValueStore {
             PersistencyKey.serverConfig,
             PersistencyKey.healthCheckState,
         ] + Self.legacyKeys
+        // Counted before the removal, because an erasure that was asked for and
+        // found nothing to erase is a different answer to "was my data deleted"
+        // than one that cleared a stored device ID.
+        let clearedKeys = keys.filter { defaults.object(forKey: namespace.key($0)) != nil }
         for key in keys {
             defaults.removeObject(forKey: namespace.key(key))
         }
-        logger?.d(Self.module, "clearAll", "stored key value state is cleared, keyCount: [\(keys.count)]")
+        logger?.d(Self.module, "clearAll", "stored key value state is cleared, keyCount: [\(keys.count)], clearedKeyCount: [\(clearedKeys.count)], clearedKeys: [\(clearedKeys.joined(separator: ", "))]")
     }
 
     // MARK: - Helpers
 
+    /// Never logs at error or warning level, whatever goes wrong: the health
+    /// tracker persists its counters through here from its own queue, and those
+    /// two levels would count the write as another incident.
     private func set(_ value: Any?, _ key: String) {
         let namespacedKey = namespace.key(key)
         if let value {
             defaults.set(value, forKey: namespacedKey)
+            logger?.d(Self.module, "set", "a value is written to the key value store, key: [\(key)], valueType: [\(type(of: value))]")
         } else {
             defaults.removeObject(forKey: namespacedKey)
+            logger?.d(Self.module, "set", "a key is removed from the key value store, key: [\(key)]")
         }
     }
 
@@ -131,18 +140,30 @@ final class KeyValueStore {
         do {
             let data = try NSKeyedArchiver.archivedData(withRootObject: value, requiringSecureCoding: false)
             defaults.set(data, forKey: namespace.key(key))
+            logger?.d(Self.module, "archive", "value is archived into the key value store, key: [\(key)], entryCount: [\(value.count)], dataSize: [\(data.count)]")
         } catch {
-            logger?.d(Self.module, "archive", "value could not be archived and will not be stored, key: [\(key)], error: [\(error.localizedDescription)]")
+            let failure = error as NSError
+            logger?.e(Self.module, "archive", "value could not be archived and is not stored, key: [\(key)], entryCount: [\(value.count)], errorDomain: [\(failure.domain)], errorCode: [\(failure.code)], error: [\(failure.localizedDescription)]")
         }
     }
 
     private func unarchiveDictionary(_ key: String) -> [String: Any] {
-        guard let data = defaults.data(forKey: namespace.key(key)) else { return [:] }
+        guard let data = defaults.data(forKey: namespace.key(key)) else {
+            logger?.d(Self.module, "unarchive", "nothing is archived under this key yet, key: [\(key)]")
+            return [:]
+        }
+
         do {
             let value = try CountlyArchive.decodeRoot(from: data)
-            return value as? [String: Any] ?? [:]
+            guard let dictionary = value as? [String: Any] else {
+                logger?.w(Self.module, "unarchive", "the archived value is not a dictionary and will be treated as empty, key: [\(key)], dataSize: [\(data.count)]")
+                return [:]
+            }
+            logger?.d(Self.module, "unarchive", "archived value is read back from the key value store, key: [\(key)], entryCount: [\(dictionary.count)], dataSize: [\(data.count)]")
+            return dictionary
         } catch {
-            logger?.d(Self.module, "unarchive", "stored value could not be read back and will be treated as empty, key: [\(key)], error: [\(error.localizedDescription)]")
+            let failure = error as NSError
+            logger?.w(Self.module, "unarchive", "stored value could not be read back and will be treated as empty, key: [\(key)], dataSize: [\(data.count)], errorDomain: [\(failure.domain)], errorCode: [\(failure.code)], error: [\(failure.localizedDescription)]")
             return [:]
         }
     }

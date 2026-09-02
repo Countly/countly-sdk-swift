@@ -350,4 +350,44 @@ final class UserProfileTests: CountlyBaseTestCase {
         XCTAssertEqual(details["name"] as? String, "Ada")
         XCTAssertEqual((details["custom"] as? [String: Any])?["plan"] as? String, "pro")
     }
+
+    // MARK: - The server's cache limit
+
+    /// The server can cap how many custom properties the SDK holds. Past the cap
+    /// the extras are dropped rather than sent, because a profile with thousands of
+    /// one-off keys is a bug in the integration and forwarding it makes it the
+    /// server's problem too.
+    func testCustomPropertiesAreTrimmedToTheServersCacheLimit() {
+        let countly = startInstance {
+            $0.sdkBehaviorSettings = ServerConfigBuilder().userPropertyCacheLimit(3).json()
+        }
+
+        // Deliberately set in an order unrelated to the sort order, so a trim that
+        // happened to keep insertion order would not pass by luck.
+        countly.userProfile.setProperties([
+            "zeta": 1, "alpha": 2, "mike": 3, "bravo": 4, "yankee": 5,
+        ])
+        countly.userProfile.save()
+
+        let custom = lastCustom(of: countly)
+
+        XCTAssertEqual(custom.count, 3, "the limit was not applied")
+        // Sorted rather than arbitrary: the same overflowing profile has to trim the
+        // same way twice, or two devices with identical data disagree on the server.
+        XCTAssertEqual(Set(custom.keys), ["alpha", "bravo", "mike"])
+    }
+
+    /// At or below the limit nothing is touched. The trim allocates and sorts, so
+    /// it must not run for the ordinary profile that is nowhere near the cap.
+    func testCustomPropertiesAreLeftAloneBelowTheLimit() {
+        let countly = startInstance {
+            $0.sdkBehaviorSettings = ServerConfigBuilder().userPropertyCacheLimit(5).json()
+        }
+
+        countly.userProfile.setProperties(["a": 1, "b": 2, "c": 3])
+        countly.userProfile.save()
+
+        XCTAssertEqual(Set(lastCustom(of: countly).keys), ["a", "b", "c"])
+    }
+
 }

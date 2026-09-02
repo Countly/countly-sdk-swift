@@ -57,8 +57,8 @@ final class RemoteConfigModule: ModuleBase {
     /// registered them.
     ///
     /// Keyed rather than a plain array because a Swift closure has no identity to
-    /// compare against, which is how the reference SDKs find the one to remove.
-    /// The token is that identity.
+    /// compare against, so removing one needs an identity of its own. The token is
+    /// that identity.
     private var downloadCallbacks: [RCCallbackToken: RCDownloadCallback] = [:]
     private var nextCallbackToken: UInt64 = 0
 
@@ -79,6 +79,9 @@ final class RemoteConfigModule: ModuleBase {
         isAutomaticTriggersEnabled = core.config.enableRemoteConfigAutomaticTriggers
         isValueCachingEnabled = core.config.enableRemoteConfigValueCaching
         enrollABOnRCDownload = core.config.enrollABOnRCDownload
+
+        logI("applyInitialConfig", "remote config initial configuration is applied, automaticTriggersEnabled: [\(isAutomaticTriggersEnabled)], valueCachingEnabled: [\(isValueCachingEnabled)], enrollABOnDownload: [\(enrollABOnRCDownload)], globalCallbackCount: [\(core.config.remoteConfigGlobalCallbacks.count)]")
+
         for callback in core.config.remoteConfigGlobalCallbacks {
             _ = registerDownloadCallback(callback)
         }
@@ -107,13 +110,20 @@ final class RemoteConfigModule: ModuleBase {
         }
 
         cachedRemoteConfig = restored
-        logD("loadCache", "remote config cache is loaded from persistency, cachedKeyCount: [\(cachedRemoteConfig.count)], migratedFromPreviousSDK: [\(foundLegacyEntries)]")
+        let staleKeyCount = cachedRemoteConfig.values.filter { !$0.isCurrentUsersData }.count
+        logD("loadCache", "remote config cache is loaded from persistency, cachedKeyCount: [\(cachedRemoteConfig.count)], staleKeyCount: [\(staleKeyCount)], migratedFromPreviousSDK: [\(foundLegacyEntries)], cachedKeys: [\(Self.describe(cachedRemoteConfig.keys))]")
 
         // Rewritten in this SDK's shape so the legacy decode runs once rather than
         // on every launch for the rest of the application's life.
         if foundLegacyEntries {
             persistCache()
         }
+    }
+
+    /// Key names in a stable order. Names are safe to log at debug, the values
+    /// behind them are not.
+    private static func describe<S: Sequence>(_ keys: S) -> String where S.Element == String {
+        keys.sorted().joined(separator: ", ")
     }
 
     /// `NSNull` is how a nil value survives being archived, and it has to come back
@@ -138,19 +148,26 @@ final class RemoteConfigModule: ModuleBase {
 
     /// The cached value for a key, with a `nil` value when it is not known.
     func getValue(_ key: String) -> CountlyRCData {
+        logI("getValue", "a remote config value is requested, key: [\(key)]")
+
         lock.lock()
         defer { lock.unlock() }
 
         let data = cachedRemoteConfig[key]
-        logD("getValue", "remote config value is read from cache, key: [\(key)], valueExists: [\(data != nil)]")
+        // Reads never hit the network, so a missing or stale value is always a
+        // question about what the last download put in the cache.
+        logD("getValue", "remote config value is served from the local cache, key: [\(key)], valueExists: [\(data != nil)], belongsToCurrentUser: [\(data?.isCurrentUsersData ?? true)], cachedKeyCount: [\(cachedRemoteConfig.count)]")
         return data ?? CountlyRCData(value: nil, isCurrentUsersData: true)
     }
 
     /// Every cached value.
     func getAllValues() -> [String: CountlyRCData] {
+        logI("getAllValues", "all remote config values are requested")
+
         lock.lock()
         defer { lock.unlock() }
-        logD("getAllValues", "all remote config values are read from cache, cachedKeyCount: [\(cachedRemoteConfig.count)]")
+        let staleKeyCount = cachedRemoteConfig.values.filter { !$0.isCurrentUsersData }.count
+        logD("getAllValues", "all remote config values are served from the local cache, cachedKeyCount: [\(cachedRemoteConfig.count)], staleKeyCount: [\(staleKeyCount)], cachedKeys: [\(Self.describe(cachedRemoteConfig.keys))]")
         return cachedRemoteConfig
     }
 
@@ -159,24 +176,28 @@ final class RemoteConfigModule: ModuleBase {
     /// Reading a value is what makes the device part of the experiment, so the
     /// enrollment is tied to the read rather than to the download.
     func getValueAndEnroll(_ key: String) -> CountlyRCData {
+        logI("getValueAndEnroll", "a remote config value and an A/B test enrollment are requested, key: [\(key)]")
+
         let data = getValue(key)
         if data.value != nil {
-            logD("getValueAndEnroll", "a value exists for the key, AB test enrollment will be requested, key: [\(key)]")
+            logD("getValueAndEnroll", "a value exists for the key, enrollment into its A/B test will be requested, key: [\(key)]")
             enrollIntoABTests(forKeys: [key])
         } else {
-            logD("getValueAndEnroll", "no value exists for the key, AB test enrollment will be skipped, key: [\(key)]")
+            logD("getValueAndEnroll", "no value exists for the key, enrollment into its A/B test will be skipped, key: [\(key)]")
         }
         return data
     }
 
     /// Reads every value and enrolls the device in all of their A/B tests.
     func getAllValuesAndEnroll() -> [String: CountlyRCData] {
+        logI("getAllValuesAndEnroll", "all remote config values and their A/B test enrollments are requested")
+
         let all = getAllValues()
         if !all.isEmpty {
-            logD("getAllValuesAndEnroll", "AB test enrollment will be requested for all cached keys, cachedKeyCount: [\(all.count)]")
+            logD("getAllValuesAndEnroll", "enrollment into the A/B tests of every cached key will be requested, cachedKeyCount: [\(all.count)]")
             enrollIntoABTests(forKeys: Array(all.keys))
         } else {
-            logD("getAllValuesAndEnroll", "no cached remote config values exist, AB test enrollment for all keys will be skipped")
+            logD("getAllValuesAndEnroll", "no cached remote config values exist, enrollment into the A/B tests of every cached key will be skipped")
         }
         return all
     }
@@ -191,7 +212,7 @@ final class RemoteConfigModule: ModuleBase {
         }
 
         guard core.modules.consent.hasConsent(for: .remoteConfig) else {
-            logV("downloadRemoteConfigAutomatically", "no consent for remote config, automatic download will be skipped")
+            logD("downloadRemoteConfigAutomatically", "no consent for remote config, automatic download will be skipped")
             return
         }
 
@@ -206,16 +227,19 @@ final class RemoteConfigModule: ModuleBase {
 
     /// Downloads every key.
     func downloadKeys(completion: RCDownloadCallback?) {
+        logI("downloadKeys", "a download of every remote config key is requested")
         downloadValues(keys: nil, omitKeys: nil, completion: completion)
     }
 
     /// Downloads only the named keys.
     func downloadSpecificKeys(_ keys: [String], completion: RCDownloadCallback?) {
+        logI("downloadSpecificKeys", "a download of specific remote config keys is requested, keyCount: [\(keys.count)], keys: [\(Self.describe(keys))]")
         downloadValues(keys: keys, omitKeys: nil, completion: completion)
     }
 
     /// Downloads everything except the named keys.
     func downloadOmittingKeys(_ omitKeys: [String], completion: RCDownloadCallback?) {
+        logI("downloadOmittingKeys", "a download of every remote config key except the named ones is requested, omitKeyCount: [\(omitKeys.count)], omitKeys: [\(Self.describe(omitKeys))]")
         downloadValues(keys: nil, omitKeys: omitKeys, completion: completion)
     }
 
@@ -223,7 +247,7 @@ final class RemoteConfigModule: ModuleBase {
         // Every early exit reports back. A completion that is captured and never
         // called leaves a caller waiting on it for the life of the process.
         guard core.modules.consent.hasConsent(for: .remoteConfig) else {
-            logV("downloadValues", "no consent for remote config, value download will be skipped")
+            logD("downloadValues", "no consent for remote config, value download will be skipped")
             completion?(.error, CountlyError.remoteConfigGeneralAPIError.asNSError, false, [:])
             return
         }
@@ -241,7 +265,7 @@ final class RemoteConfigModule: ModuleBase {
         }
 
         let isFullUpdate = keys == nil && omitKeys == nil
-        logD("downloadValues", "remote config value download is starting, fetchType: [\(isFullUpdate ? "full" : "partial")], keyCount: [\(keys?.count ?? 0)], omitKeyCount: [\(omitKeys?.count ?? 0)], completionHandlerProvided: [\(completion != nil)]")
+        logD("downloadValues", "remote config value download is starting, fetchType: [\(isFullUpdate ? "full" : "partial")], keyCount: [\(keys?.count ?? 0)], omitKeyCount: [\(omitKeys?.count ?? 0)], requestedKeys: [\(Self.describe(keys ?? []))], omittedKeys: [\(Self.describe(omitKeys ?? []))], enrollABOnDownload: [\(enrollABOnRCDownload)], completionHandlerProvided: [\(completion != nil)]")
 
         fetch(keys: keys, omitKeys: omitKeys, isLegacy: false) { [weak self] remoteConfig, error in
             guard let self else { return }
@@ -250,7 +274,7 @@ final class RemoteConfigModule: ModuleBase {
             var result = RequestResult.success
 
             if error == nil {
-                self.logD("downloadValues", "remote config value download is successful, valueCount: [\(remoteConfig?.count ?? 0)]")
+                self.logD("downloadValues", "remote config value download is successful, valueCount: [\(remoteConfig?.count ?? 0)], downloadedKeys: [\(Self.describe((remoteConfig ?? [:]).keys))]")
                 self.logV("downloadValues", "remote config value download payload detail, remoteConfig: [\(remoteConfig ?? [:])]")
 
                 self.lock.lock()
@@ -265,7 +289,8 @@ final class RemoteConfigModule: ModuleBase {
                 self.lock.unlock()
             } else {
                 result = .error
-                self.logD("downloadValues", "remote config value download failed, error: [\(error?.localizedDescription ?? "")]")
+                let nsError = error as NSError?
+                self.logD("downloadValues", "remote config value download failed, the cached values are left untouched, error: [\(nsError?.localizedDescription ?? "")], domain: [\(nsError?.domain ?? "")], code: [\(nsError?.code ?? 0)]")
             }
 
             completion?(result, error, isFullUpdate, downloaded)
@@ -332,11 +357,13 @@ final class RemoteConfigModule: ModuleBase {
             if resolvedError == nil {
                 parsed = CountlyJSON.object(from: data, logger: self.log) as? [String: Any]
                 if parsed == nil {
+                    self.logD("fetch", "the remote config response could not be read as a JSON object, statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)]")
                     resolvedError = CountlyError.remoteConfigGeneralAPIError.asNSError
                 }
             }
 
             if resolvedError == nil, statusCode != 200 {
+                self.logD("fetch", "the remote config response carries a status code other than 200, statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)]")
                 resolvedError = CountlyError.remoteConfigGeneralAPIError.asNSError
             }
 
@@ -348,10 +375,11 @@ final class RemoteConfigModule: ModuleBase {
             // way, which is what it is waiting for.
             DispatchQueue.main.async { [weak self] in
                 if let resolvedError {
-                    self?.logD("fetch", "remote config request failed, statusCode: [\(statusCode)], error: [\(resolvedError.localizedDescription)]")
+                    let nsError = resolvedError as NSError
+                    self?.logD("fetch", "remote config request failed, statusCode: [\(statusCode)], error: [\(nsError.localizedDescription)], domain: [\(nsError.domain)], code: [\(nsError.code)]")
                     completion(nil, resolvedError)
                 } else {
-                    self?.logD("fetch", "remote config request successfully completed, statusCode: [\(statusCode)], valueCount: [\(parsed?.count ?? 0)]")
+                    self?.logD("fetch", "remote config request successfully completed, statusCode: [\(statusCode)], valueCount: [\(parsed?.count ?? 0)], responseKeys: [\(Self.describe((parsed ?? [:]).keys))]")
                     completion(parsed, nil)
                 }
             }
@@ -392,19 +420,19 @@ final class RemoteConfigModule: ModuleBase {
                                            _ action: String,
                                            requiresNetworking: Bool) -> Bool {
         guard core.modules.consent.hasConsent(for: .remoteConfig) else {
-            logV(function, "no consent for remote config, \(action) will be skipped")
+            logD(function, "no consent for remote config, the call will be skipped, skippedAction: [\(action)]")
             return false
         }
 
         if requiresNetworking {
             guard core.serverConfig.networkingEnabled else {
-                logD(function, "networking is disabled by the server config, \(action) will be skipped")
+                logD(function, "networking is disabled by the server config, the call will be skipped, skippedAction: [\(action)]")
                 return false
             }
         }
 
         guard !core.modules.deviceID.isTemporary else {
-            logD(function, "device ID is in temporary mode, \(action) will be skipped")
+            logD(function, "device ID is in temporary mode, the call will be skipped, skippedAction: [\(action)]")
             return false
         }
 
@@ -415,17 +443,21 @@ final class RemoteConfigModule: ModuleBase {
 
     /// Puts the device into the A/B tests of the given keys.
     func enrollIntoABTests(forKeys keys: [String]) {
-        guard isRemoteConfigCallAllowed("enrollIntoABTests", "AB test enrollment", requiresNetworking: false) else { return }
+        logI("enrollIntoABTests", "enrollment into A/B tests is requested, keyCount: [\(keys.count)]")
 
-        logD("enrollIntoABTests", "AB test enrollment request will be sent, keyCount: [\(keys.count)]")
+        guard isRemoteConfigCallAllowed("enrollIntoABTests", "A/B test enrollment", requiresNetworking: false) else { return }
+
+        logD("enrollIntoABTests", "an enrollment request will be added to the request queue, keys: [\(Self.describe(keys))]")
         sendABRequest(method: QS.abOptIn, keys: keys, overrideEndpoint: true)
     }
 
     /// Takes the device out of the A/B tests of the given keys.
     func exitABTests(forKeys keys: [String]) {
-        guard isRemoteConfigCallAllowed("exitABTests", "AB test exit", requiresNetworking: false) else { return }
+        logI("exitABTests", "an exit from A/B tests is requested, keyCount: [\(keys.count)]")
 
-        logD("exitABTests", "AB test exit request will be sent, keyCount: [\(keys.count)]")
+        guard isRemoteConfigCallAllowed("exitABTests", "A/B test exit", requiresNetworking: false) else { return }
+
+        logD("exitABTests", "an exit request will be added to the request queue, keys: [\(Self.describe(keys))]")
         sendABRequest(method: QS.abOptOut, keys: keys, overrideEndpoint: false)
     }
 
@@ -456,28 +488,39 @@ final class RemoteConfigModule: ModuleBase {
 
     /// Every variant from the last testing download.
     func testingGetAllVariants() -> [String: Any] {
+        logI("testingGetAllVariants", "all locally cached A/B variants are requested")
+
         stateLock.lock()
         defer { stateLock.unlock() }
-        logD("testingGetAllVariants", "all locally cached variants are read, variantKeyCount: [\(localCachedVariants.count)]")
+        logD("testingGetAllVariants", "all locally cached variants are read, variantKeyCount: [\(localCachedVariants.count)], variantKeys: [\(Self.describe(localCachedVariants.keys))]")
         return localCachedVariants
     }
 
     /// The variants of one key from the last testing download.
     func testingGetVariants(forKey key: String) -> [Any] {
+        logI("testingGetVariants", "the locally cached A/B variants of a key are requested, key: [\(key)]")
+
         stateLock.lock()
         defer { stateLock.unlock() }
-        return (localCachedVariants[key] as? [Any]) ?? []
+        let variants = (localCachedVariants[key] as? [Any]) ?? []
+        logD("testingGetVariants", "locally cached variants are read for a key, key: [\(key)], variantCount: [\(variants.count)], keyIsKnown: [\(localCachedVariants[key] != nil)]")
+        return variants
     }
 
     /// Every experiment from the last testing download.
     func testingGetAllExperimentInfo() -> [String: CountlyExperimentInformation] {
+        logI("testingGetAllExperimentInfo", "all locally cached experiment information is requested")
+
         stateLock.lock()
         defer { stateLock.unlock() }
+        logD("testingGetAllExperimentInfo", "all locally cached experiments are read, experimentCount: [\(localCachedExperiments.count)], experimentIDs: [\(Self.describe(localCachedExperiments.keys))]")
         return localCachedExperiments
     }
 
     /// Downloads which variants exist, so a tester can pick one.
     func testingDownloadVariantInformation(completion: @escaping RCVariantCallback) {
+        logI("testingDownloadVariantInformation", "a download of the available A/B variants is requested")
+
         guard isRemoteConfigCallAllowed("testingDownloadVariantInformation", "variants download", requiresNetworking: true) else {
             completion(.error, CountlyError.remoteConfigGeneralAPIError.asNSError)
             return
@@ -486,7 +529,7 @@ final class RemoteConfigModule: ModuleBase {
         let queryString = testingQueryString(method: Key.fetchVariant)
         let request = core.network.instantRequest(queryString: queryString, path: Endpoint.output + Endpoint.sdk)
 
-        logD("testingDownloadVariantInformation", "variants download is starting")
+        logD("testingDownloadVariantInformation", "variants download is starting, path: [\(request.url?.path ?? "")]")
 
         core.network.instantSession().dataTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
@@ -495,7 +538,8 @@ final class RemoteConfigModule: ModuleBase {
             guard error == nil,
                   statusCode == 200,
                   let variants = CountlyJSON.object(from: data, logger: self.log) as? [String: Any] else {
-                self.logD("testingDownloadVariantInformation", "variants request failed, statusCode: [\(statusCode)]")
+                let nsError = error as NSError?
+                self.logD("testingDownloadVariantInformation", "variants request failed, statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], error: [\(nsError?.localizedDescription ?? "")], domain: [\(nsError?.domain ?? "")], code: [\(nsError?.code ?? 0)]")
                 DispatchQueue.main.async { completion(.error, error ?? CountlyError.remoteConfigGeneralAPIError.asNSError) }
                 return
             }
@@ -503,13 +547,15 @@ final class RemoteConfigModule: ModuleBase {
             self.stateLock.lock()
             self.localCachedVariants = variants
             self.stateLock.unlock()
-            self.logD("testingDownloadVariantInformation", "variants request successfully completed, variantKeyCount: [\(variants.count)]")
+            self.logD("testingDownloadVariantInformation", "variants request successfully completed, the locally cached variants are replaced, variantKeyCount: [\(variants.count)], variantKeys: [\(Self.describe(variants.keys))]")
             DispatchQueue.main.async { completion(.success, nil) }
         }.resume()
     }
 
     /// Downloads the experiments this device is part of.
     func testingDownloadExperimentInformation(completion: @escaping RCVariantCallback) {
+        logI("testingDownloadExperimentInformation", "a download of the experiments this device is part of is requested")
+
         guard isRemoteConfigCallAllowed("testingDownloadExperimentInformation", "experiment download", requiresNetworking: true) else {
             completion(.error, CountlyError.remoteConfigGeneralAPIError.asNSError)
             return
@@ -518,11 +564,15 @@ final class RemoteConfigModule: ModuleBase {
         let queryString = testingQueryString(method: Key.fetchExperiments)
         let request = core.network.instantRequest(queryString: queryString, path: Endpoint.output + Endpoint.sdk)
 
+        logD("testingDownloadExperimentInformation", "experiment download is starting, path: [\(request.url?.path ?? "")]")
+
         core.network.instantSession().dataTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
             guard error == nil, statusCode == 200 else {
+                let nsError = error as NSError?
+                self.logD("testingDownloadExperimentInformation", "experiment request failed, statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], error: [\(nsError?.localizedDescription ?? "")], domain: [\(nsError?.domain ?? "")], code: [\(nsError?.code ?? 0)]")
                 DispatchQueue.main.async { completion(.error, error ?? CountlyError.remoteConfigGeneralAPIError.asNSError) }
                 return
             }
@@ -530,19 +580,25 @@ final class RemoteConfigModule: ModuleBase {
             let parsed = CountlyJSON.object(from: data, logger: self.log)
 
             // The documented shape is an object carrying a `jsonArray` of
-            // experiments, which is what Android reads. A bare array is accepted
-            // too, and anything else yields no experiments rather than an error:
-            // this is a testing helper, and a shape the SDK did not expect must
-            // never be able to take the host application down with it.
+            // experiments. A bare array is accepted too, and anything else yields
+            // no experiments rather than an error: this is a testing helper, and a
+            // shape the SDK did not expect must never be able to take the host
+            // application down with it.
             let entries: [[String: Any]]
+            let responseShape: String
             if let container = parsed as? [String: Any] {
                 entries = (container[Key.experimentArray] as? [[String: Any]]) ?? []
+                responseShape = "object"
+            } else if let array = parsed as? [[String: Any]] {
+                entries = array
+                responseShape = "array"
             } else {
-                entries = (parsed as? [[String: Any]]) ?? []
+                entries = []
+                responseShape = "unrecognised"
             }
 
             if entries.isEmpty {
-                self.logD("testingDownloadExperimentInformation", "the experiment response carried no experiments, responseSize: [\(data?.count ?? 0)]")
+                self.logD("testingDownloadExperimentInformation", "the experiment response carried no experiments, responseShape: [\(responseShape)], responseSize: [\(data?.count ?? 0)]")
             }
 
             var experiments: [String: CountlyExperimentInformation] = [:]
@@ -556,15 +612,23 @@ final class RemoteConfigModule: ModuleBase {
                     variants: (entry["variants"] as? [String: Any]) ?? [:])
             }
 
+            if experiments.count != entries.count {
+                self.logD("testingDownloadExperimentInformation", "some experiment entries carry no id and were dropped, receivedEntryCount: [\(entries.count)], keptExperimentCount: [\(experiments.count)]")
+            }
+
             self.stateLock.lock()
             self.localCachedExperiments = experiments
             self.stateLock.unlock()
+
+            self.logD("testingDownloadExperimentInformation", "experiment request successfully completed, the locally cached experiments are replaced, responseShape: [\(responseShape)], experimentCount: [\(experiments.count)], experimentIDs: [\(Self.describe(experiments.keys))]")
             DispatchQueue.main.async { completion(.success, nil) }
         }.resume()
     }
 
     /// Forces this device into a named variant.
     func testingEnrollIntoVariant(key: String, variantName: String, completion: @escaping RCVariantCallback) {
+        logI("testingEnrollIntoVariant", "enrollment into a named A/B variant is requested, key: [\(key)], variantName: [\(variantName)]")
+
         guard !key.isEmpty, !variantName.isEmpty else {
             logE("testingEnrollIntoVariant", "key or variant name is empty, variant enrollment will be skipped")
             completion(.error, CountlyError.remoteConfigGeneralAPIError.asNSError)
@@ -587,13 +651,15 @@ final class RemoteConfigModule: ModuleBase {
         // the read endpoint the fetches use.
         let request = core.network.instantRequest(queryString: queryString, path: Endpoint.input)
 
-        logD("testingEnrollIntoVariant", "variant enrollment is starting, key: [\(key)], variantName: [\(variantName)]")
+        logD("testingEnrollIntoVariant", "variant enrollment is starting, key: [\(key)], variantName: [\(variantName)], path: [\(request.url?.path ?? "")]")
 
         core.network.instantSession().dataTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
             guard error == nil, statusCode == 200 else {
+                let nsError = error as NSError?
+                self.logD("testingEnrollIntoVariant", "variant enrollment request failed, key: [\(key)], variantName: [\(variantName)], statusCode: [\(statusCode)], error: [\(nsError?.localizedDescription ?? "")], domain: [\(nsError?.domain ?? "")], code: [\(nsError?.code ?? 0)]")
                 DispatchQueue.main.async { completion(.error, error ?? CountlyError.remoteConfigGeneralAPIError.asNSError) }
                 return
             }
@@ -602,6 +668,7 @@ final class RemoteConfigModule: ModuleBase {
             // first: refetching alone is gated on automatic triggers, so without
             // this an integration with triggers off keeps serving the old
             // variant's values forever.
+            self.logD("testingEnrollIntoVariant", "variant enrollment successfully completed, the cached values will be cleared and downloaded again, key: [\(key)], variantName: [\(variantName)]")
             self.clearCachedRemoteConfig()
             self.downloadRemoteConfigAutomatically()
             DispatchQueue.main.async { completion(.success, nil) }
@@ -619,7 +686,7 @@ final class RemoteConfigModule: ModuleBase {
         downloadCallbacks[token] = callback
         let count = downloadCallbacks.count
         stateLock.unlock()
-        logD("registerDownloadCallback", "download callback is registered, callbackCount: [\(count)]")
+        logI("registerDownloadCallback", "download callback is registered, callbackCount: [\(count)]")
         return token
     }
 
@@ -631,7 +698,7 @@ final class RemoteConfigModule: ModuleBase {
         stateLock.unlock()
 
         if removed {
-            logD("removeDownloadCallback", "download callback is removed, remainingCallbackCount: [\(count)]")
+            logI("removeDownloadCallback", "download callback is removed, remainingCallbackCount: [\(count)]")
         } else {
             logW("removeDownloadCallback", "nothing was removed, the token does not belong to a registered download callback")
         }
@@ -640,9 +707,10 @@ final class RemoteConfigModule: ModuleBase {
     /// Drops every registered download callback.
     func removeAllDownloadCallbacks() {
         stateLock.lock()
+        let removedCount = downloadCallbacks.count
         downloadCallbacks.removeAll()
         stateLock.unlock()
-        logD("removeAllDownloadCallbacks", "all download callbacks are removed")
+        logI("removeAllDownloadCallbacks", "all download callbacks are removed, removedCallbackCount: [\(removedCount)]")
     }
 
     // MARK: - Clearing
@@ -656,7 +724,7 @@ final class RemoteConfigModule: ModuleBase {
         lock.lock()
         defer { lock.unlock() }
 
-        logD("clearCachedRemoteConfig", "cached remote config values will be [\(isValueCachingEnabled ? "marked as stale" : "erased")], cachedKeyCount: [\(cachedRemoteConfig.count)]")
+        logD("clearCachedRemoteConfig", "cached remote config values are updated for the user change, valueCachingEnabled: [\(isValueCachingEnabled)], action: [\(isValueCachingEnabled ? "marked as stale" : "erased")], cachedKeyCount: [\(cachedRemoteConfig.count)]")
 
         if isValueCachingEnabled {
             for (key, data) in cachedRemoteConfig {
@@ -670,6 +738,8 @@ final class RemoteConfigModule: ModuleBase {
 
     /// Erases every cached value.
     func clearAll() {
+        logI("clearAll", "erasing every remote config value is requested")
+
         lock.lock()
         defer { lock.unlock() }
         logD("clearAll", "all remote config values will be erased, clearedKeyCount: [\(cachedRemoteConfig.count)]")
@@ -681,10 +751,13 @@ final class RemoteConfigModule: ModuleBase {
 
     override func halt(clearStorage: Bool) {
         stateLock.lock()
+        let droppedCallbackCount = downloadCallbacks.count
         downloadCallbacks.removeAll()
         localCachedVariants.removeAll()
         localCachedExperiments.removeAll()
         stateLock.unlock()
+
+        logD("halt", "remote config module is halted, callbacks and testing caches are dropped, clearStorage: [\(clearStorage)], droppedCallbackCount: [\(droppedCallbackCount)]")
         if clearStorage {
             clearAll()
         }

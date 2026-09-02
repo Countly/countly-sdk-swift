@@ -6,8 +6,12 @@
 //  Please visit www.count.ly for more information.
 //
 
-#if os(iOS) || os(visionOS)
+#if os(iOS) || os(visionOS) || os(macOS)
+#if os(macOS)
+import AppKit
+#else
 import UIKit
+#endif
 import WebKit
 
 /// Presents server-rendered content and feedback widgets, and interprets what the
@@ -19,6 +23,11 @@ import WebKit
 ///
 /// One manager presents one page. It is shared between content and feedback, so
 /// behavior that only applies to content is gated on `isFeedbackWidget`.
+///
+/// Deliberately internal, and worth keeping that way. `webView` is `private(set)`
+/// so the test suite can assert against the real object rather than a projection
+/// that would drift from it; that is only safe while the class itself is out of
+/// reach. Making this `public` would take the web view's whole API along with it.
 final class WebViewManager: NSObject {
 
     private static let module = "WebView"
@@ -53,6 +62,14 @@ final class WebViewManager: NSObject {
     /// Set when content is pinned to the portrait layout.
     private var isPinnedToPortrait = false
 
+    /// The placement as the server sent it, before any safe area shift.
+    ///
+    /// The shift is applied again on every appearance, resize and rotation, and it
+    /// is additive, so it has to be computed from this rather than from the frame
+    /// already on screen. Re-applying it to the live frame walks the page off the
+    /// bottom of the display one rotation at a time.
+    private var baseWebViewFrame: CGRect?
+
     /// Fires when a content page has not reported itself shown in time.
     private var stallTimer: Timer?
 
@@ -69,6 +86,9 @@ final class WebViewManager: NSObject {
 
     /// Used when the configured stall timeout is not a usable positive number.
     private static let defaultStallTimeout: TimeInterval = 1.0
+
+    /// When the current navigation started, so the load can be timed.
+    private var loadStartedAt: Date?
 
     /// The reload a failure scheduled, held so a load that succeeds in the delay
     /// window can cancel it. Non-nil also means "a retry is already scheduled", so
@@ -109,7 +129,7 @@ final class WebViewManager: NSObject {
 
         // Host and path only: the query string carries the app key and device ID.
         core.logger.i(Self.module, "present", "web view presentation requested, host: [\(url.host ?? "")], path: [\(url.path)], isFeedbackWidget: [\(isFeedbackWidget)], pinnedToPortrait: [\(isPinnedToPortrait)]")
-        core.logger.v(Self.module, "present", "web view presentation URL detail, url: [\(url.absoluteString)]")
+        core.logger.v(Self.module, "present", "web view presentation detail, url: [\(url.absoluteString)], appearCallbackProvided: [\(appear != nil)], dismissCallbackProvided: [\(dismiss != nil)]")
 
         appearBlock = appear
         dismissBlock = dismiss
@@ -120,16 +140,26 @@ final class WebViewManager: NSObject {
 
         let overlayWindow = OverlayWindow()
         let controller = WebViewController()
+        #if !os(macOS)
+        // The overlay is a window of its own, so the presentation style only
+        // matters where a controller can be presented modally at all.
         controller.modalPresentationStyle = .overFullScreen
+        #endif
         controller.sizeChangeHandler = { [weak self] in
             self?.handleInterfaceSizeChange()
         }
         overlayWindow.rootViewController = controller
 
         let background = PassThroughBackgroundView(frame: controller.view.bounds)
+        #if os(macOS)
+        background.wantsLayer = true
+        background.layer?.backgroundColor = NSColor.clear.cgColor
+        background.autoresizingMask = [NSView.AutoresizingMask.width, .height]
+        #else
         background.backgroundColor = .clear
-        background.reportPortraitSizeOnly = isPinnedToPortrait
         background.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        #endif
+        background.reportPortraitSizeOnly = isPinnedToPortrait
         controller.contentView = background
 
         let configuration = WKWebViewConfiguration()
@@ -150,13 +180,34 @@ final class WebViewManager: NSObject {
         configuration.userContentController.add(proxy, name: ScriptMessage.resourceVerifyResult)
 
         let targetFrame = frame ?? background.bounds
+        baseWebViewFrame = targetFrame
+        core.logger.d(Self.module, "present", "the presentation frames were computed, webViewFrame: [\(targetFrame.logValue)], backgroundFrame: [\(background.bounds.logValue)]")
+
         let web = WKWebView(frame: targetFrame, configuration: configuration)
         web.navigationDelegate = self
+        #if os(macOS)
+        // `WKWebView.scrollView` is iOS only, and an NSView is transparent unless
+        // it is told to draw. The page's own background still shows through.
+        web.setValue(false, forKey: "drawsBackground")
+        web.autoresizingMask = [NSView.AutoresizingMask.width, .height]
+        #else
         web.isOpaque = false
         web.backgroundColor = .clear
         web.scrollView.backgroundColor = .clear
         web.scrollView.bounces = false
+        // The frame this view is given already clears the safe area, so letting the
+        // scroll view inset for it a second time makes a page that exactly fills its
+        // slot taller than the slot: it scrolls, and whatever sits at the bottom of
+        // the page is cut in half by the edge of the view.
+        web.scrollView.contentInsetAdjustmentBehavior = .never
+        // Native backstop for the viewport directives the disable zoom script
+        // writes. Only the gesture is touched, never the zoom scales, which
+        // interact with the page's own initial scale.
+        if core.config.content.disableZoom {
+            web.scrollView.pinchGestureRecognizer?.isEnabled = false
+        }
         web.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        #endif
         // Hidden until the page loads, so a blank rectangle never flashes over the
         // application.
         web.isHidden = true
@@ -214,6 +265,7 @@ final class WebViewManager: NSObject {
         // checks it before reloading, so a load that succeeded during the delay
         // window is never wiped by the retry the earlier failure scheduled.
         hasAppeared = true
+        applySafeAreaPlacement()
         webView?.isHidden = false
 
         // Released once fired, the way the dismissal block is. It captures the
@@ -252,16 +304,37 @@ final class WebViewManager: NSObject {
 
     // MARK: - Layout
 
+    /// Moves the page clear of whatever the reported size had taken out of it.
+    ///
+    /// The size the server laid this page out against had the hardware cutout
+    /// subtracted from it, so the page fits only once it has been pushed past that
+    /// cutout. Always computed from `baseWebViewFrame`, never from the live frame.
+    private func applySafeAreaPlacement() {
+        guard let webView, let base = baseWebViewFrame else { return }
+
+        let offset = ContentGeometry.placementOffset(displayOption: core.config.content.webViewDisplayOption)
+        let placed = base.offsetBy(dx: offset.x, dy: offset.y)
+
+        guard placed != webView.frame else { return }
+
+        core.logger.d(Self.module, "applySafeAreaPlacement", "the page is placed clear of the safe area, baseFrame: [\(base.logValue)], offset: [\(offset.logValue)], frame: [\(placed.logValue)], safeAreaInsets: [\(ContentGeometry.safeAreaDescription)]")
+        webView.frame = placed
+    }
+
     /// Re-lays the page out after a rotation, unless it is pinned to portrait.
     private func handleInterfaceSizeChange() {
         guard !isPinnedToPortrait else { return }
-        guard let backgroundView, let webView else { return }
-        webView.frame = CGRect(origin: .zero, size: backgroundView.effectiveSize)
+        guard let backgroundView, webView != nil else { return }
+
+        let filled = CGRect(origin: .zero, size: backgroundView.effectiveSize)
+        core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed and the page is re-laid out, frame: [\(filled.logValue)]")
+        baseWebViewFrame = filled
+        applySafeAreaPlacement()
     }
 
     /// Applies a size the page asked for, in the page's own coordinate space.
     private func resize(with parameters: [String: Any]) {
-        guard let backgroundView, let webView else { return }
+        guard let backgroundView, webView != nil else { return }
 
         // The page describes where it wants to sit as a fraction of the screen,
         // under the key matching the current orientation.
@@ -276,15 +349,14 @@ final class WebViewManager: NSObject {
         guard let geometry = (parameters[preferred] as? [String: Any])
                 ?? (parameters[fallback] as? [String: Any]) else { return }
 
-        var frame = CGRect(contentGeometry: geometry, container: backgroundView.effectiveSize)
+        let usedFallback = parameters[preferred] == nil
+        let frame = CGRect(contentGeometry: geometry, container: backgroundView.effectiveSize)
 
-        if core.config.content.webViewDisplayOption == .safeArea {
-            let insets = backgroundView.safeAreaInsets
-            frame = frame.offsetBy(dx: insets.left, dy: insets.top)
-        }
+        core.logger.d(Self.module, "resize", "the page asked to be resized, orientation: [\(isPortrait ? "portrait" : "landscape")], orientationKey: [\(usedFallback ? fallback : preferred)], usedFallbackOrientation: [\(usedFallback)], x: [\(frame.origin.x.logValue)], y: [\(frame.origin.y.logValue)], width: [\(frame.width.logValue)], height: [\(frame.height.logValue)]")
+        core.logger.d(Self.module, "resize", "resize container detail, containerSize: [\(backgroundView.effectiveSize.logValue)], resizeGeometry: [\(parameters)]")
 
-        core.logger.d(Self.module, "resize", "content asked to be resized, width: [\(frame.width)], height: [\(frame.height)]")
-        webView.frame = frame
+        baseWebViewFrame = frame
+        applySafeAreaPlacement()
     }
 
     // MARK: - Actions
@@ -303,7 +375,7 @@ final class WebViewManager: NSObject {
         guard let action = parameters["action"] as? String else { return }
 
         core.logger.d(Self.module, "handleAction", "a content action was received, action: [\(action)]")
-        core.logger.v(Self.module, "handleAction", "the content action detail, action: [\(action)], queryParameters: [\(parameters)]")
+        core.logger.d(Self.module, "handleAction", "content action detail, action: [\(action)], queryParameters: [\(parameters)]")
 
         switch action {
         case "event":
@@ -328,8 +400,11 @@ final class WebViewManager: NSObject {
     private func recordEvents(fromJSON json: String) {
         guard let events = CountlyJSON.object(from: Data(json.utf8), logger: core.logger) as? [[String: Any]] else {
             core.logger.e(Self.module, "recordEvents", "the content events payload is nil or not an array, ignoring the action")
+            core.logger.d(Self.module, "recordEvents", "unparsable content events detail, jsonLength: [\(json.count)], json: [\(json)]")
             return
         }
+
+        core.logger.d(Self.module, "recordEvents", "content events payload detail, events: [\(events)]")
 
         var skipped = 0
         for event in events {
@@ -356,13 +431,14 @@ final class WebViewManager: NSObject {
             }
 
             core.logger.d(Self.module, "recordEvents", "recording a content event, key: [\(key)]")
+            core.logger.d(Self.module, "recordEvents", "content event detail, key: [\(key)], segmentation: [\(segmentation)]")
             core.modules.events.recordEvent(key, segmentation: segmentation)
         }
 
         if skipped > 0 {
-            core.logger.d(Self.module, "recordEvents", "some content events were dropped, dropped: [\(skipped)], recorded: [\(events.count - skipped)]")
+            core.logger.d(Self.module, "recordEvents", "some content events were dropped, droppedCount: [\(skipped)], recordedCount: [\(events.count - skipped)]")
         } else {
-            core.logger.i(Self.module, "recordEvents", "content events recorded, count: [\(events.count)]")
+            core.logger.i(Self.module, "recordEvents", "content events recorded, recordedCount: [\(events.count)]")
         }
 
         core.modules.events.addEventsToRequestQueue()
@@ -372,7 +448,8 @@ final class WebViewManager: NSObject {
 
     /// Hands a link to the host application, or to the browser.
     private func openExternalLink(_ urlString: String) {
-        core.logger.d(Self.module, "openExternalLink", "an external link was requested by the content")
+        core.logger.d(Self.module, "openExternalLink", "an external link was requested by the content, linkLength: [\(urlString.count)]")
+        core.logger.d(Self.module, "openExternalLink", "external link detail, link: [\(urlString)]")
 
         var url = URL(string: urlString)
         if url == nil {
@@ -389,12 +466,20 @@ final class WebViewManager: NSObject {
 
         if let handler = core.config.content.contentURLHandler, handler(url) {
             core.logger.i(Self.module, "openExternalLink", "the URL was handled by the app's content URL handler, host: [\(url.host ?? "")], path: [\(url.path)]")
+            core.logger.d(Self.module, "openExternalLink", "app content URL handler detail, url: [\(url.absoluteString)]")
             return
         }
 
+        #if os(macOS)
+        // AppKit answers synchronously and has no completion handler.
+        let opened = NSWorkspace.shared.open(url)
+        core.logger.i(Self.module, "openExternalLink", "the URL was handed to the system browser, host: [\(url.host ?? "")], path: [\(url.path)], opened: [\(opened)]")
+        #else
         UIApplication.shared.open(url, options: [:]) { [weak self] success in
-            self?.core.logger.i(Self.module, "openExternalLink", "the URL was handed to the browser, host: [\(url.host ?? "")], opened: [\(success)]")
+            self?.core.logger.i(Self.module, "openExternalLink", "the URL was handed to the browser, host: [\(url.host ?? "")], path: [\(url.path)], opened: [\(success)]")
+            self?.core.logger.d(Self.module, "openExternalLink", "browser link detail, url: [\(url.absoluteString)], opened: [\(success)]")
         }
+        #endif
     }
 
     // MARK: - Action URL parsing
@@ -728,7 +813,7 @@ final class WebViewManager: NSObject {
         cancelStallTimer()
 
         let delay = Self.resourceRetryBaseDelay * TimeInterval(resourceRetryCount)
-        core.logger.d(Self.module, "attemptRecovery", "scheduling a reload, attempt: [\(resourceRetryCount)], maxAttempts: [\(Self.maxResourceRetries)], delay: [\(delay)], reason: [\(reason)]")
+        core.logger.d(Self.module, "attemptRecovery", "scheduling a reload, attempt: [\(resourceRetryCount)], maxAttempts: [\(Self.maxResourceRetries)], delay: [\(delay.logSeconds)], reason: [\(reason)]")
 
         let reload = DispatchWorkItem { [weak self] in
             guard let self else { return }
@@ -806,8 +891,61 @@ extension WebViewManager: WKNavigationDelegate {
         decisionHandler(.allow)
     }
 
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationResponse: WKNavigationResponse,
+                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        let response = navigationResponse.response
+        let http = response as? HTTPURLResponse
+        let statusCode = http?.statusCode ?? 0
+        let headers = http?.allHeaderFields ?? [:]
+
+        // Host and path only, and no header names: both a response header and a URL
+        // query string can carry an identifier.
+        core.logger.d(Self.module, "decidePolicyForResponse", "navigation response received, host: [\(response.url?.host ?? "")], path: [\(response.url?.path ?? "")], mimeType: [\(response.mimeType ?? "")], statusCode: [\(statusCode)], headerCount: [\(headers.count)]")
+        core.logger.v(Self.module, "decidePolicyForResponse", "navigation response detail, url: [\(response.url?.absoluteString ?? "")], statusCode: [\(statusCode)], headers: [\(headers)]")
+
+        // An error page is not content. Rendering it puts the server's 404 body over
+        // the application with no close control on it, so the navigation is refused
+        // and the overlay taken down instead.
+        if statusCode >= 400 {
+            core.logger.e(Self.module, "decidePolicyForResponse", "cancelling the navigation and dismissing the web view because of an HTTP error status, statusCode: [\(statusCode)], path: [\(response.url?.path ?? "")], reason: [http-error]")
+            decisionHandler(.cancel)
+            // Deferred rather than closed here: this runs inside WebKit's own policy
+            // callback, and tearing the web view down underneath it is not safe.
+            DispatchQueue.main.async { [weak self] in self?.close() }
+            return
+        }
+
+        decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        loadStartedAt = Date()
+        core.logger.d(Self.module, "didStartProvisionalNavigation", "the navigation started, host: [\(webView.url?.host ?? "")], path: [\(webView.url?.path ?? "")], reloadOnStall: [\(core.config.content.enableContentReloadOnStall)]")
+        core.logger.v(Self.module, "didStartProvisionalNavigation", "started navigation detail, url: [\(webView.url?.absoluteString ?? "")]")
+    }
+
+    func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) {
+        core.logger.d(Self.module, "didReceiveServerRedirect", "a server redirect was received for the provisional navigation, host: [\(webView.url?.host ?? "")], path: [\(webView.url?.path ?? "")]")
+        core.logger.v(Self.module, "didReceiveServerRedirect", "server redirect detail, url: [\(webView.url?.absoluteString ?? "")]")
+    }
+
+    func webView(_ webView: WKWebView,
+                 didReceive challenge: URLAuthenticationChallenge,
+                 completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        core.logger.d(Self.module, "didReceiveChallenge", "an authentication challenge was received and the default handling is performed, host: [\(challenge.protectionSpace.host)], authenticationMethod: [\(challenge.protectionSpace.authenticationMethod)]")
+        completionHandler(.performDefaultHandling, nil)
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        core.logger.e(Self.module, "webContentProcessDidTerminate", "the web content process terminated, host: [\(webView.url?.host ?? "")], path: [\(webView.url?.path ?? "")]")
+        core.logger.v(Self.module, "webContentProcessDidTerminate", "terminated web content process detail, url: [\(webView.url?.absoluteString ?? "")]")
+    }
+
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        core.logger.d(Self.module, "didFinish", "the page finished loading")
+        let duration = loadStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+        core.logger.d(Self.module, "didFinish", "the page finished loading, host: [\(webView.url?.host ?? "")], path: [\(webView.url?.path ?? "")], duration: [\(duration.logSeconds)]")
+        core.logger.v(Self.module, "didFinish", "finished navigation detail, url: [\(webView.url?.absoluteString ?? "")]")
 
         // The load completing is progress, whatever the deadline thought. The
         // deadline is re-armed rather than dropped, because content still has to
@@ -824,16 +962,19 @@ extension WebViewManager: WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        core.logger.d(Self.module, "didFail", "the page failed to load, error: [\(error.localizedDescription)]")
+        let failure = error as NSError
+        core.logger.d(Self.module, "didFail", "the page failed to load after being committed and the web view is dismissed, error: [\(failure.localizedDescription)], domain: [\(failure.domain)], code: [\(failure.code)], reason: [navigation-failure]")
         close()
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        core.logger.d(Self.module, "didFailProvisionalNavigation", "the page failed to start loading, error: [\(error.localizedDescription)]")
+        let failure = error as NSError
+        core.logger.d(Self.module, "didFailProvisionalNavigation", "the page failed to start loading and the web view is dismissed, error: [\(failure.localizedDescription)], domain: [\(failure.domain)], code: [\(failure.code)], reason: [navigation-failure]")
         close()
     }
 }
 
+#if os(iOS) || os(visionOS)
 /// Hosts the overlay content and reports interface size changes.
 final class WebViewController: UIViewController {
 
@@ -864,6 +1005,7 @@ final class WebViewController: UIViewController {
         }
     }
 }
+#endif
 
 /// Forwards `WKScriptMessage`s to a `WebViewManager` without retaining it.
 ///

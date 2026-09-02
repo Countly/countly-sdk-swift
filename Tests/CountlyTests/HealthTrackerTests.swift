@@ -213,6 +213,18 @@ final class HealthTrackerTests: CountlyBaseTestCase {
         core(of: first).healthTracker.clearAndSave()
         core(of: first).logger.e("Test", "test", "another error")
         core(of: first).healthTracker.saveState()
+
+        // The tracker owns its counters on a serial queue and every mutation hops
+        // onto it, `saveState` included, so the write lands a turn after the call
+        // returns. Halting before it does throws the counters away and the restart
+        // below reads nothing. This waits for the value rather than for the write,
+        // because `clearAndSave` also persists and would satisfy a mere
+        // "something was stored" check while the count is still zero.
+        TestUtils.waitUntil("the error count reaches storage") {
+            let stored = core(of: first).keyValueStore.healthCheckState
+            return TestUtils.int(stored?["LErr"]) ?? 0 >= 1
+        }
+
         first.halt()
 
         MockURLProtocol.reset()

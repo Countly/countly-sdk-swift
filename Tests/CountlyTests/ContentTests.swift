@@ -237,8 +237,8 @@ final class ContentTests: CountlyBaseTestCase {
     /// which is the path that matters here: a content that cannot load must not be
     /// left as an invisible rectangle over the application.
     func testAContentInTheResponseIsPresentedAndTornDownWhenItCannotLoad() throws {
-        #if !(os(iOS) || os(visionOS))
-        throw XCTSkip("content is presented in a web view, which only exists on iOS and visionOS")
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("content is presented in a web view, which tvOS and watchOS have no WebKit for")
         #else
         MockURLProtocol.respond(pathContaining: "/o/sdk/content", json: """
         {"html": "https://example.invalid/content.html",
@@ -263,8 +263,8 @@ final class ContentTests: CountlyBaseTestCase {
     /// A response whose `html` is not a usable address is not presented, and must
     /// not leave the zone believing something is on screen.
     func testAContentWithAnUnusableAddressIsNotPresented() throws {
-        #if !(os(iOS) || os(visionOS))
-        throw XCTSkip("content is presented in a web view, which only exists on iOS and visionOS")
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("content is presented in a web view, which tvOS and watchOS have no WebKit for")
         #else
         MockURLProtocol.respond(pathContaining: "/o/sdk/content",
                                 json: #"{"html": "", "geo": {}}"#)
@@ -285,8 +285,8 @@ final class ContentTests: CountlyBaseTestCase {
     /// A preview shows the content whether or not the user qualifies for it, which
     /// is what makes it a preview.
     func testAPreviewPresentsTheContentItAskedFor() throws {
-        #if !(os(iOS) || os(visionOS))
-        throw XCTSkip("content is presented in a web view, which only exists on iOS and visionOS")
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("content is presented in a web view, which tvOS and watchOS have no WebKit for")
         #else
         MockURLProtocol.respond(pathContaining: "/o/sdk/content", json: """
         {"html": "https://example.invalid/preview.html", "geo": {}}
@@ -302,8 +302,8 @@ final class ContentTests: CountlyBaseTestCase {
     /// While a content is on screen the zone stops asking for another one, because
     /// there is only one slot and a second answer would be thrown away.
     func testNothingIsFetchedWhileAContentIsOnScreen() throws {
-        #if !(os(iOS) || os(visionOS))
-        throw XCTSkip("content is presented in a web view, which only exists on iOS and visionOS")
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("content is presented in a web view, which tvOS and watchOS have no WebKit for")
         #else
         MockURLProtocol.respond(pathContaining: "/o/sdk/content", json: """
         {"html": "https://example.invalid/content.html", "geo": {}}
@@ -406,4 +406,51 @@ final class ContentTests: CountlyBaseTestCase {
 
         XCTAssertEqual(fetches().count, afterHalt)
     }
+
+    // MARK: - Closing from another thread
+
+    /// Taking content off screen touches the view hierarchy, so it has to happen on
+    /// the main thread. Exiting the zone is a public call an application can make
+    /// from wherever it likes, most obviously from a network or database callback,
+    /// so the hop has to be inside the SDK rather than assumed of the caller.
+    ///
+    /// The path being exercised is the one where `closeShownContent` is *not*
+    /// already on the main thread, which is the branch a main-thread-only test
+    /// never reaches.
+    func testExitingTheZoneFromABackgroundThreadStillTakesContentDown() throws {
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("content is presented in a web view, which tvOS and watchOS have no WebKit for")
+        #else
+        MockURLProtocol.respond(pathContaining: "/o/sdk/content", json: """
+        {"html": "https://example.invalid/content.html",
+         "geo": {"p": {"x": 0, "y": 0, "w": 200, "h": 100},
+                 "l": {"x": 0, "y": 0, "w": 200, "h": 100}}}
+        """)
+
+        let countly = contentInstance()
+        countly.content.enterContentZone()
+        waitForFetch()
+        TestUtils.pump(1.0)
+
+        let exited = expectation(description: "the exit call returns off the main thread")
+        DispatchQueue.global(qos: .userInitiated).async {
+            XCTAssertFalse(Thread.isMainThread, "the point of this test is the non-main path")
+            countly.content.exitContentZone()
+            exited.fulfill()
+        }
+        wait(for: [exited], timeout: TestUtils.asyncTimeout)
+
+        // The teardown was handed to the main queue, so it lands a turn later.
+        TestUtils.pump(0.5)
+
+        // The zone must be free again rather than stuck believing something is on
+        // screen, which is the failure a dropped hop actually produces.
+        let before = fetches().count
+        countly.content.enterContentZone()
+        TestUtils.waitUntil("the zone accepts another entry after the background exit") {
+            self.fetches().count > before
+        }
+        #endif
+    }
+
 }

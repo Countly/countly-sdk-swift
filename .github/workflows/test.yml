@@ -26,11 +26,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # macOS is the cheap pass: `swift test` runs on the runner itself with no simulator to boot,
-  # so it is the one that gates the pull request. It is also where the whole suite has to be
-  # green, because the simulator cells below are advisory.
+  # macOS needs no simulator to boot, so it is the fastest platform to get a verdict from and
+  # the one that gates the pull request. The whole suite has to be green here, because the
+  # simulator cells below are advisory.
+  #
+  # This runs through xcodebuild rather than `swift test`, which is a change from how the job
+  # used to work, and the reason is reporting. `swift test --xunit-output <path>` does not
+  # write <path> at all unless `--parallel` is also passed: the non parallel runner execs the
+  # xctest binary directly and never collects results, so the only file that appears is the
+  # empty `<path>-swift-testing.xml` for the Swift Testing suites this package does not use.
+  # Verified on Swift 6.2: 478 tests ran, 11 skipped, 1 failed, and the JUnit file said
+  # `tests="0"` without the command failing. That is the exact failure this reporting is
+  # supposed to make impossible -- a step that succeeds while reporting nothing.
+  #
+  # `--parallel` is not an option either: several suites assert on the process wide crash
+  # handler installation and on UserDefaults, which parallel workers share and race on.
+  #
+  # So macOS goes through xcodebuild like the other four platforms, and the result bundle is
+  # converted by the same script. One code path, and the skipped counts survive.
   macos:
-    name: swift test (macOS)
+    name: xcodebuild test (macOS)
     runs-on: macos-15
     steps:
       - name: Checkout SDK code
@@ -39,42 +54,86 @@ jobs:
       - name: Set up Xcode
         run: sudo xcode-select -switch /Applications/Xcode_16.4.app
 
-      # `--parallel` is deliberately not used. Several suites assert on the process wide
-      # crash handler installation and on UserDefaults, which are shared across test cases
-      # even though each case builds its own SDK instance.
       - name: Run the test suite
-        run: swift test --enable-code-coverage
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -scheme Countly-Package \
+            -destination 'platform=macOS' \
+            -resultBundlePath TestResults.xcresult \
+            -enableCodeCoverage YES \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee xcodebuild.log
 
-      # llvm-cov needs the binary and the profdata that `swift test` leaves in .build, and
-      # their names depend on the toolchain, so they are resolved rather than hardcoded.
-      - name: Report code coverage
+      # WebKit prints its process launch durations inline, and a starved runner shows
+      # them at thirty seconds where a healthy one is under a second. Recorded so a
+      # failure caused by runner contention reads as contention rather than as the
+      # diff under test. Advisory: it never fails the job.
+      - name: Check whether the runner was starved
+        if: always()
+        run: |
+          python3 .github/scripts/runner_health.py \
+            --log xcodebuild.log \
+            --platform macOS \
+            --output runner-health/macOS.json
+
+      # Refuses to write an empty report rather than reporting nothing quietly. See the
+      # script's docstring for why this reads the result bundle instead of scraping the log.
+      - name: Convert the results to JUnit XML
+        if: always()
+        run: |
+          python3 .github/scripts/xcresult_to_junit.py \
+            --xcresult TestResults.xcresult \
+            --platform macOS \
+            --output test-results/macOS.xml
+
+      # Reported next to the iOS figure in the pull request comment, and measured with the same
+      # tool so the gap between them is a real difference in how much code each platform
+      # compiles -- `WebViewManager`, `OverlayWindow` and the notification service are compiled
+      # out here -- rather than two tools counting lines differently.
+      - name: Summarise the macOS coverage
         if: always()
         run: |
           set -euo pipefail
-          binary=$(swift build --show-bin-path)/CountlyPackageTests.xctest/Contents/MacOS/CountlyPackageTests
-          profdata=$(swift build --show-bin-path)/codecov/default.profdata
-          if [ ! -f "$binary" ] || [ ! -f "$profdata" ]; then
-            echo "::warning::coverage inputs are missing, skipping the report"
-            exit 0
-          fi
-          xcrun llvm-cov report "$binary" \
-            -instr-profile "$profdata" \
-            -ignore-filename-regex='(Tests|\.build)/' \
-            | tee coverage.txt
-          {
-            echo '### Code coverage'
-            echo
-            echo '```'
-            tail -n 1 coverage.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          xcrun xccov view --report --json TestResults.xcresult > xccov.json
+          xcrun xccov view --report --only-targets TestResults.xcresult | tee coverage.txt
+          python3 .github/scripts/coverage_summary.py \
+            --platform macOS \
+            --xccov xccov.json \
+            --output coverage/macOS.json
 
-      - name: Upload the coverage report
+      - name: Upload the JUnit results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-macos
-          path: coverage.txt
+          name: junit-macOS
+          path: test-results/macOS.xml
+          if-no-files-found: warn
+
+      - name: Upload the runner health assessment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-health-macOS
+          path: runner-health/macOS.json
+          if-no-files-found: warn
+
+      - name: Upload the coverage summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-macOS
+          path: |
+            coverage/macOS.json
+            coverage.txt
+          if-no-files-found: warn
+
+      # Only on failure: a green run's result bundle is tens of megabytes nobody opens.
+      - name: Upload the result bundle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-macOS
+          path: TestResults.xcresult
           if-no-files-found: ignore
 
   # The other four platforms need a simulator, which is slow to boot and, on watchOS and
@@ -87,7 +146,14 @@ jobs:
   # rows would put a pull request into the hours.
   simulators:
     name: xcodebuild test (${{ matrix.platform }})
+    # `needs` here is for sequencing, not for gating. The account has one concurrent
+    # macOS runner, so this keeps the simulator cells behind the macOS job rather than
+    # fighting it for the runner. Without `if: always()` a plain `needs` also stops them
+    # running whenever macOS is red, which is backwards: these cells are the diagnostics,
+    # so a failure is exactly when their result is worth having. One flaky macOS test was
+    # otherwise enough to lose the signal from all four other platforms at once.
     needs: macos
+    if: always()
     runs-on: macos-15
     continue-on-error: true
     strategy:
@@ -152,13 +218,77 @@ jobs:
               fh.write("destination=%s\n" % destination)
           PYEOF
 
+      # Coverage is instrumented on iOS only. It is the widest build -- it is the one that
+      # compiles `WebViewManager`, `OverlayWindow` and the notification service, which macOS
+      # leaves out -- so it is the number worth having next to the macOS one. Instrumenting
+      # the other three would add runner time for figures nobody reads, on a single concurrent
+      # macOS runner where every matrix cell is serialised behind the last.
       - name: Run the test suite
         run: |
+          set -o pipefail
           xcodebuild test \
             -scheme Countly-Package \
             -destination '${{ steps.destination.outputs.destination }}' \
             -resultBundlePath TestResults.xcresult \
-            CODE_SIGNING_ALLOWED=NO
+            -enableCodeCoverage ${{ matrix.platform == 'iOS' && 'YES' || 'NO' }} \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee xcodebuild.log
+
+      # See the macOS job for why this exists. Simulators are where it matters most:
+      # every matrix cell here is serialised behind the last on one macOS runner.
+      - name: Check whether the runner was starved
+        if: always()
+        run: |
+          python3 .github/scripts/runner_health.py \
+            --log xcodebuild.log \
+            --platform ${{ matrix.platform }} \
+            --output runner-health/${{ matrix.platform }}.json
+
+      # xcodebuild writes an .xcresult bundle, and the reporting action consumes JUnit XML.
+      # The converter reads the structured bundle with xcresulttool rather than scraping
+      # xcodebuild's console output the way xcbeautify and xcpretty do, and it exits non-zero
+      # rather than writing a report with no tests in it. See the script's own docstring.
+      - name: Convert the results to JUnit XML
+        if: always()
+        run: |
+          python3 .github/scripts/xcresult_to_junit.py \
+            --xcresult TestResults.xcresult \
+            --platform ${{ matrix.platform }} \
+            --output test-results/${{ matrix.platform }}.xml
+
+      - name: Summarise the iOS coverage
+        if: always() && matrix.platform == 'iOS'
+        run: |
+          set -euo pipefail
+          xcrun xccov view --report --json TestResults.xcresult > xccov.json
+          xcrun xccov view --report --only-targets TestResults.xcresult || true
+          python3 .github/scripts/coverage_summary.py \
+            --platform iOS \
+            --xccov xccov.json \
+            --output coverage/iOS.json
+
+      - name: Upload the JUnit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ matrix.platform }}
+          path: test-results/${{ matrix.platform }}.xml
+          if-no-files-found: warn
+
+      - name: Upload the runner health assessment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-health-${{ matrix.platform }}
+          path: runner-health/${{ matrix.platform }}.json
+          if-no-files-found: warn
+
+      - name: Upload the coverage summary
+        if: always() && matrix.platform == 'iOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-iOS
+          path: coverage/iOS.json
+          if-no-files-found: warn
 
       # Only on failure: a green run's result bundle is tens of megabytes nobody opens.
       - name: Upload the test results
@@ -168,3 +298,144 @@ jobs:
           name: test-results-${{ matrix.platform }}
           path: TestResults.xcresult
           if-no-files-found: ignore
+
+  # Everything above uploads; this is the only job that reports. It is deliberately a separate
+  # job rather than a step on each platform: five jobs each posting their own comment is how a
+  # branch ends up with twenty bot comments, and a per platform comparison table cannot be
+  # written by a job that only knows about its own platform.
+  #
+  # ubuntu-latest, not macos: this job downloads artifacts and runs python, and the account has
+  # a single concurrent macOS runner that the test jobs above should not have to queue behind.
+  report:
+    name: Report the results on the pull request
+    needs: [macos, simulators]
+    # `always()` is load bearing: without it a failing macOS job would skip this and produce no
+    # report, which is exactly the run where the report matters most. It used to be needed for a
+    # second reason too, that `simulators` was skipped outright whenever `macos` failed. That is
+    # fixed at the cause now, on the `simulators` job itself, rather than worked around here.
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    steps:
+      # Only for the scripts under .github/scripts; nothing here builds.
+      - name: Checkout SDK code
+        uses: actions/checkout@v4
+
+      # `merge-multiple` flattens junit-macOS, junit-iOS, ... into one directory. The files
+      # inside are named after their platform, so nothing collides.
+      # `continue-on-error` because download-artifact fails outright when the pattern matches
+      # nothing, which happens when every test job died before it could upload. That case has
+      # to reach the report as empty rows, not as a second red job.
+      - name: Download the JUnit results
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: junit-*
+          path: junit
+          merge-multiple: true
+
+      # Advisory only, so it downloads like the rest and is simply absent if no job wrote one.
+      - name: Download the runner health assessments
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: runner-health-*
+          path: runner-health
+          merge-multiple: true
+
+      - name: Download the coverage summaries
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          path: coverage
+          merge-multiple: true
+
+      # The check run with the per test drill down and the inline annotations. `comment_mode`
+      # is off on purpose: the sticky comment below is the single comment this workflow owns,
+      # and a second bot comment would just split the same result across two places.
+      #
+      # Skipped on a fork pull request, where GITHUB_TOKEN is read only and writing a check
+      # would fail. The report still reaches the run summary, which needs no write access.
+      - name: Publish the test results as a check
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        with:
+          check_name: "Test Results :rocket:"
+          comment_title: "Test Results :rocket:"
+          # Quoted deliberately: unquoted `off` is parsed as the boolean false, and the action
+          # expects the string.
+          comment_mode: "off"
+          # The macOS job already failed the run if it had to. This step reports.
+          action_fail: false
+          action_fail_on_inconclusive: false
+          files: |
+            junit/*.xml
+
+      # Writes ci-report.md and appends the same body to the run summary, so the report exists
+      # even on a fork pull request or a push with no pull request open.
+      - name: Render the report
+        if: always()
+        run: |
+          python3 .github/scripts/ci_report.py \
+            --junit-dir junit \
+            --coverage-dir coverage \
+            --runner-health-dir runner-health \
+            --simulators-result '${{ needs.simulators.result }}' \
+            --output ci-report.md
+
+      # One comment, updated in place, keyed by the HTML marker. The alternative is a new
+      # comment on every push, which nobody reads after the third one.
+      - name: Comment the report on the pull request
+        if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- countly-swift-ci-report -->';
+            let report = '';
+            try {
+              report = fs.readFileSync('ci-report.md', 'utf8');
+            } catch (e) {
+              report = 'The report step did not produce a report. See the workflow logs.';
+            }
+            const body = [
+              marker,
+              report,
+              '',
+              `[Full run log](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Upload the rendered report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-report
+          path: ci-report.md
+          if-no-files-found: warn

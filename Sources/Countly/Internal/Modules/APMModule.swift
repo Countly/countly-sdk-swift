@@ -67,7 +67,10 @@ final class APMModule: ModuleBase {
         enableForegroundBackgroundTracking = apm.enableForegroundBackgroundTracking
 
         if apm.appStartTimestampOverride > 0 {
+            logD("applyInitialConfig", "the app start measurement basis is the timestamp supplied in config, appStartTimestampMs: [\(apm.appStartTimestampOverride)], processStartTimestampMs: [\(appStartTimestamp)]")
             appStartTimestamp = apm.appStartTimestampOverride
+        } else {
+            logD("applyInitialConfig", "the app start measurement basis is the process start time read from the kernel, processStartTimestampMs: [\(appStartTimestamp)]")
         }
 
         // Without a manual trigger the SDK has no reliable moment to call the
@@ -122,7 +125,10 @@ final class APMModule: ModuleBase {
     /// deliberately does not observe resigning active for the session's sake, the
     /// trace was opened once and never closed at all.
     private func observeActivation() {
-        guard activationObservers.isEmpty else { return }
+        guard activationObservers.isEmpty else {
+            logD("observeActivation", "activation observers are already installed, nothing to do, observerCount: [\(activationObservers.count)]")
+            return
+        }
 
         #if os(iOS) || os(tvOS) || os(visionOS)
         observe(UIApplication.didBecomeActiveNotification) { [weak self] in self?.startForegroundTrace() }
@@ -131,6 +137,8 @@ final class APMModule: ModuleBase {
         observe(NSApplication.didBecomeActiveNotification) { [weak self] in self?.startForegroundTrace() }
         observe(NSApplication.willResignActiveNotification) { [weak self] in self?.startBackgroundTrace() }
         #endif
+
+        logD("observeActivation", "activation observers installed for the foreground and background traces, observerCount: [\(activationObservers.count)]")
     }
 
     private func observe(_ name: Notification.Name, handler: @escaping () -> Void) {
@@ -149,6 +157,7 @@ final class APMModule: ModuleBase {
 
     private func startForegroundTrace() {
         guard enableForegroundBackgroundTracking else { return }
+        logD("startForegroundTrace", "the app became active, the background stretch is closed and a foreground stretch is opened")
         endBackgroundTrace()
         startCustomTrace(Key.appInForeground)
     }
@@ -160,6 +169,7 @@ final class APMModule: ModuleBase {
 
     private func startBackgroundTrace() {
         guard enableForegroundBackgroundTracking else { return }
+        logD("startBackgroundTrace", "the app resigned active, the foreground stretch is closed and a background stretch is opened")
         endForegroundTrace()
         startCustomTrace(Key.appInBackground)
     }
@@ -175,12 +185,13 @@ final class APMModule: ModuleBase {
 
     /// Marks the application as fully loaded, closing the app start trace.
     func appLoadingFinished() {
+        logI("appLoadingFinished", "the host application reported that loading has finished")
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         recordAppStartDurationTrace(startTime: appStartTimestamp, endTime: now)
     }
 
     private func recordAppStartDurationTrace(startTime: Int64, endTime: Int64) {
-        logI("recordAppStartDurationTrace", "app start duration trace recording requested, startTime: [\(startTime)], endTime: [\(endTime)]")
+        logI("recordAppStartDurationTrace", "app start duration trace recording requested, startTimeMs: [\(startTime)], endTimeMs: [\(endTime)]")
 
         guard core.modules.consent.hasConsent(for: .performanceMonitoring) else {
             logV("recordAppStartDurationTrace", "no apm consent given, app start duration trace is not recorded")
@@ -197,12 +208,15 @@ final class APMModule: ModuleBase {
             return
         }
 
+        // Both ends are wall clock readings, so a negative value means the app
+        // start timestamp override is in the future or the clock moved backwards
+        // between them. Either way what reaches the dashboard is wrong.
         let duration = endTime - startTime
         if duration < 0 {
-            logW("recordAppStartDurationTrace", "app start duration is negative, it will still be recorded, duration: [\(duration)]")
+            logW("recordAppStartDurationTrace", "app start duration is negative, it will still be recorded, durationMs: [\(duration)]")
         }
 
-        logD("recordAppStartDurationTrace", "app start trace recorded, traceName: [\(Key.appStart)], duration: [\(duration)]")
+        logD("recordAppStartDurationTrace", "app start trace recorded, traceName: [\(Key.appStart)], durationMs: [\(duration)]")
 
         send(trace: [
             Key.type: Key.device,
@@ -224,7 +238,7 @@ final class APMModule: ModuleBase {
                             responseStatusCode: Int,
                             startTime: Int64,
                             endTime: Int64) {
-        logI("recordNetworkTrace", "network trace recording requested, traceName: [\(traceName)], requestPayloadSize: [\(requestPayloadSize)], responsePayloadSize: [\(responsePayloadSize)], responseStatusCode: [\(responseStatusCode)]")
+        logI("recordNetworkTrace", "network trace recording requested, traceName: [\(traceName)], requestPayloadSize: [\(requestPayloadSize)], responsePayloadSize: [\(responsePayloadSize)], responseStatusCode: [\(responseStatusCode)], startTimeMs: [\(startTime)], endTimeMs: [\(endTime)]")
 
         guard core.modules.consent.hasConsent(for: .performanceMonitoring) else {
             logV("recordNetworkTrace", "no apm consent given, network trace is not recorded")
@@ -236,14 +250,16 @@ final class APMModule: ModuleBase {
             return
         }
 
+        // Both ends come from the host application, so a negative value is a
+        // caller passing the two timestamps the wrong way round.
         let responseTime = endTime - startTime
         if responseTime < 0 {
-            logW("recordNetworkTrace", "network trace response time is negative, traceName: [\(traceName)], responseTime: [\(responseTime)]")
+            logW("recordNetworkTrace", "network trace response time is negative, the start and end timestamps are likely swapped, traceName: [\(traceName)], responseTimeMs: [\(responseTime)]")
         }
 
         let truncatedName = core.limits.truncatedKey(traceName, "Network trace name")
 
-        logD("recordNetworkTrace", "network trace recorded, traceName: [\(truncatedName)], responseTime: [\(responseTime)]")
+        logD("recordNetworkTrace", "network trace recorded, traceName: [\(truncatedName)], responseTimeMs: [\(responseTime)]")
 
         send(trace: [
             Key.type: Key.network,
@@ -317,11 +333,15 @@ final class APMModule: ModuleBase {
         let duration = endTime - startTime
         payloadMetrics[Key.duration] = duration
 
+        // Both ends come from the SDK's own strictly increasing clock, so this is
+        // unreachable unless that clock is replaced. Kept as a guard, and kept at
+        // debug: nothing an integration did could cause it, so it must not spend a
+        // health check warning.
         if duration < 0 {
-            logW("endCustomTrace", "custom trace duration is negative, it will still be recorded, traceName: [\(truncatedName)], duration: [\(duration)]")
+            logD("endCustomTrace", "custom trace duration is negative, it will still be recorded, traceName: [\(truncatedName)], durationMs: [\(duration)]")
         }
 
-        logD("endCustomTrace", "custom trace ended, traceName: [\(truncatedName)], duration: [\(duration)], metricCount: [\(payloadMetrics.count)]")
+        logD("endCustomTrace", "custom trace ended, traceName: [\(truncatedName)], durationMs: [\(duration)], metricCount: [\(payloadMetrics.count)]")
 
         send(trace: [
             Key.type: Key.device,
@@ -363,13 +383,15 @@ final class APMModule: ModuleBase {
     func clearAllCustomTraces() {
         traceLock.lock()
         defer { traceLock.unlock() }
-        logD("clearAllCustomTraces", "clearing all running custom traces, runningTraceCount: [\(startedCustomTraces.count)]")
+        logD("clearAllCustomTraces", "clearing all running custom traces, they were started and never ended, runningTraceCount: [\(startedCustomTraces.count)], traceNames: [\(startedCustomTraces.keys.sorted().joined(separator: ", "))]")
         startedCustomTraces.removeAll()
     }
 
     // MARK: - Wire
 
     private func send(trace: [String: Any]) {
+        logD("send", "apm trace request is being queued, traceType: [\(trace[Key.type] as? String ?? "")], traceName: [\(trace[Key.name] as? String ?? "")]")
+
         let queryString = "\(core.network.builder.queryEssentials())&\(QS.apm)=\(CountlyJSON.escapedString(from: trace, logger: log))"
         core.network.enqueueAndProceed(queryString)
     }
@@ -377,6 +399,7 @@ final class APMModule: ModuleBase {
     // MARK: - Lifecycle
 
     override func halt(clearStorage: Bool) {
+        logD("halt", "apm module halting, the activation observers are removed and every running trace is discarded")
         removeActivationObservers()
         clearAllCustomTraces()
         hasRecordedAppStartTrace = false

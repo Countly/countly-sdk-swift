@@ -102,6 +102,15 @@ final class ServerConfig {
     /// The `method` value of a behavior settings fetch.
     static let fetchMethod = "sc"
 
+    /// Where the document being applied came from. Carried only so a log dump
+    /// says whether the SDK is running on last run's cache, on what the developer
+    /// handed in at init, or on what the server just answered.
+    private enum Source: String {
+        case storedCache = "stored cache"
+        case developerSupplied = "developer supplied"
+        case serverFetch = "server fetch"
+    }
+
     // MARK: - Resolved values
 
     private(set) var trackingEnabled = true
@@ -185,6 +194,7 @@ final class ServerConfig {
 
     /// Stops the refresh timer. Called from `halt`.
     func stop() {
+        logger?.d(Self.module, "stop", "the behavior settings refresh timer is being stopped, wasScheduled: [\(refreshTimer != nil)]")
         refreshTimer?.invalidate()
         refreshTimer = nil
     }
@@ -212,20 +222,40 @@ final class ServerConfig {
 
         logger?.d(Self.module, "retrieveFromStorage", "automatic tracking flags seeded from the developer config, automaticSessionTracking: [\(automaticSessionTrackingEnabled)], automaticViewTracking: [\(automaticViewTrackingEnabled)], automaticCrashReporting: [\(automaticCrashReportingEnabled)]")
 
+        logDeveloperLayer(config: config)
+
         var stored = store.serverConfig ?? [:]
-        logger?.d(Self.module, "retrieveFromStorage", "behavior settings read from persisted cache, keyCount: [\(stored.count)], developerSuppliedSettings: [\(config.sdkBehaviorSettings != nil)]")
+        var source = Source.storedCache
+        logger?.d(Self.module, "retrieveFromStorage", "behavior settings read from the persisted cache, cachedEntryCount: [\(stored.count)], hasDeveloperSuppliedSettings: [\(config.sdkBehaviorSettings != nil)], storedKeys: [\(sortedKeyList(of: stored))]")
 
         if stored.isEmpty, let supplied = config.sdkBehaviorSettings {
             if let parsed = CountlyJSON.object(from: Data(supplied.utf8), logger: logger) as? [String: Any] {
                 stored = parsed
-                logger?.d(Self.module, "retrieveFromStorage", "cache was empty, falling back to developer supplied behavior settings, keyCount: [\(stored.count)]")
+                source = .developerSupplied
+                logger?.d(Self.module, "retrieveFromStorage", "the cache was empty, falling back to the developer supplied behavior settings, entryCount: [\(stored.count)], suppliedLength: [\(supplied.count)]")
             } else {
-                logger?.e(Self.module, "retrieveFromStorage", "could not parse developer supplied sdkBehaviorSettings, they will be ignored")
+                logger?.e(Self.module, "retrieveFromStorage", "the developer supplied sdkBehaviorSettings are not a JSON object and will be ignored, suppliedLength: [\(supplied.count)]")
             }
         }
 
-        populate(&stored, config: config)
+        populate(&stored, config: config, source: source)
         store.serverConfig = stored
+    }
+
+    /// The developer's own values, printed before anything can overrule them.
+    ///
+    /// Half of "the SDK is ignoring my configuration" is answered by comparing
+    /// this line against what the layers above resolve to, so it goes out on every
+    /// launch whether or not any behavior settings exist.
+    private func logDeveloperLayer(config: CountlyConfig) {
+        let limits = config.sdkInternalLimits
+        logger?.d(Self.module, "retrieveFromStorage", "developer configuration before any behavior setting is applied, eventSendThreshold: [\(config.eventSendThreshold)], storedRequestsLimit: [\(config.storedRequestsLimit)], requestDropAgeHours: [\(config.requestDropAgeHours)], updateSessionPeriod: [\(config.updateSessionPeriod.logSeconds)], requestTimeoutDuration: [\(config.requestTimeoutDuration.logSeconds)], requiresConsent: [\(config.requiresConsent)], enableDebug: [\(config.enableDebug)], disableBackoffMechanism: [\(config.disableBackoffMechanism)], contentZoneTimerInterval: [\(config.content.zoneTimerInterval)], maxKeyLength: [\(limits.maxKeyLength)], maxValueSize: [\(limits.maxValueSize)], maxSegmentationValues: [\(limits.maxSegmentationValues)], maxBreadcrumbCount: [\(limits.maxBreadcrumbCount)], maxStackTraceLineLength: [\(limits.maxStackTraceLineLength)], maxStackTraceLinesPerThread: [\(limits.maxStackTraceLinesPerThread)]")
+    }
+
+    /// Key names of a document as one readable list. Interpolating the keys
+    /// directly would print a collection description inside the brackets.
+    private func sortedKeyList(of document: [String: Any]) -> String {
+        document.keys.sorted().joined(separator: ", ")
     }
 
     // MARK: - Layer 4: the server
@@ -236,7 +266,10 @@ final class ServerConfig {
             logger?.d(Self.module, "fetchIfTimeIsUp", "periodic behavior settings check skipped, updates are disabled")
             return
         }
-        guard lastFetchTimestamp != 0 else { return }
+        guard lastFetchTimestamp != 0 else {
+            logger?.d(Self.module, "fetchIfTimeIsUp", "periodic behavior settings check skipped, nothing has been fetched yet this launch")
+            return
+        }
 
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         let elapsed = now - lastFetchTimestamp
@@ -245,6 +278,8 @@ final class ServerConfig {
         if elapsed > interval {
             logger?.d(Self.module, "fetchIfTimeIsUp", "behavior settings refresh interval elapsed, a fetch will be triggered, timePassedMs: [\(elapsed)], intervalHours: [\(currentUpdateIntervalHours)]")
             fetch(config: config)
+        } else {
+            logger?.d(Self.module, "fetchIfTimeIsUp", "behavior settings are still considered fresh, no fetch will be triggered, timePassedMs: [\(elapsed)], intervalMs: [\(interval)]")
         }
     }
 
@@ -270,26 +305,27 @@ final class ServerConfig {
             guard let self else { return }
 
             if let error {
-                self.logger?.d(Self.module, "fetch", "behavior settings fetch failed, statusCode: [\(statusCode)], error: [\(error.localizedDescription)]")
+                let failure = error as NSError
+                self.logger?.d(Self.module, "fetch", "the behavior settings request failed at the transport level, the stored settings stay in effect, statusCode: [\(statusCode)], errorDomain: [\(failure.domain)], errorCode: [\(failure.code)], error: [\(failure.localizedDescription)]")
                 return
             }
 
             guard statusCode == 200 else {
-                self.logger?.d(Self.module, "fetch", "behavior settings fetch failed, statusCode: [\(statusCode)]")
+                self.logger?.d(Self.module, "fetch", "the server refused the behavior settings request, the stored settings stay in effect, statusCode: [\(statusCode)], responseLength: [\(data?.count ?? 0)]")
                 return
             }
 
             guard let response = CountlyJSON.object(from: data, logger: self.logger) as? [String: Any],
                   response[DocKey.config] != nil else {
-                self.logger?.d(Self.module, "fetch", "no config section in the response, previously stored behavior settings will be kept")
+                self.logger?.d(Self.module, "fetch", "no config section in the response, previously stored behavior settings will be kept, responseLength: [\(data?.count ?? 0)]")
                 return
             }
 
             var stored = self.store.serverConfig ?? [:]
             self.merge(&stored, incoming: response)
-            self.populate(&stored, config: config)
+            self.populate(&stored, config: config, source: .serverFetch)
             self.store.serverConfig = stored
-            self.logger?.d(Self.module, "fetch", "fetched behavior settings were merged and persisted, storedKeyCount: [\(stored.count)]")
+            self.logger?.d(Self.module, "fetch", "fetched behavior settings were merged and persisted, responseLength: [\(data?.count ?? 0)], storedEntryCount: [\(stored.count)]")
         }
     }
 
@@ -322,18 +358,24 @@ final class ServerConfig {
     /// whole rather than partially applied.
     private func merge(_ base: inout [String: Any], incoming: [String: Any]) {
         guard incoming.count == 3, let incomingConfig = incoming[DocKey.config] as? [String: Any] else {
-            logger?.w(Self.module, "merge", "incoming behavior settings will be ignored, expected 3 entries including a config section, entryCount: [\(incoming.count)]")
+            logger?.w(Self.module, "merge", "incoming behavior settings will be ignored, expected 3 entries including a config section, entryCount: [\(incoming.count)], entryKeys: [\(sortedKeyList(of: incoming))]")
             return
         }
 
         guard incoming[DocKey.version] != nil, incoming[DocKey.timestamp] != nil else {
-            logger?.w(Self.module, "merge", "incoming behavior settings will be ignored, version or timestamp entry is missing")
+            logger?.w(Self.module, "merge", "incoming behavior settings will be ignored, version or timestamp entry is missing, entryKeys: [\(sortedKeyList(of: incoming))]")
             return
         }
 
         guard !incomingConfig.isEmpty else {
             logger?.w(Self.module, "merge", "incoming behavior settings will be ignored, config section is empty or not a dictionary")
             return
+        }
+
+        let incomingVersion = intValue(incoming[DocKey.version]) ?? 0
+        let incomingTimestamp = Int64(intValue(incoming[DocKey.timestamp]) ?? 0)
+        if incomingVersion < version || incomingTimestamp < timestamp {
+            logger?.d(Self.module, "merge", "the incoming behavior settings are older than the ones already in effect and are still applied, the server is the authority on this, incomingVersion: [\(incomingVersion)], currentVersion: [\(version)], incomingTimestamp: [\(incomingTimestamp)], currentTimestamp: [\(timestamp)]")
         }
 
         base[DocKey.timestamp] = incoming[DocKey.timestamp]
@@ -346,7 +388,7 @@ final class ServerConfig {
         removeConflictingFilterKeys(&merged, incoming: incomingConfig)
         base[DocKey.config] = merged
 
-        logger?.d(Self.module, "merge", "incoming behavior settings merged into the stored ones, incomingKeyCount: [\(incomingConfig.count)], mergedKeyCount: [\(merged.count)]")
+        logger?.d(Self.module, "merge", "incoming behavior settings merged into the stored ones, version: [\(incomingVersion)], timestamp: [\(incomingTimestamp)], incomingKeyCount: [\(incomingConfig.count)], incomingKeys: [\(sortedKeyList(of: incomingConfig))], mergedKeyCount: [\(merged.count)]")
     }
 
     /// A category can carry a blacklist or a whitelist, never both. A new list of
@@ -375,9 +417,12 @@ final class ServerConfig {
     ///
     /// Values of the wrong type or out of range are dropped from the document as
     /// well as ignored, so a bad value cannot keep being reapplied every launch.
-    private func populate(_ document: inout [String: Any], config: CountlyConfig) {
+    private func populate(_ document: inout [String: Any], config: CountlyConfig, source: Source) {
+        logger?.d(Self.module, "populate", "resolving behavior settings over the developer configuration, source: [\(source.rawValue)], entryCount: [\(document.count)]")
+
         if config.requestTimeoutDuration <= 0 {
             config.requestTimeoutDuration = 1
+            logger?.d(Self.module, "populate", "the configured request timeout is not a usable duration and was raised, requestTimeoutDuration: [\(config.requestTimeoutDuration.logSeconds)]")
         }
         requestTimeoutDuration = config.requestTimeoutDuration
 
@@ -385,16 +430,21 @@ final class ServerConfig {
         // against a server that says nothing at all, not only against one that
         // enables the mechanism.
         if config.disableBackoffMechanism {
+            logger?.d(Self.module, "populate", "the backoff mechanism is off because the developer config disables it, no behavior setting can turn it back on")
             backoffMechanism = false
         }
 
         guard let rawConfig = document[DocKey.config] as? [String: Any] else {
-            logger?.d(Self.module, "populate", "no usable config section in the behavior settings, falling back to SDK defaults")
+            if document.isEmpty {
+                logger?.d(Self.module, "populate", "no behavior settings are stored yet, the developer configuration stays in effect, source: [\(source.rawValue)]")
+            } else {
+                logger?.d(Self.module, "populate", "the behavior settings hold no usable config section, the developer configuration stays in effect, source: [\(source.rawValue)], entryKeys: [\(sortedKeyList(of: document))]")
+            }
             return
         }
 
         guard document[DocKey.version] != nil, document[DocKey.timestamp] != nil else {
-            logger?.w(Self.module, "populate", "version or timestamp is missing in the behavior settings, falling back to SDK defaults")
+            logger?.w(Self.module, "populate", "version or timestamp is missing in the behavior settings, the developer configuration stays in effect, source: [\(source.rawValue)], entryKeys: [\(sortedKeyList(of: document))]")
             return
         }
 
@@ -402,9 +452,12 @@ final class ServerConfig {
         timestamp = Int64(intValue(document[DocKey.timestamp]) ?? 0)
 
         var section = rawConfig
-        for key in section.keys where !Key.known.contains(key) {
-            logger?.d(Self.module, "populate", "unknown behavior setting key will be dropped, key: [\(key)]")
-            section.removeValue(forKey: key)
+        let unknownKeys = section.keys.filter { !Key.known.contains($0) }
+        if !unknownKeys.isEmpty {
+            logger?.d(Self.module, "populate", "behavior setting keys this SDK version does not know will be dropped, keyCount: [\(unknownKeys.count)], keys: [\(unknownKeys.sorted().joined(separator: ", "))]")
+            for key in unknownKeys {
+                section.removeValue(forKey: key)
+            }
         }
 
         var applied: [String] = []
@@ -450,27 +503,59 @@ final class ServerConfig {
             notifyChange(config: config)
         }
 
-        logger?.d(Self.module, "populate", "behavior settings applied, version: [\(version)], timestamp: [\(timestamp)], appliedValues: [\(applied.joined(separator: ", "))]")
+        logger?.d(Self.module, "populate", "behavior settings applied, source: [\(source.rawValue)], version: [\(version)], timestamp: [\(timestamp)], appliedCount: [\(applied.count)], appliedValues: [\(applied.joined(separator: ", "))]")
+        logEffectiveConfiguration(config: config)
+    }
+
+    /// The state every layer resolved to, printed as the counterpart of the
+    /// developer layer line so the two can be diffed straight out of a log dump.
+    private func logEffectiveConfiguration(config: CountlyConfig) {
+        logger?.d(Self.module, "populate", "effective behavior switches, tracking: [\(trackingEnabled)], networking: [\(networkingEnabled)], crashReporting: [\(crashReportingEnabled)], customEventTracking: [\(customEventTrackingEnabled)], sessionTracking: [\(sessionTrackingEnabled)], viewTracking: [\(viewTrackingEnabled)], locationTracking: [\(locationTrackingEnabled)], automaticSessionTracking: [\(automaticSessionTrackingEnabled)], automaticViewTracking: [\(automaticViewTrackingEnabled)], automaticCrashReporting: [\(automaticCrashReportingEnabled)], enterContentZone: [\(enterContentZone)], refreshContentZone: [\(refreshContentZoneEnabled)], backoffMechanism: [\(backoffMechanism)], consentRequired: [\(consentRequired)], logging: [\(loggingEnabled)]")
+
+        let limits = config.sdkInternalLimits
+        logger?.d(Self.module, "populate", "effective behavior values, eventSendThreshold: [\(config.eventSendThreshold)], storedRequestsLimit: [\(config.storedRequestsLimit)], requestDropAgeHours: [\(config.requestDropAgeHours)], updateSessionPeriod: [\(config.updateSessionPeriod.logSeconds)], requestTimeoutDuration: [\(requestTimeoutDuration.logSeconds)], contentZoneTimerInterval: [\(config.content.zoneTimerInterval)], userPropertyCacheLimit: [\(userPropertyCacheLimit)], backoffAcceptedTimeoutSeconds: [\(bomAcceptedTimeoutSeconds)], backoffQueuePercentage: [\(bomRQPercentage.logValue)], backoffRequestAgeHours: [\(bomRequestAge)], backoffDurationSeconds: [\(bomDuration)], maxKeyLength: [\(limits.maxKeyLength)], maxValueSize: [\(limits.maxValueSize)], maxSegmentationValues: [\(limits.maxSegmentationValues)], maxBreadcrumbCount: [\(limits.maxBreadcrumbCount)], maxStackTraceLineLength: [\(limits.maxStackTraceLineLength)], maxStackTraceLinesPerThread: [\(limits.maxStackTraceLinesPerThread)]")
     }
 
     /// Pushes the resolved values into the rest of the SDK.
     private func notifyChange(config: CountlyConfig) {
         // The server may switch logging on for an application that never asked
         // for it, which is how support gets a trace out of a shipped build.
+        if loggingEnabled, !config.enableDebug {
+            logger?.d(Self.module, "notifyChange", "logging is switched on by behavior settings for an application that did not ask for it")
+        }
         config.enableDebug = loggingEnabled || config.enableDebug
 
-        let limits = config.sdkInternalLimits
-        if limitKeyLength > 0 { limits.maxKeyLength = limitKeyLength }
-        if limitValueSize > 0 { limits.maxValueSize = limitValueSize }
-        if limitSegValues > 0 { limits.maxSegmentationValues = limitSegValues }
-        if limitBreadcrumb > 0 { limits.maxBreadcrumbCount = limitBreadcrumb }
-        if limitTraceLength > 0 { limits.maxStackTraceLineLength = limitTraceLength }
-        if limitTraceLine > 0 { limits.maxStackTraceLinesPerThread = limitTraceLine }
+        // Only the values that actually displace a developer one are collected, so
+        // the line below reads as the list of settings the server took over.
+        var overrides: [String] = []
 
-        if eventQueueSize > 0 { config.eventSendThreshold = eventQueueSize }
-        if dropOldRequestTime > 0 { config.requestDropAgeHours = dropOldRequestTime }
-        if requestQueueSize > 0 { config.storedRequestsLimit = requestQueueSize }
+        /// Zero means the server said nothing about this setting, which leaves the
+        /// developer's value alone.
+        func apply(_ name: String, _ target: inout Int, _ value: Int) {
+            guard value > 0 else { return }
+            if target != value {
+                overrides.append("\(name): \(target) to \(value)")
+            }
+            target = value
+        }
+
+        let limits = config.sdkInternalLimits
+        apply("maxKeyLength", &limits.maxKeyLength, limitKeyLength)
+        apply("maxValueSize", &limits.maxValueSize, limitValueSize)
+        apply("maxSegmentationValues", &limits.maxSegmentationValues, limitSegValues)
+        apply("maxBreadcrumbCount", &limits.maxBreadcrumbCount, limitBreadcrumb)
+        apply("maxStackTraceLineLength", &limits.maxStackTraceLineLength, limitTraceLength)
+        apply("maxStackTraceLinesPerThread", &limits.maxStackTraceLinesPerThread, limitTraceLine)
+
+        apply("eventSendThreshold", &config.eventSendThreshold, eventQueueSize)
+        apply("requestDropAgeHours", &config.requestDropAgeHours, dropOldRequestTime)
+        apply("storedRequestsLimit", &config.storedRequestsLimit, requestQueueSize)
+
         if sessionInterval > 0 {
+            let previousPeriod = Int(config.updateSessionPeriod)
+            if previousPeriod != sessionInterval {
+                overrides.append("updateSessionPeriod: \(previousPeriod) to \(sessionInterval)")
+            }
             config.updateSessionPeriod = TimeInterval(sessionInterval)
         } else {
             sessionInterval = Int(config.updateSessionPeriod)
@@ -478,8 +563,15 @@ final class ServerConfig {
 
         let consentBecameRequired = !config.requiresConsent && consentRequired
         if consentRequired { config.requiresConsent = true }
+        if consentBecameRequired {
+            logger?.d(Self.module, "notifyChange", "consent is now required by behavior settings for an application that did not require it, the consent state will be sent again")
+        }
 
-        if contentZoneInterval > 0 { config.content.zoneTimerInterval = contentZoneInterval }
+        apply("contentZoneTimerInterval", &config.content.zoneTimerInterval, contentZoneInterval)
+
+        if !overrides.isEmpty {
+            logger?.d(Self.module, "notifyChange", "behavior settings displaced developer configured values, overrideCount: [\(overrides.count)], overrides: [\(overrides.joined(separator: ", "))]")
+        }
 
         // A backoff mechanism the developer switched off stays off, whatever the
         // server says: an explicit local opt-out outranks a remote default.
@@ -511,8 +603,10 @@ final class ServerConfig {
             section.removeValue(forKey: key)
             return
         }
+        let previous = target
         target = number.boolValue
         applied.append("\(key): \(target)")
+        logger?.d(Self.module, "readBool", "a behavior settings switch was resolved, key: [\(key)], previousValue: [\(previous)], newValue: [\(target)], changed: [\(previous != target)]")
     }
 
     /// Reads an integer at or above `min`, dropping the key otherwise.
@@ -529,8 +623,10 @@ final class ServerConfig {
             section.removeValue(forKey: key)
             return
         }
+        let previous = target
         target = intValue
         applied.append("\(key): \(intValue)")
+        logger?.d(Self.module, "readInt", "a behavior settings count was resolved, key: [\(key)], previousValue: [\(previous)], newValue: [\(intValue)], changed: [\(previous != intValue)]")
     }
 
     /// Reads a fraction strictly between 0 and 1, dropping the key otherwise.
@@ -543,12 +639,14 @@ final class ServerConfig {
         }
         let doubleValue = number.doubleValue
         guard doubleValue > 0.0, doubleValue < 1.0 else {
-            logger?.w(Self.module, "readDouble", "dropping behavior setting, value is out of the accepted range, key: [\(key)], value: [\(doubleValue)], acceptedRange: [0.0 - 1.0]")
+            logger?.w(Self.module, "readDouble", "dropping behavior setting, value is out of the accepted range, key: [\(key)], value: [\(doubleValue.logValue)], acceptedRange: [0.0 to 1.0]")
             section.removeValue(forKey: key)
             return
         }
+        let previous = target
         target = doubleValue
-        applied.append("\(key): \(doubleValue)")
+        applied.append("\(key): \(doubleValue.logValue)")
+        logger?.d(Self.module, "readDouble", "a behavior settings fraction was resolved, key: [\(key)], previousValue: [\(previous.logValue)], newValue: [\(doubleValue.logValue)], changed: [\(previous != doubleValue)]")
     }
 
     private func intValue(_ value: Any?) -> Int? {
@@ -603,15 +701,26 @@ final class ServerConfig {
         if let blacklist = section[blacklistKey] as? [String] {
             set = Set(blacklist)
             isWhitelist = false
-            applied.append("\(blacklistKey): \(blacklist)")
+            applied.append("\(blacklistKey): \(blacklist.joined(separator: ", "))")
             section.removeValue(forKey: whitelistKey)
         } else if let whitelist = section[whitelistKey] as? [String] {
             set = Set(whitelist)
             isWhitelist = true
-            applied.append("\(whitelistKey): \(whitelist)")
+            applied.append("\(whitelistKey): \(whitelist.joined(separator: ", "))")
         } else {
+            logUnusableFilter(section, blacklistKey, whitelistKey)
             section.removeValue(forKey: blacklistKey)
             section.removeValue(forKey: whitelistKey)
+        }
+    }
+
+    /// A filter that arrived in a shape the SDK cannot read is dropped like any
+    /// other unusable value. Saying so is the only way an integration can tell a
+    /// filter that was refused from one that was never sent.
+    private func logUnusableFilter(_ section: [String: Any], _ keys: String...) {
+        for key in keys {
+            guard let value = section[key] else { continue }
+            logger?.d(Self.module, "updateListingFilters", "a behavior settings filter is not in a readable shape and will be dropped, key: [\(key)], receivedType: [\(type(of: value))]")
         }
     }
 
@@ -632,13 +741,14 @@ final class ServerConfig {
         if let blacklist = section[blacklistKey] as? [String: Any] {
             map = build(blacklist)
             isWhitelist = false
-            applied.append("\(blacklistKey): \(blacklist.keys.sorted())")
+            applied.append("\(blacklistKey): \(sortedKeyList(of: blacklist))")
             section.removeValue(forKey: whitelistKey)
         } else if let whitelist = section[whitelistKey] as? [String: Any] {
             map = build(whitelist)
             isWhitelist = true
-            applied.append("\(whitelistKey): \(whitelist.keys.sorted())")
+            applied.append("\(whitelistKey): \(sortedKeyList(of: whitelist))")
         } else {
+            logUnusableFilter(section, blacklistKey, whitelistKey)
             section.removeValue(forKey: blacklistKey)
             section.removeValue(forKey: whitelistKey)
         }
@@ -647,8 +757,9 @@ final class ServerConfig {
     private func resolveNameSet(_ section: inout [String: Any], key: String, set: inout Set<String>, applied: inout [String]) {
         if let list = section[key] as? [String] {
             set = Set(list)
-            applied.append("\(key): \(list)")
+            applied.append("\(key): \(list.joined(separator: ", "))")
         } else {
+            logUnusableFilter(section, key)
             section.removeValue(forKey: key)
         }
     }
@@ -680,11 +791,11 @@ final class ServerConfig {
         var result = segmentation
         for key in segmentation.keys {
             if hasGlobalFilter, segmentationFilterIsWhitelist != segmentationFilterSet.contains(key) {
-                logger?.v(Self.module, "filterSegmentation", "dropping segmentation key by the global segmentation filter, key: [\(key)], filterIsWhitelist: [\(segmentationFilterIsWhitelist)]")
+                logger?.d(Self.module, "filterSegmentation", "dropping segmentation key by the global segmentation filter, key: [\(key)], filterIsWhitelist: [\(segmentationFilterIsWhitelist)]")
                 result.removeValue(forKey: key)
             } else if hasEventFilter, let eventFilter,
                       eventSegmentationFilterIsWhitelist != eventFilter.contains(key) {
-                logger?.v(Self.module, "filterSegmentation", "dropping segmentation key by the event level segmentation filter, key: [\(key)], eventKey: [\(eventKey)]")
+                logger?.d(Self.module, "filterSegmentation", "dropping segmentation key by the event level segmentation filter, key: [\(key)], eventKey: [\(eventKey)]")
                 result.removeValue(forKey: key)
             }
         }

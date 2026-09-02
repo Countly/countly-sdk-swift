@@ -79,28 +79,33 @@ public final class EventsAPI: CountlyAPIBase {
 /// additive.
 public final class SessionsAPI: CountlyAPIBase {
 
+    private static let module = "Sessions"
+
     /// Opens a session.
     public func beginSession() {
         guard let core = core(), allowed(core, "beginSession") else { return }
+        core.logger.i(Self.module, "beginSession", "a session begin was requested through the manual sessions API")
         core.modules.sessions.beginSession()
     }
 
     /// Reports the time elapsed since the last update.
     public func updateSession() {
         guard let core = core(), allowed(core, "updateSession") else { return }
+        core.logger.i(Self.module, "updateSession", "a session update was requested through the manual sessions API")
         core.modules.sessions.updateSession()
     }
 
     /// Closes the session, sending anything recorded first.
     public func endSession() {
         guard let core = core(), allowed(core, "endSession") else { return }
+        core.logger.i(Self.module, "endSession", "a session end was requested through the manual sessions API, recorded events are sent first")
         core.modules.events.sendEventsWithSaveIfNeeded()
         core.modules.sessions.endSession()
     }
 
     private func allowed(_ core: SDKCore, _ function: String) -> Bool {
         guard core.serverConfig.automaticSessionTrackingEnabled else { return true }
-        core.logger.w("Sessions", function, "the call will be ignored since automatic session tracking is active")
+        core.logger.w(Self.module, function, "the call will be ignored since automatic session tracking is active")
         return false
     }
 }
@@ -264,6 +269,8 @@ public final class UserProfileAPI: CountlyAPIBase {
 /// Grants and withdraws consent per feature.
 public final class ConsentAPI: CountlyAPIBase {
 
+    private static let module = "Consent"
+
     /// Grants consent for one feature.
     public func giveConsent(for feature: ConsentFeature) {
         core()?.modules.consent.giveConsent(for: [feature])
@@ -276,7 +283,9 @@ public final class ConsentAPI: CountlyAPIBase {
 
     /// Grants consent for every feature.
     public func giveAllConsents() {
-        core()?.modules.consent.giveAllConsents()
+        guard let core = core() else { return }
+        core.logger.i(Self.module, "giveAllConsents", "consent for every feature was requested in one call")
+        core.modules.consent.giveAllConsents()
     }
 
     /// Withdraws consent for one feature.
@@ -291,14 +300,19 @@ public final class ConsentAPI: CountlyAPIBase {
 
     /// Withdraws consent for every feature.
     public func cancelAllConsents() {
-        core()?.modules.consent.cancelAllConsents()
+        guard let core = core() else { return }
+        core.logger.i(Self.module, "cancelAllConsents", "withdrawal of consent for every feature was requested in one call")
+        core.modules.consent.cancelAllConsents()
     }
 
     /// Whether a feature may currently be used.
     ///
     /// Always `true` when the integration does not require consent.
     public func hasConsent(for feature: ConsentFeature) -> Bool {
-        core()?.modules.consent.hasConsent(for: feature) ?? false
+        guard let core = core() else { return false }
+        let granted = core.modules.consent.hasConsent(for: feature)
+        core.logger.d(Self.module, "hasConsent", "a consent state was read through the public API, feature: [\(feature.wireName)], granted: [\(granted)]")
+        return granted
     }
 }
 
@@ -307,19 +321,33 @@ public final class ConsentAPI: CountlyAPIBase {
 /// Reads and changes the identity data is attributed to.
 public final class DeviceIDAPI: CountlyAPIBase {
 
+    private static let module = "DeviceID"
+
     /// The current device ID.
     public var current: String? {
-        core()?.modules.deviceID.deviceID
+        guard let core = core() else { return nil }
+        let deviceID = core.modules.deviceID.deviceID
+        // The value itself is verbose only: the logger delegate is live in release
+        // builds and a device ID identifies a person.
+        core.logger.d(Self.module, "current", "the device ID was read through the public API, valuePresent: [\(!deviceID.isEmpty)], typeWireValue: [\(core.modules.deviceID.deviceIDType.wireValue)]")
+        core.logger.v(Self.module, "current", "device ID detail, deviceID: [\(deviceID)]")
+        return deviceID
     }
 
     /// How the current device ID was obtained.
     public var type: DeviceIDType? {
-        core()?.modules.deviceID.deviceIDType
+        guard let core = core() else { return nil }
+        let deviceIDType = core.modules.deviceID.deviceIDType
+        core.logger.d(Self.module, "type", "the device ID type was read through the public API, typeWireValue: [\(deviceIDType.wireValue)]")
+        return deviceIDType
     }
 
     /// Whether the SDK is holding data back until a real device ID is set.
     public var isTemporaryIDMode: Bool {
-        core()?.modules.deviceID.isTemporary ?? false
+        guard let core = core() else { return false }
+        let isTemporary = core.modules.deviceID.isTemporary
+        core.logger.d(Self.module, "isTemporaryIDMode", "the temporary device ID mode flag was read through the public API, isTemporaryIDMode: [\(isTemporary)]")
+        return isTemporary
     }
 
     /// Sets the device ID, merging or not depending on where the current ID came
@@ -381,14 +409,20 @@ public final class LocationAPI: CountlyAPIBase {
 /// Operations on the queue of requests waiting to be sent.
 public final class RequestQueueAPI: CountlyAPIBase {
 
+    private static let module = "RequestQueue"
+
     /// How many requests are waiting.
     public var count: Int {
-        core()?.requestQueueStore.count ?? 0
+        guard let core = core() else { return 0 }
+        let queued = core.requestQueueStore.count
+        core.logger.d(Self.module, "count", "the request queue size was read through the public API, queuedRequestCount: [\(queued)]")
+        return queued
     }
 
     /// Sends everything that is waiting, right now.
     public func attemptToSendStoredRequests() {
         guard let core = core() else { return }
+        core.logger.i(Self.module, "attemptToSendStoredRequests", "an immediate drain of the request queue was requested, queuedRequestCount: [\(core.requestQueueStore.count)]")
         core.modules.events.addEventsToRequestQueue()
         core.requestQueueStore.saveSync()
         core.network.proceedOnQueue()
@@ -400,7 +434,7 @@ public final class RequestQueueAPI: CountlyAPIBase {
     /// discarded.
     public func flushQueues() {
         guard let core = core() else { return }
-        core.logger.i("RequestQueue", "flushQueues", "the request queue and the event queue are being flushed")
+        core.logger.i(Self.module, "flushQueues", "the request queue and the event queue are being flushed, queuedRequestCount: [\(core.requestQueueStore.count)]")
         core.modules.events.flushEvents()
         core.requestQueueStore.flush()
         core.requestQueueStore.saveSync()
@@ -410,6 +444,7 @@ public final class RequestQueueAPI: CountlyAPIBase {
     /// the current one.
     public func replaceAllAppKeysInQueueWithCurrentAppKey() {
         guard let core = core() else { return }
+        core.logger.i(Self.module, "replaceAllAppKeysInQueueWithCurrentAppKey", "queued requests recorded under a different app key will be rewritten to the current one")
         core.requestQueueStore.replaceAllAppKeys(with: core.config.appKey)
         core.requestQueueStore.saveSync()
         core.network.proceedOnQueue()
@@ -418,6 +453,7 @@ public final class RequestQueueAPI: CountlyAPIBase {
     /// Drops queued requests recorded under a different app key.
     public func removeDifferentAppKeysFromQueue() {
         guard let core = core() else { return }
+        core.logger.i(Self.module, "removeDifferentAppKeysFromQueue", "queued requests recorded under a different app key will be dropped")
         core.requestQueueStore.removeDifferentAppKeys(than: core.config.appKey)
         core.requestQueueStore.saveSync()
         core.network.proceedOnQueue()

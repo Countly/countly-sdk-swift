@@ -36,6 +36,23 @@ final class RemoteConfigTests: CountlyBaseTestCase {
         }
     }
 
+    /// Answers the remote config download but leaves the A/B enrolment unanswered.
+    ///
+    /// Enrolment requests go to `/o/sdk` as well, so a handler that answers the
+    /// whole path answers those too, and the request queue then drains the
+    /// enrolment out of itself in the background. A test that reads the queue
+    /// afterwards is racing that drain: on a fast machine it wins, on a loaded CI
+    /// runner it does not. Leaving the enrolment to the mock's default connection
+    /// failure keeps it at the head of the queue, which is exactly what the queue
+    /// assertions are written against.
+    private func respondToDownloadOnly(json: String) {
+        MockURLProtocol.respond { request in
+            guard request.path.contains("/o/sdk") else { return nil }
+            guard !request.query.contains("method=ab") else { return nil }
+            return (200, Data(json.utf8))
+        }
+    }
+
     /// Waits for `completion` to be invoked, failing the test if it never is.
     ///
     /// A remote config call that captures a completion handler and never calls it
@@ -263,7 +280,7 @@ final class RemoteConfigTests: CountlyBaseTestCase {
     /// Reading a value is what makes the device part of the experiment, so the
     /// enrollment is tied to the read rather than to the download.
     func testReadingAValueAndEnrollingAsksToBeEnrolled() {
-        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"colour": "blue"}"#)
+        respondToDownloadOnly(json: #"{"colour": "blue"}"#)
         let countly = startInstance()
 
         expectCompletion("the download reports back") { done in
@@ -273,11 +290,14 @@ final class RemoteConfigTests: CountlyBaseTestCase {
         let before = requestQueue(of: countly).count
         XCTAssertEqual(countly.remoteConfig.getValueAndEnroll("colour").value as? String, "blue")
 
-        let enrolments = requestQueue(of: countly)
+        // One snapshot answers both questions: reading the queue twice would let it
+        // change between the two reads.
+        let queued = requestQueue(of: countly)
+        let enrolments = queued
             .map(TestUtils.parseQuery)
             .filter { $0["method"] as? String == "ab" }
         XCTAssertEqual(enrolments.count, 1)
-        XCTAssertGreaterThan(requestQueue(of: countly).count, before)
+        XCTAssertGreaterThan(queued.count, before)
     }
 
     /// A key with no value is not an experiment the device is in, so reading it
@@ -292,7 +312,7 @@ final class RemoteConfigTests: CountlyBaseTestCase {
     }
 
     func testReadingEveryValueAndEnrollingCoversThemAllAtOnce() {
-        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"a": 1, "b": 2}"#)
+        respondToDownloadOnly(json: #"{"a": 1, "b": 2}"#)
         let countly = startInstance()
 
         expectCompletion("the download reports back") { done in
@@ -579,5 +599,80 @@ final class RemoteConfigTests: CountlyBaseTestCase {
             return
         }
         XCTAssertEqual(TestUtils.parseQuery(request.query)["oi"] as? String, "1")
+    }
+
+    // MARK: - Migrating a cache written by the Objective-C SDK
+
+    /// An application replacing the Objective-C Countly SDK with this one keeps the
+    /// same `UserDefaults`, so the remote config cache it finds on the first launch
+    /// was written by the old SDK in the old shape: archived `CountlyRCData`
+    /// objects rather than plain dictionaries.
+    ///
+    /// Failing to read them is silent. Nothing errors, the cache simply comes back
+    /// empty, and every value the application asked for falls back to its default
+    /// until the next successful fetch. On a launch with no network that is the
+    /// whole session, which is exactly when a cache was supposed to help.
+    ///
+    /// The stand-in below is archived under the old class's Objective-C name, which
+    /// is what `@objc(CountlyRCData)` on `LegacyArchivedRCData` exists to match.
+    func testACacheWrittenByThePreviousObjectiveCSDKIsStillReadable() throws {
+        let name = uniqueInstanceName()
+        let namespace = StorageNamespace(instanceName: name)
+
+        let legacy = LegacyRCStandIn(value: "dark", isCurrentUsersData: true)
+        let stale = LegacyRCStandIn(value: 42, isCurrentUsersData: false)
+
+        let archiver = NSKeyedArchiver(requiringSecureCoding: false)
+        // The name the previous SDK wrote, not this one's Swift type name.
+        archiver.setClassName("CountlyRCData", for: LegacyRCStandIn.self)
+        archiver.encode(["theme": legacy, "seats": stale], forKey: NSKeyedArchiveRootObjectKey)
+        archiver.finishEncoding()
+
+        UserDefaults.standard.set(archiver.encodedData,
+                                  forKey: namespace.key(PersistencyKey.remoteConfig))
+        defer { UserDefaults.standard.removeObject(forKey: namespace.key(PersistencyKey.remoteConfig)) }
+
+        let countly = start(baseConfig(instanceName: name))
+
+        XCTAssertEqual(countly.remoteConfig.getValue("theme").value as? String, "dark",
+                       "a value cached by the previous SDK was lost on migration")
+
+        // The stale marker has to survive too, or a value belonging to a previous
+        // user is silently presented as the current user's.
+        XCTAssertEqual(TestUtils.int(countly.remoteConfig.getValue("seats").value), 42)
+        XCTAssertFalse(countly.remoteConfig.getValue("seats").isCurrentUsersData,
+                       "the stale marker was dropped, so another user's value now reads as this one's")
+    }
+
+}
+
+/// Stands in for the Objective-C SDK's `CountlyRCData` when writing a legacy
+/// archive. It cannot be the real type: `LegacyArchivedRCData` has only
+/// `init?(coder:)`, by design, because nothing in the SDK should ever create one.
+// An explicit Objective-C name because `NSCoding` needs a stable one. It is not
+// the legacy name: that is applied per archive with `setClassName`, so this type
+// cannot collide with the real `@objc(CountlyRCData)`.
+@objc(CountlyTestLegacyRCStandIn)
+private final class LegacyRCStandIn: NSObject, NSCoding {
+
+    let value: Any?
+    let isCurrentUsersData: Bool
+
+    init(value: Any?, isCurrentUsersData: Bool) {
+        self.value = value
+        self.isCurrentUsersData = isCurrentUsersData
+        super.init()
+    }
+
+    init?(coder: NSCoder) {
+        value = coder.decodeObject(forKey: "value")
+        isCurrentUsersData = coder.decodeBool(forKey: "isCurrentUsersData")
+        super.init()
+    }
+
+    // The key names are the ones the previous SDK encoded under.
+    func encode(with coder: NSCoder) {
+        coder.encode(value, forKey: "value")
+        coder.encode(isCurrentUsersData, forKey: "isCurrentUsersData")
     }
 }

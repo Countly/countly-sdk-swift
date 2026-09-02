@@ -343,8 +343,8 @@ final class FeedbackTests: CountlyBaseTestCase {
     /// be left covering the application.
     func testPresentingAWidgetPutsItOnScreenAndTakesItDownWhenItCannotLoad() throws {
         try skipUnlessNetworkIsInterceptable()
-        #if !(os(iOS) || os(visionOS))
-        throw XCTSkip("feedback widgets are presented in a web view, which only exists on iOS and visionOS")
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("feedback widgets are presented in a web view, which this platform has no overlay for")
         #else
         let countly = startInstance()
         guard let widget = fetchWidgets(countly).first else {
@@ -366,8 +366,8 @@ final class FeedbackTests: CountlyBaseTestCase {
     /// both still have to fire.
     func testTheAppearAndDismissBlocksAreBothCalled() throws {
         try skipUnlessNetworkIsInterceptable()
-        #if !(os(iOS) || os(visionOS))
-        throw XCTSkip("feedback widgets are presented in a web view, which only exists on iOS and visionOS")
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("feedback widgets are presented in a web view, which this platform has no overlay for")
         #else
         let countly = startInstance()
         guard let widget = fetchWidgets(countly).first else {
@@ -387,8 +387,8 @@ final class FeedbackTests: CountlyBaseTestCase {
     /// the difference between a widget nobody saw and one everybody closed.
     func testDismissingAWidgetRecordsItAsClosed() throws {
         try skipUnlessNetworkIsInterceptable()
-        #if !(os(iOS) || os(visionOS))
-        throw XCTSkip("feedback widgets are presented in a web view, which only exists on iOS and visionOS")
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("feedback widgets are presented in a web view, which this platform has no overlay for")
         #else
         let countly = startInstance { $0.eventSendThreshold = 1 }
         guard let widget = fetchWidgets(countly).first else {
@@ -415,8 +415,8 @@ final class FeedbackTests: CountlyBaseTestCase {
     /// application asks.
     func testAWidgetIsNotPresentedWithoutConsent() throws {
         try skipUnlessNetworkIsInterceptable()
-        #if !(os(iOS) || os(visionOS))
-        throw XCTSkip("feedback widgets are presented in a web view, which only exists on iOS and visionOS")
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("feedback widgets are presented in a web view, which this platform has no overlay for")
         #else
         MockURLProtocol.respond(pathContaining: "/o/sdk", json: Self.widgetList)
         let countly = startInstance { $0.requiresConsent = true }

@@ -173,12 +173,26 @@ enum DeviceMetrics {
     ///
     /// Read from the key window, because in-app messages render in that window and
     /// its style is the theme they will be shown against.
+    ///
+    /// On macOS the overlay is a panel of its own rather than a window belonging to
+    /// the application, so the application's effective appearance is what a widget
+    /// is shown against.
     static var themeMode: String? {
         #if os(iOS) || os(tvOS)
         let traits = ScreenReader.keyWindow?.traitCollection ?? UIScreen.main.traitCollection
         switch traits.userInterfaceStyle {
         case .dark: return "d"
         case .light: return "l"
+        default: return nil
+        }
+        #elseif os(macOS)
+        // `bestMatch` rather than a name comparison: an appearance can be one of
+        // several dark variants, including the high contrast ones, and only the
+        // match resolves those to the two the widget understands.
+        let appearance = NSApplication.shared.effectiveAppearance
+        switch appearance.bestMatch(from: [.aqua, .darkAqua]) {
+        case .some(.darkAqua): return "d"
+        case .some(.aqua): return "l"
         default: return nil
         }
         #else
@@ -422,3 +436,69 @@ enum ScreenReader {
     }
 }
 #endif
+
+#if os(macOS)
+/// Screen lookups for the overlay, mirroring the UIKit reader above.
+///
+/// A macOS application has no single "key window" the SDK should present over, and
+/// content is shown in a panel of its own, so what matters here is the screen the
+/// user is actually looking at rather than any window of the host's.
+enum ScreenReader {
+
+    /// The window the person is actually working in, which is the one whose screen
+    /// content should appear on.
+    ///
+    /// The overlay sets `canBecomeMain = false`, so testing that flag skips the
+    /// overlay itself along with any other utility panel. Without it the answer
+    /// changes once content is on screen, because the overlay can become key.
+    private static var hostWindow: NSWindow? {
+        let application = NSApplication.shared
+        if let key = application.keyWindow, key.canBecomeMain { return key }
+        if let main = application.mainWindow { return main }
+        return application.windows.first { $0.isVisible && $0.canBecomeMain }
+    }
+
+    /// The screen carrying the application's own window.
+    ///
+    /// `NSScreen.main` is only the fallback, and a poor one on a multi-monitor
+    /// desk: with no key window it reports the screen holding the menu bar, which
+    /// is whichever display the person made primary rather than the one the
+    /// application is on.
+    static var activeScreen: NSScreen? {
+        hostWindow?.screen ?? NSScreen.main ?? NSScreen.screens.first
+    }
+
+    /// Backing scale of the screen content will be shown on.
+    static var screenScale: CGFloat {
+        activeScreen?.backingScaleFactor ?? 2.0
+    }
+
+    /// The size content may occupy: the screen minus the menu bar and the Dock,
+    /// which is what `visibleFrame` reports.
+    ///
+    /// Origin is zero because every caller of this wants a size. It is read for the
+    /// reported device metrics and to frame views, whose own coordinates start at
+    /// zero regardless of where on the desktop their window sits.
+    ///
+    /// Placing the overlay panel is the one case that needs the desktop origin as
+    /// well, and that reads `overlayFrame` instead.
+    static var screenBounds: CGRect {
+        guard let screen = activeScreen else { return .zero }
+        return CGRect(origin: .zero, size: screen.visibleFrame.size)
+    }
+
+    /// Where the overlay panel goes, in the global coordinate space AppKit places
+    /// windows in.
+    ///
+    /// Unlike `screenBounds` this keeps the origin. `NSWindow.init(contentRect:)`
+    /// reads that rect as a position on the desktop, not as a size, and the desktop
+    /// spans every display: the origin is what decides which monitor the panel
+    /// lands on. Passing a zeroed origin put content on whichever screen owns the
+    /// global origin, so on a multi-monitor desk it appeared on the primary display
+    /// while the application was on another.
+    static var overlayFrame: CGRect {
+        activeScreen?.visibleFrame ?? .zero
+    }
+}
+#endif
+

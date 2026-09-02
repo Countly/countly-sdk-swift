@@ -258,4 +258,69 @@ final class LifecycleTests: CountlyBaseTestCase {
                 && TestUtils.requests(self.requestQueue(of: countly), carrying: "consent").count > before
         }
     }
+
+    // MARK: - Termination
+
+    /// Termination is the one lifecycle event with no second chance: the process is
+    /// about to go away, so anything still only in memory is lost. Everything the
+    /// SDK holds has to be pushed to disk synchronously before the callback
+    /// returns, which is why this path does not use the usual async queues.
+    ///
+    /// Driven through the real notification rather than by calling the handler,
+    /// because the wiring from notification to handler is itself the thing that
+    /// breaks: a renamed callback or a dropped observer registration leaves this
+    /// silently doing nothing, and every assertion below would still pass if the
+    /// test reached past the observer.
+    func testTerminatingFlushesHeldEventsAndMarksTheInstanceTerminating() throws {
+        #if !(os(iOS) || os(tvOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("there is no application termination notification on this platform")
+        #else
+        let countly = startInstance {
+            // High enough that nothing is flushed by the threshold, so anything that
+            // reaches the queue got there because termination put it there.
+            $0.eventSendThreshold = 1000
+        }
+        countly.events.recordEvent("held-only-in-memory")
+        XCTAssertTrue(requestQueue(of: countly).isEmpty,
+                      "the event should still be held, or this test proves nothing")
+
+        #if os(macOS)
+        NotificationCenter.default.post(name: NSApplication.willTerminateNotification, object: nil)
+        #else
+        NotificationCenter.default.post(name: UIApplication.willTerminateNotification, object: nil)
+        #endif
+
+        XCTAssertTrue(core(of: countly).isTerminating,
+                      "the instance should refuse to start new requests once terminating")
+        XCTAssertFalse(requestQueue(of: countly).isEmpty,
+                       "the held event should have been written out before the process goes away")
+        #endif
+    }
+
+    /// Once terminating, the queue is written but not drained: a request begun now
+    /// would be cut off mid-flight, and the server would count a partial send.
+    func testTerminatingWritesTheQueueWithoutSendingIt() throws {
+        #if !(os(iOS) || os(tvOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("there is no application termination notification on this platform")
+        #else
+        try skipUnlessNetworkIsInterceptable()
+        MockURLProtocol.respondToEverything(json: #"{"result": "Success"}"#)
+
+        let countly = startInstance { $0.eventSendThreshold = 1000 }
+        countly.events.recordEvent("held-only-in-memory")
+
+        #if os(macOS)
+        NotificationCenter.default.post(name: NSApplication.willTerminateNotification, object: nil)
+        #else
+        NotificationCenter.default.post(name: UIApplication.willTerminateNotification, object: nil)
+        #endif
+
+        // Given a turn, a non-terminating instance would have drained this.
+        TestUtils.pump(0.4)
+
+        XCTAssertFalse(requestQueue(of: countly).isEmpty,
+                       "the request is kept for the next launch rather than started now")
+        #endif
+    }
+
 }

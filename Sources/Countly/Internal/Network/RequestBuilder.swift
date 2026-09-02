@@ -40,6 +40,8 @@ final class RequestBuilder {
         let typeValue = core.modules.deviceID.deviceIDType.wireValue
         let timestampMs = core.clock.nowMs()
 
+        core.logger.d(Self.module, "queryEssentials", "base request parameters are built, deviceIDType: [\(typeValue)], deviceIDLength: [\(deviceID.count)], timestamp: [\(timestampMs)], appKeyLength: [\(core.config.appKey.count)]")
+
         return [
             "\(QS.appKey)=\(core.config.appKey.urlEscaped)",
             "\(QS.deviceID)=\(deviceID.urlEscaped)",
@@ -58,9 +60,13 @@ final class RequestBuilder {
     /// Without a salt the request goes out unchanged rather than carrying a
     /// checksum of the literal string "nil", which would be meaningless.
     func appendChecksum(_ queryString: String) -> String {
-        guard let salt = core.config.secretSalt, !salt.isEmpty else { return queryString }
+        guard let salt = core.config.secretSalt, !salt.isEmpty else {
+            core.logger.d(Self.module, "appendChecksum", "no checksum is appended to the query string, reason: no secret salt is configured")
+            return queryString
+        }
+
         let checksum = (queryString + salt).sha256Hex
-        core.logger.v(Self.module, "appendChecksum", "checksum is appended to the query string, queryStringLength: [\(queryString.count)]")
+        core.logger.d(Self.module, "appendChecksum", "checksum is appended to the query string, queryStringLength: [\(queryString.count)]")
         return "\(queryString)&\(QS.checksum256)=\(checksum)"
     }
 
@@ -68,6 +74,7 @@ final class RequestBuilder {
     /// drives its backpressure signalling.
     func appendRemainingRequestCount(_ queryString: String) -> String {
         let remaining = max(0, core.requestQueueStore.count - 1)
+        core.logger.d(Self.module, "appendRemainingRequestCount", "the remaining request count is appended to the query string, remainingRequestCount: [\(remaining)]")
         return "\(queryString)&\(QS.remainingRequest)=\(remaining)"
     }
 
@@ -80,6 +87,7 @@ final class RequestBuilder {
         let location = core.modules.location
 
         guard core.modules.consent.hasConsent(for: .location), !location.isLocationInfoDisabled else {
+            core.logger.d(Self.module, "locationQueryString", "an empty location is sent so the server stops inferring it from the IP address, hasLocationConsent: [\(core.modules.consent.hasConsent(for: .location))], isLocationInfoDisabled: [\(location.isLocationInfoDisabled)]")
             return "&\(QS.location)="
         }
 
@@ -89,7 +97,13 @@ final class RequestBuilder {
         if let value = location.isoCountryCode { parts.append("&\(QS.locationCountry)=\(value.urlEscaped)") }
         if let value = location.ipAddress { parts.append("&\(QS.locationIP)=\(value.urlEscaped)") }
 
-        return parts.isEmpty ? nil : parts.joined()
+        guard !parts.isEmpty else {
+            core.logger.d(Self.module, "locationQueryString", "no location parameters are attached to the request, reason: none of them has a value")
+            return nil
+        }
+
+        core.logger.d(Self.module, "locationQueryString", "location parameters are attached to the request, hasCoordinate: [\(location.locationCoordinate != nil)], hasCity: [\(location.city != nil)], hasCountryCode: [\(location.isoCountryCode != nil)], hasIPAddress: [\(location.ipAddress != nil)]")
+        return parts.joined()
     }
 
     /// Marks a query string so the connection manager sends it somewhere other
@@ -99,6 +113,7 @@ final class RequestBuilder {
     /// because the queue is a list of strings that has to survive being written to
     /// disk and read back by a later launch.
     func withEndpointOverride(_ queryString: String, endpoint: String) -> String {
-        "\(queryString)\(QS.endPointOverrideTag)\(endpoint)"
+        core.logger.d(Self.module, "withEndpointOverride", "the request is marked to be sent to another endpoint, endpoint: [\(endpoint)]")
+        return "\(queryString)\(QS.endPointOverrideTag)\(endpoint)"
     }
 }

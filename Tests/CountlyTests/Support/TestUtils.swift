@@ -26,6 +26,17 @@ enum TestUtils {
     /// machine, from tripping over a value tuned on one.
     static let asyncTimeout: TimeInterval = 20
 
+    /// The ceiling for waits that depend on WebKit, which are the only ones whose
+    /// slowest step is a process launch rather than work the SDK does.
+    ///
+    /// A content page needs the WebContent and Networking processes up before any
+    /// of its own work starts, and on a contended runner those have been measured
+    /// taking over thirty seconds each to launch, which is already past
+    /// `asyncTimeout` before the page has done anything. Raising the general
+    /// ceiling to cover that would make every unrelated hang take a minute to
+    /// surface, so only the WebKit-bound suites pay it.
+    static let webKitTimeout: TimeInterval = 90
+
     /// Polls `condition` until it holds or `timeout` elapses, pumping the run loop
     /// meanwhile, and reports whether it held.
     ///

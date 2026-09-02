@@ -80,7 +80,7 @@ final class ConnectionManager: NSObject {
     /// while the request it belongs to does.
     func enqueue(_ queryString: String, callback: RequestCallback?) {
         guard !queryString.isEmpty else {
-            core.logger.d(Self.module, "enqueue", "request is not queued, reason: query string is nil or empty, callbackProvided: [\(callback != nil)]")
+            core.logger.d(Self.module, "enqueue", "request is not queued, reason: the query string is empty, callbackProvided: [\(callback != nil)]")
             return
         }
 
@@ -171,7 +171,7 @@ final class ConnectionManager: NSObject {
         }
 
         if core.requestQueueStore.isOldRequest(head) {
-            core.logger.w(Self.module, "proceedOnQueue", "dropping the request at the head of the queue, reason: request age exceeded the configured drop age, requestSize: [\(head.count)]")
+            core.logger.w(Self.module, "proceedOnQueue", "dropping the request at the head of the queue, reason: request age exceeded the configured drop age, requestDropAgeHours: [\(core.requestQueueStore.requestDropAgeHours)], requestSize: [\(head.count)], queuedRequestCount: [\(core.requestQueueStore.count)]")
             core.requestQueueStore.removeHead(head)
             core.requestQueueStore.save()
             releaseProcessing()
@@ -191,7 +191,7 @@ final class ConnectionManager: NSObject {
 
     private func finishDrain() {
         let elapsed = drainStartTime.map { -$0.timeIntervalSinceNow } ?? 0
-        core.logger.d(Self.module, "proceedOnQueue", "request queue is empty, all requests are processed, totalTimeTaken: [\(String(format: "%.2f", elapsed))]")
+        core.logger.d(Self.module, "proceedOnQueue", "request queue is empty, all requests are processed, totalTimeTaken: [\(elapsed.logSeconds)]")
 
         if !hasAnyRequestFailed {
             var runnables: [() -> Void] = []
@@ -228,6 +228,9 @@ final class ConnectionManager: NSObject {
         let callbackID = extractAndRemoveParameter(&queryString, parameter: QS.callbackID)
         if let callbackID {
             callbackQueue.sync { callback = requestCallbacks[callbackID] }
+            if callback == nil {
+                core.logger.d(Self.module, "proceedOnQueue", "the request carries a callback ID but no callback is registered under it, it was queued before the process restarted, callbackID: [\(callbackID)]")
+            }
         }
 
         queryString = builder.appendRemainingRequestCount(queryString)
@@ -257,11 +260,11 @@ final class ConnectionManager: NSObject {
             self.currentTask = nil
             self.stateLock.unlock()
 
-            let duration = Int(Date().timeIntervalSince(startedAt))
+            let elapsed = Date().timeIntervalSince(startedAt)
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
             if response != nil {
-                self.core.logger.d(Self.module, "proceedOnQueue", "response received, endpoint: [\(request.url?.path ?? "")], statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], duration: [\(duration)]")
+                self.core.logger.d(Self.module, "proceedOnQueue", "response received, endpoint: [\(request.url?.path ?? "")], statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], duration: [\(elapsed.logSeconds)]")
             }
 
             if let error {
@@ -272,7 +275,7 @@ final class ConnectionManager: NSObject {
             if self.isRequestSuccessful(response: response, data: data, endpoint: endpoint) {
                 self.handleSuccess(head: head,
                                    queryString: queryString,
-                                   duration: duration,
+                                   elapsed: elapsed,
                                    request: request,
                                    callback: callback,
                                    callbackID: callbackID,
@@ -296,12 +299,12 @@ final class ConnectionManager: NSObject {
 
     private func handleSuccess(head: String,
                                queryString: String,
-                               duration: Int,
+                               elapsed: TimeInterval,
                                request: URLRequest,
                                callback: RequestCallback?,
                                callbackID: String?,
                                response: URLResponse?) {
-        core.logger.d(Self.module, "proceedOnQueue", "request completed successfully, endpoint: [\(request.url?.path ?? "")], duration: [\(duration)]")
+        core.logger.d(Self.module, "proceedOnQueue", "request completed successfully and will be removed from the queue, endpoint: [\(request.url?.path ?? "")], statusCode: [\((response as? HTTPURLResponse)?.statusCode ?? 0)], duration: [\(elapsed.logSeconds)]")
 
         deliver(callback, callbackID: callbackID, response: response.map { String(describing: $0) }, success: true)
 
@@ -312,8 +315,8 @@ final class ConnectionManager: NSObject {
         // would let a concurrent caller re-send the request that just succeeded.
         releaseProcessing()
 
-        if core.serverConfig.backoffMechanism, shouldBackOff(responseTimeSeconds: duration, queryString: queryString) {
-            core.logger.d(Self.module, "proceedOnQueue", "stopping queue processing, reason: backoff is triggered, lastResponseDuration: [\(duration)]")
+        if core.serverConfig.backoffMechanism, shouldBackOff(responseTimeSeconds: Int(elapsed), queryString: queryString) {
+            core.logger.d(Self.module, "proceedOnQueue", "stopping queue processing, reason: backoff is triggered, responseTimeSeconds: [\(Int(elapsed))], queuedRequestCount: [\(core.requestQueueStore.count)]")
             drainStartTime = nil
             hasAnyRequestFailed = false
             startBackoffCountdown()
@@ -338,6 +341,8 @@ final class ConnectionManager: NSObject {
         core.healthTracker.logFailedNetworkRequest(statusCode: statusCode, errorResponse: body)
         core.healthTracker.saveState()
 
+        core.logger.d(Self.module, "proceedOnQueue", "queue processing is stopped after a rejected request, the request stays at the head of the queue and is sent again on the next drain, queuedRequestCount: [\(core.requestQueueStore.count)]")
+
         drainStartTime = nil
         releaseProcessing()
     }
@@ -358,6 +363,8 @@ final class ConnectionManager: NSObject {
         core.requestQueueStore.save()
         #endif
 
+        core.logger.d(Self.module, "proceedOnQueue", "queue processing is stopped after a network error, the request stays at the head of the queue and is sent again on the next drain, queuedRequestCount: [\(core.requestQueueStore.count)]")
+
         drainStartTime = nil
         releaseProcessing()
     }
@@ -367,6 +374,8 @@ final class ConnectionManager: NSObject {
     /// reads.
     private func deliver(_ callback: RequestCallback?, callbackID: String?, response: @autoclosure () -> String?, success: Bool) {
         guard let callback else { return }
+
+        core.logger.d(Self.module, "proceedOnQueue", "the outcome of the request is delivered to the callback it was queued with, success: [\(success)], callbackID: [\(callbackID ?? "none")]")
         callback(response(), success)
         if let callbackID {
             callbackQueue.sync { _ = requestCallbacks.removeValue(forKey: callbackID) }
@@ -376,7 +385,7 @@ final class ConnectionManager: NSObject {
     /// Gives up this drain, leaving the queue as it is so a later trigger picks it
     /// back up.
     private func abortProcessing(_ reason: String) {
-        core.logger.d(Self.module, "proceedOnQueue", "aborting queue processing, reason: \(reason)")
+        core.logger.d(Self.module, "proceedOnQueue", "aborting queue processing, reason: [\(reason)]")
         releaseProcessing()
     }
 
@@ -400,29 +409,37 @@ final class ConnectionManager: NSObject {
             core.healthTracker.logConsecutiveBackoffRequest()
         }
 
-        core.logger.d(Self.module, "shouldBackOff", "backoff evaluation is completed, decision: [\(result)], responseTime: [\(responseTimeSeconds)]")
         return result
     }
 
     /// The three conditions themselves, each of which is a reason to keep sending.
     private func isServerOverloaded(responseTimeSeconds: Int, queryString: String) -> Bool {
-        guard responseTimeSeconds >= core.serverConfig.bomAcceptedTimeoutSeconds else { return false }
+        guard responseTimeSeconds >= core.serverConfig.bomAcceptedTimeoutSeconds else {
+            core.logger.d(Self.module, "shouldBackOff", "backoff is not triggered, reason: the server answered within the accepted timeout, responseTimeSeconds: [\(responseTimeSeconds)], acceptedTimeoutSeconds: [\(core.serverConfig.bomAcceptedTimeoutSeconds)]")
+            return false
+        }
 
         let remaining = core.requestQueueStore.count
         let threshold = Int(Double(core.requestQueueStore.storedRequestsLimit) * core.serverConfig.bomRQPercentage)
-        guard remaining <= threshold else { return false }
+        guard remaining <= threshold else {
+            core.logger.d(Self.module, "shouldBackOff", "backoff is not triggered, reason: pausing would overflow the request queue, remainingRequestCount: [\(remaining)], requestCountThreshold: [\(threshold)], storedRequestsLimit: [\(core.requestQueueStore.storedRequestsLimit)]")
+            return false
+        }
 
         let ageSeconds = queryString.requestAgeSeconds
-        guard ageSeconds <= Double(core.serverConfig.bomRequestAge) * 3600.0 else { return false }
+        guard ageSeconds <= Double(core.serverConfig.bomRequestAge) * 3600.0 else {
+            core.logger.d(Self.module, "shouldBackOff", "backoff is not triggered, reason: the request is a backlog one and the delay no longer matters, requestAge: [\(ageSeconds.logSeconds)], acceptedRequestAgeHours: [\(core.serverConfig.bomRequestAge)]")
+            return false
+        }
 
-        core.logger.w(Self.module, "shouldBackOff", "backoff is triggered, responseTime: [\(responseTimeSeconds)], remainingRequestCount: [\(remaining)], requestCountThreshold: [\(threshold)], requestAge: [\(String(format: "%.2f", ageSeconds))]")
+        core.logger.d(Self.module, "shouldBackOff", "backoff is triggered, responseTimeSeconds: [\(responseTimeSeconds)], remainingRequestCount: [\(remaining)], requestCountThreshold: [\(threshold)], requestAge: [\(ageSeconds.logSeconds)]")
         core.healthTracker.logBackoffRequest()
         return true
     }
 
     private func startBackoffCountdown() {
         let duration = core.serverConfig.bomDuration
-        core.logger.d(Self.module, "startBackoffCountdown", "backoff countdown is started, queue processing will be paused for [\(duration)] seconds")
+        core.logger.d(Self.module, "startBackoffCountdown", "backoff countdown is started and queue processing is paused, pauseDurationSeconds: [\(duration)], queuedRequestCount: [\(core.requestQueueStore.count)]")
 
         stateLock.lock()
         isBackingOff = true
@@ -446,8 +463,8 @@ final class ConnectionManager: NSObject {
     /// because the process is about to die and an async send would not survive it.
     /// If it fails the report is queued so the next launch sends it.
     ///
-    /// Reachable from the signal handler, so every log line here stays at debug or
-    /// lower: error and warning logging touches dispatch primitives that are not
+    /// Reachable from the signal handler, so no log line here goes above info:
+    /// error and warning logging touches dispatch primitives that are not
     /// async-signal-safe.
     func sendCrashReport(_ report: String?, immediately: Bool) {
         guard core.serverConfig.networkingEnabled else {
@@ -463,6 +480,7 @@ final class ConnectionManager: NSObject {
         let queryString = "\(builder.queryEssentials())&\(QS.crash)=\(report)"
 
         guard immediately else {
+            core.logger.d(Self.module, "sendCrashReport", "crash report is added to the request queue, crashReportLength: [\(report.count)]")
             enqueueAndProceed(queryString)
             return
         }
@@ -507,8 +525,9 @@ final class ConnectionManager: NSObject {
             defer { semaphore.signal() }
             guard let self else { return }
 
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             if error != nil || !self.isRequestSuccessful(response: response, data: data, endpoint: Endpoint.input) {
-                self.core.logger.d(Self.module, "sendCrashReport", "immediate crash report request failed and it is queued to be sent later, endpoint: [\(request.url?.path ?? "")], statusCode: [\((response as? HTTPURLResponse)?.statusCode ?? 0)]")
+                self.core.logger.d(Self.module, "sendCrashReport", "immediate crash report request failed and it is queued to be sent later, endpoint: [\(request.url?.path ?? "")], statusCode: [\(statusCode)], errorDescription: [\(error?.localizedDescription ?? "none")]")
                 self.enqueue(queryString)
                 self.core.requestQueueStore.saveSync()
             } else {
@@ -559,6 +578,7 @@ final class ConnectionManager: NSObject {
         } else if queryString.count > kGETRequestMaxLength || core.config.alwaysUsePOST {
             request.httpMethod = "POST"
             request.httpBody = Data(queryString.utf8)
+            core.logger.d(Self.module, "buildRequest", "request will be sent as a POST, endpoint: [\(endpoint)], queryStringLength: [\(queryString.count)], getRequestMaxLength: [\(kGETRequestMaxLength)], alwaysUsePOST: [\(core.config.alwaysUsePOST)]")
         } else {
             request = URLRequest(url: Self.requestURL("\(urlString)?\(queryString)"))
         }
@@ -581,7 +601,10 @@ final class ConnectionManager: NSObject {
               let unescaped = userDetails.removingPercentEncoding,
               let parsed = CountlyJSON.object(from: Data(unescaped.utf8), logger: core.logger) as? [String: Any],
               let localPath = parsed[UserProfileKey.localPicturePath] as? String,
-              !localPath.isEmpty else { return nil }
+              !localPath.isEmpty else {
+            core.logger.d(Self.module, "pictureUploadData", "no local picture path is found in the user details of the request, it will be sent without a picture upload")
+            return nil
+        }
 
         core.logger.d(Self.module, "pictureUploadData", "local picture path is extracted from the query string, pathLength: [\(localPath.count)]")
 
@@ -621,10 +644,7 @@ final class ConnectionManager: NSObject {
     /// Used for the two parameters that are instructions to the SDK rather than
     /// data for the server: the endpoint override and the callback ID.
     private func extractAndRemoveParameter(_ queryString: inout String, parameter: String) -> String? {
-        guard queryString.contains(parameter) else {
-            core.logger.v(Self.module, "extractAndRemoveParameter", "parameter is not present in the query string, parameter: [\(parameter)]")
-            return nil
-        }
+        guard queryString.contains(parameter) else { return nil }
 
         guard let value = queryString.valueForQueryStringKey(parameter) else {
             core.logger.w(Self.module, "extractAndRemoveParameter", "parameter is present in the query string but its value could not be extracted, parameter: [\(parameter)]")
@@ -660,39 +680,47 @@ final class ConnectionManager: NSObject {
                                      endpoint: String,
                                      quiet: Bool = false) -> Bool {
         // Rejections are logged at debug for the health check and at error for
-        // everything else, which is the only thing `quiet` changes.
-        func logRejection(_ message: String) {
+        // everything else, which is the only thing `quiet` changes. The two
+        // wordings differ because a log message has to name one line of code.
+        func logRejection(_ reason: String) {
+            // Composed outside the literal so the message keeps the house shape,
+            // where everything after the prose is a `key: [value]` pair.
+            let line = (quiet ? "an unqueued request is judged as failed, " : "a queued request is judged as failed, ") + reason
             if quiet {
-                core.logger.d(Self.module, "isRequestSuccessful", message)
+                core.logger.d(Self.module, "isRequestSuccessful", line)
             } else {
-                core.logger.e(Self.module, "isRequestSuccessful", message)
+                core.logger.e(Self.module, "isRequestSuccessful", line)
             }
         }
 
-        guard let http = response as? HTTPURLResponse else { return false }
+        guard let http = response as? HTTPURLResponse else {
+            core.logger.d(Self.module, "isRequestSuccessful", "the request is judged as failed, reason: the reply is not an HTTP response, endpoint: [\(endpoint)], hasReply: [\(response != nil)]")
+            return false
+        }
 
         guard (200..<300).contains(http.statusCode) else {
-            core.logger.v(Self.module, "isRequestSuccessful", "HTTP status code is not in the 2XX series, statusCode: [\(http.statusCode)], responseSize: [\(data?.count ?? 0)]")
+            core.logger.d(Self.module, "isRequestSuccessful", "the request is judged as failed, reason: the HTTP status code is not in the 2XX series, endpoint: [\(endpoint)], statusCode: [\(http.statusCode)], responseSize: [\(data?.count ?? 0)]")
             return false
         }
 
         guard endpoint == Endpoint.input else {
-            core.logger.v(Self.module, "isRequestSuccessful", "2XX on a non ingest endpoint is a success, the reply body is application payload and is not validated, endpoint: [\(endpoint)], responseSize: [\(data?.count ?? 0)]")
+            core.logger.d(Self.module, "isRequestSuccessful", "2XX on a non ingest endpoint is a success, the reply body is application payload and is not validated, endpoint: [\(endpoint)], statusCode: [\(http.statusCode)], responseSize: [\(data?.count ?? 0)]")
             return true
         }
 
         guard let reply = CountlyJSON.object(from: data, logger: nil) as? [String: Any] else {
-            logRejection("server reply is not a valid JSON, the request is considered failed, responseSize: [\(data?.count ?? 0)]")
+            logRejection("reason: the server reply is not valid JSON, statusCode: [\(http.statusCode)], responseSize: [\(data?.count ?? 0)]")
             return false
         }
 
         core.logger.v(Self.module, "isRequestSuccessful", "server reply detail, fullResponseURL: [\(response?.url?.absoluteString ?? "")], parsedServerReply: [\(reply)]")
 
-        guard reply["result"] != nil else {
-            logRejection("server reply does not contain the result field, the request is considered failed, responseSize: [\(data?.count ?? 0)]")
+        guard let result = reply["result"] else {
+            logRejection("reason: the server reply does not contain the result field, statusCode: [\(http.statusCode)], replyKeys: [\(reply.keys.sorted().joined(separator: ", "))]")
             return false
         }
 
+        core.logger.d(Self.module, "isRequestSuccessful", "the server accepted the request, result: [\(result)]")
         return true
     }
 
@@ -701,7 +729,7 @@ final class ConnectionManager: NSObject {
         let sentSize = (request.url?.absoluteString.count ?? 0) + bodySize
         core.logger.i(Self.module, "logRequest", "sending request, endpoint: [\(request.url?.path ?? "")], method: [\(request.httpMethod ?? "GET")], approximateSentDataSize: [\(sentSize)], bodySize: [\(bodySize)]")
 
-        core.logger.v(Self.module, "logRequest", "request detail, method: [\(request.httpMethod ?? "GET")], URL: [\(request.url?.absoluteString ?? "")], body: [\(request.httpBody.flatMap { String(data: $0, encoding: .utf8) } ?? "Picture uploading...")]")
+        core.logger.v(Self.module, "logRequest", "request detail, method: [\(request.httpMethod ?? "GET")], URL: [\(request.url?.absoluteString ?? "")], body: [\(request.httpBody.flatMap { String(data: $0, encoding: .utf8) } ?? "binary picture upload data")]")
     }
 
     // MARK: - Sessions
@@ -717,6 +745,8 @@ final class ConnectionManager: NSObject {
         let configuration = core.config.urlSessionConfiguration
         configuration.timeoutIntervalForRequest = core.serverConfig.requestTimeoutDuration
         configuration.timeoutIntervalForResource = core.serverConfig.requestTimeoutDuration
+
+        core.logger.d(Self.module, "session", "building the URL session used for queued requests, requestTimeout: [\(core.serverConfig.requestTimeoutDuration.logSeconds)], customHeaderCount: [\(configuration.httpAdditionalHeaders?.count ?? 0)]")
 
         let session: URLSession
         if !core.config.pinnedCertificates.isEmpty {
@@ -748,6 +778,8 @@ final class ConnectionManager: NSObject {
         // which is already why the headers above are here.
         configuration.protocolClasses = core.config.urlSessionConfiguration.protocolClasses
 
+        core.logger.d(Self.module, "instantSession", "building the URL session used for unqueued requests, requestTimeout: [\(core.serverConfig.requestTimeoutDuration.logSeconds)], pinnedCertificateCount: [\(core.config.pinnedCertificates.count)]")
+
         let session: URLSession
         if !core.config.pinnedCertificates.isEmpty {
             session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
@@ -760,7 +792,10 @@ final class ConnectionManager: NSObject {
 
     /// Adds headers to every request. Rebuilds the session so they take effect.
     func addCustomNetworkRequestHeaders(_ headers: [String: String]?) {
-        guard let headers else { return }
+        guard let headers else {
+            core.logger.d(Self.module, "addCustomNetworkRequestHeaders", "no custom network request headers are provided, the ones already set are kept")
+            return
+        }
 
         var updated = (core.config.urlSessionConfiguration.httpAdditionalHeaders as? [String: String]) ?? [:]
         var skipped = 0
@@ -777,7 +812,7 @@ final class ConnectionManager: NSObject {
             core.logger.w(Self.module, "addCustomNetworkRequestHeaders", "some custom network request headers are skipped, reason: empty key, skippedHeaderCount: [\(skipped)]")
         }
 
-        core.logger.i(Self.module, "addCustomNetworkRequestHeaders", "custom network request headers are applied, totalHeaderCount: [\(updated.count)]")
+        core.logger.i(Self.module, "addCustomNetworkRequestHeaders", "custom network request headers are applied, totalHeaderCount: [\(updated.count)], headerNames: [\(updated.keys.sorted().joined(separator: ", "))]")
         core.config.urlSessionConfiguration.httpAdditionalHeaders = updated
         discardSessions()
     }
@@ -797,6 +832,8 @@ final class ConnectionManager: NSObject {
         urlSession = nil
         immediateSession = nil
         sessionLock.unlock()
+
+        core.logger.d(Self.module, "discardSessions", "the cached URL sessions are invalidated, a request in flight is cancelled and sent again from the queue, hadQueuedSession: [\(queued != nil)], hadInstantSession: [\(instant != nil)]")
 
         // `finishTasksAndInvalidate` would keep the delegate alive until the
         // in-flight task completes. The queue is what guarantees delivery, not the
@@ -859,6 +896,7 @@ extension ConnectionManager: URLSessionDelegate {
                            didReceive challenge: URLAuthenticationChallenge,
                            completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
         guard let serverTrust = challenge.protectionSpace.serverTrust else {
+            core.logger.d(Self.module, "didReceiveChallenge", "the authentication challenge is cancelled, reason: it carries no server trust to evaluate, authenticationMethod: [\(challenge.protectionSpace.authenticationMethod)]")
             completionHandler(.cancelAuthenticationChallenge, nil)
             return
         }
@@ -881,7 +919,7 @@ extension ConnectionManager: URLSessionDelegate {
             guard let localTrust, let localKey = Self.publicKey(of: localTrust) else { continue }
 
             if let serverKey, localKey == serverKey {
-                core.logger.d(Self.module, "didReceiveChallenge", "pinned certificate and server certificate match")
+                core.logger.d(Self.module, "didReceiveChallenge", "pinned certificate and server certificate match, certificate: [\(name)]")
                 keysMatch = true
                 break
             }
@@ -930,11 +968,14 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
         queryString = builder.appendChecksum(queryString)
 
         let request = instantRequest(queryString: queryString, path: Endpoint.input)
-        core.logger.d(Self.module, "sendHealthCheck", "health check request prepared as [\(request.httpMethod ?? "GET")], queryLength: [\(queryString.count)]")
+        core.logger.d(Self.module, "sendHealthCheck", "health check request is prepared, method: [\(request.httpMethod ?? "GET")], queryLength: [\(queryString.count)]")
 
         instantSession().dataTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
-            completion(self.isRequestSuccessful(response: response, data: data, endpoint: Endpoint.input, quiet: true), error)
+
+            let wasAccepted = self.isRequestSuccessful(response: response, data: data, endpoint: Endpoint.input, quiet: true)
+            self.core.logger.d(Self.module, "sendHealthCheck", "health check response received, accepted: [\(wasAccepted)], statusCode: [\((response as? HTTPURLResponse)?.statusCode ?? 0)], responseSize: [\(data?.count ?? 0)], errorDescription: [\(error?.localizedDescription ?? "none")]")
+            completion(wasAccepted, error)
         }.resume()
     }
 
@@ -946,10 +987,12 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
         queryString = builder.appendChecksum(queryString)
 
         let request = instantRequest(queryString: queryString, path: Endpoint.output + Endpoint.sdk)
-        core.logger.d(Self.module, "fetchServerConfig", "behavior settings request prepared as [\(request.httpMethod ?? "GET")], queryLength: [\(queryString.count)]")
+        core.logger.d(Self.module, "fetchServerConfig", "behavior settings request is prepared, method: [\(request.httpMethod ?? "GET")], queryLength: [\(queryString.count)]")
 
-        instantSession().dataTask(with: request) { data, response, error in
-            completion(data, (response as? HTTPURLResponse)?.statusCode ?? 0, error)
+        instantSession().dataTask(with: request) { [weak self] data, response, error in
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            self?.core.logger.d(Self.module, "fetchServerConfig", "behavior settings response received, statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], errorDescription: [\(error?.localizedDescription ?? "none")]")
+            completion(data, statusCode, error)
         }.resume()
     }
 

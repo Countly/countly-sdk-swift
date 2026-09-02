@@ -37,10 +37,22 @@ final class RequestQueueStore {
     private var requests: [String] = []
 
     /// Maximum number of requests kept. Older ones are dropped past this.
-    var storedRequestsLimit: Int = 1000
+    ///
+    /// Reported on change: the queue drops against the value it holds, not against
+    /// the one in the developer config, and a report of lost requests is answered
+    /// by knowing which of the two the queue was actually running on.
+    var storedRequestsLimit: Int = 1000 {
+        didSet {
+            logger?.d(Self.module, "storedRequestsLimit", "the request queue limit is set, previousValue: [\(oldValue)], newValue: [\(storedRequestsLimit)], queuedRequestCount: [\(count)]")
+        }
+    }
 
     /// Requests older than this are dropped. Zero disables age based dropping.
-    var requestDropAgeHours: Int = 0
+    var requestDropAgeHours: Int = 0 {
+        didSet {
+            logger?.d(Self.module, "requestDropAgeHours", "the request drop age is set, previousValue: [\(oldValue)], newValue: [\(requestDropAgeHours)], ageBasedDroppingEnabled: [\(requestDropAgeHours > 0)]")
+        }
+    }
 
     /// Set while a bulk rewrite of the queue is in progress, so the connection
     /// manager does not start sending a request that is about to be rewritten.
@@ -91,12 +103,12 @@ final class RequestQueueStore {
     ///     request is discarded instead of queued.
     func enqueue(_ queryString: String, appVersion: String, trackingEnabled: Bool) {
         guard trackingEnabled else {
-            logger?.d(Self.module, "enqueue", "request is not queued, reason: SDK tracking is disabled from server config, queryStringLength: [\(queryString.count)]")
+            logger?.d(Self.module, "enqueue", "request is not stored in the queue, reason: tracking is disabled by behavior settings, queryStringLength: [\(queryString.count)]")
             return
         }
 
         guard !queryString.isEmpty else {
-            logger?.d(Self.module, "enqueue", "request is not queued, reason: query string is nil or empty")
+            logger?.d(Self.module, "enqueue", "request is not stored in the queue, reason: it reached the store with an empty query string")
             return
         }
 
@@ -113,13 +125,13 @@ final class RequestQueueStore {
                 // this request needs.
                 let exceeded = requests.count - storedRequestsLimit
                 let removeCount = min(min(exceeded, Self.removalLoopLimit) + 1, requests.count)
-                logger?.d(Self.module, "enqueue", "request queue size: [\(requests.count)] exceeded the limit: [\(storedRequestsLimit)], the first [\(removeCount)] request(s) will be dropped")
+                logger?.d(Self.module, "enqueue", "the oldest queued requests are dropped because the queue is over its limit, queuedRequestCount: [\(requests.count)], storedRequestsLimit: [\(storedRequestsLimit)], droppedRequestCount: [\(removeCount)], exceededBy: [\(exceeded)]")
                 requests.removeFirst(removeCount)
             }
         }
 
         requests.append(stamped)
-        logger?.v(Self.module, "enqueue", "request is queued, queryStringLength: [\(stamped.count)], queueSize: [\(requests.count)]")
+        logger?.d(Self.module, "enqueue", "request is stored in the queue, queryStringLength: [\(stamped.count)], queuedRequestCount: [\(requests.count)], storedRequestsLimit: [\(storedRequestsLimit)]")
     }
 
     /// Removes the request at the head of the queue, but only if it still is the
@@ -128,7 +140,10 @@ final class RequestQueueStore {
         lock.lock()
         defer { lock.unlock() }
 
-        guard requests.first == queryString else { return }
+        guard requests.first == queryString else {
+            logger?.d(Self.module, "removeHead", "the request that was sent is no longer at the head of the queue and nothing is removed, queryStringLength: [\(queryString.count)], queuedRequestCount: [\(requests.count)]")
+            return
+        }
         requests.removeFirst()
         logger?.d(Self.module, "removeHead", "request at the head of the queue is removed, remainingRequestCount: [\(requests.count)]")
     }
@@ -139,7 +154,7 @@ final class RequestQueueStore {
         defer { lock.unlock() }
 
         if !requests.isEmpty {
-            logger?.d(Self.module, "flush", "request queue is being flushed, [\(requests.count)] queued request(s) will be dropped")
+            logger?.d(Self.module, "flush", "the request queue is being emptied and everything still in it is dropped, droppedRequestCount: [\(requests.count)]")
         }
         requests.removeAll()
     }
@@ -151,21 +166,22 @@ final class RequestQueueStore {
         lock.lock()
         defer { lock.unlock() }
 
-        logger?.d(Self.module, "replaceTemporaryDeviceIDs", "replacing the temporary device ID in the queued requests, queuedRequestCount: [\(requests.count)]")
-
         let temporaryID = "&\(QS.deviceID)=\(TemporaryDeviceID.value)"
         let realID = "&\(QS.deviceID)=\(deviceID.urlEscaped)"
         let temporaryType = "&\(QS.deviceIDType)=\(DeviceIDType.temporary.wireValue)"
         let realType = "&\(QS.deviceIDType)=\(typeValue)"
 
+        var replacedCount = 0
         isBeingModified = true
         for index in requests.indices where requests[index].contains(temporaryID) {
-            logger?.v(Self.module, "replaceTemporaryDeviceIDs", "a queued request with the temporary device ID is replaced with the real device ID, requestIndex: [\(index)]")
             requests[index] = requests[index]
                 .replacingOccurrences(of: temporaryID, with: realID)
                 .replacingOccurrences(of: temporaryType, with: realType)
+            replacedCount += 1
         }
         isBeingModified = false
+
+        logger?.d(Self.module, "replaceTemporaryDeviceIDs", "queued requests carrying the temporary device ID now carry the real one, replacedRequestCount: [\(replacedCount)], queuedRequestCount: [\(requests.count)], deviceIDType: [\(typeValue)]")
     }
 
     /// Rewrites queued requests recorded under a different app key so they report
@@ -174,18 +190,24 @@ final class RequestQueueStore {
         lock.lock()
         defer { lock.unlock() }
 
-        logger?.d(Self.module, "replaceAllAppKeys", "replacing different app keys in the queued requests, queuedRequestCount: [\(requests.count)]")
-
         let escaped = appKey.urlEscaped
+        var replacedCount = 0
+        var withoutAppKeyCount = 0
         isBeingModified = true
         for index in requests.indices {
-            guard let existing = Self.appKey(in: requests[index]), existing != escaped else { continue }
-            logger?.v(Self.module, "replaceAllAppKeys", "a queued request with a different app key is replaced with the current app key, requestIndex: [\(index)]")
+            guard let existing = Self.appKey(in: requests[index]) else {
+                withoutAppKeyCount += 1
+                continue
+            }
+            guard existing != escaped else { continue }
             requests[index] = requests[index].replacingOccurrences(
                 of: "\(QS.appKey)=\(existing)",
                 with: "\(QS.appKey)=\(escaped)")
+            replacedCount += 1
         }
         isBeingModified = false
+
+        logger?.d(Self.module, "replaceAllAppKeys", "queued requests recorded under another app key now carry the current one, replacedRequestCount: [\(replacedCount)], requestsWithoutAnAppKey: [\(withoutAppKeyCount)], queuedRequestCount: [\(requests.count)]")
     }
 
     /// Drops queued requests recorded under a different app key.
@@ -196,17 +218,11 @@ final class RequestQueueStore {
         let before = requests.count
         let escaped = appKey.urlEscaped
         isBeingModified = true
-        requests = requests.filter { request in
-            let isSame = Self.appKey(in: request) == escaped
-            if !isSame {
-                logger?.v(Self.module, "removeDifferentAppKeys", "a queued request with a different app key will be dropped")
-            }
-            return isSame
-        }
+        requests = requests.filter { Self.appKey(in: $0) == escaped }
         isBeingModified = false
 
         if before > requests.count {
-            logger?.w(Self.module, "removeDifferentAppKeys", "dropped [\(before - requests.count)] queued request(s) with a different app key, remainingRequestCount: [\(requests.count)]")
+            logger?.d(Self.module, "removeDifferentAppKeys", "queued requests recorded under another app key are dropped, droppedRequestCount: [\(before - requests.count)], remainingRequestCount: [\(requests.count)]")
         }
     }
 
@@ -220,8 +236,12 @@ final class RequestQueueStore {
     /// Whether a request is past the configured drop age. Always `false` when age
     /// based dropping is off.
     func isOldRequest(_ queryString: String) -> Bool {
-        guard requestDropAgeHours > 0 else { return false }
-        return isOldRequestInternal(queryString)
+        guard requestDropAgeHours > 0, isOldRequestInternal(queryString) else { return false }
+
+        // Only the single request path says this. The bulk drop below runs the
+        // same check over the whole queue and reports one count instead.
+        logger?.d(Self.module, "isOldRequest", "a queued request is past the configured drop age, requestAgeHours: [\((queryString.requestAgeSeconds / 3600.0).logSeconds)], requestDropAgeHours: [\(requestDropAgeHours)], queryStringLength: [\(queryString.count)]")
+        return true
     }
 
     private func removeOldAgeRequestsLocked() {
@@ -233,7 +253,7 @@ final class RequestQueueStore {
         isBeingModified = false
 
         if before > requests.count {
-            logger?.d(Self.module, "removeOldAgeRequests", "dropped [\(before - requests.count)] old age queued request(s), requestDropAgeHours: [\(requestDropAgeHours)], remainingRequestCount: [\(requests.count)]")
+            logger?.d(Self.module, "removeOldAgeRequests", "queued requests past the configured drop age are dropped, droppedRequestCount: [\(before - requests.count)], requestDropAgeHours: [\(requestDropAgeHours)], remainingRequestCount: [\(requests.count)]")
         }
     }
 
@@ -255,12 +275,7 @@ final class RequestQueueStore {
     }
 
     private func isOldRequestInternal(_ queryString: String) -> Bool {
-        let ageHours = queryString.requestAgeSeconds / 3600.0
-        let isOld = ageHours >= Double(requestDropAgeHours)
-        if isOld {
-            logger?.v(Self.module, "isOldRequest", "a queued request exceeded the request drop age and will be dropped, requestAgeHours: [\(String(format: "%.2f", ageHours))], requestDropAgeHours: [\(requestDropAgeHours)]")
-        }
-        return isOld
+        queryString.requestAgeSeconds / 3600.0 >= Double(requestDropAgeHours)
     }
 
     // MARK: - Persistence
@@ -312,17 +327,39 @@ final class RequestQueueStore {
 
         let payload: [String: Any] = [PersistencyKey.queuedRequests: snapshot]
 
+        let data: Data
         do {
-            let data = try NSKeyedArchiver.archivedData(withRootObject: payload, requiringSecureCoding: false)
-            let success = (try? data.write(to: fileURL, options: .atomic)) != nil
-            logger?.d(Self.module, "saveSync", "request queue is written to the persistent storage file, success: [\(success)], dataSize: [\(data.count)], requestCount: [\(snapshot.count)]")
+            data = try NSKeyedArchiver.archivedData(withRootObject: payload, requiringSecureCoding: false)
         } catch {
-            logger?.d(Self.module, "saveSync", "writing the request queue to the persistent storage file failed, requestCount: [\(snapshot.count)], error: [\(error.localizedDescription)]")
+            let failure = error as NSError
+            logger?.d(Self.module, "saveSync", "the request queue could not be archived and nothing is written, the queue stays in memory only, requestCount: [\(snapshot.count)], errorDomain: [\(failure.domain)], errorCode: [\(failure.code)], error: [\(failure.localizedDescription)]")
+            return
+        }
+
+        do {
+            try data.write(to: fileURL, options: .atomic)
+            logger?.d(Self.module, "saveSync", "request queue is written to the persistent storage file, dataSize: [\(data.count)], requestCount: [\(snapshot.count)]")
+        } catch {
+            let failure = error as NSError
+            logger?.d(Self.module, "saveSync", "writing the request queue to the persistent storage file failed, the queue stays in memory only, requestCount: [\(snapshot.count)], dataSize: [\(data.count)], path: [\(fileURL.path)], errorDomain: [\(failure.domain)], errorCode: [\(failure.code)], error: [\(failure.localizedDescription)]")
         }
     }
 
     private func load() {
-        guard let data = try? Data(contentsOf: fileURL) else { return }
+        let data: Data
+        do {
+            data = try Data(contentsOf: fileURL)
+        } catch {
+            // Nothing to read is how every first launch starts, so the two are
+            // told apart: a file that exists and will not open is the incident.
+            let failure = error as NSError
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                logger?.d(Self.module, "load", "the persistent storage file exists but could not be opened, the queue starts empty, path: [\(fileURL.path)], errorDomain: [\(failure.domain)], errorCode: [\(failure.code)], error: [\(failure.localizedDescription)]")
+            } else {
+                logger?.d(Self.module, "load", "no persistent storage file yet, the queue starts empty, path: [\(fileURL.path)]")
+            }
+            return
+        }
 
         do {
             let root = try CountlyArchive.decodeRoot(from: data)
@@ -331,9 +368,12 @@ final class RequestQueueStore {
                let stored = dictionary[PersistencyKey.queuedRequests] as? [String] {
                 requests = stored
                 logger?.d(Self.module, "load", "persistent storage file is loaded, dataSize: [\(data.count)], restoredRequestCount: [\(requests.count)]")
+            } else {
+                logger?.d(Self.module, "load", "the persistent storage file does not hold a request queue and will be treated as empty, dataSize: [\(data.count)], rootType: [\(root.map { "\(type(of: $0))" } ?? "none")]")
             }
         } catch {
-            logger?.d(Self.module, "load", "persistent storage file could not be read and will be treated as empty, error: [\(error.localizedDescription)]")
+            let failure = error as NSError
+            logger?.d(Self.module, "load", "persistent storage file could not be read and will be treated as empty, dataSize: [\(data.count)], errorDomain: [\(failure.domain)], errorCode: [\(failure.code)], error: [\(failure.localizedDescription)]")
         }
     }
 
@@ -343,7 +383,18 @@ final class RequestQueueStore {
     /// asked for the data to be erased cannot re-create the file afterwards.
     func deleteFile() {
         writeQueue.sync {
-            try? FileManager.default.removeItem(at: fileURL)
+            guard FileManager.default.fileExists(atPath: fileURL.path) else {
+                logger?.d(Self.module, "deleteFile", "there is no persistent storage file of the request queue to delete, path: [\(fileURL.path)]")
+                return
+            }
+
+            do {
+                try FileManager.default.removeItem(at: fileURL)
+                logger?.d(Self.module, "deleteFile", "the persistent storage file of the request queue is deleted, path: [\(fileURL.path)]")
+            } catch {
+                let failure = error as NSError
+                logger?.d(Self.module, "deleteFile", "the persistent storage file of the request queue was not deleted, path: [\(fileURL.path)], errorDomain: [\(failure.domain)], errorCode: [\(failure.code)], error: [\(failure.localizedDescription)]")
+            }
         }
     }
 
