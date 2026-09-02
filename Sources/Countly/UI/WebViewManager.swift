@@ -447,11 +447,24 @@ final class WebViewManager: NSObject {
 
     /// Runs whatever the page asked for.
     private func handleAction(_ parameters: [String: Any]) {
+        let link = parameters["link"] as? String
+
+        // `close` arrives one of two ways, and both mean the same thing.
+        //
+        // Usually it is a parameter of its own. On a link action it is instead
+        // carried inside the link, as in `link=mailto:a@b.com?close=1`, because the
+        // page appends it to the address it wants opened. The query parser is right
+        // to leave it there: it splits on `&close=`, and that one is a `?close=`
+        // belonging to the URL. So the link is asked as well, or a call to action
+        // that opens something and dismisses itself only ever does the first half.
+        let closeParameter = (parameters["close"] as? String).map(Self.isTruthy) ?? false
+        let closeInLink = link.map(Self.closeRequested(in:)) ?? false
+
         // The action runs first: a closing call to action carries both its event
         // and `close`, and returning early would throw the event away.
         defer {
-            if let closeValue = parameters["close"] as? String, Self.isTruthy(closeValue) {
-                core.logger.d(Self.module, "handleAction", "the content asked to be closed")
+            if closeParameter || closeInLink {
+                core.logger.d(Self.module, "handleAction", "the content asked to be closed, asOwnParameter: [\(closeParameter)], carriedInTheLink: [\(closeInLink)]")
                 close()
             }
         }
@@ -467,8 +480,11 @@ final class WebViewManager: NSObject {
                 recordEvents(fromJSON: eventsJSON)
             }
         case "link":
-            if let link = parameters["link"] as? String {
-                openExternalLink(link)
+            if let link {
+                // Countly's own flag never reaches the target: a mail client or a
+                // deep link handler has no use for it, and it would show up as a
+                // stray parameter in whatever the link opens.
+                openExternalLink(Self.withoutCloseParameter(link))
             }
         case "resize_me":
             if let resizeJSON = parameters["resize_me"] as? String,

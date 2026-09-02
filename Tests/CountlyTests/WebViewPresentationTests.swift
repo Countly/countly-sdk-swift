@@ -636,6 +636,60 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         XCTAssertGreaterThan(size.width, 435, "a widget with no placement should fill")
     }
 
+
+    // MARK: - A link that also asks to close
+
+    /// A call to action that opens something and dismisses itself carries `close`
+    /// inside the link, not beside it: the page appends it to the address, so the
+    /// URL reads `mailto:a@b.com?close=1`.
+    ///
+    /// Regression test. Only a top-level `close` parameter used to be honoured, so
+    /// the mail client opened and the content stayed on screen behind it forever.
+    /// The query parser is not at fault and is deliberately left alone: it splits on
+    /// `&close=`, and this is a `?close=` that belongs to the URL.
+    func testALinkCarryingCloseInsideItDismissesTheContent() {
+        let countly = startInstance()
+        var handed: URL?
+        core(of: countly).config.content.contentURLHandler = { url in
+            handed = url
+            return true
+        }
+
+        var dismissed = false
+        let manager = present(countly, dismiss: { dismissed = true })
+        waitForLoad(manager)
+
+        navigate(manager, to: "https://countly_action_event?cly_x_action_event=1&action=link&link=mailto:a@b.com?close=1")
+
+        TestUtils.waitUntil("the content is taken down", timeout: TestUtils.webKitTimeout) { dismissed }
+
+        // And the flag is Countly's, so it does not travel on to the mail client.
+        XCTAssertEqual(handed?.absoluteString, "mailto:a@b.com")
+    }
+
+    /// The same link without the flag opens and leaves the content up, which is what
+    /// makes the flag mean something.
+    func testALinkWithoutCloseLeavesTheContentUp() {
+        let countly = startInstance()
+        var handed: URL?
+        core(of: countly).config.content.contentURLHandler = { url in
+            handed = url
+            return true
+        }
+
+        var dismissed = false
+        let manager = present(countly, dismiss: { dismissed = true })
+        waitForLoad(manager)
+
+        navigate(manager, to: "https://countly_action_event?cly_x_action_event=1&action=link&link=mailto:a@b.com")
+
+        TestUtils.waitUntil("the link is handed over", timeout: TestUtils.webKitTimeout) { handed != nil }
+        TestUtils.pump(0.4)
+
+        XCTAssertEqual(handed?.absoluteString, "mailto:a@b.com")
+        XCTAssertFalse(dismissed, "nothing asked for the content to close")
+    }
+
 }
 
 #if os(iOS) || os(visionOS)
