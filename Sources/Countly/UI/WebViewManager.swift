@@ -409,19 +409,37 @@ final class WebViewManager: NSObject {
             return
         }
 
-        let filled = CGRect(origin: .zero, size: backgroundView.effectiveSize)
+        let filled = CGRect(origin: .zero, size: containerSize)
         core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed and the page is re-laid out, frame: [\(filled.logValue)]")
         baseWebViewFrame = filled
         applySafeAreaPlacement()
     }
 
     /// Applies a size the page asked for, in the page's own coordinate space.
+    /// The space a page's `{x, y, w, h}` is measured against.
+    ///
+    /// Not the background view's own size on macOS. There the panel is shrunk to
+    /// the page so the rest of the screen stays clickable, and the background view
+    /// shrinks with it, so reading it back would measure the next request against
+    /// the page rather than the screen and walk the page into a corner one resize
+    /// at a time. The screen is the space the server placed against and the space
+    /// every request means.
+    private var containerSize: CGSize {
+        #if os(macOS)
+        return ContentGeometry.windowSize(displayOption: core.config.content.webViewDisplayOption)
+        #else
+        return backgroundView?.effectiveSize ?? .zero
+        #endif
+    }
+
     private func resize(with parameters: [String: Any]) {
-        guard let backgroundView, webView != nil else { return }
+        guard backgroundView != nil, webView != nil else { return }
+
+        let container = containerSize
 
         // The page describes where it wants to sit as a fraction of the screen,
         // under the key matching the current orientation.
-        let isPortrait = backgroundView.effectiveSize.height >= backgroundView.effectiveSize.width
+        let isPortrait = container.height >= container.width
         let preferred = isPortrait ? "p" : "l"
         let fallback = isPortrait ? "l" : "p"
 
@@ -433,10 +451,10 @@ final class WebViewManager: NSObject {
                 ?? (parameters[fallback] as? [String: Any]) else { return }
 
         let usedFallback = parameters[preferred] == nil
-        let frame = CGRect(contentGeometry: geometry, container: backgroundView.effectiveSize)
+        let frame = CGRect(contentGeometry: geometry, container: container)
 
         core.logger.d(Self.module, "resize", "the page asked to be resized, orientation: [\(isPortrait ? "portrait" : "landscape")], orientationKey: [\(usedFallback ? fallback : preferred)], usedFallbackOrientation: [\(usedFallback)], x: [\(frame.origin.x.logValue)], y: [\(frame.origin.y.logValue)], width: [\(frame.width.logValue)], height: [\(frame.height.logValue)]")
-        core.logger.d(Self.module, "resize", "resize container detail, containerSize: [\(backgroundView.effectiveSize.logValue)], resizeGeometry: [\(parameters)]")
+        core.logger.d(Self.module, "resize", "resize container detail, containerSize: [\(container.logValue)], resizeGeometry: [\(parameters)]")
 
         baseWebViewFrame = frame
         hasExplicitPlacement = true
