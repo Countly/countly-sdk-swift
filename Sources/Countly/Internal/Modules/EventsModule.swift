@@ -343,9 +343,15 @@ final class EventsModule: ModuleBase {
     /// once the server has it is what makes a journey react to the trigger.
     private func journeyTriggerCallback() -> RequestCallback {
         { [weak self] _, success in
-            guard success, let self else { return }
-            DispatchQueue.main.async {
-                self.core.modules.content.refreshContentZoneForJourneyTrigger()
+            guard success else { return }
+            // `weak` on the hop as well as on the callback, which is not belt and
+            // braces. Binding `self` in the outer closure and hopping would capture
+            // it strongly, keeping this module alive on the main queue while the
+            // `SDKCore` that owns it is released by a halt. `core` is `unowned`, so
+            // the block would then read a deallocated object and trap, taking the
+            // host application down from a request that had already been answered.
+            DispatchQueue.main.async { [weak self] in
+                self?.core.modules.content.refreshContentZoneForJourneyTrigger()
             }
         }
     }
