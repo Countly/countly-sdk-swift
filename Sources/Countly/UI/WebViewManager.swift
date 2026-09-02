@@ -107,6 +107,9 @@ final class WebViewManager: NSObject {
     /// resize.
     private var isSDKPlacedWidget = false
 
+    /// The deadline that shows a widget which never stated its size.
+    private var pendingFirstFit: DispatchWorkItem?
+
     #if os(macOS)
     /// Observers for the host window moving or resizing.
     ///
@@ -362,6 +365,12 @@ final class WebViewManager: NSObject {
         }
 
         applySafeAreaPlacement()
+
+        // The page is told the new viewport so it can ask for a size against it.
+        // A widget's own answer supersedes the SDK's layout, and a content page
+        // that reflows gets the chance to say so, which is the whole point of the
+        // exchange: the SDK never guesses a size it can ask for.
+        reportSurfaceToPage()
     }
     #endif
 
@@ -404,6 +413,38 @@ final class WebViewManager: NSObject {
         }
 
         onMainThread(finish)
+    }
+
+    /// How long a widget is held back waiting for the page to state its size.
+    ///
+    /// Short enough not to be felt, long enough for a page that is going to answer
+    /// to have answered: the answer is a `postMessage` round trip inside a page that
+    /// has already loaded, not a network call.
+    private static let firstFitDeadline: TimeInterval = 0.35
+
+    /// Waits for the page's first `resize_me` before showing it, so the card is
+    /// placed once rather than placed and then moved in front of the user.
+    private func awaitFirstFitThenAppear() {
+        guard !hasAppeared, pendingFirstFit == nil else { return }
+
+        let deadline = DispatchWorkItem { [weak self] in
+            guard let self, !self.hasAppeared else { return }
+            self.pendingFirstFit = nil
+            self.core.logger.d(Self.module, "awaitFirstFitThenAppear", "the page did not ask for a size within the deadline, so it is shown at the size its type allows")
+            self.reportAppearance()
+        }
+        pendingFirstFit = deadline
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.firstFitDeadline, execute: deadline)
+    }
+
+    /// Called when the page states its size, so it can be shown at once rather than
+    /// waiting out the deadline.
+    private func firstFitArrived() {
+        guard let pending = pendingFirstFit else { return }
+        pending.cancel()
+        pendingFirstFit = nil
+        core.logger.d(Self.module, "firstFitArrived", "the page asked for its size before the deadline, so it is shown already fitted")
+        reportAppearance()
     }
 
     private func reportAppearance() {
@@ -538,6 +579,9 @@ final class WebViewManager: NSObject {
         guard !hasExplicitPlacement else {
             core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed, the page keeps the placement the server gave it, frame: [\(baseWebViewFrame?.logValue ?? "none")]")
             applySafeAreaPlacement()
+            // Told anyway: the placement stands, but the room available changed and
+            // the page may want a different size within it.
+            reportSurfaceToPage()
             return
         }
 
@@ -545,6 +589,7 @@ final class WebViewManager: NSObject {
         core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed and the page is re-laid out, frame: [\(filled.logValue)], containerSize: [\(containerSize.logValue)]")
         baseWebViewFrame = filled
         applySafeAreaPlacement()
+        reportSurfaceToPage()
     }
 
     /// Applies a size the page asked for, in the page's own coordinate space.
@@ -594,6 +639,9 @@ final class WebViewManager: NSObject {
         // The page has said where it wants to be, so the SDK stops deciding.
         isSDKPlacedWidget = false
         applySafeAreaPlacement()
+
+        // If the widget was being held back for exactly this, show it now.
+        firstFitArrived()
     }
 
     // MARK: - Actions
@@ -1277,11 +1325,53 @@ extension WebViewManager: WKNavigationDelegate {
         cancelPendingReload(rearmDeadline: true)
         verifyResourceStatuses()
 
+        // The page can only work out its own card size once it knows the viewport,
+        // and it only listens for that after its own page has loaded.
+        reportSurfaceToPage()
+
         // A feedback widget renders itself as soon as it loads and never reports a
         // shown event, so loading is the only signal it has appeared.
+        //
+        // Revealed a moment later rather than now: the surface was just reported and
+        // the page answers it with a `resize_me`, so showing immediately would put
+        // the card on screen at the full box and then visibly jump it to its real
+        // size. Waiting for that answer means one placement and no movement. The
+        // deadline is what covers a page that never answers.
         if isFeedbackWidget {
-            reportAppearance()
+            awaitFirstFitThenAppear()
         }
+    }
+
+    /// Tells the page how much room it has.
+    ///
+    /// The page cannot know: it is handed a web view, not a window, and nothing in
+    /// the DOM says how big the SDK intends the card to be. Given the viewport it
+    /// answers with a `resize_me` carrying the size it actually wants, which is the
+    /// only way the SDK learns a widget needs 414 points rather than the 450 its
+    /// type allows. Without this the box is always the type's maximum and a shorter
+    /// card floats inside it.
+    ///
+    /// The message shape is the one every Countly SDK sends and every widget page
+    /// listens for.
+    private func reportSurfaceToPage() {
+        guard let webView else { return }
+
+        let size = surfaceSizeForPage()
+        core.logger.d(Self.module, "reportSurfaceToPage", "the page is told how much room it has, so it can ask for the size it wants, width: [\(size.width.logValue)], height: [\(size.height.logValue)]")
+
+        let script = "window.postMessage({type: 'resize', width: \(size.width), height: \(size.height)}, '*');"
+        webView.evaluateJavaScript(script) { [weak self] _, error in
+            guard let error else { return }
+            self?.core.logger.w(Self.module, "reportSurfaceToPage", "the surface could not be reported to the page, so it will size itself against the viewport it was given, error: [\(error.localizedDescription)]")
+        }
+    }
+
+    /// The size reported to the page, transposed for a page pinned to portrait the
+    /// same way the resolution sent to the server is.
+    private func surfaceSizeForPage() -> CGSize {
+        let size = containerSize
+        guard isPinnedToPortrait, size.width > size.height else { return size }
+        return CGSize(width: size.height, height: size.width)
     }
 
 
