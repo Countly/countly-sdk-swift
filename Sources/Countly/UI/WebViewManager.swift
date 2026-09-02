@@ -97,6 +97,16 @@ final class WebViewManager: NSObject {
     private var presentedWidgetType: FeedbackWidgetType?
     private var presentedWidgetPosition: String?
 
+    /// Whether the frame on screen is one `WidgetLayout` produced.
+    ///
+    /// Only such a frame may be recomputed when the surface changes, because only
+    /// such a frame is a function of the surface. A frame the caller passed in, or
+    /// one the page asked for through `resize_me`, is somebody else's decision and
+    /// recomputing it would throw that decision away: a banner the server placed at
+    /// 435x144 would silently become a 480x650 widget box on the first window
+    /// resize.
+    private var isSDKPlacedWidget = false
+
     #if os(macOS)
     /// Observers for the host window moving or resizing.
     ///
@@ -250,6 +260,7 @@ final class WebViewManager: NSObject {
         if let frame {
             targetFrame = frame
         } else if isFeedbackWidget {
+            isSDKPlacedWidget = true
             targetFrame = WidgetLayout.resolve(type: widgetType,
                                                position: widgetPosition,
                                                surface: surface)
@@ -340,14 +351,14 @@ final class WebViewManager: NSObject {
         // Content was placed by the server against the surface it reported at fetch
         // time; re-deriving that here would invent coordinates the server never
         // sent, so it keeps its frame and is only re-converted to the new position.
-        if isFeedbackWidget {
+        if isSDKPlacedWidget {
             let frame = WidgetLayout.resolve(type: presentedWidgetType,
                                              position: presentedWidgetPosition,
                                              surface: surface)
             core.logger.d(Self.module, "surfaceDidChange", "the surface changed and the widget is laid out again, widgetType: [\(presentedWidgetType?.wireName ?? "unknown")], frame: [\(frame.logValue)], surface: [\(surface.logValue)]")
             baseWebViewFrame = frame
         } else {
-            core.logger.d(Self.module, "surfaceDidChange", "the surface changed and the content is placed again at the frame the server gave it, frame: [\(baseWebViewFrame?.logValue ?? "none")], surface: [\(surface.logValue)]")
+            core.logger.d(Self.module, "surfaceDidChange", "the surface changed and the page keeps the frame it was given, because the SDK did not choose it, frame: [\(baseWebViewFrame?.logValue ?? "none")], surface: [\(surface.logValue)]")
         }
 
         applySafeAreaPlacement()
@@ -580,6 +591,8 @@ final class WebViewManager: NSObject {
 
         baseWebViewFrame = frame
         hasExplicitPlacement = true
+        // The page has said where it wants to be, so the SDK stops deciding.
+        isSDKPlacedWidget = false
         applySafeAreaPlacement()
     }
 
