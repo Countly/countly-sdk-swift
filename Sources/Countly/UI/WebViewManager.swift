@@ -369,6 +369,7 @@ final class WebViewManager: NSObject {
         // to the page is what leaves the rest of the screen alone.
         guard let window else { return }
         let screenArea = ScreenReader.surfaceFrame(core.config.content.presentationSurface)
+        core.logger.d(Self.module, "applySafeAreaPlacement", "the presentation surface was resolved, \(ScreenReader.surfaceDescription(core.config.content.presentationSurface))")
         // `placed` is measured from the top of that area, because the background
         // view is flipped; an AppKit window is placed from the bottom of the screen.
         let target = CGRect(x: screenArea.origin.x + placed.origin.x,

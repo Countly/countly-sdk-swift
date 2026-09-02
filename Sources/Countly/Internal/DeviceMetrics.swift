@@ -451,11 +451,31 @@ enum ScreenReader {
     /// The overlay sets `canBecomeMain = false`, so testing that flag skips the
     /// overlay itself along with any other utility panel. Without it the answer
     /// changes once content is on screen, because the overlay can become key.
-    private static var hostWindow: NSWindow? {
+    static var hostWindow: NSWindow? {
         let application = NSApplication.shared
-        if let key = application.keyWindow, key.canBecomeMain { return key }
-        if let main = application.mainWindow { return main }
-        return application.windows.first { $0.isVisible && $0.canBecomeMain }
+
+        // A window worth measuring against: on screen, big enough to be real, and
+        // not a panel. `NSPanel` covers the SDK's own overlay along with every
+        // inspector, tooltip and menu AppKit puts in `windows`, and `canBecomeMain`
+        // alone lets some of those through. A window smaller than a hundred points
+        // either way is a helper of some kind, not the application.
+        func isHost(_ window: NSWindow) -> Bool {
+            guard window.isVisible, !(window is NSPanel), window.canBecomeMain else { return false }
+            return window.frame.width >= 100 && window.frame.height >= 100
+        }
+
+        // `mainWindow` first, because that is AppKit's own answer to "which window
+        // is this application", and it stays right while a sheet, a popover or the
+        // SDK's overlay holds key. Asking `keyWindow` first meant that whatever had
+        // focus at the moment content appeared decided the surface.
+        if let main = application.mainWindow, isHost(main) { return main }
+        if let key = application.keyWindow, isHost(key) { return key }
+
+        // Largest rather than first: `windows` is in no order worth relying on, and
+        // when nothing is main or key the biggest window is the application.
+        return application.windows
+            .filter(isHost)
+            .max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
     }
 
     /// The screen carrying the application's own window.
@@ -516,6 +536,22 @@ enum ScreenReader {
             return overlayFrame
         }
         return window.frame
+    }
+
+    /// What the surface resolved to and why, for a log line.
+    ///
+    /// The choice is a guess about which window is "the application", and when it
+    /// guesses wrong the only symptom is content in the wrong place, so the guess
+    /// is reported rather than left to be inferred.
+    static func surfaceDescription(_ surface: PresentationSurface) -> String {
+        let requested = surface == .applicationWindow ? "applicationWindow" : "screen"
+        guard surface == .applicationWindow else {
+            return "requested: [\(requested)], screen: [\(overlayFrame.logValue)]"
+        }
+        guard let window = hostWindow else {
+            return "requested: [\(requested)], resolved: [screen, no host window found], screen: [\(overlayFrame.logValue)]"
+        }
+        return "requested: [\(requested)], hostWindow: [\(window.title)], windowFrame: [\(window.frame.logValue)], isMain: [\(window === NSApplication.shared.mainWindow)], isKey: [\(window === NSApplication.shared.keyWindow)], windowCount: [\(NSApplication.shared.windows.count)]"
     }
 }
 #endif
