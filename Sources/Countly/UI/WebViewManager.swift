@@ -91,6 +91,29 @@ final class WebViewManager: NSObject {
     /// own, which is every feedback widget, is re-filled when the interface resizes.
     private var hasExplicitPlacement = false
 
+    /// What the SDK is showing, kept so its placement can be worked out again when
+    /// the surface changes. A widget's frame is derived from the surface, so a
+    /// surface that resizes invalidates it.
+    private var presentedWidgetType: FeedbackWidgetType?
+    private var presentedWidgetPosition: String?
+
+    #if os(macOS)
+    /// Observers for the host window moving or resizing.
+    ///
+    /// The overlay is a window of its own, so nothing about the application's window
+    /// reaches it: `viewDidLayout` fires for the panel, and the panel does not
+    /// change when the window behind it does. Without these a widget laid out for
+    /// the window keeps the size and position the window had when it appeared, and
+    /// content shown on one screen stays there after the window is dragged to
+    /// another.
+    private var surfaceObservers: [NSObjectProtocol] = []
+
+    /// What the surface was when the placement was last worked out, so a
+    /// notification that changed nothing relevant costs nothing.
+    private var lastKnownSurfaceSize: CGSize = .zero
+    private var lastKnownSurfaceFrame: CGRect = .zero
+    #endif
+
     /// Fires when a content page has not reported itself shown in time.
     private var stallTimer: Timer?
 
@@ -148,6 +171,8 @@ final class WebViewManager: NSObject {
         }
 
         isFeedbackWidget = url.path.contains(Endpoint.feedback)
+        presentedWidgetType = widgetType
+        presentedWidgetPosition = widgetPosition
         isPinnedToPortrait = !isFeedbackWidget && core.config.content.disableRotation
 
         // Host and path only: the query string carries the app key and device ID.
@@ -176,6 +201,10 @@ final class WebViewManager: NSObject {
             self?.handleInterfaceSizeChange()
         }
         overlayWindow.rootViewController = controller
+
+        #if os(macOS)
+        observeSurfaceChanges()
+        #endif
 
         let background = PassThroughBackgroundView(frame: controller.view.bounds)
         #if os(macOS)
@@ -275,9 +304,66 @@ final class WebViewManager: NSObject {
     }
 
     /// Takes the page off screen and reports the dismissal once.
+    #if os(macOS)
+    /// Follows the application's window, so what the SDK draws stays where it
+    /// belongs when that window is resized or dragged.
+    ///
+    /// Every window is observed rather than only the host: which window counts as
+    /// the host can change while content is up, and the notifications are cheap.
+    /// The work itself is skipped unless the surface actually moved.
+    private func observeSurfaceChanges() {
+        let recompute: (Notification) -> Void = { [weak self] _ in
+            self?.surfaceDidChange()
+        }
+
+        for name in [NSWindow.didResizeNotification, NSWindow.didMoveNotification] {
+            surfaceObservers.append(
+                NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { note in
+                    recompute(note)
+                })
+        }
+    }
+
+    /// Re-derives the placement after the surface moved or changed size.
+    private func surfaceDidChange() {
+        guard !isClosed, webView != nil else { return }
+
+        let surface = containerSize
+        guard surface != lastKnownSurfaceSize || ScreenReader.surfaceFrame(withinApp: core.config.content.showWidgetsWithinApp) != lastKnownSurfaceFrame else {
+            return
+        }
+
+        lastKnownSurfaceSize = surface
+        lastKnownSurfaceFrame = ScreenReader.surfaceFrame(withinApp: core.config.content.showWidgetsWithinApp)
+
+        // A widget's frame is a function of the surface, so it is worked out again.
+        // Content was placed by the server against the surface it reported at fetch
+        // time; re-deriving that here would invent coordinates the server never
+        // sent, so it keeps its frame and is only re-converted to the new position.
+        if isFeedbackWidget {
+            let frame = WidgetLayout.resolve(type: presentedWidgetType,
+                                             position: presentedWidgetPosition,
+                                             surface: surface)
+            core.logger.d(Self.module, "surfaceDidChange", "the surface changed and the widget is laid out again, widgetType: [\(presentedWidgetType?.wireName ?? "unknown")], frame: [\(frame.logValue)], surface: [\(surface.logValue)]")
+            baseWebViewFrame = frame
+        } else {
+            core.logger.d(Self.module, "surfaceDidChange", "the surface changed and the content is placed again at the frame the server gave it, frame: [\(baseWebViewFrame?.logValue ?? "none")], surface: [\(surface.logValue)]")
+        }
+
+        applySafeAreaPlacement()
+    }
+    #endif
+
     func close() {
         guard !isClosed else { return }
         isClosed = true
+
+        #if os(macOS)
+        for observer in surfaceObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        surfaceObservers.removeAll()
+        #endif
 
         core.logger.d(Self.module, "close", "web view is being closed")
 
