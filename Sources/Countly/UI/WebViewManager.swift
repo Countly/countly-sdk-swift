@@ -70,6 +70,13 @@ final class WebViewManager: NSObject {
     /// bottom of the display one rotation at a time.
     private var baseWebViewFrame: CGRect?
 
+    /// Set when the caller supplied a frame, which means the server placed this
+    /// page deliberately rather than asking for one that fills the screen.
+    ///
+    /// A placed page must survive a re-layout. Only a page with no placement of its
+    /// own, which is every feedback widget, is re-filled when the interface resizes.
+    private var hasExplicitPlacement = false
+
     /// Fires when a content page has not reported itself shown in time.
     private var stallTimer: Timer?
 
@@ -181,6 +188,7 @@ final class WebViewManager: NSObject {
 
         let targetFrame = frame ?? background.bounds
         baseWebViewFrame = targetFrame
+        hasExplicitPlacement = frame != nil
         core.logger.d(Self.module, "present", "the presentation frames were computed, webViewFrame: [\(targetFrame.logValue)], backgroundFrame: [\(background.bounds.logValue)]")
 
         let web = WKWebView(frame: targetFrame, configuration: configuration)
@@ -315,16 +323,63 @@ final class WebViewManager: NSObject {
         let offset = ContentGeometry.placementOffset(displayOption: core.config.content.webViewDisplayOption)
         let placed = base.offsetBy(dx: offset.x, dy: offset.y)
 
+        #if os(macOS)
+        // The panel is shrunk to the page rather than the page being positioned
+        // inside a screen sized panel.
+        //
+        // A `UIWindow` whose hit test returns nil lets the touch fall through to the
+        // window beneath it, so on iOS a screen sized overlay costs the application
+        // nothing. AppKit has no such rule: a borderless panel owns every point in
+        // its frame whatever `hitTest` answers, so a screen sized panel makes the
+        // whole desktop unclickable while a 435x144 banner is up. Sizing the panel
+        // to the page is what leaves the rest of the screen alone.
+        guard let window else { return }
+        let screenArea = ScreenReader.overlayFrame
+        // `placed` is measured from the top of that area, because the background
+        // view is flipped; an AppKit window is placed from the bottom of the screen.
+        let target = CGRect(x: screenArea.origin.x + placed.origin.x,
+                            y: screenArea.origin.y + screenArea.height - placed.origin.y - placed.height,
+                            width: placed.width,
+                            height: placed.height)
+
+        // Compared against the window, not the web view: the web view always fills
+        // the panel here, so comparing its frame would never settle and every layout
+        // pass would schedule another.
+        guard target != window.frame else { return }
+
+        core.logger.d(Self.module, "applySafeAreaPlacement", "the panel is sized to the page so the rest of the screen stays interactive, baseFrame: [\(base.logValue)], offset: [\(offset.logValue)], pageFrame: [\(placed.logValue)], panelFrame: [\(target.logValue)], screenArea: [\(screenArea.logValue)]")
+        window.setFrame(target, display: true)
+        webView.frame = CGRect(origin: .zero, size: target.size)
+        backgroundView?.frame = CGRect(origin: .zero, size: target.size)
+        #else
         guard placed != webView.frame else { return }
 
         core.logger.d(Self.module, "applySafeAreaPlacement", "the page is placed clear of the safe area, baseFrame: [\(base.logValue)], offset: [\(offset.logValue)], frame: [\(placed.logValue)], safeAreaInsets: [\(ContentGeometry.safeAreaDescription)]")
         webView.frame = placed
+        #endif
+    }
+
+    /// Drives the re-layout the platform would deliver, so the suite can assert on
+    /// what a layout pass does to a placed page without waiting for a real one.
+    func simulateInterfaceSizeChangeForTesting() {
+        handleInterfaceSizeChange()
     }
 
     /// Re-lays the page out after a rotation, unless it is pinned to portrait.
     private func handleInterfaceSizeChange() {
         guard !isPinnedToPortrait else { return }
         guard let backgroundView, webView != nil else { return }
+
+        // A page the server placed keeps its placement. macOS calls this from
+        // `viewDidLayout`, which runs during the presentation itself, so filling
+        // here would throw the server's coordinates away before the page had even
+        // been seen: a 435x144 banner became the whole 3840x2130 screen. Only a
+        // page that asked to fill, which is every feedback widget, is re-filled.
+        guard !hasExplicitPlacement else {
+            core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed, the page keeps the placement the server gave it, frame: [\(baseWebViewFrame?.logValue ?? "none")]")
+            applySafeAreaPlacement()
+            return
+        }
 
         let filled = CGRect(origin: .zero, size: backgroundView.effectiveSize)
         core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed and the page is re-laid out, frame: [\(filled.logValue)]")
@@ -356,6 +411,7 @@ final class WebViewManager: NSObject {
         core.logger.d(Self.module, "resize", "resize container detail, containerSize: [\(backgroundView.effectiveSize.logValue)], resizeGeometry: [\(parameters)]")
 
         baseWebViewFrame = frame
+        hasExplicitPlacement = true
         applySafeAreaPlacement()
     }
 

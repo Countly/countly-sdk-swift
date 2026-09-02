@@ -585,6 +585,57 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
     }
     #endif
 
+
+    // MARK: - A placed page keeps its placement
+
+    /// The server places content deliberately: it returns a rect, and a banner that
+    /// was laid out as 435x144 in the corner has to stay 435x144 in the corner.
+    ///
+    /// Regression test. A re-layout used to replace that rect with one filling the
+    /// whole window, because the fill is what a feedback widget wants and the two
+    /// shared a path. On iOS the re-layout only runs on rotation so it was never
+    /// seen; on macOS `viewDidLayout` runs during the presentation itself, so a
+    /// placed banner was blown up to the full screen before it was ever displayed.
+    func testAPageTheServerPlacedIsNotResizedToFillTheWindow() {
+        let countly = startInstance()
+        let placement = CGRect(x: 16, y: 40, width: 435, height: 144)
+
+        let manager = present(countly, frame: placement)
+        waitForLoad(manager)
+
+        // The size change the platform delivers on its own during presentation, and
+        // again on any later layout pass.
+        onMain { manager.simulateInterfaceSizeChangeForTesting() }
+        TestUtils.pump(0.3)
+
+        guard let size = onMain({ self.page(of: manager)?.frame.size }) else {
+            XCTFail("the page should still be present")
+            return
+        }
+        XCTAssertEqual(size.width, placement.width, accuracy: 1,
+                       "the placed page was resized to fill the window")
+        XCTAssertEqual(size.height, placement.height, accuracy: 1,
+                       "the placed page was resized to fill the window")
+    }
+
+    /// The counterpart: a page with no placement of its own, which is every feedback
+    /// widget, still fills the window and must keep doing so.
+    func testAPageWithNoPlacementStillFillsTheWindow() {
+        let countly = startInstance()
+
+        let manager = present(countly)
+        waitForLoad(manager)
+
+        onMain { manager.simulateInterfaceSizeChangeForTesting() }
+        TestUtils.pump(0.3)
+
+        guard let size = onMain({ self.page(of: manager)?.frame.size }) else {
+            XCTFail("the page should still be present")
+            return
+        }
+        XCTAssertGreaterThan(size.width, 435, "a widget with no placement should fill")
+    }
+
 }
 
 #if os(iOS) || os(visionOS)
