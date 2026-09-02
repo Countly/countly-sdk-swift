@@ -138,6 +138,8 @@ final class WebViewManager: NSObject {
     ///   - dismiss: Called once the page has been taken off screen.
     func present(url: URL?,
                  frame: CGRect? = nil,
+                 widgetType: FeedbackWidgetType? = nil,
+                 widgetPosition: String? = nil,
                  appear: (() -> Void)?,
                  dismiss: (() -> Void)?) {
         guard let url else {
@@ -200,9 +202,23 @@ final class WebViewManager: NSObject {
         configuration.userContentController.add(proxy, name: ScriptMessage.resourceLoadError)
         configuration.userContentController.add(proxy, name: ScriptMessage.resourceVerifyResult)
 
-        let targetFrame = frame ?? background.bounds
+        // A widget is laid out by the SDK, because unlike a content page it never
+        // says where it wants to go and the server never says either. See
+        // `WidgetLayout`, which is the same placement the Java SDK applies.
+        let targetFrame: CGRect
+        if let frame {
+            targetFrame = frame
+        } else if isFeedbackWidget {
+            targetFrame = WidgetLayout.resolve(type: widgetType,
+                                               position: widgetPosition,
+                                               surface: background.bounds.size)
+            core.logger.d(Self.module, "present", "the widget is placed by the SDK, widgetType: [\(widgetType?.wireName ?? "unknown")], appearancePosition: [\(widgetPosition ?? "none")], frame: [\(targetFrame.logValue)], surface: [\(background.bounds.size.logValue)]")
+        } else {
+            targetFrame = background.bounds
+        }
         baseWebViewFrame = targetFrame
-        hasExplicitPlacement = frame != nil
+        // A widget the SDK placed is placed, so a layout pass must not refill it.
+        hasExplicitPlacement = frame != nil || isFeedbackWidget
         core.logger.d(Self.module, "present", "the presentation frames were computed, webViewFrame: [\(targetFrame.logValue)], backgroundFrame: [\(background.bounds.logValue)]")
 
         let web = WKWebView(frame: targetFrame, configuration: configuration)
@@ -1151,101 +1167,10 @@ extension WebViewManager: WKNavigationDelegate {
         // A feedback widget renders itself as soon as it loads and never reports a
         // shown event, so loading is the only signal it has appeared.
         if isFeedbackWidget {
-            measureAndPlace()
             reportAppearance()
         }
     }
 
-    /// Asks a widget page how big it actually drew itself, and places it there.
-    ///
-    /// A widget page is handed the whole window and never sends `resize_me`, so
-    /// nothing sizes it. On the web nothing needs to: the page is in an iframe
-    /// inside a wrapper the server's stylesheet has already sized, so it renders
-    /// into a small viewport and its CSS looks right. Native has no wrapper, so the
-    /// page lays out against the entire screen.
-    ///
-    /// Rather than pick a size, this asks the page. The measurement is the union of
-    /// what the page actually painted, so the answer comes from the page's own CSS:
-    /// a card with a `max-width` reports that width wherever it sits, and the widget
-    /// is then placed exactly there. A page that genuinely fills reports the whole
-    /// viewport and is left alone, which is the case this must not make worse.
-    private func measureAndPlace() {
-        guard let webView else { return }
-
-        webView.evaluateJavaScript(Self.measureContentScript) { [weak self] result, error in
-            guard let self else { return }
-
-            if let error {
-                self.core.logger.d(Self.module, "measureAndPlace", "the widget could not be measured and keeps the frame it was given, error: [\(error.localizedDescription)]")
-                return
-            }
-
-            guard let box = result as? [String: Any],
-                  let x = (box["x"] as? NSNumber)?.doubleValue,
-                  let y = (box["y"] as? NSNumber)?.doubleValue,
-                  let width = (box["w"] as? NSNumber)?.doubleValue,
-                  let height = (box["h"] as? NSNumber)?.doubleValue else {
-                self.core.logger.d(Self.module, "measureAndPlace", "the widget reported nothing measurable and keeps the frame it was given")
-                return
-            }
-
-            let container = self.containerSize
-            let measured = CGRect(x: x, y: y, width: width, height: height)
-
-            // A measurement is only worth acting on if it is smaller than what the
-            // page already has. Anything else is a page that fills, a page still
-            // laying out, or a measurement gone wrong, and the safe answer to all
-            // three is to leave it as it was.
-            guard measured.width > 0, measured.height > 0,
-                  measured.width < container.width || measured.height < container.height,
-                  measured.maxX <= container.width + 1, measured.maxY <= container.height + 1 else {
-                self.core.logger.d(Self.module, "measureAndPlace", "the widget measured as filling the window, so it is left as it is, measured: [\(measured.logValue)], containerSize: [\(container.logValue)]")
-                return
-            }
-
-            self.core.logger.i(Self.module, "measureAndPlace", "the widget reported the area it drew itself into and is placed there, frame: [\(measured.logValue)], containerSize: [\(container.logValue)]")
-            self.baseWebViewFrame = measured
-            self.hasExplicitPlacement = true
-            self.applySafeAreaPlacement()
-        }
-    }
-
-    /// Returns the union of everything the page painted, in viewport coordinates.
-    ///
-    /// Elements that span the whole viewport are skipped: they are the scaffolding a
-    /// page wraps around its content, and including them would always report the
-    /// full window and make the measurement useless. What remains is the widget the
-    /// page drew, wherever its own CSS put it.
-    private static let measureContentScript = """
-    (function () {
-        var body = document.body;
-        if (!body) { return null; }
-
-        var vw = window.innerWidth, vh = window.innerHeight;
-        var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity, found = false;
-
-        var all = body.querySelectorAll('*');
-        for (var i = 0; i < all.length; i++) {
-            var el = all[i];
-            var style = window.getComputedStyle(el);
-            if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) === 0) {
-                continue;
-            }
-            var r = el.getBoundingClientRect();
-            if (r.width <= 0 || r.height <= 0) { continue; }
-            if (r.width >= vw && r.height >= vh) { continue; }
-
-            found = true;
-            if (r.left < minX) { minX = r.left; }
-            if (r.top < minY) { minY = r.top; }
-            if (r.right > maxX) { maxX = r.right; }
-            if (r.bottom > maxY) { maxY = r.bottom; }
-        }
-
-        if (!found) { return null; }
-        return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
-    })()
-    """
 
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {

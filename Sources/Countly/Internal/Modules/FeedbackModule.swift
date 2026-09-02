@@ -200,6 +200,8 @@ final class FeedbackModule: ModuleBase {
             // would close the cycle and leak the web view, the overlay window and
             // the module itself for the life of the process.
             manager.present(url: url,
+                            widgetType: widget.type,
+                            widgetPosition: widget.position,
                             appear: { [weak self] in
                                 self?.logI("present", "widget shown, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
                                 callback?(.appeared)

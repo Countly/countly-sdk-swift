@@ -100,14 +100,6 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         TestUtils.pump(0.3)
     }
 
-    /// Replaces the page with markup of the suite's choosing, so a test can decide
-    /// what the widget "drew" and assert on where the SDK then puts it.
-    private func loadHTML(_ manager: WebViewManager, _ html: String) {
-        onMain { self.page(of: manager)?.loadHTMLString(html, baseURL: nil) }
-        // The measurement runs from `didFinish`, so the load has to complete first.
-        TestUtils.pump(1.0)
-    }
-
     private func waitForLoad(_ manager: WebViewManager) {
         TestUtils.waitUntil("the page finishes loading", timeout: TestUtils.webKitTimeout) {
             guard let page = self.page(of: manager) else { return false }
@@ -724,69 +716,6 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
 
 
 
-    // MARK: - Measuring what a widget actually drew
-
-    /// A widget page is handed the whole window and never asks to be resized, so on
-    /// a screen far larger than it was drawn for it lays out against a viewport it
-    /// was never designed for. Rather than pick a size, the SDK asks the page how
-    /// big it made itself and places it there, so the answer comes from the page's
-    /// own CSS.
-    func testAWidgetIsPlacedWhereItActuallyDrewItself() throws {
-        let countly = startInstance()
-        let manager = present(countly, url: "https://example.com/feedback/nps")
-        waitForLoad(manager)
-
-        let container = onMain { manager.containerSizeForTesting }
-        try XCTSkipUnless(container.width > 400 && container.height > 300,
-                          "this window is too small for the measurement to differ from a fill")
-
-        // A page whose content is a fixed box, which is what a widget with a
-        // `max-width` card looks like to the measurement.
-        loadHTML(manager, """
-        <html><body style="margin:0">
-          <div style="position:absolute;left:40px;top:60px;width:300px;height:200px;background:#333"></div>
-        </body></html>
-        """)
-
-        TestUtils.waitUntil("the widget is placed where it drew itself",
-                            timeout: TestUtils.webKitTimeout) {
-            (onMain { manager.placedFrameForTesting?.width } ?? 0) <= 320
-        }
-
-        guard let frame = onMain({ manager.placedFrameForTesting }) else {
-            XCTFail("the widget should have been placed")
-            return
-        }
-        XCTAssertEqual(frame.width, 300, accuracy: 2)
-        XCTAssertEqual(frame.height, 200, accuracy: 2)
-        XCTAssertEqual(frame.origin.x, 40, accuracy: 2)
-        XCTAssertEqual(frame.origin.y, 60, accuracy: 2)
-    }
-
-    /// A page that genuinely fills is left exactly as it was. The measurement exists
-    /// to catch a widget adrift in a huge viewport, and it must not shrink a page
-    /// that meant to cover the window.
-    func testAWidgetThatFillsTheWindowIsLeftAlone() {
-        let countly = startInstance()
-        let manager = present(countly, url: "https://example.com/feedback/nps")
-        waitForLoad(manager)
-
-        let container = onMain { manager.containerSizeForTesting }
-
-        loadHTML(manager, """
-        <html><body style="margin:0">
-          <div style="width:100%;height:100%;background:#333"></div>
-        </body></html>
-        """)
-        TestUtils.pump(1.0)
-
-        guard let frame = onMain({ manager.placedFrameForTesting }) else {
-            XCTFail("the page should still be present")
-            return
-        }
-        XCTAssertEqual(frame.width, container.width, accuracy: 1,
-                       "a page that fills should keep the whole window")
-    }
 
 }
 
