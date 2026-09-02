@@ -38,6 +38,20 @@ final class WebViewManager: NSObject {
     /// Marker that means "open this in the browser, not in the web view".
     private static let externalLinkMarker = "cly_x_int=1"
 
+    /// Schemes the web view renders itself. Everything else is the system's.
+    private static let webSchemes: Set<String> = ["http", "https"]
+
+    /// Schemes never handed to the system, whatever the page asks.
+    ///
+    /// `file` and `content` reach the device's own storage, `javascript` and `data`
+    /// execute or inject, and the rest are historic Android intent smuggling
+    /// vectors. A content page is remote input, so these are refused rather than
+    /// forwarded. Mirrors the block list Android applies in
+    /// `Utils.isWebContentSchemeAllowed`.
+    private static let refusedSchemes: Set<String> = [
+        "file", "content", "javascript", "data", "blob", "jar", "zip", "intent", "about",
+    ]
+
     /// Parameters whose values may themselves contain an unescaped `&`.
     private static let reservedKeys = ["action", "event", "resize_me", "close", "link"]
 
@@ -348,9 +362,23 @@ final class WebViewManager: NSObject {
         guard target != window.frame else { return }
 
         core.logger.d(Self.module, "applySafeAreaPlacement", "the panel is sized to the page so the rest of the screen stays interactive, baseFrame: [\(base.logValue)], offset: [\(offset.logValue)], pageFrame: [\(placed.logValue)], panelFrame: [\(target.logValue)], screenArea: [\(screenArea.logValue)]")
-        window.setFrame(target, display: true)
-        webView.frame = CGRect(origin: .zero, size: target.size)
-        backgroundView?.frame = CGRect(origin: .zero, size: target.size)
+
+        // Applied a turn later, never inline.
+        //
+        // This runs from `viewDidLayout`, and resizing a window lays its content out
+        // again, so setting the frame here starts a layout pass inside the one that
+        // is already running. AppKit calls that out with "not legal to call
+        // -layoutSubtreeIfNeeded on a view which is already being laid out" and the
+        // behaviour past that point is its own business. Deferring keeps the resize
+        // outside the pass; the equality guard above stops the next pass repeating it.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let window = self.window, let webView = self.webView else { return }
+            guard target != window.frame else { return }
+
+            window.setFrame(target, display: true)
+            webView.frame = CGRect(origin: .zero, size: target.size)
+            self.backgroundView?.frame = CGRect(origin: .zero, size: target.size)
+        }
         #else
         guard placed != webView.frame else { return }
 
@@ -944,7 +972,77 @@ extension WebViewManager: WKNavigationDelegate {
             return
         }
 
+        // A scheme the web view cannot render is a request for the system to take
+        // over: `mailto:`, `tel:`, `sms:`, or an application's own deep link. Left
+        // to `.allow` the navigation simply fails, the mail client never opens, and
+        // a `close` travelling with it is never seen, so the content stays on screen
+        // with nothing having happened.
+        if let scheme = navigationAction.request.url?.scheme?.lowercased(),
+           !Self.webSchemes.contains(scheme) {
+            guard !Self.refusedSchemes.contains(scheme) else {
+                core.logger.w(Self.module, "decidePolicyFor", "the navigation is refused, the scheme is not one a content page may hand to the system, scheme: [\(scheme)]")
+                decisionHandler(.cancel)
+                return
+            }
+
+            core.logger.i(Self.module, "decidePolicyFor", "the navigation uses a scheme the web view cannot render and is handed to the system, scheme: [\(scheme)]")
+            // `close` is the SDK's, not the scheme handler's. `mailto:` accepts only
+            // `subject`, `body`, `cc`, `bcc` and `to`, and Mail can refuse the whole
+            // URL over an unknown header rather than ignoring it, so the compose
+            // window never opens. Stripped for every scheme, because an application
+            // deep link has no reason to receive it either.
+            let external = Self.withoutCloseParameter(url)
+            if external != url {
+                core.logger.d(Self.module, "decidePolicyFor", "the SDK's close parameter is removed before the link is handed over, handedURL: [\(external)]")
+            }
+            openExternalLink(external)
+
+            if Self.closeRequested(in: url) {
+                core.logger.d(Self.module, "decidePolicyFor", "the link that was handed to the system also asked for the content to be closed")
+                close()
+            }
+
+            decisionHandler(.cancel)
+            return
+        }
+
         decisionHandler(.allow)
+    }
+
+    /// The URL without the SDK's own `close` parameter.
+    ///
+    /// Rebuilt by hand rather than through `URLComponents`, which reports no query
+    /// for the opaque schemes this is used with and would drop the rest of the URL
+    /// on the way back out.
+    static func withoutCloseParameter(_ urlString: String) -> String {
+        guard let mark = urlString.firstIndex(where: { $0 == "?" || $0 == "&" }) else { return urlString }
+
+        let head = String(urlString[urlString.startIndex..<mark])
+        let kept = urlString[urlString.index(after: mark)...]
+            .split(separator: "&", omittingEmptySubsequences: false)
+            .filter { pair in
+                let parts = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+                return !(parts.count == 2 && parts[0] == "close")
+            }
+
+        guard !kept.isEmpty else { return head }
+        return head + String(urlString[mark]) + kept.joined(separator: "&")
+    }
+
+    /// Whether a URL carries a truthy `close` in its query.
+    ///
+    /// Reads the raw string rather than `URLComponents`, which does not expose a
+    /// query for the opaque schemes this is used with: `mailto:a@b.com?close=1` has
+    /// no host and no path, and `URLComponents.queryItems` comes back nil for it.
+    static func closeRequested(in urlString: String) -> Bool {
+        guard let mark = urlString.firstIndex(where: { $0 == "?" || $0 == "&" }) else { return false }
+
+        for pair in urlString[urlString.index(after: mark)...].split(separator: "&") {
+            let parts = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2, parts[0] == "close" else { continue }
+            return isTruthy(String(parts[1]))
+        }
+        return false
     }
 
     func webView(_ webView: WKWebView,
