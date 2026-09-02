@@ -499,6 +499,24 @@ enum ScreenReader {
     static var overlayFrame: CGRect {
         activeScreen?.visibleFrame ?? .zero
     }
+
+    /// The area content is laid out and shown in, for the configured surface.
+    ///
+    /// The window's *frame* rather than its content rect: the overlay is a panel of
+    /// its own sitting over the application, not a view inside it, so what matters
+    /// is the region of desktop the application occupies.
+    ///
+    /// Falls back to the screen when the application has no window, which is an
+    /// agent or a menu bar application, and when the window is degenerate. A zero
+    /// sized surface would place content nowhere at all, and the screen is the
+    /// answer the SDK gave before this was configurable.
+    static func surfaceFrame(_ surface: PresentationSurface) -> CGRect {
+        guard surface == .applicationWindow else { return overlayFrame }
+        guard let window = hostWindow, window.frame.width > 1, window.frame.height > 1 else {
+            return overlayFrame
+        }
+        return window.frame
+    }
 }
 #endif
 

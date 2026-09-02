@@ -473,7 +473,8 @@ final class ContentModule: ModuleBase {
     /// is actually going to be given. See `ContentGeometry`.
     private func windowSize() -> CGSize {
         let displayOption = core.config.content.webViewDisplayOption
-        let size = ContentGeometry.windowSize(displayOption: displayOption)
+        let size = ContentGeometry.windowSize(displayOption: displayOption,
+                                              surface: core.config.content.presentationSurface)
 
         // Every part of the sum, not just its result. A page laid out against the
         // wrong size is the failure this path causes, and the result on its own

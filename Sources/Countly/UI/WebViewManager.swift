@@ -161,7 +161,11 @@ final class WebViewManager: NSObject {
         resourceRetryCount = 0
         cancelPendingReload()
 
+        #if os(macOS)
+        let overlayWindow = OverlayWindow(surfaceFrame: ScreenReader.surfaceFrame(core.config.content.presentationSurface))
+        #else
         let overlayWindow = OverlayWindow()
+        #endif
         let controller = WebViewController()
         #if !os(macOS)
         // The overlay is a window of its own, so the presentation style only
@@ -364,7 +368,7 @@ final class WebViewManager: NSObject {
         // whole desktop unclickable while a 435x144 banner is up. Sizing the panel
         // to the page is what leaves the rest of the screen alone.
         guard let window else { return }
-        let screenArea = ScreenReader.overlayFrame
+        let screenArea = ScreenReader.surfaceFrame(core.config.content.presentationSurface)
         // `placed` is measured from the top of that area, because the background
         // view is flipped; an AppKit window is placed from the bottom of the screen.
         let target = CGRect(x: screenArea.origin.x + placed.origin.x,
@@ -448,7 +452,8 @@ final class WebViewManager: NSObject {
     /// every request means.
     private var containerSize: CGSize {
         #if os(macOS)
-        return ContentGeometry.windowSize(displayOption: core.config.content.webViewDisplayOption)
+        return ContentGeometry.windowSize(displayOption: core.config.content.webViewDisplayOption,
+                                          surface: core.config.content.presentationSurface)
         #else
         return backgroundView?.effectiveSize ?? .zero
         #endif

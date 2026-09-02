@@ -102,11 +102,12 @@ import AppKit
 /// what keeps the application's own window key while content is on screen.
 final class OverlayWindow: NSPanel {
 
-    init() {
-        // `overlayFrame` rather than `screenBounds`: this rect positions the panel
-        // on the desktop, so it has to carry the active screen's origin or the panel
-        // lands on whichever display owns the global origin.
-        super.init(contentRect: ScreenReader.overlayFrame,
+    /// - Parameter surfaceFrame: the desktop region content is shown in, which is
+    ///   the screen or the application's own window depending on configuration.
+    ///   This rect positions the panel on the desktop, so it has to carry a real
+    ///   origin or the panel lands on whichever display owns the global origin.
+    init(surfaceFrame: CGRect) {
+        super.init(contentRect: surfaceFrame,
                    styleMask: [.borderless, .nonactivatingPanel],
                    backing: .buffered,
                    defer: false)
@@ -197,7 +198,11 @@ final class WebViewController: NSViewController {
     }
 
     override func loadView() {
-        let background = PassThroughBackgroundView(frame: ScreenReader.screenBounds)
+        // Not read from `view`: `loadView` is what creates it, so touching it here
+        // calls straight back into this method. The window resizes the content view
+        // to itself as soon as it is installed, and the autoresizing mask keeps it
+        // that way, so this initial frame only has to be non-degenerate.
+        let background = PassThroughBackgroundView(frame: ScreenReader.overlayFrame)
         background.wantsLayer = true
         background.layer?.backgroundColor = NSColor.clear.cgColor
         background.autoresizingMask = [NSView.AutoresizingMask.width, .height]

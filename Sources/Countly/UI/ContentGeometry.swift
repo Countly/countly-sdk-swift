@@ -24,11 +24,11 @@ enum ContentGeometry {
 
 #if os(macOS)
 
-    /// The overlay is a panel of its own and `ScreenReader.screenBounds` is already
-    /// the screen's visible frame, with the menu bar and the Dock taken out, so
-    /// there is nothing further to subtract.
-    static func windowSize(displayOption: WebViewDisplayOption) -> CGSize {
-        ScreenReader.screenBounds.size
+    /// The overlay is a panel of its own and the surface frame already has the menu
+    /// bar and the Dock taken out, so there is nothing further to subtract.
+    static func windowSize(displayOption: WebViewDisplayOption,
+                           surface: PresentationSurface = .screen) -> CGSize {
+        ScreenReader.surfaceFrame(surface).size
     }
 
     /// Nothing to clear: the size above had nothing removed from it.

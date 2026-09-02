@@ -574,7 +574,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         guard let screen = ScreenReader.activeScreen else {
             throw XCTSkip("no screen attached")
         }
-        let overlay = OverlayWindow()
+        let overlay = OverlayWindow(surfaceFrame: ScreenReader.surfaceFrame(.screen))
         defer { overlay.close() }
 
         // `NSWindow` may inset the frame it was asked for, so intersection is the
@@ -620,10 +620,14 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
 
     /// The counterpart: a page with no placement of its own still fills the window
     /// and must keep doing so, which is what distinguishes it from a placed page.
-    func testAPageWithNoPlacementStillFillsTheWindow() {
+    ///
+    /// Content rather than a widget, because the two now differ: a feedback widget
+    /// is placed by `WidgetLayout` and so counts as placed, while a content the
+    /// server sent no geometry for is the only thing left that fills.
+    func testAContentWithNoPlacementStillFillsTheWindow() {
         let countly = startInstance()
 
-        let manager = present(countly)
+        let manager = present(countly, url: "https://example.com/_external/content")
         waitForLoad(manager)
 
         let container = onMain { manager.containerSizeForTesting }
