@@ -574,7 +574,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         guard let screen = ScreenReader.activeScreen else {
             throw XCTSkip("no screen attached")
         }
-        let overlay = OverlayWindow(surfaceFrame: ScreenReader.surfaceFrame(.screen))
+        let overlay = OverlayWindow(surfaceFrame: ScreenReader.surfaceFrame(withinApp: false))
         defer { overlay.close() }
 
         // `NSWindow` may inset the frame it was asked for, so intersection is the

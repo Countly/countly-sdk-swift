@@ -27,8 +27,8 @@ enum ContentGeometry {
     /// The overlay is a panel of its own and the surface frame already has the menu
     /// bar and the Dock taken out, so there is nothing further to subtract.
     static func windowSize(displayOption: WebViewDisplayOption,
-                           surface: PresentationSurface = .screen) -> CGSize {
-        ScreenReader.surfaceFrame(surface).size
+                           withinApp: Bool = false) -> CGSize {
+        ScreenReader.surfaceFrame(withinApp: withinApp).size
     }
 
     /// Nothing to clear: the size above had nothing removed from it.

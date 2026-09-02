@@ -24,27 +24,6 @@ public enum WebViewDisplayOption: Int, Sendable {
     case safeArea
 }
 
-/// The area SDK-rendered content and feedback widgets are laid out and shown in.
-///
-/// Only meaningful where the application does not already own the whole screen,
-/// which today is macOS. Everywhere else the two are the same thing and this has
-/// no effect.
-public enum PresentationSurface: Int, Sendable {
-
-    /// The whole screen the application is on, minus the menu bar and the Dock.
-    ///
-    /// Content is placed against the display, so it can sit in a corner of the
-    /// screen regardless of where the application's own window happens to be.
-    case screen
-
-    /// The application's own window.
-    ///
-    /// Content is placed against the window and moves with it, which is what an
-    /// application that should not paint outside itself wants. Falls back to the
-    /// screen when the application has no window to speak of.
-    case applicationWindow
-}
-
 /// Called when a content presentation finishes.
 public typealias ContentCallback = (_ status: ContentStatus, _ data: [String: Any]) -> Void
 
@@ -109,17 +88,18 @@ public final class CountlyContentConfig {
     /// view, which is how an app routes its own deep links.
     public var contentURLHandler: ContentURLHandler?
 
-    /// Whether content and feedback widgets are laid out against the whole screen
-    /// or against the application's own window.
+    /// Shows content and feedback widgets inside the application's own window
+    /// rather than over the whole screen.
     ///
-    /// Defaults to the screen, which is what the SDK has always done and what an
-    /// application that wants content to sit in a corner of the display expects.
-    /// Set it to `applicationWindow` to keep everything the SDK draws inside the
-    /// application, so it moves with the window and never paints over anything
-    /// else.
+    /// Off by default, which lays everything out against the screen the application
+    /// is on, minus the menu bar and the Dock. Turn it on to keep everything the
+    /// SDK draws within the application, so it moves with the window and never
+    /// paints over anything else. Falls back to the screen when the application has
+    /// no window to measure, which is an agent or a menu bar application.
     ///
-    /// Has no effect where the application already fills the screen.
-    public var presentationSurface: PresentationSurface = .screen
+    /// Has no effect where the application already fills the screen, which is every
+    /// platform except macOS.
+    public var showWidgetsWithinApp: Bool = false
 
     public init() {}
 }

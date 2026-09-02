@@ -162,7 +162,7 @@ final class WebViewManager: NSObject {
         cancelPendingReload()
 
         #if os(macOS)
-        let overlayWindow = OverlayWindow(surfaceFrame: ScreenReader.surfaceFrame(core.config.content.presentationSurface))
+        let overlayWindow = OverlayWindow(surfaceFrame: ScreenReader.surfaceFrame(withinApp: core.config.content.showWidgetsWithinApp))
         #else
         let overlayWindow = OverlayWindow()
         #endif
@@ -209,21 +209,29 @@ final class WebViewManager: NSObject {
         // A widget is laid out by the SDK, because unlike a content page it never
         // says where it wants to go and the server never says either. See
         // `WidgetLayout`, which is the same placement the Java SDK applies.
+        // `containerSize`, never the background view's own bounds. The background
+        // view is built at screen size, but the surface a page is laid out against
+        // is whatever `showWidgetsWithinApp` says, and `applySafeAreaPlacement`
+        // converts the result against that same surface. Measuring here against the
+        // screen and converting there against the window put a widget laid out for
+        // a 2130 tall screen at the bottom of a 1023 tall window, which is to say
+        // ten points below it.
+        let surface = containerSize
         let targetFrame: CGRect
         if let frame {
             targetFrame = frame
         } else if isFeedbackWidget {
             targetFrame = WidgetLayout.resolve(type: widgetType,
                                                position: widgetPosition,
-                                               surface: background.bounds.size)
-            core.logger.d(Self.module, "present", "the widget is placed by the SDK, widgetType: [\(widgetType?.wireName ?? "unknown")], appearancePosition: [\(widgetPosition ?? "none")], frame: [\(targetFrame.logValue)], surface: [\(background.bounds.size.logValue)]")
+                                               surface: surface)
+            core.logger.d(Self.module, "present", "the widget is placed by the SDK, widgetType: [\(widgetType?.wireName ?? "unknown")], appearancePosition: [\(widgetPosition ?? "none")], frame: [\(targetFrame.logValue)], surface: [\(surface.logValue)]")
         } else {
-            targetFrame = background.bounds
+            targetFrame = CGRect(origin: .zero, size: surface)
         }
         baseWebViewFrame = targetFrame
         // A widget the SDK placed is placed, so a layout pass must not refill it.
         hasExplicitPlacement = frame != nil || isFeedbackWidget
-        core.logger.d(Self.module, "present", "the presentation frames were computed, webViewFrame: [\(targetFrame.logValue)], backgroundFrame: [\(background.bounds.logValue)]")
+        core.logger.d(Self.module, "present", "the presentation frames were computed, webViewFrame: [\(targetFrame.logValue)], surface: [\(surface.logValue)], backgroundFrame: [\(background.bounds.logValue)]")
 
         let web = WKWebView(frame: targetFrame, configuration: configuration)
         web.navigationDelegate = self
@@ -368,8 +376,8 @@ final class WebViewManager: NSObject {
         // whole desktop unclickable while a 435x144 banner is up. Sizing the panel
         // to the page is what leaves the rest of the screen alone.
         guard let window else { return }
-        let screenArea = ScreenReader.surfaceFrame(core.config.content.presentationSurface)
-        core.logger.d(Self.module, "applySafeAreaPlacement", "the presentation surface was resolved, \(ScreenReader.surfaceDescription(core.config.content.presentationSurface))")
+        let screenArea = ScreenReader.surfaceFrame(withinApp: core.config.content.showWidgetsWithinApp)
+        core.logger.d(Self.module, "applySafeAreaPlacement", "the presentation surface was resolved, \(ScreenReader.surfaceDescription(withinApp: core.config.content.showWidgetsWithinApp))")
         // `placed` is measured from the top of that area, because the background
         // view is flipped; an AppKit window is placed from the bottom of the screen.
         let target = CGRect(x: screenArea.origin.x + placed.origin.x,
@@ -454,7 +462,7 @@ final class WebViewManager: NSObject {
     private var containerSize: CGSize {
         #if os(macOS)
         return ContentGeometry.windowSize(displayOption: core.config.content.webViewDisplayOption,
-                                          surface: core.config.content.presentationSurface)
+                                          withinApp: core.config.content.showWidgetsWithinApp)
         #else
         return backgroundView?.effectiveSize ?? .zero
         #endif

@@ -530,8 +530,8 @@ enum ScreenReader {
     /// agent or a menu bar application, and when the window is degenerate. A zero
     /// sized surface would place content nowhere at all, and the screen is the
     /// answer the SDK gave before this was configurable.
-    static func surfaceFrame(_ surface: PresentationSurface) -> CGRect {
-        guard surface == .applicationWindow else { return overlayFrame }
+    static func surfaceFrame(withinApp: Bool) -> CGRect {
+        guard withinApp else { return overlayFrame }
         guard let window = hostWindow, window.frame.width > 1, window.frame.height > 1 else {
             return overlayFrame
         }
@@ -543,9 +543,9 @@ enum ScreenReader {
     /// The choice is a guess about which window is "the application", and when it
     /// guesses wrong the only symptom is content in the wrong place, so the guess
     /// is reported rather than left to be inferred.
-    static func surfaceDescription(_ surface: PresentationSurface) -> String {
-        let requested = surface == .applicationWindow ? "applicationWindow" : "screen"
-        guard surface == .applicationWindow else {
+    static func surfaceDescription(withinApp: Bool) -> String {
+        let requested = withinApp ? "withinApp" : "screen"
+        guard withinApp else {
             return "requested: [\(requested)], screen: [\(overlayFrame.logValue)]"
         }
         guard let window = hostWindow else {

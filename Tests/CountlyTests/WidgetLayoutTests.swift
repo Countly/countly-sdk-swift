@@ -119,4 +119,36 @@ final class WidgetLayoutTests: XCTestCase {
         XCTAssertEqual(frame.origin.x, (3840 - 480) / 2)
         XCTAssertEqual(frame.origin.y, (2130 - 650) / 2)
     }
+
+    // MARK: - The surface the layout is measured against
+
+    /// Layout and placement have to agree on which rectangle they mean.
+    ///
+    /// Regression test for a real misplacement: the frame was computed against the
+    /// screen while the panel was positioned against the application window, so an
+    /// NPS laid out for the bottom of a 2130 tall screen was placed against a 1023
+    /// tall window and ended up below its bottom edge, ten points off screen, and
+    /// off centre horizontally too. The arithmetic below is what the placement step
+    /// performs, so it fails if the two ever diverge again.
+    func testAWidgetPlacedInAWindowLandsInsideThatWindow() {
+        // A window on a second display, left of and below the origin, which is what
+        // made the mismatch obvious rather than merely wrong.
+        let window = CGRect(x: -1634, y: 1097, width: 1289, height: 1023)
+
+        let placed = WidgetLayout.resolve(type: .nps, position: nil, surface: window.size)
+
+        // Measured from the top of the surface, as the background view is flipped.
+        XCTAssertEqual(placed.maxY, window.height, "flush with the bottom of the window")
+        XCTAssertEqual(placed.origin.x, (window.width - 480) / 2, "centred in the window")
+
+        // The conversion the placement step applies, from a top left origin within
+        // the surface to AppKit's bottom left desktop coordinates.
+        let panelY = window.origin.y + window.height - placed.origin.y - placed.height
+        let panelX = window.origin.x + placed.origin.x
+
+        XCTAssertEqual(panelY, window.origin.y, "the panel sits on the window's bottom edge")
+        XCTAssertGreaterThanOrEqual(panelX, window.origin.x, "and within its left edge")
+        XCTAssertLessThanOrEqual(panelX + placed.width, window.maxX, "and its right")
+    }
+
 }

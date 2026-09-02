@@ -474,7 +474,7 @@ final class ContentModule: ModuleBase {
     private func windowSize() -> CGSize {
         let displayOption = core.config.content.webViewDisplayOption
         let size = ContentGeometry.windowSize(displayOption: displayOption,
-                                              surface: core.config.content.presentationSurface)
+                                              withinApp: core.config.content.showWidgetsWithinApp)
 
         // Every part of the sum, not just its result. A page laid out against the
         // wrong size is the failure this path causes, and the result on its own
