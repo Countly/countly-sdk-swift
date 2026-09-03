@@ -23,6 +23,9 @@ final class FeedbackModule: ModuleBase {
         static let appVersion = "app_version"
         static let rating = "rating"
         static let widgetID = "widget_id"
+
+        /// The origin the page compares an incoming `resize` message against.
+        static let origin = "origin"
         static let feedback = "feedback"
         static let email = "email"
         static let comment = "comment"
@@ -257,6 +260,14 @@ final class FeedbackModule: ModuleBase {
             "\(Key.platform)=\(DeviceMetrics.osName ?? "")",
             "\(Key.widgetID)=\(widget.id)",
             "\(QS.appVersion)=\(DeviceMetrics.appVersion)",
+            // What the page checks a `resize` message against.
+            //
+            // The widget's own listener compares `event.origin` to the `origin`
+            // query parameter and ignores anything that does not match, without
+            // logging or erroring. Omit this and the page never answers the SDK's
+            // surface message, so it never states the size it wants and every
+            // widget is shown at the maximum its type allows.
+            "\(Key.origin)=\(core.config.normalizedHost.urlEscaped)",
         ].joined(separator: "&")
 
         queryItems = core.network.builder.appendChecksum(queryItems)

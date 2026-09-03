@@ -110,6 +110,9 @@ final class WebViewManager: NSObject {
     /// The deadline that shows a widget which never stated its size.
     private var pendingFirstFit: DispatchWorkItem?
 
+    /// How many times this page has been fitted, bounded by `maximumFits`.
+    private var fitCount = 0
+
     #if os(macOS)
     /// Observers for the host window moving or resizing.
     ///
@@ -156,7 +159,38 @@ final class WebViewManager: NSObject {
     private enum ScriptMessage {
         static let resourceLoadError = "resourceLoadError"
         static let resourceVerifyResult = "resourceVerifyResult"
+        static let widgetCommand = "widgetCommand"
     }
+
+    /// Forwards the page's own replies out to the SDK.
+    ///
+    /// A widget answers the surface message with
+    /// `window.parent.postMessage(payload, parentOrigin)`. In a single frame web
+    /// view `window.parent === window`, so that reply lands back on the page's own
+    /// `message` listeners and never reaches `window.webkit.messageHandlers` at
+    /// all. Nothing is dropped and nothing errors; the SDK simply never hears it,
+    /// which is why the surface message looked unanswered.
+    ///
+    /// This listens for the same event the page posts to itself and hands anything
+    /// carrying `cly_widget_command` to the native side. The payload arrives as an
+    /// object from some templates and as a JSON string from others, so both are
+    /// accepted.
+    private static let widgetBridgeScript = """
+    (function () {
+        if (window.__countlyWidgetBridge) { return; }
+        window.__countlyWidgetBridge = true;
+        window.addEventListener('message', function (event) {
+            var data = event.data;
+            try {
+                if (typeof data === 'string') { data = JSON.parse(data); }
+            } catch (e) { return; }
+            if (!data || !data.cly_widget_command) { return; }
+            try {
+                window.webkit.messageHandlers.\(ScriptMessage.widgetCommand).postMessage(JSON.stringify(data));
+            } catch (e) {}
+        });
+    })()
+    """
 
     init(core: SDKCore) {
         self.core = core
@@ -247,6 +281,7 @@ final class WebViewManager: NSObject {
         configuration.userContentController.addUserScript(Self.resourceErrorScript)
         configuration.userContentController.add(proxy, name: ScriptMessage.resourceLoadError)
         configuration.userContentController.add(proxy, name: ScriptMessage.resourceVerifyResult)
+        configuration.userContentController.add(proxy, name: ScriptMessage.widgetCommand)
 
         // A widget is laid out by the SDK, because unlike a content page it never
         // says where it wants to go and the server never says either. See
@@ -421,6 +456,20 @@ final class WebViewManager: NSObject {
     /// to have answered: the answer is a `postMessage` round trip inside a page that
     /// has already loaded, not a network call.
     private static let firstFitDeadline: TimeInterval = 0.35
+
+    /// Below this in either dimension the measurement is a wrapper, not a card.
+    private static let minimumCardSide: CGFloat = 120
+
+    /// A difference this small is layout noise rather than a fit worth making.
+    private static let fitTolerance: CGFloat = 4
+
+    /// A page that keeps reporting a different size is not converging, so the SDK
+    /// stops rather than resizing the window indefinitely.
+    private static let maximumFits = 3
+
+    /// How long after placement the card is measured, giving the page a moment to
+    /// lay itself out at the size it was just given.
+    private static let measureDelay: TimeInterval = 0.16
 
     /// Waits for the page's first `resize_me` before showing it, so the card is
     /// placed once rather than placed and then moved in front of the user.
@@ -918,6 +967,36 @@ final class WebViewManager: NSObject {
 
     // MARK: - Critical resource failures
 
+    /// Acts on a reply the page sent to itself, forwarded by the bridge.
+    ///
+    /// The same `resize_me` an action URL would carry, arriving by the other route
+    /// the widget templates use. Routed into the same handler so a page that
+    /// answers this way is placed exactly like one that navigates.
+    private func handleWidgetCommand(_ body: Any) {
+        let payload: [String: Any]?
+        if let text = body as? String {
+            payload = CountlyJSON.object(from: Data(text.utf8), logger: core.logger) as? [String: Any]
+        } else {
+            payload = body as? [String: Any]
+        }
+
+        guard let payload else {
+            core.logger.d(Self.module, "handleWidgetCommand", "a widget command arrived that could not be read, ignoring it")
+            return
+        }
+
+        core.logger.d(Self.module, "handleWidgetCommand", "the page replied, keys: [\(payload.keys.sorted())]")
+
+        if let geometry = payload["resize_me"] as? [String: Any] {
+            resize(with: geometry)
+        }
+
+        if let closeValue = payload["close"], Self.isTruthy(String(describing: closeValue)) {
+            core.logger.d(Self.module, "handleWidgetCommand", "the page asked to be closed")
+            close()
+        }
+    }
+
     /// Reports a stylesheet or script that failed to load.
     ///
     /// Two mechanisms, because neither sees everything: the capturing `error`
@@ -1030,6 +1109,9 @@ final class WebViewManager: NSObject {
     /// Receives both injected scripts' messages.
     fileprivate func handleScriptMessage(name: String, body: Any) {
         switch name {
+        case ScriptMessage.widgetCommand:
+            handleWidgetCommand(body)
+
         case ScriptMessage.resourceLoadError:
             guard let payload = body as? [String: Any] else { return }
             let tag = payload["tag"] as? String ?? "?"
@@ -1325,6 +1407,10 @@ extension WebViewManager: WKNavigationDelegate {
         cancelPendingReload(rearmDeadline: true)
         verifyResourceStatuses()
 
+        // Order matters: the bridge has to be listening before the page is asked
+        // anything, or its answer arrives with nothing to catch it.
+        installWidgetBridge()
+
         // The page can only work out its own card size once it knows the viewport,
         // and it only listens for that after its own page has loaded.
         reportSurfaceToPage()
@@ -1339,6 +1425,13 @@ extension WebViewManager: WKNavigationDelegate {
         // deadline is what covers a page that never answers.
         if isFeedbackWidget {
             awaitFirstFitThenAppear()
+
+            // Measured a moment later so the page has laid itself out at the size it
+            // was just given. If it answered the surface message in the meantime,
+            // that answer wins and this finds nothing worth changing.
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.measureDelay) { [weak self] in
+                self?.measureAndFitCard()
+            }
         }
     }
 
@@ -1353,6 +1446,96 @@ extension WebViewManager: WKNavigationDelegate {
     ///
     /// The message shape is the one every Countly SDK sends and every widget page
     /// listens for.
+    /// Measures the card the page actually drew.
+    ///
+    /// The page states its size through `resize_me` when it states one at all, and
+    /// a rating widget never does while an NPS sometimes does not. Without a second
+    /// route the box stays at the maximum its type allows and a shorter card floats
+    /// inside it, which is the gap that shows up on a large screen.
+    ///
+    /// The selector list, its order and the guards are `FxSurfaces.java` in
+    /// `countly-sdk-java`, which measures these same templates on a desktop. Worth
+    /// keeping identical: the obvious heuristics do not work here. Every one of
+    /// these templates wraps its card in a *transparent* wrapper, so anything that
+    /// looks for a painted background returns nothing on a perfectly good page, and
+    /// a bounding box union picks up the wrapper and reports the whole viewport.
+    private static let measureCardScript = """
+    (function () {
+        var body = document.body;
+        if (!body) { return null; }
+
+        var selectors = ['#widget-body', '.modal-content', '[class*="survey-widget"]',
+                         '[id^="nps-"]', '[class*="countly-ratings"]', '[class*="cly-"]',
+                         '.smiley-container'];
+
+        for (var i = 0; i < selectors.length; i++) {
+            var el = body.querySelector(selectors[i]);
+            if (!el) { continue; }
+            var r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) {
+                return { w: r.width, h: r.height, via: selectors[i] };
+            }
+        }
+
+        // Nothing matched, so the largest thing painted stands in for the card.
+        var best = null, bestArea = 0;
+        var all = body.querySelectorAll('*');
+        for (var j = 0; j < all.length; j++) {
+            var rect = all[j].getBoundingClientRect();
+            var area = rect.width * rect.height;
+            if (area > bestArea) { bestArea = area; best = rect; }
+        }
+        if (!best || best.width <= 0 || best.height <= 0) { return null; }
+        return { w: best.width, h: best.height, via: 'largest' };
+    })()
+    """
+
+    /// Fits the box to the card the page drew, when the page never said how big it
+    /// wanted to be.
+    private func measureAndFitCard() {
+        guard isSDKPlacedWidget, !isClosed, let webView else { return }
+        guard fitCount < Self.maximumFits else { return }
+
+        webView.evaluateJavaScript(Self.measureCardScript) { [weak self] result, _ in
+            guard let self, self.isSDKPlacedWidget, !self.isClosed else { return }
+
+            guard let box = result as? [String: Any],
+                  let width = (box["w"] as? NSNumber)?.doubleValue,
+                  let height = (box["h"] as? NSNumber)?.doubleValue else {
+                self.core.logger.d(Self.module, "measureAndFitCard", "the card could not be measured, so the widget keeps the size its type allows")
+                return
+            }
+
+            // Under the floor is a wrapper caught mid layout, not a card.
+            guard width >= Self.minimumCardSide, height >= Self.minimumCardSide else {
+                self.core.logger.d(Self.module, "measureAndFitCard", "the measurement is too small to be the card and is ignored, measured: [\(width.logValue)x\(height.logValue)]")
+                return
+            }
+
+            let current = self.baseWebViewFrame?.height ?? 0
+            guard abs(current - height) > Self.fitTolerance else { return }
+
+            self.fitCount += 1
+            let fitted = WidgetLayout.resolve(type: self.presentedWidgetType,
+                                              position: self.presentedWidgetPosition,
+                                              surface: self.containerSize,
+                                              requestedHeight: height)
+
+            self.core.logger.i(Self.module, "measureAndFitCard", "the page drew a card smaller than the box it was given, so the box is fitted to it, measuredCard: [\(width.logValue)x\(height.logValue)], via: [\(box["via"] as? String ?? "?")], from: [\(current.logValue)], to: [\(fitted.height.logValue)], fit: [\(self.fitCount)]")
+
+            self.baseWebViewFrame = fitted
+            self.applySafeAreaPlacement()
+            self.firstFitArrived()
+        }
+    }
+
+    private func installWidgetBridge() {
+        webView?.evaluateJavaScript(Self.widgetBridgeScript) { [weak self] _, error in
+            guard let error else { return }
+            self?.core.logger.w(Self.module, "installWidgetBridge", "the page's replies cannot be forwarded, so a size it asks for will not be seen, error: [\(error.localizedDescription)]")
+        }
+    }
+
     private func reportSurfaceToPage() {
         guard let webView else { return }
 
