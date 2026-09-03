@@ -825,3 +825,53 @@ private final class DummyTransitionCoordinator: NSObject, UIViewControllerTransi
 #endif
 
 #endif
+
+#if os(macOS)
+
+/// Whether the overlay lets the window it covers still be resized and still look
+/// like itself.
+///
+/// Sized to the application's own window, the panel lies exactly over the window's
+/// border. Everything the user does to a window happens at that border: dragging it
+/// to resize, and seeing its rounded corners. A page that paints a full-surface
+/// backdrop takes both away, and neither loss is anything the SDK is entitled to
+/// cause: the content is a guest on someone else's window.
+final class OverlayEdgeTests: XCTestCase {
+
+    private func makeBackground(margin: CGFloat) -> PassThroughBackgroundView {
+        let background = PassThroughBackgroundView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        background.passThroughEdgeMargin = margin
+        let page = NSView(frame: background.bounds)
+        background.addSubview(page)
+        return background
+    }
+
+    func testTheWindowBorderIsLeftToTheWindow() {
+        let background = makeBackground(margin: 4)
+
+        // Each of the four borders, at the point the user actually grabs.
+        XCTAssertNil(background.hitTest(NSPoint(x: 1, y: 150)), "the left border was claimed by the overlay")
+        XCTAssertNil(background.hitTest(NSPoint(x: 399, y: 150)), "the right border was claimed by the overlay")
+        XCTAssertNil(background.hitTest(NSPoint(x: 200, y: 1)), "the bottom border was claimed by the overlay")
+        XCTAssertNil(background.hitTest(NSPoint(x: 200, y: 299)), "the top border was claimed by the overlay")
+    }
+
+    func testThePageStillReceivesEverythingInsideTheBorder() {
+        let background = makeBackground(margin: 4)
+
+        XCTAssertNotNil(background.hitTest(NSPoint(x: 200, y: 150)), "the middle of the page stopped receiving clicks")
+        // Just inside the strip: the margin has to be narrow enough that a close
+        // button in the corner is still reachable.
+        XCTAssertNotNil(background.hitTest(NSPoint(x: 6, y: 6)), "the margin reaches further in than it should")
+    }
+
+    func testCoveringTheWholeScreenKeepsEveryPoint() {
+        // No window border underneath, so nothing to hand back.
+        let background = makeBackground(margin: 0)
+
+        XCTAssertNotNil(background.hitTest(NSPoint(x: 0, y: 150)), "the overlay gave away a click with no window to give it to")
+    }
+}
+
+
+#endif

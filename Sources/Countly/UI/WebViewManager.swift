@@ -110,8 +110,28 @@ final class WebViewManager: NSObject {
     /// The deadline that shows a widget which never stated its size.
     private var pendingFirstFit: DispatchWorkItem?
 
+    /// Corner radius of a standard macOS window.
+    ///
+    /// AppKit exposes no way to read it, so it is matched by measurement. Being a
+    /// point or two out is invisible; leaving the corners square is not.
+    static let hostWindowCornerRadius: CGFloat = 10
+
+    /// Width of the border strip the overlay hands back for window resizing.
+    ///
+    /// Wide enough to catch the pointer on the window's edge, narrow enough that it
+    /// does not eat clicks on anything the page puts near its border.
+    static let windowResizeEdgeMargin: CGFloat = 4
+
     /// How many times this page has been fitted, bounded by `maximumFits`.
     private var fitCount = 0
+
+    /// The height the card was last measured at.
+    ///
+    /// Kept because the surface changing does not change how tall the card is. A
+    /// re-layout that forgets it hands the widget back the maximum its type allows,
+    /// so a window drag undoes the fit and the gap under the card returns for as
+    /// long as the drag lasts.
+    private var measuredCardHeight: CGFloat = 0
 
     /// The last surface size the page was told about, so it is not told twice.
     private var lastReportedSurface: CGSize?
@@ -261,6 +281,15 @@ final class WebViewManager: NSObject {
         background.wantsLayer = true
         background.layer?.backgroundColor = NSColor.clear.cgColor
         background.autoresizingMask = [NSView.AutoresizingMask.width, .height]
+        if core.config.content.showWidgetsWithinApp {
+            // Sized to the application's own window, so the overlay inherits that
+            // window's rounded corners. Without the mask a page painting a
+            // full-surface backdrop draws square corners over the window's curved
+            // ones, and the mismatch shows as four dark wedges outside the window.
+            background.layer?.cornerRadius = Self.hostWindowCornerRadius
+            background.layer?.masksToBounds = true
+            background.passThroughEdgeMargin = Self.windowResizeEdgeMargin
+        }
         #else
         background.backgroundColor = .clear
         background.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -393,11 +422,23 @@ final class WebViewManager: NSObject {
         // time; re-deriving that here would invent coordinates the server never
         // sent, so it keeps its frame and is only re-converted to the new position.
         if isSDKPlacedWidget {
+            // The card's measured height is carried across: the surface changed, the
+            // card did not, and resolving without it would hand back the type's
+            // maximum and undo the fit on every step of a window drag.
             let frame = WidgetLayout.resolve(type: presentedWidgetType,
                                              position: presentedWidgetPosition,
-                                             surface: surface)
-            core.logger.d(Self.module, "surfaceDidChange", "the surface changed and the widget is laid out again, widgetType: [\(presentedWidgetType?.wireName ?? "unknown")], frame: [\(frame.logValue)], surface: [\(surface.logValue)]")
+                                             surface: surface,
+                                             requestedHeight: measuredCardHeight)
+            core.logger.d(Self.module, "surfaceDidChange", "the surface changed and the widget is laid out again, widgetType: [\(presentedWidgetType?.wireName ?? "unknown")], frame: [\(frame.logValue)], surface: [\(surface.logValue)], measuredCardHeight: [\(measuredCardHeight.logValue)]")
             baseWebViewFrame = frame
+
+            // Measured again once the drag settles: a different width can reflow the
+            // card to a different height. The budget is renewed for the new surface,
+            // and the tolerance stops it as soon as the answer stops moving.
+            fitCount = 0
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.measureDelay) { [weak self] in
+                self?.measureAndFitCard()
+            }
         } else {
             core.logger.d(Self.module, "surfaceDidChange", "the surface changed and the page keeps the frame it was given, because the SDK did not choose it, frame: [\(baseWebViewFrame?.logValue ?? "none")], surface: [\(surface.logValue)]")
         }
@@ -1574,6 +1615,7 @@ extension WebViewManager: WKNavigationDelegate {
             guard abs(current - height) > Self.fitTolerance else { return }
 
             self.fitCount += 1
+            self.measuredCardHeight = height
             let fitted = WidgetLayout.resolve(type: self.presentedWidgetType,
                                               position: self.presentedWidgetPosition,
                                               surface: self.containerSize,

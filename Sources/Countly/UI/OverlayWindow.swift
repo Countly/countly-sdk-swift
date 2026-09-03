@@ -162,8 +162,26 @@ final class PassThroughBackgroundView: NSView {
     /// here as it does on iOS. Without this every `resize_me` would be upside down.
     override var isFlipped: Bool { true }
 
+    /// How far in from the edge clicks are handed back to whatever is underneath.
+    ///
+    /// Non-zero only when the overlay is sized to the application's own window,
+    /// where the panel lies exactly over the window's resize edges. A page drawing
+    /// a full-surface backdrop otherwise claims those few points and the user can
+    /// no longer grab the window border to resize it while content is up.
+    var passThroughEdgeMargin: CGFloat = 0
+
+    /// Whether a point falls in the border strip reserved for window resizing.
+    private func isOnResizeEdge(_ point: NSPoint) -> Bool {
+        let margin = passThroughEdgeMargin
+        return point.x <= bounds.minX + margin
+            || point.x >= bounds.maxX - margin
+            || point.y <= bounds.minY + margin
+            || point.y >= bounds.maxY - margin
+    }
+
     override func hitTest(_ point: NSPoint) -> NSView? {
         let local = convert(point, from: superview)
+        if passThroughEdgeMargin > 0, isOnResizeEdge(local) { return nil }
         for subview in subviews.reversed() {
             if let hit = subview.hitTest(convert(local, to: superview)) { return hit }
         }

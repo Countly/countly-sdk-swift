@@ -60,8 +60,15 @@ public final class CountlyContentConfig {
     /// The shortest polling interval the SDK accepts, in seconds.
     static let minimumZoneTimerInterval = 15
 
-    /// Layout of the content and feedback web views. Default `.immersive`.
-    public var webViewDisplayOption: WebViewDisplayOption = .immersive
+    /// Layout of the content and feedback web views. Default `.safeArea`.
+    ///
+    /// The safe area rather than the full screen, so what the SDK draws clears the
+    /// notch, the home indicator and, on macOS, the menu bar and the Dock. A page
+    /// laid out under any of those is a page with part of itself unreadable or
+    /// untappable, and the SDK cannot know which part matters.
+    ///
+    /// Note this differs from the Android SDK, which defaults to `IMMERSIVE`.
+    public var webViewDisplayOption: WebViewDisplayOption = .safeArea
 
     /// Reloads the content web view when a load stalls instead of closing it.
     ///
