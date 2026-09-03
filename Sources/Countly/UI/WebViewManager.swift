@@ -401,11 +401,9 @@ final class WebViewManager: NSObject {
 
         applySafeAreaPlacement()
 
-        // The page is told the new viewport so it can ask for a size against it.
-        // A widget's own answer supersedes the SDK's layout, and a content page
-        // that reflows gets the chance to say so, which is the whole point of the
-        // exchange: the SDK never guesses a size it can ask for.
-        reportSurfaceToPage()
+        // Widgets only: a content page is placed by the server against the
+        // resolution the SDK already reported with the fetch.
+        if isFeedbackWidget { reportSurfaceToPage() }
     }
     #endif
 
@@ -628,9 +626,7 @@ final class WebViewManager: NSObject {
         guard !hasExplicitPlacement else {
             core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed, the page keeps the placement the server gave it, frame: [\(baseWebViewFrame?.logValue ?? "none")]")
             applySafeAreaPlacement()
-            // Told anyway: the placement stands, but the room available changed and
-            // the page may want a different size within it.
-            reportSurfaceToPage()
+            if isFeedbackWidget { reportSurfaceToPage() }
             return
         }
 
@@ -638,7 +634,7 @@ final class WebViewManager: NSObject {
         core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed and the page is re-laid out, frame: [\(filled.logValue)], containerSize: [\(containerSize.logValue)]")
         baseWebViewFrame = filled
         applySafeAreaPlacement()
-        reportSurfaceToPage()
+        if isFeedbackWidget { reportSurfaceToPage() }
     }
 
     /// Applies a size the page asked for, in the page's own coordinate space.
@@ -991,7 +987,12 @@ final class WebViewManager: NSObject {
             resize(with: geometry)
         }
 
-        if let closeValue = payload["close"], Self.isTruthy(String(describing: closeValue)) {
+        // Only a widget may dismiss itself this way. The bridge is installed only
+        // for widgets, but the guard stays: a `close` arriving on this route for a
+        // content page would take it off screen the moment it appeared, and that
+        // failure is silent and looks exactly like content never being served.
+        if isFeedbackWidget,
+           let closeValue = payload["close"], Self.isTruthy(String(describing: closeValue)) {
             core.logger.d(Self.module, "handleWidgetCommand", "the page asked to be closed")
             close()
         }
@@ -1407,13 +1408,21 @@ extension WebViewManager: WKNavigationDelegate {
         cancelPendingReload(rearmDeadline: true)
         verifyResourceStatuses()
 
-        // Order matters: the bridge has to be listening before the page is asked
-        // anything, or its answer arrives with nothing to catch it.
-        installWidgetBridge()
-
-        // The page can only work out its own card size once it knows the viewport,
-        // and it only listens for that after its own page has loaded.
-        reportSurfaceToPage()
+        // Feedback widgets only, deliberately.
+        //
+        // A content page is placed by the server, which already knows the viewport
+        // because the SDK reported it with the fetch, and in four scenario runs no
+        // content page ever answered this message. So it gains nothing there and it
+        // is not free: the bridge injects a listener and the surface message runs
+        // script inside a page that was working, and content is only ever revealed
+        // by its own `[CLY]_content_shown`, so anything that disturbs it before
+        // that leaves the content placed and invisible.
+        if isFeedbackWidget {
+            // Order matters: the bridge has to be listening before the page is
+            // asked anything, or its answer arrives with nothing to catch it.
+            installWidgetBridge()
+            reportSurfaceToPage()
+        }
 
         // A feedback widget renders itself as soon as it loads and never reports a
         // shown event, so loading is the only signal it has appeared.
