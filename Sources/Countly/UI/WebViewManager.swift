@@ -401,9 +401,8 @@ final class WebViewManager: NSObject {
 
         applySafeAreaPlacement()
 
-        // Widgets only: a content page is placed by the server against the
-        // resolution the SDK already reported with the fetch.
-        if isFeedbackWidget { reportSurfaceToPage() }
+        // Both kinds: the room available changed, and either may want to react.
+        reportSurfaceToPage()
     }
     #endif
 
@@ -626,7 +625,7 @@ final class WebViewManager: NSObject {
         guard !hasExplicitPlacement else {
             core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed, the page keeps the placement the server gave it, frame: [\(baseWebViewFrame?.logValue ?? "none")]")
             applySafeAreaPlacement()
-            if isFeedbackWidget { reportSurfaceToPage() }
+            reportSurfaceToPage()
             return
         }
 
@@ -634,7 +633,7 @@ final class WebViewManager: NSObject {
         core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed and the page is re-laid out, frame: [\(filled.logValue)], containerSize: [\(containerSize.logValue)]")
         baseWebViewFrame = filled
         applySafeAreaPlacement()
-        if isFeedbackWidget { reportSurfaceToPage() }
+        reportSurfaceToPage()
     }
 
     /// Applies a size the page asked for, in the page's own coordinate space.
@@ -674,15 +673,39 @@ final class WebViewManager: NSObject {
                 ?? (parameters[fallback] as? [String: Any]) else { return }
 
         let usedFallback = parameters[preferred] == nil
-        let frame = CGRect(contentGeometry: geometry, container: container)
+        var frame = CGRect(contentGeometry: geometry, container: container)
+
+        // A widget states a size, not a position.
+        //
+        // The page reports where it sits in its own viewport, which is `0,0`: it
+        // has no idea where the SDK put its box on the desktop. Applying that
+        // literally drops every widget in the top left the moment it answers, which
+        // is what happened here as soon as the message bridge started working and
+        // the answers began arriving at all.
+        //
+        // So the size is taken and the position is worked out again by
+        // `WidgetLayout`, which is the same thing the Java SDK does: its log reads
+        // "putting the nps at {x=-2160, y=542, w=480, h=414} (it asked for {x=0,
+        // y=0, w=480, h=414})". Content is untouched, because the server placed it
+        // deliberately and its coordinates mean something.
+        if isFeedbackWidget {
+            let anchored = WidgetLayout.resolve(type: presentedWidgetType,
+                                                position: presentedWidgetPosition,
+                                                surface: container,
+                                                requestedHeight: frame.height)
+            core.logger.d(Self.module, "resize", "the widget asked for a size, so the size is taken and the position is kept, asked: [\(frame.logValue)], placed: [\(anchored.logValue)]")
+            frame = anchored
+        }
 
         core.logger.d(Self.module, "resize", "the page asked to be resized, orientation: [\(isPortrait ? "portrait" : "landscape")], orientationKey: [\(usedFallback ? fallback : preferred)], usedFallbackOrientation: [\(usedFallback)], x: [\(frame.origin.x.logValue)], y: [\(frame.origin.y.logValue)], width: [\(frame.width.logValue)], height: [\(frame.height.logValue)]")
         core.logger.d(Self.module, "resize", "resize container detail, containerSize: [\(container.logValue)], resizeGeometry: [\(parameters)]")
 
         baseWebViewFrame = frame
         hasExplicitPlacement = true
-        // The page has said where it wants to be, so the SDK stops deciding.
-        isSDKPlacedWidget = false
+        // A content page has said where it wants to be, so the SDK stops deciding.
+        // A widget only stated a size, and the SDK still owns where that size goes,
+        // so it stays SDK placed and is re-anchored when the surface changes.
+        isSDKPlacedWidget = isFeedbackWidget
         applySafeAreaPlacement()
 
         // If the widget was being held back for exactly this, show it now.
@@ -1408,21 +1431,16 @@ extension WebViewManager: WKNavigationDelegate {
         cancelPendingReload(rearmDeadline: true)
         verifyResourceStatuses()
 
-        // Feedback widgets only, deliberately.
+        // Both kinds of page are told, because both resize.
         //
-        // A content page is placed by the server, which already knows the viewport
-        // because the SDK reported it with the fetch, and in four scenario runs no
-        // content page ever answered this message. So it gains nothing there and it
-        // is not free: the bridge injects a listener and the surface message runs
-        // script inside a page that was working, and content is only ever revealed
-        // by its own `[CLY]_content_shown`, so anything that disturbs it before
-        // that leaves the content placed and invisible.
-        if isFeedbackWidget {
-            // Order matters: the bridge has to be listening before the page is
-            // asked anything, or its answer arrives with nothing to catch it.
-            installWidgetBridge()
-            reportSurfaceToPage()
-        }
+        // A widget answers with the size it wants; a content page reflows against
+        // the room it is given. Neither can know the viewport on its own: the page
+        // is handed a web view, not a window.
+        //
+        // Order matters: the bridge has to be listening before the page is asked
+        // anything, or its answer arrives with nothing to catch it.
+        installWidgetBridge()
+        reportSurfaceToPage()
 
         // A feedback widget renders itself as soon as it loads and never reports a
         // shown event, so loading is the only signal it has appeared.

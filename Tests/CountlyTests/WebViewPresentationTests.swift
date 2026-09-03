@@ -294,7 +294,10 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
     func testAResizeRequestMovesTheWebView() {
         let countly = startInstance()
 
-        let manager = present(countly)
+        // Content, not a widget. Both are resized by this path, but only content is
+        // obeyed exactly: a widget states a size and the SDK decides where it goes,
+        // so asserting an exact rect there would be asserting the wrong rule.
+        let manager = present(countly, url: "https://example.com/_external/content")
         waitForLoad(manager)
 
         let before = onMain { self.page(of: manager)?.frame }
@@ -313,7 +316,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
     func testAResizeWithOnlyTheOtherOrientationStillApplies() {
         let countly = startInstance()
 
-        let manager = present(countly)
+        let manager = present(countly, url: "https://example.com/_external/content")
         waitForLoad(manager)
 
         let before = onMain { self.page(of: manager)?.frame }
@@ -720,6 +723,61 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
 
 
 
+
+
+    // MARK: - What a widget's own answer may and may not change
+
+    /// A widget reports where it sits inside its own viewport, which is the origin,
+    /// because it has no idea where the SDK put its box on the desktop. Taking that
+    /// literally drops the widget in the top left.
+    ///
+    /// Regression test. This did not bite while the page's answers were never
+    /// reaching the SDK; the moment the message bridge started working and the
+    /// answers arrived, every widget jumped to the corner. Java has the same rule:
+    /// its log reads "putting the nps at {x=-2160, y=542} (it asked for {x=0, y=0})".
+    func testAWidgetsRequestedSizeIsTakenButItsPositionIsNot() {
+        let countly = startInstance()
+        let manager = present(countly, url: "https://example.com/feedback/nps")
+        waitForLoad(manager)
+
+        // A size at the origin, which is what these pages actually send.
+        navigate(manager, to: #"https://countly_action_event?cly_x_action_event=1&action=resize_me&resize_me={"l":{"x":0,"y":0,"w":480,"h":300},"p":{"x":0,"y":0,"w":480,"h":300}}"#)
+        TestUtils.pump(0.6)
+
+        guard let frame = onMain({ manager.placedFrameForTesting }) else {
+            XCTFail("the widget should have been placed")
+            return
+        }
+
+        // Asserted against the frame itself rather than against a separately read
+        // container: the surface is resolved from whichever screen the process is
+        // associated with, and reading it a second time in a test process can
+        // answer differently. What must hold is that the reported origin was not
+        // taken, which is the regression, and that the anchor survived.
+        XCTAssertEqual(frame.height, 300, accuracy: 1, "the size it asked for is honoured")
+        XCTAssertNotEqual(frame.origin, .zero, "but not the origin it reported")
+        XCTAssertGreaterThan(frame.origin.y, 0, "an NPS is pushed down to its anchor, not left at the top")
+        XCTAssertGreaterThan(frame.origin.x, 0, "and in from the left, because it is centred")
+    }
+
+    /// Content is the opposite: the server placed it deliberately and its
+    /// coordinates mean something, so a geometry it sends is applied exactly.
+    func testContentKeepsTheExactGeometryItWasSent() {
+        let countly = startInstance()
+        let manager = present(countly, url: "https://example.com/_external/content")
+        waitForLoad(manager)
+
+        navigate(manager, to: #"https://countly_action_event?cly_x_action_event=1&action=resize_me&resize_me={"l":{"x":16,"y":40,"w":435,"h":144},"p":{"x":16,"y":40,"w":435,"h":144}}"#)
+        TestUtils.pump(0.6)
+
+        guard let frame = onMain({ manager.placedFrameForTesting }) else {
+            XCTFail("the content should have been placed")
+            return
+        }
+        XCTAssertEqual(frame.origin.x, 16, accuracy: 1)
+        XCTAssertEqual(frame.origin.y, 40, accuracy: 1)
+        XCTAssertEqual(frame.width, 435, accuracy: 1)
+    }
 
 }
 
