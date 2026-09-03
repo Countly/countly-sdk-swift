@@ -457,6 +457,9 @@ final class WebViewManager: NSObject {
     /// Below this in either dimension the measurement is a wrapper, not a card.
     private static let minimumCardSide: CGFloat = 120
 
+    /// Below this a requested size is not a layout, it is a disappearance.
+    private static let minimumUsableSide: CGFloat = 8
+
     /// A difference this small is layout noise rather than a fit worth making.
     private static let fitTolerance: CGFloat = 4
 
@@ -674,6 +677,18 @@ final class WebViewManager: NSObject {
 
         let usedFallback = parameters[preferred] == nil
         var frame = CGRect(contentGeometry: geometry, container: container)
+
+        // A page that asks to be a sliver is asking to be invisible.
+        //
+        // The geometry is applied as sent, so a reply carrying a zero or near zero
+        // dimension leaves a view too small to see and no error anywhere: the page
+        // is placed, loaded and reported, and nothing appears. Refusing the request
+        // leaves whatever it had, which is at worst the wrong size and at best
+        // exactly right, and either beats a page nobody can see.
+        guard frame.width >= Self.minimumUsableSide, frame.height >= Self.minimumUsableSide else {
+            core.logger.w(Self.module, "resize", "the page asked for a size too small to be visible and keeps the one it has, asked: [\(frame.logValue)], containerSize: [\(container.logValue)]")
+            return
+        }
 
         // A widget states a size, not a position.
         //
@@ -1004,7 +1019,8 @@ final class WebViewManager: NSObject {
             return
         }
 
-        core.logger.d(Self.module, "handleWidgetCommand", "the page replied, keys: [\(payload.keys.sorted())]")
+        core.logger.d(Self.module, "handleWidgetCommand", "the page replied, isFeedbackWidget: [\(isFeedbackWidget)], keys: [\(payload.keys.sorted())]")
+        core.logger.v(Self.module, "handleWidgetCommand", "page reply detail, payload: [\(payload)]")
 
         if let geometry = payload["resize_me"] as? [String: Any] {
             resize(with: geometry)
@@ -1553,6 +1569,21 @@ extension WebViewManager: WKNavigationDelegate {
             self.baseWebViewFrame = fitted
             self.applySafeAreaPlacement()
             self.firstFitArrived()
+
+            // Measured again, because one pass does not converge.
+            //
+            // The card was measured inside the box it had at the time. Shrinking
+            // the box to the card reflows the page, and the card settles at a
+            // different height again, leaving the same gap one size smaller. Java
+            // allows three fits per page load for exactly this; running the
+            // measurement once ported the limit without the loop it was limiting.
+            //
+            // This terminates: `fitCount` caps it, and the tolerance above stops it
+            // as soon as two passes agree within a few points, which is what
+            // convergence looks like.
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.measureDelay) { [weak self] in
+                self?.measureAndFitCard()
+            }
         }
     }
 
