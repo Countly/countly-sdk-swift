@@ -113,6 +113,9 @@ final class WebViewManager: NSObject {
     /// How many times this page has been fitted, bounded by `maximumFits`.
     private var fitCount = 0
 
+    /// The last surface size the page was told about, so it is not told twice.
+    private var lastReportedSurface: CGSize?
+
     #if os(macOS)
     /// Observers for the host window moving or resizing.
     ///
@@ -687,6 +690,18 @@ final class WebViewManager: NSObject {
         // exactly right, and either beats a page nobody can see.
         guard frame.width >= Self.minimumUsableSide, frame.height >= Self.minimumUsableSide else {
             core.logger.w(Self.module, "resize", "the page asked for a size too small to be visible and keeps the one it has, asked: [\(frame.logValue)], containerSize: [\(container.logValue)]")
+            return
+        }
+
+        // A reply that hands the surface back is not an answer.
+        //
+        // These templates echo the viewport they were given rather than reporting
+        // the card they drew: told 3840x2130, they reply 3840x2130. Treating that
+        // as a requested size clamps it to the type's maximum every time and
+        // undoes the measurement, which is the real answer. Ignored, so the
+        // measured card stands.
+        if isFeedbackWidget, frame.size == container {
+            core.logger.d(Self.module, "resize", "the widget echoed the surface back rather than stating a card size, so the size it was given stands, surface: [\(container.logValue)]")
             return
         }
 
@@ -1598,6 +1613,17 @@ extension WebViewManager: WKNavigationDelegate {
         guard let webView else { return }
 
         let size = surfaceSizeForPage()
+
+        // Only when it changed.
+        //
+        // This is called from the layout pass, and resizing the panel *is* a layout
+        // pass, so reporting unconditionally makes a loop: tell the page, the page
+        // answers, the answer resizes the panel, the resize re-tells the page. The
+        // widget then oscillates between the size its type allows and the size its
+        // card measured, several times a second, and never settles. The page only
+        // needs telling when the room it has is genuinely different.
+        guard size != lastReportedSurface else { return }
+        lastReportedSurface = size
         core.logger.d(Self.module, "reportSurfaceToPage", "the page is told how much room it has, so it can ask for the size it wants, width: [\(size.width.logValue)], height: [\(size.height.logValue)]")
 
         let script = "window.postMessage({type: 'resize', width: \(size.width), height: \(size.height)}, '*');"
