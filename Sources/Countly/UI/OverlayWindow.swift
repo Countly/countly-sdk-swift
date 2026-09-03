@@ -135,6 +135,35 @@ final class OverlayWindow: NSPanel {
     /// content is up.
     override var canBecomeMain: Bool { false }
 
+    /// Ties the overlay to the window it is covering.
+    ///
+    /// A floating panel sits above every application on the desktop, which is right
+    /// for content shown over the whole screen and wrong for content shown over one
+    /// window: bring another application forward and the overlay stays on top of
+    /// it, dimming a window it has nothing to do with.
+    ///
+    /// A child window is ordered with its parent instead. It stays above the window
+    /// it belongs to, goes behind whatever the user brings in front of that window,
+    /// and follows it between spaces and across the desktop.
+    func bind(to host: NSWindow?) {
+        guard let host else { return }
+        // Ordered with the parent from here on, so the level that lifted it above
+        // everything has to come back down or it would still win.
+        level = .normal
+        // A child window already follows its parent between spaces, and claiming
+        // all of them fights that.
+        collectionBehavior = [.fullScreenAuxiliary]
+        host.addChildWindow(self, ordered: .above)
+    }
+
+    /// Releases the overlay from the window it was bound to.
+    ///
+    /// A parent keeps its children alive and on screen, so a panel left attached
+    /// after it is closed comes back the next time that window is ordered front.
+    func unbind() {
+        parent?.removeChildWindow(self)
+    }
+
     /// AppKit's counterpart of the iOS window's `isHidden`, so the shared
     /// presentation code reads the same on both platforms.
     var isHidden: Bool {

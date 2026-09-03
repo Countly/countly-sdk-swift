@@ -110,11 +110,13 @@ final class WebViewManager: NSObject {
     /// The deadline that shows a widget which never stated its size.
     private var pendingFirstFit: DispatchWorkItem?
 
-    /// Corner radius of a standard macOS window.
+    /// Corner radius used when the window will not say what its own is.
     ///
-    /// AppKit exposes no way to read it, so it is matched by measurement. Being a
-    /// point or two out is invisible; leaving the corners square is not.
-    static let hostWindowCornerRadius: CGFloat = 10
+    /// Only reached when the frame view has no radius on its layer. Erring large is
+    /// deliberate: rounding more than the window does costs a sliver of the page at
+    /// each corner, while rounding less leaves the square wedges outside the window
+    /// that the mask exists to remove.
+    static let fallbackWindowCornerRadius: CGFloat = 16
 
     /// Width of the border strip the overlay hands back for window resizing.
     ///
@@ -286,9 +288,14 @@ final class WebViewManager: NSObject {
             // window's rounded corners. Without the mask a page painting a
             // full-surface backdrop draws square corners over the window's curved
             // ones, and the mismatch shows as four dark wedges outside the window.
-            background.layer?.cornerRadius = Self.hostWindowCornerRadius
+            background.layer?.cornerRadius = ScreenReader.hostWindowCornerRadius(fallback: Self.fallbackWindowCornerRadius)
             background.layer?.masksToBounds = true
             background.passThroughEdgeMargin = Self.windowResizeEdgeMargin
+            // Ordered with the window it covers rather than above the whole desktop,
+            // so bringing another application forward puts it in front of the
+            // content the way it would in front of any other window.
+            overlayWindow.bind(to: ScreenReader.hostWindow)
+            core.logger.d(Self.module, "present", "the overlay is bound to the host window, cornerRadius: [\(background.layer?.cornerRadius ?? 0)]")
         }
         #else
         background.backgroundColor = .clear
@@ -478,6 +485,11 @@ final class WebViewManager: NSObject {
             controller?.removeAllUserScripts()
             self.webView?.removeFromSuperview()
             self.webView = nil
+            #if os(macOS)
+            // Before hiding it: a parent holds its children on screen, so an
+            // attached panel would return with the window it was left on.
+            self.window?.unbind()
+            #endif
             self.window?.isHidden = true
             self.window?.rootViewController = nil
             self.window = nil

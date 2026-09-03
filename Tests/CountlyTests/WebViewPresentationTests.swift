@@ -865,6 +865,28 @@ final class OverlayEdgeTests: XCTestCase {
         XCTAssertNotNil(background.hitTest(NSPoint(x: 6, y: 6)), "the margin reaches further in than it should")
     }
 
+    func testTheOverlayIsOrderedWithTheWindowItCovers() {
+        let host = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 600, height: 400),
+                            styleMask: [.titled, .resizable],
+                            backing: .buffered,
+                            defer: false)
+        let overlay = OverlayWindow(surfaceFrame: host.frame)
+
+        // Floating out of the box, which is what puts it above other applications.
+        XCTAssertEqual(overlay.level, .floating)
+
+        overlay.bind(to: host)
+
+        XCTAssertTrue(overlay.parent === host, "the overlay was not attached to the window it covers")
+        XCTAssertEqual(overlay.level, .normal, "the overlay still outranks every other window")
+        XCTAssertFalse(overlay.collectionBehavior.contains(.canJoinAllSpaces),
+                       "the overlay still follows the user off the window's space")
+
+        overlay.unbind()
+
+        XCTAssertNil(overlay.parent, "the overlay stayed attached and would return with the window")
+    }
+
     func testCoveringTheWholeScreenKeepsEveryPoint() {
         // No window border underneath, so nothing to hand back.
         let background = makeBackground(margin: 0)

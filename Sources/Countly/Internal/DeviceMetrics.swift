@@ -478,6 +478,28 @@ enum ScreenReader {
             .max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
     }
 
+    /// The corner radius of the application's own window, in points.
+    ///
+    /// Read from the window rather than assumed, because the value is not a
+    /// constant: it has changed across macOS releases and differs again for
+    /// full-screen and sheet-style windows. An overlay masked to the wrong radius
+    /// is visibly wrong either way, showing square wedges of page backdrop outside
+    /// the window when it rounds too little.
+    ///
+    /// The radius lives on the layer of the window's frame view, which is the
+    /// content view's superview. That view is AppKit's own, but reaching it is
+    /// ordinary public API and reading a layer property is not a call into it, so
+    /// there is nothing here that a future release can break other than by
+    /// returning zero, which is the case the fallback covers.
+    static func hostWindowCornerRadius(fallback: CGFloat) -> CGFloat {
+        guard let frameView = hostWindow?.contentView?.superview,
+              let radius = frameView.layer?.cornerRadius,
+              radius > 0 else {
+            return fallback
+        }
+        return radius
+    }
+
     /// The screen carrying the application's own window.
     ///
     /// `NSScreen.main` is only the fallback, and a poor one on a multi-monitor
