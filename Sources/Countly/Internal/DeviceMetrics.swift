@@ -483,22 +483,66 @@ enum ScreenReader {
     /// Read from the window rather than assumed, because the value is not a
     /// constant: it has changed across macOS releases and differs again for
     /// full-screen and sheet-style windows. An overlay masked to the wrong radius
-    /// is visibly wrong either way, showing square wedges of page backdrop outside
-    /// the window when it rounds too little.
+    /// is visibly wrong either way, and wrong in the direction that matters when it
+    /// rounds too little, leaving square wedges of page backdrop outside the
+    /// window.
     ///
-    /// The radius lives on the layer of the window's frame view, which is the
-    /// content view's superview. That view is AppKit's own, but reaching it is
-    /// ordinary public API and reading a layer property is not a call into it, so
-    /// there is nothing here that a future release can break other than by
-    /// returning zero, which is the case the fallback covers.
+    /// The whole layer tree of the window's frame view is searched, not just that
+    /// view's own layer. AppKit does not consistently put the radius there: it may
+    /// sit on a mask, or on a backing sublayer, and which one it is has moved
+    /// between releases. Those views are AppKit's own, but reaching them is
+    /// ordinary public API and reading a layer property is not a call into them.
     static func hostWindowCornerRadius(fallback: CGFloat) -> CGFloat {
         guard let frameView = hostWindow?.contentView?.superview,
-              let radius = frameView.layer?.cornerRadius,
-              radius > 0 else {
+              let root = frameView.layer else {
             return fallback
         }
-        return radius
+        let radius = windowCornerRadius(in: root, matching: frameView.bounds.size, depth: 0)
+        return radius > 0 ? radius : fallback
     }
+
+    /// The radius the overlay should be masked to.
+    ///
+    /// The configured value is not a hint to be reconciled with what the window
+    /// says: an application that sets it has a window shape the SDK cannot see, so
+    /// there is nothing to reconcile it against and reading the window would only
+    /// overrule the one party that knows.
+    static func overlayCornerRadius(configured: CGFloat?, fallback: CGFloat) -> CGFloat {
+        configured ?? hostWindowCornerRadius(fallback: fallback)
+    }
+
+    /// Largest corner radius on any layer that is shaped like the window itself.
+    ///
+    /// The size match is what makes the answer trustworthy. A layer tree holds
+    /// rounded things that are not the window, and the largest radius found without
+    /// that check would just as happily be a button's.
+    static func windowCornerRadius(in layer: CALayer, matching size: CGSize, depth: Int) -> CGFloat {
+        // The radius is near the top of the tree wherever it turns out to live, and
+        // an unbounded walk of a whole window's layers is not worth it to find out.
+        guard depth <= 4 else { return 0 }
+
+        var largest: CGFloat = 0
+        let bounds = layer.bounds.size
+        if abs(bounds.width - size.width) <= cornerRadiusSizeTolerance,
+           abs(bounds.height - size.height) <= cornerRadiusSizeTolerance {
+            largest = layer.cornerRadius
+        }
+
+        if let mask = layer.mask {
+            largest = Swift.max(largest, windowCornerRadius(in: mask, matching: size, depth: depth + 1))
+        }
+        for sublayer in layer.sublayers ?? [] {
+            largest = Swift.max(largest, windowCornerRadius(in: sublayer, matching: size, depth: depth + 1))
+        }
+        return largest
+    }
+
+    /// How far a layer may differ from the window and still be taken for it.
+    ///
+    /// Loose enough for the shadow and border insets AppKit puts between the frame
+    /// view and the layer that carries the shape, tight enough to exclude anything
+    /// that is merely large.
+    private static let cornerRadiusSizeTolerance: CGFloat = 12
 
     /// The screen carrying the application's own window.
     ///

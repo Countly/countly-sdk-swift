@@ -60,6 +60,19 @@ public final class CountlyContentConfig {
     /// The shortest polling interval the SDK accepts, in seconds.
     static let minimumZoneTimerInterval = 15
 
+    /// Corner radius of the overlay, in points, or `nil` to take the window's own.
+    ///
+    /// Only has an effect alongside `showWidgetsWithinApp`, where the overlay is
+    /// sized to the application's window and has to be shaped like it: a page that
+    /// paints a full-surface backdrop otherwise draws square corners over the
+    /// window's curved ones.
+    ///
+    /// Left `nil`, the SDK reads the radius from the window at presentation time,
+    /// which is right for a standard window on any macOS version and needs no
+    /// configuration. Set it when the application gives its window a shape of its
+    /// own, since nothing the SDK can read will describe that.
+    public var overlayCornerRadius: CGFloat?
+
     /// Layout of the content and feedback web views. Default `.safeArea`.
     ///
     /// The safe area rather than the full screen, so what the SDK draws clears the

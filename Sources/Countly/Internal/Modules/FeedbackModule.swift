@@ -190,7 +190,12 @@ final class FeedbackModule: ModuleBase {
 
             // Built on the main thread: the URL carries the resolved theme, and
             // resolving it reads interface state that is only safe to touch there.
-            let url = self.widgetURL(for: widget)
+            // Read here rather than inside the builder so the URL carries the same
+            // surface the overlay is about to be given.
+            let surface = ContentGeometry.windowSize(
+                displayOption: self.core.config.content.webViewDisplayOption,
+                withinApp: self.core.config.content.showWidgetsWithinApp)
+            let url = self.widgetURL(for: widget, surface: surface)
 
             // Retained for the lifetime of the presentation. Nothing else holds
             // it: the web view's navigation delegate is weak, so without this the
@@ -248,7 +253,11 @@ final class FeedbackModule: ModuleBase {
     }
 
     /// The URL the widget web view loads.
-    private func widgetURL(for widget: CountlyFeedbackWidget) -> URL? {
+    ///
+    /// - Parameter surface: the size the widget will be shown in. It goes into
+    ///   `custom` because the widget templates lay themselves out from it, not from
+    ///   anything they can measure on their own.
+    private func widgetURL(for widget: CountlyFeedbackWidget, surface: CGSize) -> URL? {
         var urlString = "\(core.config.normalizedHost)\(Endpoint.feedback)/\(widget.type.wireName)"
 
         var queryItems = [
@@ -275,11 +284,8 @@ final class FeedbackModule: ModuleBase {
 
         // Tells the page it is being shown inside the SDK's own container, and for
         // a newer widget version that it should render its own close control.
-        var custom: [String: String] = ["tc": "1"]
-        if widget.widgetVersion != nil {
-            custom["rw"] = "1"
-            custom["xb"] = "1"
-        }
+        let custom = Self.customParameters(rendersOwnCloseControl: widget.widgetVersion != nil,
+                                           surface: surface)
         urlString += "&custom=\(CountlyJSON.escapedString(from: custom, logger: log))"
 
         let finalURL = DeviceMetrics.urlStringByAppendingThemeMode(urlString)
@@ -292,6 +298,35 @@ final class FeedbackModule: ModuleBase {
             logE("widgetURL", "the widget URL could not be parsed, the widget cannot be shown, widgetID: [\(widget.id)]")
         }
         return url
+    }
+
+    /// The `custom` object the widget templates read their layout from.
+    ///
+    /// - Parameter rendersOwnCloseControl: whether the widget is new enough to draw
+    ///   its own close button rather than relying on the SDK's.
+    /// - Parameter surface: the area the widget will be shown in.
+    ///
+    /// The dimensions are not decoration. A template picks its breakpoint from
+    /// `width` and `height` and works out where to put the card by subtracting the
+    /// card's height from theirs. Send neither and it falls through to its largest
+    /// breakpoint, caps the card at that breakpoint's maximum whatever the real
+    /// screen is, and places the card at the top because the number it subtracts
+    /// from is undefined. What the user sees is a short card in the wrong corner
+    /// with its content scrolling inside it, which looks like anything except a
+    /// missing query parameter.
+    static func customParameters(rendersOwnCloseControl: Bool, surface: CGSize) -> [String: String] {
+        var custom: [String: String] = ["tc": "1"]
+        if rendersOwnCloseControl {
+            custom["rw"] = "1"
+            custom["xb"] = "1"
+        }
+        // Omitted rather than sent as zero when there is no surface to report: a
+        // zero is a dimension the template will believe and lay out against.
+        if surface.width > 0, surface.height > 0 {
+            custom["width"] = String(Int(surface.width.rounded()))
+            custom["height"] = String(Int(surface.height.rounded()))
+        }
+        return custom
     }
 
     // MARK: - Widget data

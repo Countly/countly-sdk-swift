@@ -486,6 +486,28 @@ final class ContentModule: ModuleBase {
 
     // MARK: - Presentation
 
+    /// Adds the `origin` the page's own message listener checks against.
+    ///
+    /// The server's content URL does not carry one. A content block never reads
+    /// it, but a survey served through the content queue does: its listener
+    /// accepts the host's `resize` message only when `event.origin` matches this
+    /// parameter, and silently drops it otherwise. Without it a hosted survey is
+    /// never told the surface changed and never re-anchors itself.
+    ///
+    /// The value is the page's own origin, because that is what `event.origin`
+    /// reports for a message the page posts to itself through the SDK's bridge.
+    static func appendingOrigin(to url: URL) -> URL {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme, let host = components.host else { return url }
+        var items = components.queryItems ?? []
+        guard !items.contains(where: { $0.name == "origin" }) else { return url }
+        var origin = "\(scheme)://\(host)"
+        if let port = components.port { origin += ":\(port)" }
+        items.append(URLQueryItem(name: "origin", value: origin))
+        components.queryItems = items
+        return components.url ?? url
+    }
+
     private func showContent(urlString: String, placement: [String: Any]) {
         #if os(iOS) || os(visionOS) || os(macOS)
         guard let url = URL(string: urlString), url.scheme != nil, url.host != nil else {
@@ -519,7 +541,7 @@ final class ContentModule: ModuleBase {
 
             // The theme is resolved here, on the main thread, where reading the
             // trait collection is safe.
-            let themedURL = URL(string: DeviceMetrics.urlStringByAppendingThemeMode(urlString)) ?? url
+            let themedURL = Self.appendingOrigin(to: URL(string: DeviceMetrics.urlStringByAppendingThemeMode(urlString)) ?? url)
 
             self.logI("showContent", "showing a content, host: [\(themedURL.host ?? "")], path: [\(themedURL.path)], frame: [\(frame.logValue)], isLandscape: [\(isLandscape)], rotationDisabled: [\(self.core.config.content.disableRotation)]")
             self.logD("showContent", "shown content placement detail, orientationKey: [\(isLandscape ? "l" : "p")], x: [\(frame.origin.x.logValue)], y: [\(frame.origin.y.logValue)], width: [\(frame.width.logValue)], height: [\(frame.height.logValue)], windowSize: [\(windowSize.logValue)]")

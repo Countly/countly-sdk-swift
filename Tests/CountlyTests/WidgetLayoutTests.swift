@@ -152,3 +152,93 @@ final class WidgetLayoutTests: XCTestCase {
     }
 
 }
+
+/// A height the SDK measured is not a height the page asked for.
+///
+/// The page's announcement is clamped by its own breakpoint and, for an NPS,
+/// arrives before the incoming screen has laid out, so it understates a tall
+/// step. The measurement is the page's own formula read after layout. The first
+/// is held to the type's maximum; the second is held only to the surface, because
+/// a comment step that needs 675 points and gets 450 scrolls inside its card.
+final class WidgetLayoutMeasuredHeightTests: XCTestCase {
+
+    private let surface = CGSize(width: 1440, height: 900)
+
+    func testAMeasuredHeightMayPassTheTypeMaximum() {
+        let frame = WidgetLayout.resolve(type: .nps, position: nil, surface: surface,
+                                         requestedHeight: 675, boundedByTypeMaximum: false)
+
+        XCTAssertEqual(frame.height, 675)
+        // Still along the bottom edge, which is where an NPS belongs.
+        XCTAssertEqual(frame.maxY, surface.height)
+    }
+
+    func testAnAnnouncedHeightStaysHeldToTheTypeMaximum() {
+        let frame = WidgetLayout.resolve(type: .nps, position: nil, surface: surface,
+                                         requestedHeight: 675)
+
+        XCTAssertEqual(frame.height, WidgetLayout.npsMaximumHeight,
+                       "an announced height escaped the maximum that guards against a viewport echo")
+    }
+
+    func testAMeasuredHeightIsStillHeldToTheSurface() {
+        let small = CGSize(width: 480, height: 600)
+        let frame = WidgetLayout.resolve(type: .nps, position: nil, surface: small,
+                                         requestedHeight: 675, boundedByTypeMaximum: false)
+
+        XCTAssertEqual(frame.height, small.height)
+        XCTAssertEqual(frame.minY, 0)
+    }
+
+    func testASurveyMeasurementIsTreatedTheSameWay() {
+        let frame = WidgetLayout.resolve(type: .survey, position: "bRight", surface: surface,
+                                         requestedHeight: 720, boundedByTypeMaximum: false)
+
+        XCTAssertEqual(frame.height, 720)
+        XCTAssertEqual(frame.maxX, surface.width - WidgetLayout.sideMargin)
+    }
+}
+
+/// A rectangle the page asked for is a size, not a proportion. When the surface
+/// changes it keeps its size, stays against the edge it was nearer to, and is
+/// clamped onto the surface.
+final class WidgetLayoutReanchorTests: XCTestCase {
+
+    func testABottomAlignedFrameStaysOnTheBottomAsTheWindowGrows() {
+        let old = CGSize(width: 1000, height: 600)
+        let frame = CGRect(x: 50, y: 300, width: 500, height: 300)   // flush with the bottom
+        let moved = WidgetLayout.reanchor(frame, from: old, to: CGSize(width: 1000, height: 900))
+
+        XCTAssertEqual(moved.size, frame.size, "the page's size was changed")
+        XCTAssertEqual(moved.maxY, 900, "it floated mid-window instead of following the bottom edge")
+        XCTAssertEqual(moved.minX, 50, "it was nearer the left edge and should have stayed there")
+    }
+
+    func testARightAlignedFrameFollowsTheRightEdge() {
+        let old = CGSize(width: 1000, height: 600)
+        let frame = CGRect(x: 450, y: 0, width: 500, height: 200)    // 50 from the right, 450 from the left
+        let moved = WidgetLayout.reanchor(frame, from: old, to: CGSize(width: 1400, height: 600))
+
+        XCTAssertEqual(moved.maxX, 1350)
+    }
+
+    func testACentredFrameStaysCentred() {
+        let old = CGSize(width: 1000, height: 600)
+        let frame = CGRect(x: 250, y: 150, width: 500, height: 300)
+        let moved = WidgetLayout.reanchor(frame, from: old, to: CGSize(width: 1600, height: 1000))
+
+        XCTAssertEqual(moved.midX, 800)
+        XCTAssertEqual(moved.midY, 500)
+    }
+
+    func testAFrameIsClampedOntoASmallerSurface() {
+        let old = CGSize(width: 1000, height: 600)
+        let frame = CGRect(x: 450, y: 300, width: 500, height: 300)
+        let moved = WidgetLayout.reanchor(frame, from: old, to: CGSize(width: 400, height: 250))
+
+        XCTAssertEqual(moved.minX, 0)
+        XCTAssertEqual(moved.minY, 0)
+        XCTAssertEqual(moved.width, 400, "wider than the surface, so as wide as the surface")
+        XCTAssertEqual(moved.height, 250)
+    }
+}

@@ -44,10 +44,18 @@ enum WidgetLayout {
     ///     `bRight`. Only a survey is placed by it; an NPS is always centred.
     ///   - requestedHeight: a height the page asked for, or zero. Honoured up to
     ///     the type's maximum, so a short survey does not get a tall box.
+    ///   - boundedByTypeMaximum: whether `requestedHeight` is held to the type's
+    ///     maximum. It is when the page announced the height, because the
+    ///     templates echo the viewport they were given and the maximum is what
+    ///     keeps an echo from becoming the box. It is not when the SDK measured the
+    ///     card in the DOM: that number is the page's own formula, unclamped, and a
+    ///     step taller than the maximum needs a box that tall or it scrolls inside
+    ///     itself. Either way the surface bounds it.
     static func resolve(type: FeedbackWidgetType?,
                         position: String?,
                         surface: CGSize,
-                        requestedHeight: CGFloat = 0) -> CGRect {
+                        requestedHeight: CGFloat = 0,
+                        boundedByTypeMaximum: Bool = true) -> CGRect {
         guard let type else {
             let width = min(maximumWidth, surface.width)
             let height = min(requestedHeight > 0 ? requestedHeight : surveyMaximumHeight, surface.height)
@@ -62,7 +70,8 @@ enum WidgetLayout {
 
         let maximumHeight = type == .nps ? npsMaximumHeight : surveyMaximumHeight
         let width = min(maximumWidth, surface.width)
-        let height = min(requestedHeight > 0 ? min(requestedHeight, maximumHeight) : maximumHeight,
+        let ceiling = boundedByTypeMaximum ? maximumHeight : surface.height
+        let height = min(requestedHeight > 0 ? min(requestedHeight, ceiling) : maximumHeight,
                          surface.height)
 
         // Along the bottom edge. A widget is an interruption, and the bottom is
@@ -71,6 +80,37 @@ enum WidgetLayout {
                       y: max(0, surface.height - height),
                       width: width,
                       height: height)
+    }
+
+    /// Moves a page-sized frame onto a new surface without changing its size.
+    ///
+    /// A rectangle the page asked for is a size, not a proportion: a survey wants
+    /// its 500 wide card whatever the window is. So the size is kept, and on each
+    /// axis the frame stays against whichever edge it was nearer to; equal margins
+    /// mean it was centred and stays centred. Then it is clamped onto the surface,
+    /// because a frame that keeps its old origin as the window shrinks ends up with
+    /// part of itself off screen, and one that keeps it as the window grows floats
+    /// mid-window rather than against the edge it was placed at.
+    static func reanchor(_ frame: CGRect, from oldSurface: CGSize, to newSurface: CGSize) -> CGRect {
+        func axis(origin: CGFloat, length: CGFloat, old: CGFloat, new: CGFloat) -> CGFloat {
+            let usable = max(0, new - length)
+            guard old > 0 else { return min(max(0, origin), usable) }
+            let leading = origin
+            let trailing = old - origin - length
+            let anchored: CGFloat
+            if abs(leading - trailing) <= 1 {
+                anchored = (new - length) / 2
+            } else if leading < trailing {
+                anchored = leading
+            } else {
+                anchored = new - length - trailing
+            }
+            return min(max(0, anchored), usable)
+        }
+        return CGRect(x: axis(origin: frame.origin.x, length: frame.width, old: oldSurface.width, new: newSurface.width),
+                      y: axis(origin: frame.origin.y, length: frame.height, old: oldSurface.height, new: newSurface.height),
+                      width: min(frame.width, newSurface.width),
+                      height: min(frame.height, newSurface.height))
     }
 
     private static func centred(width: CGFloat, height: CGFloat, in surface: CGSize) -> CGRect {

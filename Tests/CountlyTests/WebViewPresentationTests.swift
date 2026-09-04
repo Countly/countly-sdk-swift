@@ -107,6 +107,190 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         }
     }
 
+    /// Presents a widget of a known type, so the type's layout rules apply.
+    @discardableResult
+    private func presentWidget(_ countly: CountlyInstance, type: FeedbackWidgetType) -> WebViewManager {
+        let manager = WebViewManager(core: core(of: countly))
+        self.manager = manager
+        onMain {
+            manager.present(url: URL(string: "https://example.com/feedback/\(type.wireName)"),
+                            widgetType: type, widgetPosition: nil, appear: nil, dismiss: nil)
+            self.page(of: manager)?.loadHTMLString("<html><body>ok</body></html>",
+                                                   baseURL: URL(string: "https://example.com/"))
+        }
+        waitForLoad(manager)
+        return manager
+    }
+
+    /// Delivers what the in-page observer would post about the card.
+    private func reportCard(_ manager: WebViewManager, height: Double, reason: String) {
+        onMain {
+            manager.handleScriptMessage(name: "cardSize",
+                                        body: ["w": 480, "h": height, "via": "#nps-comments", "reason": reason])
+        }
+        TestUtils.pump(0.3)
+    }
+
+    private func placedHeight(_ manager: WebViewManager) -> CGFloat? {
+        onMain { manager.placedFrameForTesting?.height }
+    }
+
+    // MARK: - Measured card
+
+    /// The page announces a size on every screen switch, but measures before the
+    /// incoming screen has laid out, and clamps what it measures to its own
+    /// breakpoint. The comment step of an NPS therefore arrives short and scrolls
+    /// inside its card. The observer's measurement is the page's own formula read
+    /// after layout, and it is trusted past the type's maximum.
+    func testAMeasuredCardMayGrowTheBoxPastTheTypeMaximum() {
+        let manager = presentWidget(startInstance(), type: .nps)
+        XCTAssertEqual(placedHeight(manager), WidgetLayout.npsMaximumHeight, "an NPS starts at its maximum")
+
+        reportCard(manager, height: 500, reason: "mutation")
+
+        guard let frame = onMain({ manager.placedFrameForTesting }) else {
+            XCTFail("the widget should have been placed")
+            return
+        }
+        XCTAssertEqual(frame.height, 500, accuracy: 1, "the measured step is given the room it needs")
+        XCTAssertGreaterThan(frame.origin.y, 0, "and stays anchored to the bottom rather than the top")
+    }
+
+    /// The fit budget stops one screen's measurement chasing itself. It must not
+    /// freeze the card at the first screen's size: a new screen starts it over.
+    func testTheFitBudgetIsRenewedWhenTheScreenChanges() {
+        let manager = presentWidget(startInstance(), type: .nps)
+
+        reportCard(manager, height: 300, reason: "resize")
+        reportCard(manager, height: 320, reason: "resize")
+        reportCard(manager, height: 340, reason: "resize")
+        XCTAssertEqual(placedHeight(manager) ?? 0, 340, accuracy: 1)
+
+        // The budget is spent, so a fourth measurement of the same screen is ignored.
+        reportCard(manager, height: 400, reason: "resize")
+        XCTAssertEqual(placedHeight(manager) ?? 0, 340, accuracy: 1, "a spent budget still let a fit through")
+
+        // A new screen is a fresh budget.
+        reportCard(manager, height: 400, reason: "mutation")
+        XCTAssertEqual(placedHeight(manager) ?? 0, 400, accuracy: 1, "a new screen was held to the old screen's budget")
+    }
+
+    /// The page repeats its announcement every time the surface is reported. If it
+    /// outranked the measurement, every window move would shrink a fitted comment
+    /// step back to the clamp, and the observer, seeing no change in the card,
+    /// would never put it right again.
+    func testAStaleAnnouncementCannotUndoAMeasuredFit() {
+        let manager = presentWidget(startInstance(), type: .nps)
+        reportCard(manager, height: 500, reason: "mutation")
+        XCTAssertEqual(placedHeight(manager) ?? 0, 500, accuracy: 1)
+
+        navigate(manager, to: #"https://countly_action_event?cly_x_action_event=1&action=resize_me&resize_me={"l":{"x":0,"y":0,"w":480,"h":300},"p":{"x":0,"y":0,"w":480,"h":300}}"#)
+        TestUtils.pump(0.6)
+
+        XCTAssertEqual(placedHeight(manager) ?? 0, 500, accuracy: 1, "the page's clamped announcement undid the measured fit")
+    }
+
+    /// A wrapper caught mid layout measures as a sliver. It is not the card.
+    func testAMeasurementTooSmallToBeTheCardIsIgnored() {
+        let manager = presentWidget(startInstance(), type: .nps)
+
+        reportCard(manager, height: 50, reason: "mutation")
+
+        XCTAssertEqual(placedHeight(manager), WidgetLayout.npsMaximumHeight, "a sliver was taken for the card")
+    }
+
+    // MARK: - One overlay at a time
+
+    /// Two overlays would fight for the same edge of the same screen, so the second
+    /// is refused, as Android does. The refused caller hears at once.
+    func testASecondOverlayIsRefusedWhileTheFirstIsUp() {
+        let countly = startInstance()
+        let first = present(countly)
+        waitForLoad(first)
+
+        var refusedDismissed = false
+        let second = WebViewManager(core: core(of: countly))
+        onMain {
+            second.present(url: URL(string: "https://example.com/feedback/nps"),
+                           appear: nil, dismiss: { refusedDismissed = true })
+        }
+
+        XCTAssertTrue(refusedDismissed, "the refused caller was left waiting for a dismissal that is not coming")
+        XCTAssertNil(onMain { self.page(of: second) }, "the refused presentation built a web view anyway")
+        XCTAssertNotNil(onMain { self.page(of: first) }, "refusing the second took the first down")
+    }
+
+    /// A content block on screen blocks a feedback widget, not only another content.
+    func testAFeedbackWidgetIsRefusedWhileContentIsUp() {
+        let countly = startInstance()
+        let content = present(countly, url: "https://example.com/o/content/abc",
+                              frame: CGRect(x: 0, y: 0, width: 300, height: 200))
+        waitForLoad(content)
+
+        var refused = false
+        let widget = WebViewManager(core: core(of: countly))
+        onMain {
+            widget.present(url: URL(string: "https://example.com/feedback/nps"),
+                           widgetType: .nps, widgetPosition: nil, appear: nil, dismiss: { refused = true })
+        }
+
+        XCTAssertTrue(refused, "a widget was shown on top of a content block")
+        XCTAssertNil(onMain { self.page(of: widget) })
+        XCTAssertNotNil(onMain { self.page(of: content) }, "the content was taken down by the refused widget")
+    }
+
+    /// A caller may present again from inside its own dismiss callback.
+    ///
+    /// Two things make that true, and either alone would do: `close()` marks the
+    /// manager closed before anything else, and the gate treats a closed holder as
+    /// free; and the gate is released explicitly before the callback runs. What is
+    /// asserted is the behaviour, not the mechanism: a presentation started from
+    /// inside the callback actually builds its web view.
+    func testACallerMayPresentAgainFromInsideItsDismissCallback() {
+        let countly = startInstance()
+        var next: WebViewManager?
+        var refused = false
+        let manager = present(countly, dismiss: {
+            let again = WebViewManager(core: self.core(of: countly))
+            // A refused presentation fires its dismiss callback at once, so a flag
+            // set here separates "refused by the gate" from any other reason for
+            // the web view to be missing.
+            again.present(url: URL(string: "https://example.com/feedback/nps"), appear: nil, dismiss: { refused = true })
+            // Loaded from a string, as the helper does: a real load fails in the
+            // sandbox at once and the page closes itself through recovery, which
+            // would look exactly like a refusal.
+            again.webView?.loadHTMLString("<html><body>ok</body></html>", baseURL: URL(string: "https://example.com/"))
+            next = again
+        })
+        waitForLoad(manager)
+
+        onMain { manager.close() }
+        TestUtils.pump(0.3)
+
+        guard let next else {
+            XCTFail("the dismiss callback did not run")
+            return
+        }
+        XCTAssertFalse(refused, "the gate refused a presentation started from the dismiss callback")
+        XCTAssertNotNil(onMain { self.page(of: next) }, "the presentation started from the dismiss callback has no web view")
+        onMain { next.close() }
+    }
+
+    /// A survey served through the content queue reads `origin`; a content block
+    /// ignores it. Without it the hosted survey never hears the surface changed.
+    func testTheContentURLCarriesThePagesOwnOrigin() {
+        let url = ContentModule.appendingOrigin(to: URL(string: "https://cdn.example.com:8443/content/abc?theme=dark")!)
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+
+        XCTAssertEqual(items.first { $0.name == "origin" }?.value, "https://cdn.example.com:8443")
+        XCTAssertEqual(items.first { $0.name == "theme" }?.value, "dark", "an existing parameter was lost")
+    }
+
+    func testAnExistingOriginIsLeftAlone() {
+        let original = URL(string: "https://cdn.example.com/content/abc?origin=https://other.example.com")!
+        XCTAssertEqual(ContentModule.appendingOrigin(to: original), original)
+    }
+
     // MARK: - Presentation
 
     /// The page is hidden until it loads, so a blank rectangle never flashes over
@@ -885,6 +1069,92 @@ final class OverlayEdgeTests: XCTestCase {
         overlay.unbind()
 
         XCTAssertNil(overlay.parent, "the overlay stayed attached and would return with the window")
+    }
+
+    private func layer(size: CGSize, radius: CGFloat) -> CALayer {
+        let layer = CALayer()
+        layer.bounds = CGRect(origin: .zero, size: size)
+        layer.cornerRadius = radius
+        return layer
+    }
+
+    func testTheWindowRadiusIsFoundWhereverAppKitKeepsIt() {
+        let windowSize = CGSize(width: 600, height: 400)
+        let root = layer(size: windowSize, radius: 0)
+
+        // The radius on a mask rather than the view's own layer, which is the shape
+        // that made the first attempt read zero.
+        let masked = layer(size: windowSize, radius: 0)
+        masked.mask = layer(size: windowSize, radius: 26)
+        root.addSublayer(masked)
+
+        XCTAssertEqual(ScreenReader.windowCornerRadius(in: root, matching: windowSize, depth: 0), 26)
+    }
+
+    func testSomethingMerelyRoundedIsNotMistakenForTheWindow() {
+        let windowSize = CGSize(width: 600, height: 400)
+        let root = layer(size: windowSize, radius: 0)
+        // A pill-shaped control: a large radius on a layer nothing like the window.
+        root.addSublayer(layer(size: CGSize(width: 80, height: 24), radius: 12))
+
+        XCTAssertEqual(ScreenReader.windowCornerRadius(in: root, matching: windowSize, depth: 0), 0,
+                       "a control's corner radius was taken for the window's")
+    }
+
+    func testAWindowThatRoundsNothingReportsNothing() {
+        let windowSize = CGSize(width: 600, height: 400)
+
+        XCTAssertEqual(ScreenReader.windowCornerRadius(in: layer(size: windowSize, radius: 0),
+                                                       matching: windowSize,
+                                                       depth: 0), 0)
+    }
+
+    func testAConfiguredRadiusOverrulesTheWindow() {
+        // A value the window could not plausibly report, so the assertion cannot
+        // pass by coincidence of whatever window this test process happens to own.
+        XCTAssertEqual(ScreenReader.overlayCornerRadius(configured: 33, fallback: 16), 33)
+    }
+
+    func testTheRadiusIsLeftToTheWindowWhenNoneIsConfigured() {
+        // Nothing configured and, in a test process, no host window to read either,
+        // so the fallback is what an application gets rather than a zero radius
+        // that would put the square corners straight back.
+        XCTAssertEqual(ScreenReader.overlayCornerRadius(configured: nil, fallback: 16), 16)
+    }
+
+    func testNoRadiusIsConfiguredByDefault() {
+        XCTAssertNil(CountlyContentConfig().overlayCornerRadius,
+                     "the SDK stopped reading the radius from the window by default")
+    }
+
+    func testTheSurfaceIsSentToTheWidgetTemplate() {
+        let custom = FeedbackModule.customParameters(rendersOwnCloseControl: true,
+                                                     surface: CGSize(width: 1440, height: 900))
+
+        // The template picks its breakpoint and its card position from these two.
+        XCTAssertEqual(custom["width"], "1440")
+        XCTAssertEqual(custom["height"], "900")
+        XCTAssertEqual(custom["tc"], "1")
+        XCTAssertEqual(custom["xb"], "1")
+    }
+
+    func testFractionalSurfacesAreSentAsWholePoints() {
+        let custom = FeedbackModule.customParameters(rendersOwnCloseControl: false,
+                                                     surface: CGSize(width: 1439.6, height: 899.4))
+
+        XCTAssertEqual(custom["width"], "1440")
+        XCTAssertEqual(custom["height"], "899")
+        XCTAssertNil(custom["xb"], "an older widget was told to draw its own close control")
+    }
+
+    func testNoSurfaceIsSentRatherThanAZeroOne() {
+        let custom = FeedbackModule.customParameters(rendersOwnCloseControl: true, surface: .zero)
+
+        // A zero is a dimension the template would believe and lay out against,
+        // which is worse than the fallback it uses when the key is absent.
+        XCTAssertNil(custom["width"])
+        XCTAssertNil(custom["height"])
+        XCTAssertEqual(custom["tc"], "1")
     }
 
     func testCoveringTheWholeScreenKeepsEveryPoint() {

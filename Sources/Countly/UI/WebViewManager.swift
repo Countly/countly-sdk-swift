@@ -91,6 +91,17 @@ final class WebViewManager: NSObject {
     /// own, which is every feedback widget, is re-filled when the interface resizes.
     private var hasExplicitPlacement = false
 
+    /// Whether the current frame is one the page asked for through `resize_me`.
+    ///
+    /// Distinguished from a frame the server gave, because the two behave
+    /// differently when the surface changes: the server's is a proportion of the
+    /// surface and the page re-lays it out when told the new size, while the page's
+    /// own is a size that has to be kept and moved back against its edge.
+    private var frameRequestedByPage = false
+
+    /// The surface the current frame was placed against.
+    private var surfaceAtPlacement: CGSize = .zero
+
     /// What the SDK is showing, kept so its placement can be worked out again when
     /// the surface changes. A widget's frame is derived from the surface, so a
     /// surface that resizes invalidates it.
@@ -185,6 +196,7 @@ final class WebViewManager: NSObject {
         static let resourceLoadError = "resourceLoadError"
         static let resourceVerifyResult = "resourceVerifyResult"
         static let widgetCommand = "widgetCommand"
+        static let cardSize = "cardSize"
     }
 
     /// Forwards the page's own replies out to the SDK.
@@ -222,6 +234,46 @@ final class WebViewManager: NSObject {
         super.init()
     }
 
+    deinit {
+        Self.gate.release(self)
+    }
+
+    /// One overlay at a time across content and feedback widgets.
+    ///
+    /// The Android SDK refuses a second presentation while any content or feedback
+    /// overlay is up, and this does the same: two overlays would fight for the
+    /// same edge of the same screen, and the second would land on top of a page
+    /// the user is in the middle of answering. The refused caller hears about it
+    /// at once through its dismiss callback so nothing upstream waits on it, and a
+    /// content zone simply fetches again after its interval.
+    ///
+    /// Process wide rather than per instance, as Android's flag is: the screen is
+    /// shared whatever instance is drawing on it.
+    static let gate = PresentationGate()
+
+    final class PresentationGate {
+        private let lock = NSLock()
+        private weak var holder: WebViewManager?
+
+        /// Claims the gate for `manager`, or reports who holds it.
+        func claim(_ manager: WebViewManager) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            if let holder, holder !== manager, !holder.isClosed { return false }
+            holder = manager
+            return true
+        }
+
+        func release(_ manager: WebViewManager) {
+            lock.lock(); defer { lock.unlock() }
+            if holder === manager { holder = nil }
+        }
+
+        var isHeld: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return holder != nil && !(holder?.isClosed ?? true)
+        }
+    }
+
     // MARK: - Presentation
 
     /// Puts a page on screen.
@@ -243,6 +295,17 @@ final class WebViewManager: NSObject {
         }
 
         isFeedbackWidget = url.path.contains(Endpoint.feedback)
+
+        guard Self.gate.claim(self) else {
+            core.logger.i(Self.module, "present", "another content or feedback overlay is already being shown, skipping this presentation, isFeedbackWidget: [\(isFeedbackWidget)]")
+            // Told now rather than never: the caller's bookkeeping runs off this
+            // callback, and a caller that waited for a dismissal that is not
+            // coming would hold its own state open indefinitely.
+            isClosed = true
+            dismiss?()
+            return
+        }
+
         presentedWidgetType = widgetType
         presentedWidgetPosition = widgetPosition
         isPinnedToPortrait = !isFeedbackWidget && core.config.content.disableRotation
@@ -288,14 +351,21 @@ final class WebViewManager: NSObject {
             // window's rounded corners. Without the mask a page painting a
             // full-surface backdrop draws square corners over the window's curved
             // ones, and the mismatch shows as four dark wedges outside the window.
-            background.layer?.cornerRadius = ScreenReader.hostWindowCornerRadius(fallback: Self.fallbackWindowCornerRadius)
+            // The application's own value wins: a window it has given a custom
+            // shape is one nothing the SDK can read will describe correctly.
+            background.layer?.cornerRadius = ScreenReader.overlayCornerRadius(
+                configured: core.config.content.overlayCornerRadius,
+                fallback: Self.fallbackWindowCornerRadius)
             background.layer?.masksToBounds = true
             background.passThroughEdgeMargin = Self.windowResizeEdgeMargin
             // Ordered with the window it covers rather than above the whole desktop,
             // so bringing another application forward puts it in front of the
             // content the way it would in front of any other window.
             overlayWindow.bind(to: ScreenReader.hostWindow)
-            core.logger.d(Self.module, "present", "the overlay is bound to the host window, cornerRadius: [\(background.layer?.cornerRadius ?? 0)]")
+            let radius = background.layer?.cornerRadius ?? 0
+            let source = core.config.content.overlayCornerRadius != nil ? "configuration"
+                : (radius == Self.fallbackWindowCornerRadius ? "fallback" : "window")
+            core.logger.d(Self.module, "present", "the overlay is bound to the host window, cornerRadius: [\(radius)], source: [\(source)]")
         }
         #else
         background.backgroundColor = .clear
@@ -321,6 +391,7 @@ final class WebViewManager: NSObject {
         configuration.userContentController.add(proxy, name: ScriptMessage.resourceLoadError)
         configuration.userContentController.add(proxy, name: ScriptMessage.resourceVerifyResult)
         configuration.userContentController.add(proxy, name: ScriptMessage.widgetCommand)
+        configuration.userContentController.add(proxy, name: ScriptMessage.cardSize)
 
         // A widget is laid out by the SDK, because unlike a content page it never
         // says where it wants to go and the server never says either. See
@@ -348,6 +419,8 @@ final class WebViewManager: NSObject {
         baseWebViewFrame = targetFrame
         // A widget the SDK placed is placed, so a layout pass must not refill it.
         hasExplicitPlacement = frame != nil || isFeedbackWidget
+        frameRequestedByPage = false
+        surfaceAtPlacement = surface
         core.logger.d(Self.module, "present", "the presentation frames were computed, webViewFrame: [\(targetFrame.logValue)], surface: [\(surface.logValue)], backgroundFrame: [\(background.bounds.logValue)]")
 
         let web = WKWebView(frame: targetFrame, configuration: configuration)
@@ -435,7 +508,8 @@ final class WebViewManager: NSObject {
             let frame = WidgetLayout.resolve(type: presentedWidgetType,
                                              position: presentedWidgetPosition,
                                              surface: surface,
-                                             requestedHeight: measuredCardHeight)
+                                             requestedHeight: measuredCardHeight,
+                                             boundedByTypeMaximum: false)
             core.logger.d(Self.module, "surfaceDidChange", "the surface changed and the widget is laid out again, widgetType: [\(presentedWidgetType?.wireName ?? "unknown")], frame: [\(frame.logValue)], surface: [\(surface.logValue)], measuredCardHeight: [\(measuredCardHeight.logValue)]")
             baseWebViewFrame = frame
 
@@ -446,6 +520,12 @@ final class WebViewManager: NSObject {
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.measureDelay) { [weak self] in
                 self?.measureAndFitCard()
             }
+        } else if frameRequestedByPage, let current = baseWebViewFrame {
+            // A size, not a proportion: kept, moved back against its edge, clamped.
+            let moved = WidgetLayout.reanchor(current, from: surfaceAtPlacement, to: surface)
+            core.logger.d(Self.module, "surfaceDidChange", "the surface changed and the page-sized frame is re-anchored, from: [\(current.logValue)], to: [\(moved.logValue)], surface: [\(surface.logValue)]")
+            baseWebViewFrame = moved
+            surfaceAtPlacement = surface
         } else {
             core.logger.d(Self.module, "surfaceDidChange", "the surface changed and the page keeps the frame it was given, because the SDK did not choose it, frame: [\(baseWebViewFrame?.logValue ?? "none")], surface: [\(surface.logValue)]")
         }
@@ -482,6 +562,8 @@ final class WebViewManager: NSObject {
             let controller = self.webView?.configuration.userContentController
             controller?.removeScriptMessageHandler(forName: ScriptMessage.resourceLoadError)
             controller?.removeScriptMessageHandler(forName: ScriptMessage.resourceVerifyResult)
+            controller?.removeScriptMessageHandler(forName: ScriptMessage.widgetCommand)
+            controller?.removeScriptMessageHandler(forName: ScriptMessage.cardSize)
             controller?.removeAllUserScripts()
             self.webView?.removeFromSuperview()
             self.webView = nil
@@ -495,6 +577,9 @@ final class WebViewManager: NSObject {
             self.window = nil
             self.backgroundView = nil
 
+            // Released before the caller is told, so a caller may present again
+            // from inside its own dismiss callback.
+            Self.gate.release(self)
             let dismiss = self.dismissBlock
             self.dismissBlock = nil
             dismiss?()
@@ -682,7 +767,14 @@ final class WebViewManager: NSObject {
         // been seen: a 435x144 banner became the whole 3840x2130 screen. Only a
         // page that asked to fill, which is every feedback widget, is re-filled.
         guard !hasExplicitPlacement else {
-            core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed, the page keeps the placement the server gave it, frame: [\(baseWebViewFrame?.logValue ?? "none")]")
+            if frameRequestedByPage, let current = baseWebViewFrame, containerSize != surfaceAtPlacement {
+                let moved = WidgetLayout.reanchor(current, from: surfaceAtPlacement, to: containerSize)
+                core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed and the page-sized frame is re-anchored, from: [\(current.logValue)], to: [\(moved.logValue)]")
+                baseWebViewFrame = moved
+                surfaceAtPlacement = containerSize
+            } else {
+                core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed, the page keeps the placement the server gave it, frame: [\(baseWebViewFrame?.logValue ?? "none")]")
+            }
             applySafeAreaPlacement()
             reportSurfaceToPage()
             return
@@ -772,11 +864,21 @@ final class WebViewManager: NSObject {
         // y=0, w=480, h=414})". Content is untouched, because the server placed it
         // deliberately and its coordinates mean something.
         if isFeedbackWidget {
+            // A measurement, once there is one, outranks what the page announces.
+            //
+            // The announcement is the same formula clamped to the page's breakpoint
+            // and, on a screen switch, taken before the incoming screen has laid
+            // out. The page repeats it every time the surface is reported, so
+            // honouring it here would shrink a fitted box back to the clamp each
+            // time the window moved, and the observer, seeing no change in the
+            // card itself, would have no reason to put it right again.
+            let hasMeasurement = measuredCardHeight > 0
             let anchored = WidgetLayout.resolve(type: presentedWidgetType,
                                                 position: presentedWidgetPosition,
                                                 surface: container,
-                                                requestedHeight: frame.height)
-            core.logger.d(Self.module, "resize", "the widget asked for a size, so the size is taken and the position is kept, asked: [\(frame.logValue)], placed: [\(anchored.logValue)]")
+                                                requestedHeight: hasMeasurement ? measuredCardHeight : frame.height,
+                                                boundedByTypeMaximum: !hasMeasurement)
+            core.logger.d(Self.module, "resize", "the widget asked for a size, so the size is taken and the position is kept, asked: [\(frame.logValue)], measuredCardHeight: [\(measuredCardHeight.logValue)], placed: [\(anchored.logValue)]")
             frame = anchored
         }
 
@@ -785,6 +887,8 @@ final class WebViewManager: NSObject {
 
         baseWebViewFrame = frame
         hasExplicitPlacement = true
+        frameRequestedByPage = true
+        surfaceAtPlacement = container
         // A content page has said where it wants to be, so the SDK stops deciding.
         // A widget only stated a size, and the SDK still owns where that size goes,
         // so it stays SDK placed and is re-anchored when the surface changes.
@@ -1215,10 +1319,18 @@ final class WebViewManager: NSObject {
     }
 
     /// Receives both injected scripts' messages.
-    fileprivate func handleScriptMessage(name: String, body: Any) {
+    func handleScriptMessage(name: String, body: Any) {
         switch name {
         case ScriptMessage.widgetCommand:
             handleWidgetCommand(body)
+
+        case ScriptMessage.cardSize:
+            guard let box = body as? [String: Any],
+                  let width = (box["w"] as? NSNumber)?.doubleValue,
+                  let height = (box["h"] as? NSNumber)?.doubleValue else { return }
+            applyMeasuredCard(width: width, height: height,
+                              via: box["via"] as? String ?? "?",
+                              reason: box["reason"] as? String ?? "?")
 
         case ScriptMessage.resourceLoadError:
             guard let payload = body as? [String: Any] else { return }
@@ -1535,6 +1647,7 @@ extension WebViewManager: WKNavigationDelegate {
         // size. Waiting for that answer means one placement and no movement. The
         // deadline is what covers a page that never answers.
         if isFeedbackWidget {
+            installCardObserver()
             awaitFirstFitThenAppear()
 
             // Measured a moment later so the page has laid itself out at the size it
@@ -1570,34 +1683,107 @@ extension WebViewManager: WKNavigationDelegate {
     /// these templates wraps its card in a *transparent* wrapper, so anything that
     /// looks for a painted background returns nothing on a perfectly good page, and
     /// a bounding box union picks up the wrapper and reports the whole viewport.
-    private static let measureCardScript = """
-    (function () {
+    /// Measures the card the way the page itself does.
+    ///
+    /// This is `calculateHeight` from the widget templates, minus the clamp: the
+    /// active screen's container plus the modal's top padding. The template reports
+    /// that number held to its breakpoint's maximum, so the clamped figure is what
+    /// the SDK is told and the unclamped one is what the step actually needs. The
+    /// active screen is the one with a box; the others are `display: none`.
+    ///
+    /// The screens are looked for before `#widget-body`, which is only a wrapper
+    /// in the survey template and is absent from the NPS one, and before the class
+    /// based fallbacks that cover the rating widget, whose markup is different.
+    private static let cardMeasurementFunction = """
+    function __clyMeasureCard() {
         var body = document.body;
         if (!body) { return null; }
-
-        var selectors = ['#widget-body', '.modal-content', '[class*="survey-widget"]',
-                         '[id^="nps-"]', '[class*="countly-ratings"]', '[class*="cly-"]',
-                         '.smiley-container'];
-
-        for (var i = 0; i < selectors.length; i++) {
-            var el = body.querySelector(selectors[i]);
-            if (!el) { continue; }
-            var r = el.getBoundingClientRect();
-            if (r.width > 0 && r.height > 0) {
-                return { w: r.width, h: r.height, via: selectors[i] };
+        var el = null, via = null;
+        var screens = body.querySelectorAll('[id^="nps-"], [id^="ias-"]');
+        for (var i = 0; i < screens.length; i++) {
+            var r0 = screens[i].getBoundingClientRect();
+            if (r0.width > 0 && r0.height > 0) { el = screens[i]; via = '#' + screens[i].id; break; }
+        }
+        var padding = 0;
+        var modal = body.querySelector('.modal-content');
+        if (el && modal) { padding = parseFloat(window.getComputedStyle(modal).paddingTop) || 0; }
+        if (!el) {
+            var fallbacks = ['#widget-body', '.modal-content', '[class*="survey-widget"]',
+                             '[class*="countly-ratings"]', '[class*="cly-"]', '.smiley-container'];
+            for (var j = 0; j < fallbacks.length && !el; j++) {
+                var c = body.querySelector(fallbacks[j]);
+                if (!c) { continue; }
+                var rc = c.getBoundingClientRect();
+                if (rc.width > 0 && rc.height > 0) { el = c; via = fallbacks[j]; }
             }
         }
-
-        // Nothing matched, so the largest thing painted stands in for the card.
-        var best = null, bestArea = 0;
-        var all = body.querySelectorAll('*');
-        for (var j = 0; j < all.length; j++) {
-            var rect = all[j].getBoundingClientRect();
-            var area = rect.width * rect.height;
-            if (area > bestArea) { bestArea = area; best = rect; }
+        if (!el) {
+            var best = null, bestArea = 0;
+            var all = body.querySelectorAll('*');
+            for (var k = 0; k < all.length; k++) {
+                var rect = all[k].getBoundingClientRect();
+                var area = rect.width * rect.height;
+                if (area > bestArea) { bestArea = area; best = all[k]; }
+            }
+            if (!best) { return null; }
+            el = best; via = 'largest';
         }
-        if (!best || best.width <= 0 || best.height <= 0) { return null; }
-        return { w: best.width, h: best.height, via: 'largest' };
+        var r = el.getBoundingClientRect();
+        var h = (el.offsetHeight || r.height) + padding;
+        if (r.width <= 0 || h <= 0) { return null; }
+        return { w: r.width, h: h, via: via };
+    }
+    """
+
+    private static let measureCardScript = """
+    (function () {
+        \(cardMeasurementFunction)
+        return __clyMeasureCard();
+    })()
+    """
+
+    /// Watches the card and reports its size whenever that changes.
+    ///
+    /// The page does announce a size on every screen switch, but it measures in the
+    /// same call that starts the incoming screen's fade, before that screen has laid
+    /// out, so what it announces for the comment step is a stale number. Waiting on
+    /// the announcement alone leaves the step in a box a few dozen points short with
+    /// its content scrolling inside it.
+    ///
+    /// Three sources, because none sees everything: `ResizeObserver` for the card
+    /// changing size, `MutationObserver` for a screen being swapped in, and a cheap
+    /// interval for whatever neither catches. A report crosses into native only when
+    /// the numbers change, and then at once rather than batched: a screen swap is one
+    /// change, and following it in the same frame is what reads as smooth.
+    ///
+    /// `reason` tells native whether the change came with a mutation, which is how it
+    /// knows a new screen is up and the fit budget starts over.
+    private static let cardObserverScript = """
+    (function () {
+        if (window.__countlyCardObserver) { return; }
+        window.__countlyCardObserver = true;
+        \(cardMeasurementFunction)
+        var last = null;
+        function report(reason) {
+            var m = __clyMeasureCard();
+            if (!m) { return; }
+            var key = Math.round(m.w) + 'x' + Math.round(m.h) + '@' + m.via;
+            if (key === last) { return; }
+            last = key;
+            m.reason = reason;
+            try { window.webkit.messageHandlers.\(ScriptMessage.cardSize).postMessage(m); } catch (e) {}
+        }
+        if (window.ResizeObserver) {
+            var ro = new ResizeObserver(function () { report('resize'); });
+            var targets = document.querySelectorAll('[id^="nps-"], [id^="ias-"], #widget-body, .modal-content');
+            for (var i = 0; i < targets.length; i++) { ro.observe(targets[i]); }
+        }
+        if (window.MutationObserver && document.body) {
+            new MutationObserver(function () { report('mutation'); })
+                .observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class'] });
+        }
+        setInterval(function () { report('poll'); }, 250);
+        report('initial');
     })()
     """
 
@@ -1617,27 +1803,9 @@ extension WebViewManager: WKNavigationDelegate {
                 return
             }
 
-            // Under the floor is a wrapper caught mid layout, not a card.
-            guard width >= Self.minimumCardSide, height >= Self.minimumCardSide else {
-                self.core.logger.d(Self.module, "measureAndFitCard", "the measurement is too small to be the card and is ignored, measured: [\(width.logValue)x\(height.logValue)]")
-                return
-            }
-
-            let current = self.baseWebViewFrame?.height ?? 0
-            guard abs(current - height) > Self.fitTolerance else { return }
-
-            self.fitCount += 1
-            self.measuredCardHeight = height
-            let fitted = WidgetLayout.resolve(type: self.presentedWidgetType,
-                                              position: self.presentedWidgetPosition,
-                                              surface: self.containerSize,
-                                              requestedHeight: height)
-
-            self.core.logger.i(Self.module, "measureAndFitCard", "the page drew a card smaller than the box it was given, so the box is fitted to it, measuredCard: [\(width.logValue)x\(height.logValue)], via: [\(box["via"] as? String ?? "?")], from: [\(current.logValue)], to: [\(fitted.height.logValue)], fit: [\(self.fitCount)]")
-
-            self.baseWebViewFrame = fitted
-            self.applySafeAreaPlacement()
-            self.firstFitArrived()
+            guard self.applyMeasuredCard(width: width, height: height,
+                                         via: box["via"] as? String ?? "?",
+                                         reason: "measure") else { return }
 
             // Measured again, because one pass does not converge.
             //
@@ -1647,12 +1815,62 @@ extension WebViewManager: WKNavigationDelegate {
             // allows three fits per page load for exactly this; running the
             // measurement once ported the limit without the loop it was limiting.
             //
-            // This terminates: `fitCount` caps it, and the tolerance above stops it
-            // as soon as two passes agree within a few points, which is what
+            // This terminates: `fitCount` caps it, and the tolerance stops it as
+            // soon as two passes agree within a few points, which is what
             // convergence looks like.
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.measureDelay) { [weak self] in
                 self?.measureAndFitCard()
             }
+        }
+    }
+
+    /// Fits the box to a measured card. Returns whether the box changed.
+    ///
+    /// - Parameter reason: what prompted the measurement. `mutation` means the page
+    ///   changed its content, which is a new screen, and a new screen gets a fresh
+    ///   fit budget: the cap exists to stop one screen's measurement chasing
+    ///   itself, not to freeze the card at the first screen's size.
+    @discardableResult
+    private func applyMeasuredCard(width: CGFloat, height: CGFloat, via: String, reason: String) -> Bool {
+        guard isSDKPlacedWidget, !isClosed else { return false }
+
+        // Under the floor is a wrapper caught mid layout, not a card.
+        guard width >= Self.minimumCardSide, height >= Self.minimumCardSide else {
+            core.logger.d(Self.module, "applyMeasuredCard", "the measurement is too small to be the card and is ignored, measured: [\(width.logValue)x\(height.logValue)], reason: [\(reason)]")
+            return false
+        }
+
+        if reason == "mutation" { fitCount = 0 }
+        guard fitCount < Self.maximumFits else {
+            core.logger.d(Self.module, "applyMeasuredCard", "the fit budget for this screen is spent, so the measurement is ignored, measured: [\(width.logValue)x\(height.logValue)], reason: [\(reason)]")
+            return false
+        }
+
+        let current = baseWebViewFrame?.height ?? 0
+        guard abs(current - height) > Self.fitTolerance else { return false }
+
+        fitCount += 1
+        measuredCardHeight = height
+        // Not held to the type's maximum: this is the page's own formula read after
+        // layout, and a step taller than the maximum needs the room or it scrolls.
+        let fitted = WidgetLayout.resolve(type: presentedWidgetType,
+                                          position: presentedWidgetPosition,
+                                          surface: containerSize,
+                                          requestedHeight: height,
+                                          boundedByTypeMaximum: false)
+
+        core.logger.i(Self.module, "applyMeasuredCard", "the box is fitted to the card the page drew, measuredCard: [\(width.logValue)x\(height.logValue)], via: [\(via)], reason: [\(reason)], from: [\(current.logValue)], to: [\(fitted.height.logValue)], fit: [\(fitCount)]")
+
+        baseWebViewFrame = fitted
+        applySafeAreaPlacement()
+        firstFitArrived()
+        return true
+    }
+
+    private func installCardObserver() {
+        webView?.evaluateJavaScript(Self.cardObserverScript) { [weak self] _, error in
+            guard let error else { return }
+            self?.core.logger.w(Self.module, "installCardObserver", "the card cannot be watched, so a screen the page mis-measures keeps the wrong size, error: [\(error.localizedDescription)]")
         }
     }
 
