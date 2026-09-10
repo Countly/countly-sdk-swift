@@ -132,6 +132,26 @@ final class ConnectionTestModule: ModuleBase {
         stateLock.unlock()
     }
 
+    /// Takes the single battery slot, checked and claimed in one critical section
+    /// so two deliveries landing together cannot both start one. Returns why the
+    /// claim was refused, or `nil` once it is held.
+    private func claimBattery() -> String? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+
+        if halted { return "the module is halted, the armed connection test is ignored" }
+        if batteryRunning { return "a battery is already running, this delivery is ignored" }
+        batteryRunning = true
+        return nil
+    }
+
+    /// Lets the next armed delivery start a battery.
+    private func releaseBattery() {
+        stateLock.lock()
+        batteryRunning = false
+        stateLock.unlock()
+    }
+
     // MARK: - Battery
 
     /// Runs the battery off the calling thread, once per delivery.
@@ -146,21 +166,10 @@ final class ConnectionTestModule: ModuleBase {
             return
         }
 
-        // Checked and claimed in one critical section, so two deliveries landing
-        // together cannot both start a battery.
-        stateLock.lock()
-        if halted {
-            stateLock.unlock()
-            logD("startBattery", "the module is halted, the armed connection test is ignored")
+        if let refusal = claimBattery() {
+            logD("startBattery", refusal)
             return
         }
-        if batteryRunning {
-            stateLock.unlock()
-            logD("startBattery", "a battery is already running, this delivery is ignored")
-            return
-        }
-        batteryRunning = true
-        stateLock.unlock()
 
         logI("startBattery", "connection test armed by the server, running the probe battery, serverConfigLatencyMs: [\(serverConfigLatencyMs)]")
 
@@ -170,9 +179,7 @@ final class ConnectionTestModule: ModuleBase {
         DispatchQueue.global(qos: .utility).async { [weak self, core] in
             guard let self else { return }
             self.runBatteryAndReport(serverConfigLatencyMs: serverConfigLatencyMs, serverURL: core.config.normalizedHost)
-            self.stateLock.lock()
-            self.batteryRunning = false
-            self.stateLock.unlock()
+            self.releaseBattery()
         }
     }
 
@@ -352,8 +359,6 @@ protocol ProbeTransport: AnyObject {
 /// probes ride the same custom headers and, through the delegate, the same
 /// certificate pinning. Caching is off and redirects are not followed.
 final class URLSessionProbeTransport: NSObject, ProbeTransport {
-
-    private static let module = "ConnectionTest"
 
     /// Held weakly: the core owns the module that owns this transport, and a
     /// URLSession retains its delegate until it is invalidated.

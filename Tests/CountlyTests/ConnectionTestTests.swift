@@ -88,6 +88,14 @@ final class ConnectionTestTests: CountlyBaseTestCase {
         requestQueue(of: instance).map(TestUtils.parseQuery).compactMap { $0["ct_results"] as? [String: Any] }
     }
 
+    /// Waits until the behavior settings fetch was answered, which is the moment a
+    /// live `ct` would have armed the battery.
+    private func waitForBehaviorSettingsFetch() {
+        TestUtils.waitUntil("the behavior settings fetch is answered") {
+            MockURLProtocol.requests.contains { $0.query.contains("method=sc") }
+        }
+    }
+
     private func waitForReport(of instance: CountlyInstance) -> [String: Any]? {
         TestUtils.waitUntil("a ct_results report reaches the request queue") { !queuedReports(of: instance).isEmpty }
         return queuedReports(of: instance).first
@@ -270,9 +278,7 @@ final class ConnectionTestTests: CountlyBaseTestCase {
         let config = baseConfig(instanceName: name)
         config.sdkBehaviorSettings = ServerConfigBuilder().armConnectionTest().json()
         let second = start(config)
-        TestUtils.waitUntil("the plain behavior settings fetch is answered") {
-            MockURLProtocol.requests.contains { $0.query.contains("method=sc") }
-        }
+        waitForBehaviorSettingsFetch()
         TestUtils.pump(0.5)
 
         XCTAssertTrue(probes().isEmpty, "the battery ran from stored config: \(probes().map(probePath))")
@@ -341,9 +347,7 @@ final class ConnectionTestTests: CountlyBaseTestCase {
         try skipUnlessNetworkIsInterceptable()
         installHandler(scResponse: ServerConfigBuilder().json())
         let countly = startInstance()
-        TestUtils.waitUntil("the behavior settings fetch is answered") {
-            MockURLProtocol.requests.contains { $0.query.contains("method=sc") }
-        }
+        waitForBehaviorSettingsFetch()
 
         let module = module(of: countly)
         // 16 x 1 s minus 15.5 s: a cap of half a second, with probes that take 0.2 s.

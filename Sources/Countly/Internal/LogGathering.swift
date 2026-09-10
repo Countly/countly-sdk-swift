@@ -207,25 +207,17 @@ final class LogGatherer {
 
     // MARK: - State
 
-    /// Whether lines still have to be held: undecided or gathering. This is what
-    /// makes the logger format a line while console logging is off.
-    var isCapturing: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return state != .off
-    }
-
-    var isGathering: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return state == .gathering
-    }
-
     var currentState: LogGatheringState {
         lock.lock()
         defer { lock.unlock() }
         return state
     }
+
+    /// Whether lines still have to be held: undecided or gathering. This is what
+    /// makes the logger format a line while console logging is off.
+    var isCapturing: Bool { currentState != .off }
+
+    var isGathering: Bool { currentState == .gathering }
 
     /// The directive in effect, for tests and log dumps.
     var currentDirective: LogGatheringDirective {
@@ -254,6 +246,13 @@ final class LogGatherer {
         return droppedCount
     }
 
+    /// Whether the request queue is usable yet. Nothing is delivered before it is.
+    private var isInitFinished: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return initFinished
+    }
+
     // MARK: - Directives
 
     /// Applies a directive from a live response to what is held.
@@ -278,9 +277,8 @@ final class LogGatherer {
         state = newState
         self.directive = directive
 
-        if newState == .off {
-            clearBufferLocked()
-        } else if wasGathering, previousGatherID != directive.gatherID {
+        let gatherReplaced = wasGathering && previousGatherID != directive.gatherID
+        if newState == .off || gatherReplaced {
             clearBufferLocked()
         } else {
             filterBufferLocked()
@@ -429,12 +427,9 @@ final class LogGatherer {
     // MARK: - Delivery
 
     private func scheduleDelivery(includePartialBatch: Bool) {
-        lock.lock()
-        let ready = initFinished
-        lock.unlock()
         // The request queue is not usable before init finishes; the tail goes out
         // from `sdkInitFinished`.
-        guard ready else { return }
+        guard isInitFinished else { return }
 
         deliveryQueue.async { [weak self] in
             self?.deliver(includePartialBatch: includePartialBatch)
@@ -445,10 +440,7 @@ final class LogGatherer {
     /// held while the request queue would drop them: tracking off, or no consent
     /// given yet.
     private func deliver(includePartialBatch: Bool) {
-        lock.lock()
-        let ready = initFinished
-        lock.unlock()
-        guard ready, let transport else { return }
+        guard isInitFinished, let transport else { return }
 
         deliveryLock.lock()
         defer { deliveryLock.unlock() }
@@ -497,9 +489,7 @@ final class LogGatherer {
         let count = min(directive.batchSize, lines.count)
         let taken = Array(lines.prefix(count))
         lines.removeFirst(count)
-        for line in taken {
-            heldChars -= line.message.countlyLength
-        }
+        heldChars -= Self.charCount(of: taken)
         let batch = Batch(lines: taken, dropped: droppedCount, gatherID: gatherID)
         droppedCount = 0
         return batch
@@ -513,9 +503,7 @@ final class LogGatherer {
         guard state == .gathering, directive.gatherID == batch.gatherID else { return }
 
         lines.insert(contentsOf: batch.lines, at: 0)
-        for line in batch.lines {
-            heldChars += line.message.countlyLength
-        }
+        heldChars += Self.charCount(of: batch.lines)
         droppedCount += batch.dropped
         trimBufferLocked()
     }
@@ -542,6 +530,12 @@ final class LogGatherer {
     }
 
     // MARK: - Buffer maintenance, under the lock
+
+    /// What these lines add up to in `heldChars`, the unit the character ceiling
+    /// is measured in.
+    private static func charCount(of lines: [Line]) -> Int {
+        lines.reduce(0) { $0 + $1.message.countlyLength }
+    }
 
     /// Enforces both ceilings by dropping the oldest lines and counting them.
     private func trimBufferLocked() {

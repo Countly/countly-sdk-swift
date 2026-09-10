@@ -583,7 +583,7 @@ final class LogGatheringTests: CountlyBaseTestCase {
         // Let the request path finish reporting the failed send of that batch.
         TestUtils.pump(0.5)
 
-        let held = gatherer(of: countly).heldLines.map(\.message)
+        let held = messages(gatherer(of: countly))
         XCTAssertTrue(held.allSatisfy { !$0.contains("sdk_logs") }, "held a line describing the upload: \(held.filter { $0.contains("sdk_logs") })")
         XCTAssertTrue(held.allSatisfy { !$0.contains("sendSdkLogs") }, "held the request path's own commentary: \(held.filter { $0.contains("sendSdkLogs") })")
         let uploaded = uploadedBatches(of: countly).flatMap { lines(in: $0) }.compactMap { $0["m"] as? String }
@@ -727,6 +727,5 @@ final class LogGatheringTests: CountlyBaseTestCase {
 
         XCTAssertEqual(gatherer.currentState, .off)
         XCTAssertEqual(gatherer.heldLineCount, 0, "nothing from the gather survives, and halt's own lines are not held either")
-        XCTAssertTrue(uploadedBatches(of: countly).isEmpty || true, "the queue is gone with the instance")
     }
 }
