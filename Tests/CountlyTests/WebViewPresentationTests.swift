@@ -904,11 +904,6 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         XCTAssertEqual(frame.origin.y, 40, accuracy: 1)
     }
 
-
-
-
-
-
     // MARK: - What a widget's own answer may and may not change
 
     /// A widget reports where it sits inside its own viewport, which is the origin,
@@ -1131,19 +1126,20 @@ final class OverlayEdgeTests: XCTestCase {
         let custom = FeedbackModule.customParameters(rendersOwnCloseControl: true,
                                                      surface: CGSize(width: 1440, height: 900))
 
-        // The template picks its breakpoint and its card position from these two.
-        XCTAssertEqual(custom["width"], "1440")
-        XCTAssertEqual(custom["height"], "900")
-        XCTAssertEqual(custom["tc"], "1")
-        XCTAssertEqual(custom["xb"], "1")
+        // The template picks its breakpoint and its card position from these two,
+        // and decides orientation by comparing them, which only works on numbers.
+        XCTAssertEqual(custom["width"] as? Int, 1440)
+        XCTAssertEqual(custom["height"] as? Int, 900)
+        XCTAssertEqual(custom["tc"] as? String, "1")
+        XCTAssertEqual(custom["xb"] as? String, "1")
     }
 
     func testFractionalSurfacesAreSentAsWholePoints() {
         let custom = FeedbackModule.customParameters(rendersOwnCloseControl: false,
                                                      surface: CGSize(width: 1439.6, height: 899.4))
 
-        XCTAssertEqual(custom["width"], "1440")
-        XCTAssertEqual(custom["height"], "899")
+        XCTAssertEqual(custom["width"] as? Int, 1440)
+        XCTAssertEqual(custom["height"] as? Int, 899)
         XCTAssertNil(custom["xb"], "an older widget was told to draw its own close control")
     }
 
@@ -1154,7 +1150,7 @@ final class OverlayEdgeTests: XCTestCase {
         // which is worse than the fallback it uses when the key is absent.
         XCTAssertNil(custom["width"])
         XCTAssertNil(custom["height"])
-        XCTAssertEqual(custom["tc"], "1")
+        XCTAssertEqual(custom["tc"] as? String, "1")
     }
 
     func testCoveringTheWholeScreenKeepsEveryPoint() {
@@ -1164,6 +1160,5 @@ final class OverlayEdgeTests: XCTestCase {
         XCTAssertNotNil(background.hitTest(NSPoint(x: 0, y: 150)), "the overlay gave away a click with no window to give it to")
     }
 }
-
 
 #endif

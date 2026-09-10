@@ -314,17 +314,22 @@ final class FeedbackModule: ModuleBase {
     /// from is undefined. What the user sees is a short card in the wrong corner
     /// with its content scrolling inside it, which looks like anything except a
     /// missing query parameter.
-    static func customParameters(rendersOwnCloseControl: Bool, surface: CGSize) -> [String: String] {
-        var custom: [String: String] = ["tc": "1"]
+    static func customParameters(rendersOwnCloseControl: Bool, surface: CGSize) -> [String: Any] {
+        var custom: [String: Any] = ["tc": "1"]
         if rendersOwnCloseControl {
             custom["rw"] = "1"
             custom["xb"] = "1"
         }
+        // Numbers, not strings. The template decides orientation with
+        // `custom.width > custom.height` on the parsed values, and two JSON strings
+        // compare character by character: "1440" > "900" is false, so a landscape
+        // window would be laid out as a portrait one. The web SDK sends numbers.
+        //
         // Omitted rather than sent as zero when there is no surface to report: a
         // zero is a dimension the template will believe and lay out against.
         if surface.width > 0, surface.height > 0 {
-            custom["width"] = String(Int(surface.width.rounded()))
-            custom["height"] = String(Int(surface.height.rounded()))
+            custom["width"] = Int(surface.width.rounded())
+            custom["height"] = Int(surface.height.rounded())
         }
         return custom
     }

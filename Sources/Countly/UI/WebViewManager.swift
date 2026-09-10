@@ -263,14 +263,10 @@ final class WebViewManager: NSObject {
             return true
         }
 
+        /// Gives the gate up, if `manager` is the one holding it.
         func release(_ manager: WebViewManager) {
             lock.lock(); defer { lock.unlock() }
             if holder === manager { holder = nil }
-        }
-
-        var isHeld: Bool {
-            lock.lock(); defer { lock.unlock() }
-            return holder != nil && !(holder?.isClosed ?? true)
         }
     }
 
@@ -347,25 +343,7 @@ final class WebViewManager: NSObject {
         background.layer?.backgroundColor = NSColor.clear.cgColor
         background.autoresizingMask = [NSView.AutoresizingMask.width, .height]
         if core.config.content.showWidgetsWithinApp {
-            // Sized to the application's own window, so the overlay inherits that
-            // window's rounded corners. Without the mask a page painting a
-            // full-surface backdrop draws square corners over the window's curved
-            // ones, and the mismatch shows as four dark wedges outside the window.
-            // The application's own value wins: a window it has given a custom
-            // shape is one nothing the SDK can read will describe correctly.
-            background.layer?.cornerRadius = ScreenReader.overlayCornerRadius(
-                configured: core.config.content.overlayCornerRadius,
-                fallback: Self.fallbackWindowCornerRadius)
-            background.layer?.masksToBounds = true
-            background.passThroughEdgeMargin = Self.windowResizeEdgeMargin
-            // Ordered with the window it covers rather than above the whole desktop,
-            // so bringing another application forward puts it in front of the
-            // content the way it would in front of any other window.
-            overlayWindow.bind(to: ScreenReader.hostWindow)
-            let radius = background.layer?.cornerRadius ?? 0
-            let source = core.config.content.overlayCornerRadius != nil ? "configuration"
-                : (radius == Self.fallbackWindowCornerRadius ? "fallback" : "window")
-            core.logger.d(Self.module, "present", "the overlay is bound to the host window, cornerRadius: [\(radius)], source: [\(source)]")
+            shapeOverlayToHostWindow(overlayWindow, background: background)
         }
         #else
         background.backgroundColor = .clear
@@ -464,8 +442,40 @@ final class WebViewManager: NSObject {
         armStallTimerIfNeeded()
     }
 
-    /// Takes the page off screen and reports the dismissal once.
     #if os(macOS)
+    /// Shapes the overlay like the window it covers, and orders it with that window.
+    ///
+    /// Sized to the application's own window, the overlay inherits that window's
+    /// rounded corners. Without the mask a page painting a full-surface backdrop
+    /// draws square corners over the window's curved ones, and the mismatch shows as
+    /// four dark wedges outside the window. The application's own value wins: a
+    /// window it has given a custom shape is one nothing the SDK can read will
+    /// describe correctly.
+    private func shapeOverlayToHostWindow(_ overlayWindow: OverlayWindow,
+                                          background: PassThroughBackgroundView) {
+        let configured = core.config.content.overlayCornerRadius
+        let radius = ScreenReader.overlayCornerRadius(configured: configured,
+                                                      fallback: Self.fallbackWindowCornerRadius)
+        background.layer?.cornerRadius = radius
+        background.layer?.masksToBounds = true
+        background.passThroughEdgeMargin = Self.windowResizeEdgeMargin
+
+        // Ordered with the window it covers rather than above the whole desktop, so
+        // bringing another application forward puts it in front of the content the
+        // way it would in front of any other window.
+        overlayWindow.bind(to: ScreenReader.hostWindow)
+
+        let source: String
+        if configured != nil {
+            source = "configuration"
+        } else if radius == Self.fallbackWindowCornerRadius {
+            source = "fallback"
+        } else {
+            source = "window"
+        }
+        core.logger.d(Self.module, "present", "the overlay is bound to the host window, cornerRadius: [\(radius)], source: [\(source)]")
+    }
+
     /// Follows the application's window, so what the SDK draws stays where it
     /// belongs when that window is resized or dragged.
     ///
@@ -537,6 +547,7 @@ final class WebViewManager: NSObject {
     }
     #endif
 
+    /// Takes the page off screen and reports the dismissal once.
     func close() {
         guard !isClosed else { return }
         isClosed = true
@@ -787,7 +798,6 @@ final class WebViewManager: NSObject {
         reportSurfaceToPage()
     }
 
-    /// Applies a size the page asked for, in the page's own coordinate space.
     /// The space a page's `{x, y, w, h}` is measured against.
     ///
     /// Not the background view's own size on macOS. There the panel is shrunk to
@@ -805,6 +815,7 @@ final class WebViewManager: NSObject {
         #endif
     }
 
+    /// Applies a size the page asked for, in the page's own coordinate space.
     private func resize(with parameters: [String: Any]) {
         guard backgroundView != nil, webView != nil else { return }
 
@@ -1849,8 +1860,6 @@ extension WebViewManager: WKNavigationDelegate {
         let current = baseWebViewFrame?.height ?? 0
         guard abs(current - height) > Self.fitTolerance else { return false }
 
-        fitCount += 1
-        measuredCardHeight = height
         // Not held to the type's maximum: this is the page's own formula read after
         // layout, and a step taller than the maximum needs the room or it scrolls.
         let fitted = WidgetLayout.resolve(type: presentedWidgetType,
@@ -1858,6 +1867,14 @@ extension WebViewManager: WKNavigationDelegate {
                                           surface: containerSize,
                                           requestedHeight: height,
                                           boundedByTypeMaximum: false)
+
+        // A type with a fixed box, the rating widget, resolves to the same frame
+        // whatever was measured. That is not a fit, and counting it against the
+        // budget or logging it as one would misreport what happened.
+        guard fitted != baseWebViewFrame else { return false }
+
+        fitCount += 1
+        measuredCardHeight = height
 
         core.logger.i(Self.module, "applyMeasuredCard", "the box is fitted to the card the page drew, measuredCard: [\(width.logValue)x\(height.logValue)], via: [\(via)], reason: [\(reason)], from: [\(current.logValue)], to: [\(fitted.height.logValue)], fit: [\(fitCount)]")
 

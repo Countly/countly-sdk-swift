@@ -497,15 +497,18 @@ final class ContentModule: ModuleBase {
     /// The value is the page's own origin, because that is what `event.origin`
     /// reports for a message the page posts to itself through the SDK's bridge.
     static func appendingOrigin(to url: URL) -> URL {
-        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              let scheme = components.scheme, let host = components.host else { return url }
-        var items = components.queryItems ?? []
-        guard !items.contains(where: { $0.name == "origin" }) else { return url }
-        var origin = "\(scheme)://\(host)"
-        if let port = components.port { origin += ":\(port)" }
-        items.append(URLQueryItem(name: "origin", value: origin))
-        components.queryItems = items
-        return components.url ?? url
+        // `URLComponents` is read only here. Writing the query back through it
+        // re-encodes every existing value, and the server's content URL is taken
+        // as given, so the parameter is appended to the string the way the theme
+        // is, leaving what was already there byte for byte.
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme, let host = components.host,
+              !(components.queryItems ?? []).contains(where: { $0.name == "origin" }) else { return url }
+
+        let port = components.port.map { ":\($0)" } ?? ""
+        let origin = "\(scheme)://\(host)\(port)".urlEscaped
+        let separator = url.query == nil ? "?" : "&"
+        return URL(string: "\(url.absoluteString)\(separator)origin=\(origin)") ?? url
     }
 
     private func showContent(urlString: String, placement: [String: Any]) {
@@ -541,7 +544,8 @@ final class ContentModule: ModuleBase {
 
             // The theme is resolved here, on the main thread, where reading the
             // trait collection is safe.
-            let themedURL = Self.appendingOrigin(to: URL(string: DeviceMetrics.urlStringByAppendingThemeMode(urlString)) ?? url)
+            let themed = DeviceMetrics.urlStringByAppendingThemeMode(urlString)
+            let themedURL = Self.appendingOrigin(to: URL(string: themed) ?? url)
 
             self.logI("showContent", "showing a content, host: [\(themedURL.host ?? "")], path: [\(themedURL.path)], frame: [\(frame.logValue)], isLandscape: [\(isLandscape)], rotationDisabled: [\(self.core.config.content.disableRotation)]")
             self.logD("showContent", "shown content placement detail, orientationKey: [\(isLandscape ? "l" : "p")], x: [\(frame.origin.x.logValue)], y: [\(frame.origin.y.logValue)], width: [\(frame.width.logValue)], height: [\(frame.height.logValue)], windowSize: [\(windowSize.logValue)]")

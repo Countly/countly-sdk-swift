@@ -70,9 +70,17 @@ enum WidgetLayout {
 
         let maximumHeight = type == .nps ? npsMaximumHeight : surveyMaximumHeight
         let width = min(maximumWidth, surface.width)
-        let ceiling = boundedByTypeMaximum ? maximumHeight : surface.height
-        let height = min(requestedHeight > 0 ? min(requestedHeight, ceiling) : maximumHeight,
-                         surface.height)
+
+        // A height nobody asked for is the type's maximum. One that was asked for is
+        // held to the type's maximum only when the page announced it; either way the
+        // surface has the last word.
+        let height: CGFloat
+        if requestedHeight > 0 {
+            let ceiling = boundedByTypeMaximum ? maximumHeight : surface.height
+            height = min(requestedHeight, ceiling, surface.height)
+        } else {
+            height = min(maximumHeight, surface.height)
+        }
 
         // Along the bottom edge. A widget is an interruption, and the bottom is
         // where it interrupts least.
@@ -92,25 +100,40 @@ enum WidgetLayout {
     /// part of itself off screen, and one that keeps it as the window grows floats
     /// mid-window rather than against the edge it was placed at.
     static func reanchor(_ frame: CGRect, from oldSurface: CGSize, to newSurface: CGSize) -> CGRect {
-        func axis(origin: CGFloat, length: CGFloat, old: CGFloat, new: CGFloat) -> CGFloat {
-            let usable = max(0, new - length)
-            guard old > 0 else { return min(max(0, origin), usable) }
-            let leading = origin
-            let trailing = old - origin - length
-            let anchored: CGFloat
-            if abs(leading - trailing) <= 1 {
-                anchored = (new - length) / 2
-            } else if leading < trailing {
-                anchored = leading
-            } else {
-                anchored = new - length - trailing
-            }
-            return min(max(0, anchored), usable)
+        CGRect(x: reanchoredOrigin(frame.origin.x, length: frame.width,
+                                   from: oldSurface.width, to: newSurface.width),
+               y: reanchoredOrigin(frame.origin.y, length: frame.height,
+                                   from: oldSurface.height, to: newSurface.height),
+               width: min(frame.width, newSurface.width),
+               height: min(frame.height, newSurface.height))
+    }
+
+    /// A margin difference this small is rounding, not an alignment.
+    private static let centringTolerance: CGFloat = 1
+
+    /// Where one axis of a re-anchored frame starts on the new surface.
+    private static func reanchoredOrigin(_ origin: CGFloat,
+                                         length: CGFloat,
+                                         from old: CGFloat,
+                                         to new: CGFloat) -> CGFloat {
+        let usable = max(0, new - length)
+
+        // No old surface to have been placed against, so there is no edge to have
+        // been nearer to and the origin is only clamped.
+        guard old > 0 else { return min(max(0, origin), usable) }
+
+        let leading = origin
+        let trailing = old - origin - length
+
+        let anchored: CGFloat
+        if abs(leading - trailing) <= centringTolerance {
+            anchored = (new - length) / 2
+        } else if leading < trailing {
+            anchored = leading
+        } else {
+            anchored = new - length - trailing
         }
-        return CGRect(x: axis(origin: frame.origin.x, length: frame.width, old: oldSurface.width, new: newSurface.width),
-                      y: axis(origin: frame.origin.y, length: frame.height, old: oldSurface.height, new: newSurface.height),
-                      width: min(frame.width, newSurface.width),
-                      height: min(frame.height, newSurface.height))
+        return min(max(0, anchored), usable)
     }
 
     private static func centred(width: CGFloat, height: CGFloat, in surface: CGSize) -> CGRect {

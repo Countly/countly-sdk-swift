@@ -521,12 +521,10 @@ enum ScreenReader {
         // an unbounded walk of a whole window's layers is not worth it to find out.
         guard depth <= 4 else { return 0 }
 
-        var largest: CGFloat = 0
         let bounds = layer.bounds.size
-        if abs(bounds.width - size.width) <= cornerRadiusSizeTolerance,
-           abs(bounds.height - size.height) <= cornerRadiusSizeTolerance {
-            largest = layer.cornerRadius
-        }
+        let isWindowShaped = abs(bounds.width - size.width) <= cornerRadiusSizeTolerance
+            && abs(bounds.height - size.height) <= cornerRadiusSizeTolerance
+        var largest = isWindowShaped ? layer.cornerRadius : 0
 
         if let mask = layer.mask {
             largest = Swift.max(largest, windowCornerRadius(in: mask, matching: size, depth: depth + 1))
