@@ -216,7 +216,20 @@ final class ConnectionManager: NSObject {
         releaseProcessing()
     }
 
+    /// Sends the head of the queue.
+    ///
+    /// Lines logged while sending a gathered log batch are not gathered, or every
+    /// tick would upload a batch about the last one. The caller may already be
+    /// marked, since the delivery loop lands here synchronously, so the mark is
+    /// restored on the way out.
     private func send(head: String) {
+        let isSdkLogsTransport = head.contains("&\(QS.sdkLogs)=")
+        core.logGatherer.markingTransportWork(isSdkLogsTransport) {
+            sendMarked(head: head, isSdkLogsTransport: isSdkLogsTransport)
+        }
+    }
+
+    private func sendMarked(head: String, isSdkLogsTransport: Bool) {
         var queryString = head
         var endpoint = Endpoint.input
 
@@ -236,8 +249,9 @@ final class ConnectionManager: NSObject {
         queryString = builder.appendRemainingRequestCount(queryString)
 
         // Checked with a substring first: resolving it means decoding the whole
-        // query, and only a profile picture save ever carries one.
-        let pictureUpload = queryString.contains(QS.userDetails) ? pictureUploadData(for: queryString) : nil
+        // query, and only a profile picture save ever carries one. The key is
+        // matched as a parameter, because a gathered log batch can quote its name.
+        let pictureUpload = queryString.contains("&\(QS.userDetails)=") ? pictureUploadData(for: queryString) : nil
         if pictureUpload == nil {
             queryString = builder.appendChecksum(queryString)
         }
@@ -260,32 +274,36 @@ final class ConnectionManager: NSObject {
             self.currentTask = nil
             self.stateLock.unlock()
 
-            let elapsed = Date().timeIntervalSince(startedAt)
-            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            // The completion runs on a session thread of its own, which has to be
+            // marked in turn while it deals with a gathered log batch.
+            self.core.logGatherer.markingTransportWork(isSdkLogsTransport) {
+                let elapsed = Date().timeIntervalSince(startedAt)
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
-            if response != nil {
-                self.core.logger.d(Self.module, "proceedOnQueue", "response received, endpoint: [\(request.url?.path ?? "")], statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], duration: [\(elapsed.logSeconds)]")
-            }
+                if response != nil {
+                    self.core.logger.d(Self.module, "proceedOnQueue", "response received, endpoint: [\(request.url?.path ?? "")], statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], duration: [\(elapsed.logSeconds)]")
+                }
 
-            if let error {
-                self.handleTransportFailure(error: error, request: request, callback: callback, callbackID: callbackID)
-                return
-            }
+                if let error {
+                    self.handleTransportFailure(error: error, request: request, callback: callback, callbackID: callbackID)
+                    return
+                }
 
-            if self.isRequestSuccessful(response: response, data: data, endpoint: endpoint) {
-                self.handleSuccess(head: head,
-                                   queryString: queryString,
-                                   elapsed: elapsed,
-                                   request: request,
-                                   callback: callback,
-                                   callbackID: callbackID,
-                                   response: response)
-            } else {
-                self.handleServerFailure(statusCode: statusCode,
-                                         data: data,
-                                         request: request,
-                                         callback: callback,
-                                         callbackID: callbackID)
+                if self.isRequestSuccessful(response: response, data: data, endpoint: endpoint) {
+                    self.handleSuccess(head: head,
+                                       queryString: queryString,
+                                       elapsed: elapsed,
+                                       request: request,
+                                       callback: callback,
+                                       callbackID: callbackID,
+                                       response: response)
+                } else {
+                    self.handleServerFailure(statusCode: statusCode,
+                                             data: data,
+                                             request: request,
+                                             callback: callback,
+                                             callbackID: callbackID)
+                }
             }
         }
 
@@ -453,6 +471,30 @@ final class ConnectionManager: NSObject {
             self.stateLock.unlock()
             self.proceedOnQueue()
         }
+    }
+
+    // MARK: - Operator armed diagnostics
+
+    /// Queues one connection test report as its own request.
+    ///
+    /// No consent gate, by cross SDK rule: the report describes the network the
+    /// device is on, not the user, and the health check bypasses consent on the
+    /// same grounds. The queue's own rules still govern it.
+    func sendConnectionTestResults(_ resultsJSON: String) {
+        guard enqueueDiagnostic(key: QS.connectionTestResults, payload: resultsJSON) else {
+            core.logger.d(Self.module, "sendConnectionTestResults", "the connection test report is dropped, the instance is halted or tracking is disabled, reportLength: [\(resultsJSON.count)]")
+            return
+        }
+        core.logger.d(Self.module, "sendConnectionTestResults", "the connection test report is queued, reportLength: [\(resultsJSON.count)]")
+    }
+
+    /// Queues one operator armed diagnostic payload as its own request and starts
+    /// a drain. Returns whether the store took it: a halted instance and tracking
+    /// switched off are the two reasons it would not.
+    private func enqueueDiagnostic(key: String, payload: String) -> Bool {
+        guard core.hasStarted, core.serverConfig.trackingEnabled else { return false }
+        enqueueAndProceed("\(builder.queryEssentials())&\(key)=\(payload.urlEscaped)")
+        return true
     }
 
     // MARK: - Crash reports
@@ -644,7 +686,9 @@ final class ConnectionManager: NSObject {
     /// Used for the two parameters that are instructions to the SDK rather than
     /// data for the server: the endpoint override and the callback ID.
     private func extractAndRemoveParameter(_ queryString: inout String, parameter: String) -> String? {
-        guard queryString.contains(parameter) else { return nil }
+        // Matched as a parameter, not as text: a gathered log batch can quote the
+        // parameter's name, and a false match here would raise a warning per batch.
+        guard queryString.contains("&\(parameter)=") else { return nil }
 
         guard let value = queryString.valueForQueryStringKey(parameter) else {
             core.logger.w(Self.module, "extractAndRemoveParameter", "parameter is present in the query string but its value could not be extracted, parameter: [\(parameter)]")
@@ -949,6 +993,25 @@ extension ConnectionManager: URLSessionDelegate {
 
         core.logger.e(Self.module, "didReceiveChallenge", "pinned certificate check failed, cancelling the request, host: [\(host)]")
         completionHandler(.cancelAuthenticationChallenge, nil)
+    }
+}
+
+// MARK: - Log gathering
+
+extension ConnectionManager {
+
+    /// Queues one `sdk_logs` batch as its own request. Consent is the caller's
+    /// business, which holds the lines back until it is given.
+    ///
+    /// Returns `false` when the store would drop it, so the caller keeps what it
+    /// was about to send.
+    func sendSdkLogs(_ payload: String) -> Bool {
+        guard enqueueDiagnostic(key: QS.sdkLogs, payload: payload) else {
+            core.logger.d(Self.module, "sendSdkLogs", "the gathered log batch is not queued, the instance is halted or tracking is disabled, payloadLength: [\(payload.count)]")
+            return false
+        }
+        core.logger.d(Self.module, "sendSdkLogs", "a gathered log batch is queued, payloadLength: [\(payload.count)]")
+        return true
     }
 }
 

@@ -936,7 +936,12 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         XCTAssertEqual(frame.height, 300, accuracy: 1, "the size it asked for is honoured")
         XCTAssertNotEqual(frame.origin, .zero, "but not the origin it reported")
         XCTAssertGreaterThan(frame.origin.y, 0, "an NPS is pushed down to its anchor, not left at the top")
-        XCTAssertGreaterThan(frame.origin.x, 0, "and in from the left, because it is centred")
+        // Centred means in from the left only when there is room: on a phone the
+        // widget is as wide as the surface and a centred origin of zero is right.
+        let container = onMain { manager.containerSizeForTesting }
+        if frame.width < container.width {
+            XCTAssertGreaterThan(frame.origin.x, 0, "and in from the left, because it is centred")
+        }
     }
 
     /// Content is the opposite: the server placed it deliberately and its

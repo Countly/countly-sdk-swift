@@ -97,6 +97,10 @@ final class SessionsModule: ModuleBase {
     /// and closed the session, and a tick landing afterwards would reopen work the
     /// SDK just finished.
     private func onUpdateTimer() {
+        // Every tick uploads the gathered log lines too, for a buffer that never
+        // reaches the batch size.
+        core.logGatherer.scheduleFlush()
+
         guard !isSuspended else {
             logD("onUpdateTimer", "the SDK is suspended, this session update tick will be skipped entirely")
             return

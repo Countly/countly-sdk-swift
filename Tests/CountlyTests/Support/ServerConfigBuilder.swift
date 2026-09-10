@@ -24,6 +24,50 @@ final class ServerConfigBuilder {
 
     private var settings: [String: Any] = [:]
 
+    /// Siblings of `c` on the response, for the two operator armed keys.
+    private var topLevel: [String: Any] = [:]
+
+    // MARK: - Operator armed diagnostics
+
+    /// The `lg` directive that arms log gathering.
+    @discardableResult
+    func armLogGathering(id: String, levels: String? = "ewidv", batchSize: Int? = 100) -> Self {
+        var directive: [String: Any] = ["e": true, "i": id]
+        if let levels { directive["l"] = levels }
+        if let batchSize { directive["b"] = batchSize }
+        topLevel["lg"] = directive
+        return self
+    }
+
+    /// The `lg` directive that turns log gathering off.
+    @discardableResult
+    func disarmLogGathering() -> Self {
+        topLevel["lg"] = ["e": false]
+        return self
+    }
+
+    /// A raw `lg` value, for the malformed shapes.
+    @discardableResult
+    func logGathering(_ raw: Any) -> Self {
+        topLevel["lg"] = raw
+        return self
+    }
+
+    /// The `ct` flag that arms the connection test.
+    @discardableResult
+    func armConnectionTest(_ value: Any = 1) -> Self {
+        topLevel["ct"] = value
+        return self
+    }
+
+    /// Any other top level sibling of `c`, for asserting that unknown ones are
+    /// ignored rather than refused.
+    @discardableResult
+    func topLevel(_ key: String, _ value: Any) -> Self {
+        topLevel[key] = value
+        return self
+    }
+
     // MARK: - Switches
 
     @discardableResult
@@ -160,7 +204,11 @@ final class ServerConfigBuilder {
     /// The full document, wrapped in the version and timestamp the SDK requires
     /// before it will apply anything at all.
     func document(version: Int = 1, timestamp: Int64 = 1_700_000_000_000) -> [String: Any] {
-        ["v": version, "t": timestamp, "c": settings]
+        var document: [String: Any] = ["v": version, "t": timestamp, "c": settings]
+        for (key, value) in topLevel {
+            document[key] = value
+        }
+        return document
     }
 
     /// The document as the JSON string `config.sdkBehaviorSettings` takes.

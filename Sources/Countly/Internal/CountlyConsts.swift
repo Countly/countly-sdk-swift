@@ -72,6 +72,11 @@ enum QS {
     static let abOptIn = "ab"
     static let abOptOut = "ab_opt_out"
 
+    /// One batch of the SDK's own gathered log lines, see `LogGatherer`.
+    static let sdkLogs = "sdk_logs"
+    /// The connection test report, see `ConnectionTestModule`.
+    static let connectionTestResults = "ct_results"
+
     static let newEndPoint = "new_end_point"
     static let endPointOverrideTag = "&new_end_point="
     static let callbackID = "callback_id"

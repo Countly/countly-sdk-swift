@@ -811,7 +811,17 @@ final class WebViewManager: NSObject {
         return ContentGeometry.windowSize(displayOption: core.config.content.webViewDisplayOption,
                                           withinApp: core.config.content.showWidgetsWithinApp)
         #else
-        return backgroundView?.effectiveSize ?? .zero
+        // The background view has no size until the overlay window's first layout
+        // pass, and a widget is placed before that: presenting reads this at once.
+        // Read then, the view answers zero, `WidgetLayout` resolves a zero frame,
+        // and the widget is invisible until something happens to lay it out again.
+        // On visionOS in a test host nothing ever does. So an unsized view falls
+        // back to the same screen derived size the content module lays out
+        // against, which is what the view will measure once it has been laid out.
+        if let size = backgroundView?.effectiveSize, size.width > 0, size.height > 0 {
+            return size
+        }
+        return ContentGeometry.windowSize(displayOption: core.config.content.webViewDisplayOption)
         #endif
     }
 

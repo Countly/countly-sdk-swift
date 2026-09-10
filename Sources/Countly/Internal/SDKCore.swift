@@ -26,6 +26,11 @@ final class SDKCore {
     let namespace: StorageNamespace
 
     let logger: Logger
+
+    /// Holds the logger's lines for the server while a gather is armed or not yet
+    /// decided. Created with the logger, so the very first init lines are held.
+    let logGatherer: LogGatherer
+
     let clock: MonotonicClock
 
     /// The config this instance was started with. Mutated in place by behavior
@@ -75,6 +80,9 @@ final class SDKCore {
         logger.level = config.internalLogLevel
         logger.delegate = config.loggerDelegate
 
+        self.logGatherer = LogGatherer(logger: logger)
+        logger.gatherer = logGatherer
+
         self.clock = MonotonicClock()
         self.limits = LimitsEnforcer(limits: config.sdkInternalLimits, logger: logger)
 
@@ -92,6 +100,7 @@ final class SDKCore {
     func attach(network: ConnectionManager, modules: ModuleRegistry) {
         self.network = network
         self.modules = modules
+        logGatherer.transport = self
     }
 
     /// Rebuilds the limit enforcer after behavior settings changed the limits.
@@ -116,6 +125,25 @@ final class SDKCore {
     }
 }
 
+/// The core is what the log gatherer delivers through, rather than the
+/// connection manager directly: a delivery in flight holds its transport strongly,
+/// and holding the core keeps everything the send touches alive across a `halt`.
+/// Holding only the manager would leave it reading a released core.
+extension SDKCore: LogGatheringTransport {
+
+    var isTrackingEnabled: Bool {
+        serverConfig.trackingEnabled
+    }
+
+    var hasAnyConsent: Bool {
+        modules.consent.hasAnyConsent
+    }
+
+    func sendSdkLogs(_ payload: String) -> Bool {
+        network.sendSdkLogs(payload)
+    }
+}
+
 /// Strong references to every module of one instance.
 ///
 /// A class rather than a struct so the core can hold it after the modules were
@@ -136,6 +164,7 @@ final class ModuleRegistry {
     let feedback: FeedbackModule
     let content: ContentModule
     let push: PushModule
+    let connectionTest: ConnectionTestModule
 
     init(consent: ConsentModule,
          deviceID: DeviceIDModule,
@@ -150,7 +179,8 @@ final class ModuleRegistry {
          apm: APMModule,
          feedback: FeedbackModule,
          content: ContentModule,
-         push: PushModule) {
+         push: PushModule,
+         connectionTest: ConnectionTestModule) {
         self.consent = consent
         self.deviceID = deviceID
         self.events = events
@@ -165,12 +195,13 @@ final class ModuleRegistry {
         self.feedback = feedback
         self.content = content
         self.push = push
+        self.connectionTest = connectionTest
     }
 
     /// Every module, for operations that fan out over all of them.
     var all: [ModuleBase] {
         [consent, deviceID, events, sessions, views, userProfile, location,
-         crashes, remoteConfig, attribution, apm, feedback, content, push]
+         crashes, remoteConfig, attribution, apm, feedback, content, push, connectionTest]
     }
 }
 

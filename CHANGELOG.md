@@ -113,6 +113,9 @@
   * Event, user property and view segmentation allow and block lists
   * Developer-supplied settings via "CountlyConfig.sdkBehaviorSettings", and "disableSDKBehaviorSettingsUpdates" to pin them
 
+* Added support for server requested SDK log gathering. When the server asks for it, the SDK uploads its own internal log lines, even if logging is disabled.
+* Added support for the SDK connection test. When the server asks for it, the SDK checks that it can reach every endpoint it depends on and reports the results.
+
 * Added networking configuration on "CountlyConfig":
   * "addCustomNetworkRequestHeaders(headers)" and "customNetworkRequestHeaders"
   * "storedRequestsLimit" / "requestDropAgeHours" / "requestTimeoutDuration" / "alwaysUsePOST"

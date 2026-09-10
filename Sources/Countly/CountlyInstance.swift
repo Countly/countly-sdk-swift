@@ -166,13 +166,16 @@ public final class CountlyInstance {
             apm: APMModule(core: core),
             feedback: FeedbackModule(core: core),
             content: ContentModule(core: core),
-            push: PushModule(core: core))
+            push: PushModule(core: core),
+            connectionTest: ConnectionTestModule(core: core))
 
         core.attach(network: network, modules: modules)
 
         core.healthTracker.transport = network
         core.serverConfig.transport = network
         core.serverConfig.delegate = self
+        core.serverConfig.logGatherer = core.logGatherer
+        core.serverConfig.connectionTest = modules.connectionTest
     }
 
     /// Applies the config in the order the features depend on each other.
@@ -300,6 +303,10 @@ public final class CountlyInstance {
 
         core.hasFinishedInit = true
 
+        // The request queue is usable from here on, so this is the first chance
+        // for the lines gathered during init to go out.
+        core.logGatherer.sdkInitFinished()
+
         for module in modules.all {
             module.didInit()
         }
@@ -324,6 +331,9 @@ public final class CountlyInstance {
         observer.onBackground = { [weak self] in
             guard let self, let core = self.core else { return }
             for module in core.modules.all { module.didEnterBackground() }
+            // Nothing about the gathered lines is persisted, so the only way the
+            // tail survives the app going away is getting it into the queue now.
+            core.logGatherer.flushNow()
         }
 
         observer.onWillResignActive = { [weak self] in
@@ -351,6 +361,9 @@ public final class CountlyInstance {
         core.isTerminating = true
         core.modules.views.applicationWillTerminate()
         core.modules.events.sendEventsWithSaveIfNeeded()
+        // The queue is not drained while terminating, but a queued tail survives to
+        // the next launch through the sync save below.
+        core.logGatherer.flushNow()
         core.modules.apm.endBackgroundTrace()
         core.requestQueueStore.saveSync()
     }
@@ -500,6 +513,7 @@ public final class CountlyInstance {
         }
 
         core.serverConfig.stop()
+        core.logGatherer.halt()
         core.network.reset()
 
         if clearStorage {
