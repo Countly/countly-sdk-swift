@@ -7,6 +7,7 @@
   * "Countly.instance(named:)", returns the instance for a name, creating it if needed. Getting a handle never starts it; the caller always calls "start(with:)".
   * "Countly.getInstance(named:)" / "Countly.listInstances()"
   * "Countly.haltAllInstances(clearStorage:)"
+  * "Countly.removeInstance(named:)", stops a named instance and drops it from the registry, keeping its stored data.
   * Each instance owns its own app key, server, request queue, device ID, logger, monotonic clock and storage namespace. Named instances get their own files and user defaults keys; the default instance keeps the legacy ones.
 
 * Added instance lifecycle on "CountlyInstance":

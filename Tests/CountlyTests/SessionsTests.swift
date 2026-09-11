@@ -39,6 +39,23 @@ final class SessionsTests: CountlyBaseTestCase {
         XCTAssertNotNil(metrics[MetricKey.appVersion])
     }
 
+    /// Hybrid mode leaves session updates to the timer, so a manual update is
+    /// ignored rather than producing an extra duration report.
+    func testAManualUpdateIsIgnoredInHybridMode() {
+        let countly = startInstance {
+            $0.manualSessionHandling = true
+            $0.enableManualSessionControlHybridMode = true
+        }
+
+        countly.sessions.beginSession()
+        TestUtils.pump(1.1)
+        countly.sessions.updateSession()
+
+        let updates = requestQueue(of: countly).map(TestUtils.parseQuery)
+            .filter { $0["session_duration"] != nil && $0["end_session"] == nil }
+        XCTAssertTrue(updates.isEmpty, "a manual update in hybrid mode must not be sent: \(updates)")
+    }
+
     func testTheFullManualCycleProducesBeginUpdateAndEndInThatOrder() {
         let countly = startInstance { $0.manualSessionHandling = true }
 

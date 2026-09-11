@@ -44,7 +44,7 @@ enum QS {
     static let location = "location"
     static let locationCity = "city"
     static let locationCountry = "country_code"
-    static let locationIP = "ip_address"
+    static let locationIP = "ip"
 
     static let attributionID = "aid"
     static let idfa = "idfa"

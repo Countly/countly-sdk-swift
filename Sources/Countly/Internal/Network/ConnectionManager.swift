@@ -527,15 +527,10 @@ final class ConnectionManager: NSObject {
             return
         }
 
-        // Stops the event and end-session requests below from starting a drain
-        // that would race the crash report out of order.
+        // Stops anything else from starting a drain that would race the crash
+        // report. Only the crash leaves at crash time: recorded events and the
+        // running session stay on disk and are reported on the next launch.
         core.isCrashing = true
-
-        core.modules.events.sendEventsWithSaveIfNeeded()
-
-        if core.serverConfig.automaticSessionTrackingEnabled {
-            core.modules.sessions.endSession()
-        }
 
         if core.modules.deviceID.isTemporary {
             core.logger.d(Self.module, "sendCrashReport", "crash report is stored to be sent later, reason: device ID is the temporary device ID, crashReportLength: [\(report.count)]")

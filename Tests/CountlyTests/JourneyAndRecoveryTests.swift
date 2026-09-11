@@ -113,6 +113,29 @@ final class JourneyAndRecoveryTests: CountlyBaseTestCase {
         }
     }
 
+    /// Two triggers close together run one retry series, not two: the second
+    /// trigger arrives while the first is still asking and is skipped.
+    func testASecondTriggerDuringTheRetrySeriesStartsNoSecondSeries() throws {
+        try skipUnlessNetworkIsInterceptable()
+
+        MockURLProtocol.respond { captured in
+            captured.path == "/i" ? (200, Data(Self.accepted.utf8)) : nil
+        }
+
+        let countly = startInstance()
+        let content = core(of: countly).modules.content
+        content.refreshContentZoneForJourneyTrigger()
+        content.refreshContentZoneForJourneyTrigger()
+
+        TestUtils.waitUntil("the retry series ran to its end") {
+            MockURLProtocol.requests.filter { $0.path.contains("/o/sdk/content") }.count >= 3
+        }
+        TestUtils.pump(1.5)
+
+        XCTAssertEqual(MockURLProtocol.requests.filter { $0.path.contains("/o/sdk/content") }.count, 3,
+                       "one series of three attempts, the second trigger must not add its own")
+    }
+
     func testTheJourneyRefreshIsSkippedWhenTheServerDisablesIt() throws {
         try skipUnlessNetworkIsInterceptable()
         MockURLProtocol.respondToEverything(json: Self.accepted)

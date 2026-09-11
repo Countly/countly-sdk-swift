@@ -660,7 +660,7 @@ final class LogGatheringTests: CountlyBaseTestCase {
     }
 
     func testTemporaryDeviceIDModeAndDisabledUpdatesDecideOffAtOnce() {
-        let temporary = startInstance { $0.temporaryDeviceIDMode = true }
+        let temporary = startInstance { $0.temporaryDeviceIDMode = true; $0.deviceID = nil }
         XCTAssertEqual(gatherer(of: temporary).currentState, .off, "no behavior settings are fetched in temporary mode, so no directive can arrive")
 
         let disabled = startInstance { $0.disableSDKBehaviorSettingsUpdates = true }

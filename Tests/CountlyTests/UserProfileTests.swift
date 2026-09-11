@@ -160,6 +160,21 @@ final class UserProfileTests: CountlyBaseTestCase {
         XCTAssertNotNil((custom["removed_tags"] as? [String: Any])?["$pull"])
     }
 
+    /// A pull on a key that already carries pushes must not throw the pushes away:
+    /// the server applies both, and that is what every other Countly SDK sends.
+    func testAPullKeepsThePushesStagedForTheSameKey() {
+        let countly = startInstance()
+
+        countly.userProfile.push("tags", value: "alpha")
+        countly.userProfile.push("tags", value: "beta")
+        countly.userProfile.pull("tags", value: "alpha")
+        countly.userProfile.save()
+
+        let tags = lastCustom(of: countly)["tags"] as? [String: Any]
+        XCTAssertEqual((tags?["$push"] as? [Any])?.count, 2, "both pushes survive the pull")
+        XCTAssertEqual(tags?["$pull"] as? String, "alpha")
+    }
+
     /// Pushing three values before a save has to send all three. Overwriting would
     /// silently drop the first two, which is the kind of loss nobody notices until
     /// the numbers are wrong.

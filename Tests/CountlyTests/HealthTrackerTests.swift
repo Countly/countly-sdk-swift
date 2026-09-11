@@ -246,7 +246,7 @@ final class HealthTrackerTests: CountlyBaseTestCase {
     func testNoHealthCheckIsSentInTemporaryDeviceIDMode() {
         MockURLProtocol.respondToEverything(json: #"{"result": "Success"}"#)
 
-        _ = startInstance { $0.temporaryDeviceIDMode = true }
+        _ = startInstance { $0.temporaryDeviceIDMode = true; $0.deviceID = nil }
         TestUtils.pump(0.3)
 
         XCTAssertTrue(healthChecks.isEmpty)

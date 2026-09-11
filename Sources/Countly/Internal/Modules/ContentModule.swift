@@ -60,6 +60,11 @@ final class ContentModule: ModuleBase {
     /// Set from the moment the zone is entered, before the polling timer exists.
     private var isZoneEntered = false
 
+    /// Set while a journey trigger's retry series is running, so a second trigger
+    /// arriving during it does not start a series of its own. Cleared when a
+    /// content is shown or the attempts run out.
+    private var isJourneyRetrying = false
+
     /// Bumped on every enter and every clear, so work scheduled by one visit to
     /// the zone cannot land after a later exit. The initial fetch is delayed by up
     /// to `contentInitialDelay` seconds, which is a long time for an application to
@@ -196,8 +201,23 @@ final class ContentModule: ModuleBase {
             return
         }
 
+        stateLock.lock()
+        if isJourneyRetrying {
+            stateLock.unlock()
+            logD("refreshContentZoneForJourneyTrigger", "a journey content fetch is already retrying, skipping this trigger")
+            return
+        }
+        isJourneyRetrying = true
+        stateLock.unlock()
+
         clearContentState()
         fetchForJourney(attempt: 1)
+    }
+
+    private func endJourneyRetry() {
+        stateLock.lock()
+        isJourneyRetrying = false
+        stateLock.unlock()
     }
 
     private func fetchForJourney(attempt: Int) {
@@ -218,6 +238,7 @@ final class ContentModule: ModuleBase {
                 }
             } else {
                 self.logD("fetchForJourney", "the journey content fetch exhausted every attempt, re-entering the content zone")
+                self.endJourneyRetry()
                 DispatchQueue.main.async { [weak self] in self?.enterContentZone() }
             }
         }
@@ -276,6 +297,7 @@ final class ContentModule: ModuleBase {
 
         guard !isContentShown else { return (false, presentationSequence) }
         isContentShown = true
+        isJourneyRetrying = false
         presentationSequence &+= 1
         return (true, presentationSequence)
     }

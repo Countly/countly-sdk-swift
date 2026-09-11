@@ -91,6 +91,10 @@ public final class SessionsAPI: CountlyAPIBase {
     /// Reports the time elapsed since the last update.
     public func updateSession() {
         guard let core = core(), allowed(core, "updateSession") else { return }
+        guard !core.config.enableManualSessionControlHybridMode else {
+            core.logger.w(Self.module, "updateSession", "the call will be ignored since manual session control hybrid mode is enabled, session updates are sent by the timer")
+            return
+        }
         core.logger.i(Self.module, "updateSession", "a session update was requested through the manual sessions API")
         core.modules.sessions.updateSession()
     }

@@ -143,6 +143,7 @@ final class ConnectionManagerTests: CountlyBaseTestCase {
         MockURLProtocol.respondToEverything(json: Self.accepted)
         let countly = startInstance {
             $0.temporaryDeviceIDMode = true
+            $0.deviceID = nil
             $0.features = [.crashReporting]
         }
 
@@ -313,6 +314,7 @@ final class ConnectionManagerTests: CountlyBaseTestCase {
         MockURLProtocol.respondToEverything(json: Self.accepted)
         let countly = startInstance {
             $0.temporaryDeviceIDMode = true
+            $0.deviceID = nil
             $0.eventSendThreshold = 1
         }
 

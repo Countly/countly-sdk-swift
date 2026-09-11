@@ -175,7 +175,7 @@ final class ContentTests: CountlyBaseTestCase {
     /// what to show them.
     func testNothingIsFetchedInTemporaryDeviceIDMode() {
         MockURLProtocol.respond(pathContaining: "/o/sdk/content", json: "{}")
-        let countly = contentInstance { $0.temporaryDeviceIDMode = true }
+        let countly = contentInstance { $0.temporaryDeviceIDMode = true; $0.deviceID = nil }
 
         countly.content.enterContentZone()
         TestUtils.pump(0.4)

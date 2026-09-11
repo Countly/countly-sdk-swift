@@ -93,7 +93,7 @@ final class FeedbackTests: CountlyBaseTestCase {
     func testEveryRefusalStillCallsTheCompletionHandler() {
         let cases: [(String, (CountlyConfig) -> Void)] = [
             ("no consent", { $0.requiresConsent = true }),
-            ("temporary device ID", { $0.temporaryDeviceIDMode = true }),
+            ("temporary device ID", { $0.temporaryDeviceIDMode = true; $0.deviceID = nil }),
             ("networking off", {
                 $0.sdkBehaviorSettings = ServerConfigBuilder().networking(false).json()
             }),

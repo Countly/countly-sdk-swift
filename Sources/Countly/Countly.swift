@@ -96,6 +96,35 @@ public enum Countly {
         }
     }
 
+    /// Stops a named instance and drops it from the registry.
+    ///
+    /// The next `instance(named:)` under the same name hands back a fresh,
+    /// unstarted instance. Stored data is kept: deregistering must not throw away
+    /// what the instance recorded but has not sent yet, so a caller who wants it
+    /// gone calls `halt(clearStorage: true)` on the instance first. The default
+    /// instance cannot be removed; `halt()` resets it.
+    public static func removeInstance(named name: String?) {
+        guard let name, !name.isEmpty, name != defaultInstanceName else {
+            Logger.print("[Warning] [Countly] removeInstance, the default instance can not be removed, use halt() to reset it, the call is ignored")
+            return
+        }
+
+        // Deregistered under the same lock `instance(named:)` creates under, and
+        // before the halt, so a concurrent creation gets a fresh object rather than
+        // the one being torn down.
+        lock.lock()
+        let removed = instances.removeValue(forKey: name)
+        lock.unlock()
+
+        guard let removed else {
+            Logger.print("[Debug] [Countly] removeInstance, no instance is registered under the name, nothing to remove, name: [\(name)]")
+            return
+        }
+
+        // Outside the lock: the halt does real work and must not block creation.
+        removed.halt(clearStorage: false)
+    }
+
     // MARK: - Push notification plumbing
 
     #if os(iOS) || os(visionOS) || os(macOS)
