@@ -118,6 +118,21 @@ final class WebViewManager: NSObject {
     /// resize.
     private var isSDKPlacedWidget = false
 
+    /// Whether a feedback widget is laid out as a card the SDK sizes and places.
+    ///
+    /// Only on macOS. A phone is the viewport the widget pages were authored for,
+    /// so on iOS, tvOS and visionOS a widget fills the surface exactly as the
+    /// Objective-C SDK presents it, and the page lays itself out inside that. The
+    /// card layout exists for a desktop, where a screen-sized page drifts into a
+    /// corner and a screen-sized panel blocks the whole desktop.
+    private static var usesCardLayoutForWidgets: Bool {
+        #if os(macOS)
+        return true
+        #else
+        return false
+        #endif
+    }
+
     /// The deadline that shows a widget which never stated its size.
     private var pendingFirstFit: DispatchWorkItem?
 
@@ -385,18 +400,21 @@ final class WebViewManager: NSObject {
         let targetFrame: CGRect
         if let frame {
             targetFrame = frame
-        } else if isFeedbackWidget {
+        } else if isFeedbackWidget, Self.usesCardLayoutForWidgets {
             isSDKPlacedWidget = true
             targetFrame = WidgetLayout.resolve(type: widgetType,
                                                position: widgetPosition,
                                                surface: surface)
             core.logger.d(Self.module, "present", "the widget is placed by the SDK, widgetType: [\(widgetType?.wireName ?? "unknown")], appearancePosition: [\(widgetPosition ?? "none")], frame: [\(targetFrame.logValue)], surface: [\(surface.logValue)]")
         } else {
+            // Content the server sent no geometry for, and a feedback widget on a
+            // platform without the card layout: both fill the surface and are
+            // refilled on rotation.
             targetFrame = CGRect(origin: .zero, size: surface)
         }
         baseWebViewFrame = targetFrame
         // A widget the SDK placed is placed, so a layout pass must not refill it.
-        hasExplicitPlacement = frame != nil || isFeedbackWidget
+        hasExplicitPlacement = frame != nil || isSDKPlacedWidget
         frameRequestedByPage = false
         surfaceAtPlacement = surface
         core.logger.d(Self.module, "present", "the presentation frames were computed, webViewFrame: [\(targetFrame.logValue)], surface: [\(surface.logValue)], backgroundFrame: [\(background.bounds.logValue)]")
@@ -829,6 +847,13 @@ final class WebViewManager: NSObject {
     private func resize(with parameters: [String: Any]) {
         guard backgroundView != nil, webView != nil else { return }
 
+        // The page states a card size, and a widget that fills the surface has no
+        // card: the Objective-C SDK gives widgets no resize channel either.
+        if isFeedbackWidget, !Self.usesCardLayoutForWidgets {
+            core.logger.d(Self.module, "resize", "a feedback widget fills the surface on this platform, the size the page asked for is ignored, asked: [\(parameters.keys.sorted())]")
+            return
+        }
+
         let container = containerSize
 
         // The page describes where it wants to sit as a fraction of the screen,
@@ -913,7 +938,7 @@ final class WebViewManager: NSObject {
         // A content page has said where it wants to be, so the SDK stops deciding.
         // A widget only stated a size, and the SDK still owns where that size goes,
         // so it stays SDK placed and is re-anchored when the surface changes.
-        isSDKPlacedWidget = isFeedbackWidget
+        isSDKPlacedWidget = isFeedbackWidget && Self.usesCardLayoutForWidgets
         applySafeAreaPlacement()
 
         // If the widget was being held back for exactly this, show it now.
@@ -1667,7 +1692,11 @@ extension WebViewManager: WKNavigationDelegate {
         // the card on screen at the full box and then visibly jump it to its real
         // size. Waiting for that answer means one placement and no movement. The
         // deadline is what covers a page that never answers.
-        if isFeedbackWidget {
+        if isFeedbackWidget, !isSDKPlacedWidget {
+            // No card to fit: the page fills the surface and is shown as it loads.
+            core.logger.d(Self.module, "webView(didFinish:)", "the feedback widget fills the surface and is shown as soon as it has loaded")
+            reportAppearance()
+        } else if isFeedbackWidget {
             installCardObserver()
             awaitFirstFitThenAppear()
 

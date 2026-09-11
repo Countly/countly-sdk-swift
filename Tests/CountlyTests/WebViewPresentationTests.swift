@@ -137,6 +137,40 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
 
     // MARK: - Measured card
 
+    #if !os(macOS)
+    /// A widget page was authored for a phone viewport, so on iOS it fills the
+    /// surface as the Objective-C SDK presents it, ignores any size it announces,
+    /// and appears as soon as it has loaded.
+    func testAWidgetFillsTheSurfaceAndIgnoresAnnouncedSizes() {
+        let countly = startInstance()
+        let manager = presentWidget(countly, type: .nps)
+        let container = onMain { manager.containerSizeForTesting }
+
+        guard let placed = onMain({ manager.placedFrameForTesting }) else {
+            XCTFail("the widget should have been placed")
+            return
+        }
+        XCTAssertEqual(placed.origin, .zero)
+        XCTAssertEqual(placed.size.width, container.width, accuracy: 1, "a widget fills the surface on iOS")
+        XCTAssertEqual(placed.size.height, container.height, accuracy: 1, "a widget fills the surface on iOS")
+
+        navigate(manager, to: #"https://countly_action_event?cly_x_action_event=1&action=resize_me&resize_me={"l":{"x":0,"y":0,"w":480,"h":300},"p":{"x":0,"y":0,"w":480,"h":300}}"#)
+        reportCard(manager, height: 320, reason: "mutation")
+        TestUtils.pump(0.6)
+
+        XCTAssertEqual(onMain { manager.placedFrameForTesting }?.size.height ?? 0, container.height, accuracy: 1,
+                       "neither an announced nor a measured size shrinks a filling widget")
+        // The load completing is delivered by hand: the helper's HTML load races the
+        // presentation's own navigation, so the delegate is not reliably told here.
+        onMain {
+            guard let page = self.page(of: manager) else { return }
+            manager.webView(page, didFinish: nil)
+        }
+        XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, false, "the widget is visible as soon as it loaded")
+    }
+    #endif
+
+    #if os(macOS)
     /// The page announces a size on every screen switch, but measures before the
     /// incoming screen has laid out, and clamps what it measures to its own
     /// breakpoint. The comment step of an NPS therefore arrives short and scrolls
@@ -198,6 +232,8 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
 
         XCTAssertEqual(placedHeight(manager), WidgetLayout.npsMaximumHeight, "a sliver was taken for the card")
     }
+    #endif
+
 
     // MARK: - One overlay at a time
 
@@ -914,6 +950,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
     /// reaching the SDK; the moment the message bridge started working and the
     /// answers arrived, every widget jumped to the corner. Java has the same rule:
     /// its log reads "putting the nps at {x=-2160, y=542} (it asked for {x=0, y=0})".
+    #if os(macOS)
     func testAWidgetsRequestedSizeIsTakenButItsPositionIsNot() {
         let countly = startInstance()
         let manager = present(countly, url: "https://example.com/feedback/nps")
@@ -943,6 +980,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
             XCTAssertGreaterThan(frame.origin.x, 0, "and in from the left, because it is centred")
         }
     }
+    #endif
 
     /// Content is the opposite: the server placed it deliberately and its
     /// coordinates mean something, so a geometry it sends is applied exactly.
