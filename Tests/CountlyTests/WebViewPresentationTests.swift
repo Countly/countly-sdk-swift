@@ -482,6 +482,45 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         wait(for: [appeared], timeout: TestUtils.webKitTimeout)
     }
 
+    /// A content page whose stylesheets and scripts verified good is revealed
+    /// there and then, the way the Objective-C SDK does it. Waiting for the page's
+    /// own shown report would hide a template that only reports once it is visible.
+    func testAContentPageIsRevealedOnceItsResourcesVerifyGood() {
+        let countly = startInstance { $0.eventSendThreshold = 1 }
+
+        let appeared = expectation(description: "the content is reported visible")
+        appeared.assertForOverFulfill = false
+        let manager = present(countly,
+                              url: "https://example.com/o/sdk/content",
+                              appear: { appeared.fulfill() })
+
+        onMain {
+            manager.handleScriptMessage(name: "resourceVerifyResult",
+                                        body: ["results": [["tag": "LINK", "url": "https://example.com/a.css", "status": 200]]])
+        }
+
+        wait(for: [appeared], timeout: TestUtils.webKitTimeout)
+        XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, false, "the verified page is on screen")
+    }
+
+    /// A verification that finds a failed resource does not reveal the page.
+    func testAContentPageStaysHiddenWhenAResourceVerifiedAsFailed() {
+        let countly = startInstance { $0.eventSendThreshold = 1 }
+
+        var appearCount = 0
+        let manager = present(countly,
+                              url: "https://example.com/o/sdk/content",
+                              appear: { appearCount += 1 })
+
+        onMain {
+            manager.handleScriptMessage(name: "resourceVerifyResult",
+                                        body: ["results": [["tag": "SCRIPT", "url": "https://example.com/a.js", "status": 404]]])
+        }
+        TestUtils.pump(0.3)
+
+        XCTAssertEqual(appearCount, 0, "a failed verification is not an appearance")
+    }
+
     /// An events payload that is not an array is ignored rather than crashing or
     /// recording nonsense.
     func testAMalformedEventsPayloadIsIgnored() {

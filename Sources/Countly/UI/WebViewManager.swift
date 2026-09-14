@@ -1362,7 +1362,20 @@ final class WebViewManager: NSObject {
         webView.evaluateJavaScript(source) { [weak self] _, error in
             guard let self, let error else { return }
             self.core.logger.d(Self.module, "verifyResourceStatuses", "the resource verification script could not be injected, continuing without verification, error: [\(error.localizedDescription)]")
+            self.revealVerifiedContent()
         }
+    }
+
+    /// Shows a content page whose load verified good, or could not be verified.
+    ///
+    /// The page's own `[CLY]_content_shown` report is not waited for. A hidden web
+    /// view is a hidden document to the page, and a template that reports itself
+    /// shown only once it is visible would otherwise never be revealed at all. The
+    /// stall deadline stays armed, so a page that renders nothing is still caught.
+    private func revealVerifiedContent() {
+        guard !isFeedbackWidget, !isClosed, !hasAppeared else { return }
+        core.logger.d(Self.module, "revealVerifiedContent", "the load verified good, revealing the content")
+        reportAppearance()
     }
 
     /// Receives both injected scripts' messages.
@@ -1399,6 +1412,7 @@ final class WebViewManager: NSObject {
             guard let failure else {
                 core.logger.d(Self.module, "handleScriptMessage", "every stylesheet and script verified good, resourceCount: [\(results.count)]")
                 cancelPendingReload(rearmDeadline: true)
+                revealVerifiedContent()
                 return
             }
 
