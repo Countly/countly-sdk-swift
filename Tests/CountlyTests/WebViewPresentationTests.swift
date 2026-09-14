@@ -211,6 +211,23 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, false, "the content never came back")
     }
 
+    /// The server places a content for both orientations, and a rotation takes the
+    /// geometry for the orientation the surface now has, never the other one's.
+    func testTheServersPlacementForTheNewOrientationIsTakenOnRotation() {
+        let placement: [String: Any] = [
+            "p": ["x": 0, "y": 0, "w": 402, "h": 812],
+            "l": ["x": 0, "y": 0, "w": 812, "h": 402],
+        ]
+        XCTAssertEqual(WebViewManager.serverFrame(from: placement, for: CGSize(width: 402, height: 812)),
+                       CGRect(x: 0, y: 0, width: 402, height: 812))
+        XCTAssertEqual(WebViewManager.serverFrame(from: placement, for: CGSize(width: 812, height: 402)),
+                       CGRect(x: 0, y: 0, width: 812, height: 402))
+        XCTAssertNil(WebViewManager.serverFrame(from: ["p": ["x": 16, "y": 16, "w": 370, "h": 144]],
+                                                for: CGSize(width: 812, height: 402)),
+                     "a placement the server did not give is not invented from the other orientation")
+        XCTAssertNil(WebViewManager.serverFrame(from: [:], for: CGSize(width: 402, height: 812)))
+    }
+
     /// A banner covers a strip of the screen, and the rest of it stays the
     /// application's: a tap beside the page falls through the overlay window.
     func testATapOutsideTheContentFallsThroughTheOverlay() {

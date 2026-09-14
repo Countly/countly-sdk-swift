@@ -579,6 +579,7 @@ final class ContentModule: ModuleBase {
 
             manager.present(url: themedURL,
                             frame: frame,
+                            placement: placement,
                             appear: { [weak self] in
                                 self?.logI("showContent", "the content web view appeared on screen")
                             },

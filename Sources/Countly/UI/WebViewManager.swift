@@ -84,6 +84,12 @@ final class WebViewManager: NSObject {
     /// bottom of the display one rotation at a time.
     private var baseWebViewFrame: CGRect?
 
+    /// The server's placement for each orientation, under `"p"` and `"l"`, for a
+    /// content the server placed. Consulted again on every rotation: the server
+    /// laid the content out for both orientations, and only one of them was in
+    /// effect when it was first shown.
+    private var serverPlacement: [String: Any] = [:]
+
     /// Set when the caller supplied a frame, which means the server placed this
     /// page deliberately rather than asking for one that fills the screen.
     ///
@@ -304,6 +310,7 @@ final class WebViewManager: NSObject {
     ///   - dismiss: Called once the page has been taken off screen.
     func present(url: URL?,
                  frame: CGRect? = nil,
+                 placement: [String: Any] = [:],
                  widgetType: FeedbackWidgetType? = nil,
                  widgetPosition: String? = nil,
                  appear: (() -> Void)?,
@@ -327,6 +334,7 @@ final class WebViewManager: NSObject {
 
         presentedWidgetType = widgetType
         presentedWidgetPosition = widgetPosition
+        serverPlacement = placement
         isPinnedToPortrait = !isFeedbackWidget && core.config.content.disableRotation
 
         // Host and path only: the query string carries the app key and device ID.
@@ -840,7 +848,18 @@ final class WebViewManager: NSObject {
         // been seen: a 435x144 banner became the whole 3840x2130 screen. Only a
         // page that asked to fill, which is every feedback widget, is re-filled.
         if hasExplicitPlacement {
-            if frameRequestedByPage, let current = baseWebViewFrame, containerSize != surfaceAtPlacement {
+            if let placed = Self.serverFrame(from: serverPlacement, for: containerSize) {
+                // The server laid the content out for this orientation too, so its
+                // geometry is applied straight away rather than the other
+                // orientation's frame being kept or squeezed. A full-screen survey
+                // shown in portrait was otherwise 402 wide on an 812 wide screen
+                // after a rotation, since the page was only asked for a size after
+                // the fact. The page is still told the new room and may refine this.
+                core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed and the server's placement for the new orientation is applied, frame: [\(placed.logValue)], containerSize: [\(containerSize.logValue)]")
+                baseWebViewFrame = placed
+                frameRequestedByPage = false
+                surfaceAtPlacement = containerSize
+            } else if frameRequestedByPage, let current = baseWebViewFrame, containerSize != surfaceAtPlacement {
                 let moved = WidgetLayout.reanchor(current, from: surfaceAtPlacement, to: containerSize)
                 core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed and the page-sized frame is re-anchored, from: [\(current.logValue)], to: [\(moved.logValue)]")
                 baseWebViewFrame = moved
@@ -907,6 +926,16 @@ final class WebViewManager: NSObject {
         }
     }
     #endif
+
+    /// The frame the server's placement gives a content on a surface of `container`,
+    /// taken from the entry for that surface's orientation. Nil when the server
+    /// said nothing for it: the other orientation's frame is not a substitute, since
+    /// its coordinates were measured against a surface of the other shape.
+    static func serverFrame(from placement: [String: Any], for container: CGSize) -> CGRect? {
+        let key = container.width > container.height ? "l" : "p"
+        guard let geometry = placement[key] as? [String: Any], !geometry.isEmpty else { return nil }
+        return CGRect(contentGeometry: geometry, container: container)
+    }
 
     /// The space a page's `{x, y, w, h}` is measured against.
     ///
