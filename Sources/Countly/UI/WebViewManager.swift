@@ -136,6 +136,14 @@ final class WebViewManager: NSObject {
     /// The deadline that shows a widget which never stated its size.
     private var pendingFirstFit: DispatchWorkItem?
 
+    /// Set while a visible page is held off screen for a rotation, until it has
+    /// been fitted to the new orientation or the wait for that ran out.
+    private var isConcealedForRotation = false
+
+    /// The deadline by which a rotated page is shown whether or not it asked for a
+    /// new size.
+    private var pendingRotationReveal: DispatchWorkItem?
+
     /// Corner radius used when the window will not say what its own is.
     ///
     /// Only reached when the frame view has no radius on its layer. Erring large is
@@ -586,6 +594,8 @@ final class WebViewManager: NSObject {
             self.cancelStallTimer()
             self.pendingReload?.cancel()
             self.pendingReload = nil
+            self.pendingRotationReveal?.cancel()
+            self.pendingRotationReveal = nil
             self.webView?.stopLoading()
             self.webView?.navigationDelegate = nil
             let controller = self.webView?.configuration.userContentController
@@ -644,6 +654,9 @@ final class WebViewManager: NSObject {
     /// How long a visible page takes to slide to a new frame. Matches the
     /// Objective-C SDK's resize animation.
     private static let placementAnimationDuration: TimeInterval = 0.3
+
+    /// How long a page fades back in after a rotation.
+    private static let revealAnimationDuration: TimeInterval = 0.2
 
     /// Waits for the page's first `resize_me` before showing it, so the card is
     /// placed once rather than placed and then moved in front of the user.
@@ -800,8 +813,8 @@ final class WebViewManager: NSObject {
 
     /// Drives the re-layout the platform would deliver, so the suite can assert on
     /// what a layout pass does to a placed page without waiting for a real one.
-    func simulateInterfaceSizeChangeForTesting() {
-        handleInterfaceSizeChange(reportToPage: true)
+    func simulateInterfaceSizeChangeForTesting(settled: Bool = true) {
+        handleInterfaceSizeChange(reportToPage: settled)
     }
 
     /// Re-lays the page out after a rotation, unless it is pinned to portrait.
@@ -811,14 +824,22 @@ final class WebViewManager: NSObject {
     /// a single `resize_me` against final numbers rather than one per pass.
     private func handleInterfaceSizeChange(reportToPage: Bool) {
         guard !isPinnedToPortrait else { return }
-        guard let backgroundView, webView != nil else { return }
+        guard backgroundView != nil, webView != nil else { return }
+
+        #if !os(macOS)
+        // The first pass of a rotation takes a visible page off screen. Left on
+        // screen it would be seen rotating at its old size, landing, and then
+        // jumping again when the page asks for its landscape size. It comes back
+        // once that answer has been applied, or the wait for it ran out.
+        if !reportToPage { concealForRotation() }
+        #endif
 
         // A page the server placed keeps its placement. macOS calls this from
         // `viewDidLayout`, which runs during the presentation itself, so filling
         // here would throw the server's coordinates away before the page had even
         // been seen: a 435x144 banner became the whole 3840x2130 screen. Only a
         // page that asked to fill, which is every feedback widget, is re-filled.
-        guard !hasExplicitPlacement else {
+        if hasExplicitPlacement {
             if frameRequestedByPage, let current = baseWebViewFrame, containerSize != surfaceAtPlacement {
                 let moved = WidgetLayout.reanchor(current, from: surfaceAtPlacement, to: containerSize)
                 core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed and the page-sized frame is re-anchored, from: [\(current.logValue)], to: [\(moved.logValue)]")
@@ -827,17 +848,65 @@ final class WebViewManager: NSObject {
             } else {
                 core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed, the page keeps the placement the server gave it, frame: [\(baseWebViewFrame?.logValue ?? "none")]")
             }
-            applySafeAreaPlacement()
-            if reportToPage { reportSurfaceToPage() }
+        } else {
+            let filled = CGRect(origin: .zero, size: containerSize)
+            core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed and the page is re-laid out, frame: [\(filled.logValue)], containerSize: [\(containerSize.logValue)]")
+            baseWebViewFrame = filled
+        }
+        applySafeAreaPlacement()
+
+        guard reportToPage else { return }
+        reportSurfaceToPage()
+        #if !os(macOS)
+        awaitRefitThenReveal()
+        #endif
+    }
+
+    #if !os(macOS)
+    /// Hides a page the user can see for the length of a rotation.
+    private func concealForRotation() {
+        guard let webView, hasAppeared, !webView.isHidden, !isConcealedForRotation else { return }
+        isConcealedForRotation = true
+        webView.isHidden = true
+        core.logger.d(Self.module, "concealForRotation", "the page is held off screen while the interface rotates")
+    }
+
+    /// Brings a concealed page back once it has answered the new surface with a
+    /// size, or after the same wait a first presentation allows for that answer.
+    private func awaitRefitThenReveal() {
+        guard isConcealedForRotation else { return }
+
+        // A widget fills the surface and never states a size, so there is nothing
+        // to wait for: it is back as soon as it has been re-filled.
+        guard !isFeedbackWidget || Self.usesCardLayoutForWidgets else {
+            revealAfterRotation(reason: "the widget fills the surface")
             return
         }
 
-        let filled = CGRect(origin: .zero, size: containerSize)
-        core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed and the page is re-laid out, frame: [\(filled.logValue)], containerSize: [\(containerSize.logValue)]")
-        baseWebViewFrame = filled
-        applySafeAreaPlacement()
-        if reportToPage { reportSurfaceToPage() }
+        pendingRotationReveal?.cancel()
+        let deadline = DispatchWorkItem { [weak self] in
+            self?.revealAfterRotation(reason: "the page did not ask for a size within the deadline")
+        }
+        pendingRotationReveal = deadline
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.firstFitDeadline, execute: deadline)
     }
+
+    /// Fades a page concealed for a rotation back in at its new frame.
+    private func revealAfterRotation(reason: String) {
+        pendingRotationReveal?.cancel()
+        pendingRotationReveal = nil
+        guard isConcealedForRotation else { return }
+        isConcealedForRotation = false
+        guard let webView, !isClosed else { return }
+
+        core.logger.d(Self.module, "revealAfterRotation", "the page is shown again after the rotation, reason: [\(reason)], frame: [\(webView.frame.logValue)]")
+        webView.alpha = 0
+        webView.isHidden = false
+        UIView.animate(withDuration: Self.revealAnimationDuration) {
+            webView.alpha = 1
+        }
+    }
+    #endif
 
     /// The space a page's `{x, y, w, h}` is measured against.
     ///
@@ -967,6 +1036,10 @@ final class WebViewManager: NSObject {
 
         // If the widget was being held back for exactly this, show it now.
         firstFitArrived()
+        #if !os(macOS)
+        // Likewise a page held off screen for a rotation.
+        revealAfterRotation(reason: "the page asked for its size")
+        #endif
     }
 
     // MARK: - Actions

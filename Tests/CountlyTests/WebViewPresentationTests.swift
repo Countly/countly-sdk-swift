@@ -169,6 +169,48 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, false, "the widget is visible as soon as it loaded")
     }
 
+    /// A visible content is taken off screen for the rotation and comes back only
+    /// once it has been fitted to the new orientation, so it is never seen landing
+    /// at its old size and then jumping to the new one.
+    func testAContentIsConcealedForARotationUntilItAsksForItsNewSize() {
+        let countly = startInstance()
+        let manager = present(countly, url: "https://example.com/o/sdk/content",
+                              frame: CGRect(x: 16, y: 16, width: 370, height: 144))
+        waitForLoad(manager)
+        onMain { manager.handleScriptMessage(name: "resourceVerifyResult", body: ["results": []]) }
+        TestUtils.pump(0.2)
+        XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, false, "the content should be on screen before the rotation")
+
+        onMain { manager.simulateInterfaceSizeChangeForTesting(settled: false) }
+        XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, true, "the content stays visible while rotating")
+
+        onMain { manager.simulateInterfaceSizeChangeForTesting(settled: true) }
+        XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, true, "the content came back before the page answered with a size")
+
+        navigate(manager, to: #"https://countly_action_event?cly_x_action_event=1&action=resize_me&resize_me={"l":{"x":10,"y":10,"w":300,"h":120},"p":{"x":10,"y":10,"w":300,"h":120}}"#)
+
+        XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, false, "the fitted content is not shown again")
+        XCTAssertEqual(onMain { manager.placedFrameForTesting }, CGRect(x: 10, y: 10, width: 300, height: 120))
+    }
+
+    /// A page that never answers the new surface is shown again anyway, after the
+    /// same wait a first presentation gives that answer.
+    func testAConcealedContentComesBackAfterTheDeadlineWithoutAnAnswer() {
+        let countly = startInstance()
+        let manager = present(countly, url: "https://example.com/o/sdk/content",
+                              frame: CGRect(x: 16, y: 16, width: 370, height: 144))
+        waitForLoad(manager)
+        onMain { manager.handleScriptMessage(name: "resourceVerifyResult", body: ["results": []]) }
+        TestUtils.pump(0.2)
+
+        onMain { manager.simulateInterfaceSizeChangeForTesting(settled: false) }
+        onMain { manager.simulateInterfaceSizeChangeForTesting(settled: true) }
+        XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, true)
+
+        TestUtils.pump(0.8)
+        XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, false, "the content never came back")
+    }
+
     /// A banner covers a strip of the screen, and the rest of it stays the
     /// application's: a tap beside the page falls through the overlay window.
     func testATapOutsideTheContentFallsThroughTheOverlay() {
