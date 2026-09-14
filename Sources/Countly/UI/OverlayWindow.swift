@@ -56,9 +56,17 @@ final class OverlayWindow: UIWindow {
     ///
     /// Without this the whole screen would be captured by a widget occupying a
     /// corner of it.
+    ///
+    /// A window returning nil hands the touch to the next window down. Both the
+    /// window itself and its root view have to be filtered: when no subview claims
+    /// the point `UIView.hitTest` answers with the deepest view that contains it,
+    /// and for a screen sized window with a pass-through root that is the window.
+    /// Filtering only the root view left the window as the hit, and every tap
+    /// beside a banner went nowhere.
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         let hit = super.hitTest(point, with: event)
-        return hit === rootViewController?.view ? nil : hit
+        if hit === self || hit === rootViewController?.view { return nil }
+        return hit
     }
 }
 
@@ -232,7 +240,10 @@ final class PassThroughBackgroundView: NSView {
 /// which is the same signal for the same purpose.
 final class WebViewController: NSViewController {
 
-    var sizeChangeHandler: (() -> Void)?
+    /// A macOS layout pass is already settled when it reports, so this is always
+    /// called with `true`; the parameter exists so both platforms' controllers can
+    /// be wired the same way.
+    var sizeChangeHandler: ((_ settled: Bool) -> Void)?
 
     var contentView: NSView? {
         didSet {
@@ -258,7 +269,7 @@ final class WebViewController: NSViewController {
 
     override func viewDidLayout() {
         super.viewDidLayout()
-        sizeChangeHandler?()
+        sizeChangeHandler?(true)
     }
 }
 #endif

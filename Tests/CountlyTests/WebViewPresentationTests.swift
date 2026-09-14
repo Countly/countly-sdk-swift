@@ -168,6 +168,30 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         }
         XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, false, "the widget is visible as soon as it loaded")
     }
+
+    /// A banner covers a strip of the screen, and the rest of it stays the
+    /// application's: a tap beside the page falls through the overlay window.
+    func testATapOutsideTheContentFallsThroughTheOverlay() {
+        let countly = startInstance()
+        let banner = CGRect(x: 16, y: 16, width: 370, height: 144)
+        let manager = present(countly, url: "https://example.com/o/sdk/content", frame: banner)
+
+        onMain {
+            manager.handleScriptMessage(name: "resourceVerifyResult", body: ["results": []])
+        }
+        TestUtils.pump(0.3)
+
+        guard let page = onMain({ self.page(of: manager) }), let window = onMain({ page.window }) else {
+            XCTFail("the content should be on a window")
+            return
+        }
+
+        let inside = onMain { window.convert(CGPoint(x: page.bounds.midX, y: page.bounds.midY), from: page) }
+        let below = onMain { CGPoint(x: window.bounds.midX, y: page.frame.maxY + 200) }
+
+        XCTAssertNil(onMain { window.hitTest(below, with: nil) }, "a tap beside the banner was swallowed by the overlay")
+        XCTAssertNotNil(onMain { window.hitTest(inside, with: nil) }, "a tap on the banner did not reach the page")
+    }
     #endif
 
     #if os(macOS)

@@ -343,8 +343,8 @@ final class WebViewManager: NSObject {
         // matters where a controller can be presented modally at all.
         controller.modalPresentationStyle = .overFullScreen
         #endif
-        controller.sizeChangeHandler = { [weak self] in
-            self?.handleInterfaceSizeChange()
+        controller.sizeChangeHandler = { [weak self] settled in
+            self?.handleInterfaceSizeChange(reportToPage: settled)
         }
         overlayWindow.rootViewController = controller
 
@@ -641,6 +641,10 @@ final class WebViewManager: NSObject {
     /// lay itself out at the size it was just given.
     private static let measureDelay: TimeInterval = 0.16
 
+    /// How long a visible page takes to slide to a new frame. Matches the
+    /// Objective-C SDK's resize animation.
+    private static let placementAnimationDuration: TimeInterval = 0.3
+
     /// Waits for the page's first `resize_me` before showing it, so the card is
     /// placed once rather than placed and then moved in front of the user.
     private func awaitFirstFitThenAppear() {
@@ -769,7 +773,22 @@ final class WebViewManager: NSObject {
         guard placed != webView.frame else { return }
 
         core.logger.d(Self.module, "applySafeAreaPlacement", "the page is placed clear of the safe area, baseFrame: [\(base.logValue)], offset: [\(offset.logValue)], frame: [\(placed.logValue)], safeAreaInsets: [\(ContentGeometry.safeAreaDescription)]")
-        webView.frame = placed
+
+        // A page the user can already see slides to its new frame, the way the
+        // Objective-C SDK moves it when the page asks for a size. Snapping it after
+        // a rotation, or when a `resize_me` arrives, reads as a glitch. A page still
+        // hidden is simply put where it belongs: animating a frame nobody can see
+        // would only show as a slide the moment it is revealed. Inside a rotation
+        // this nests in the transition's own animation and follows its timing.
+        guard !webView.isHidden else {
+            webView.frame = placed
+            return
+        }
+        UIView.animate(withDuration: Self.placementAnimationDuration,
+                       delay: 0,
+                       options: [.beginFromCurrentState, .curveEaseInOut]) {
+            webView.frame = placed
+        }
         #endif
     }
 
@@ -782,11 +801,15 @@ final class WebViewManager: NSObject {
     /// Drives the re-layout the platform would deliver, so the suite can assert on
     /// what a layout pass does to a placed page without waiting for a real one.
     func simulateInterfaceSizeChangeForTesting() {
-        handleInterfaceSizeChange()
+        handleInterfaceSizeChange(reportToPage: true)
     }
 
     /// Re-lays the page out after a rotation, unless it is pinned to portrait.
-    private func handleInterfaceSizeChange() {
+    ///
+    /// `reportToPage` is false for the pass that runs inside the rotation animation:
+    /// the page is told its new room once the transition has settled, so it answers
+    /// a single `resize_me` against final numbers rather than one per pass.
+    private func handleInterfaceSizeChange(reportToPage: Bool) {
         guard !isPinnedToPortrait else { return }
         guard let backgroundView, webView != nil else { return }
 
@@ -805,7 +828,7 @@ final class WebViewManager: NSObject {
                 core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed, the page keeps the placement the server gave it, frame: [\(baseWebViewFrame?.logValue ?? "none")]")
             }
             applySafeAreaPlacement()
-            reportSurfaceToPage()
+            if reportToPage { reportSurfaceToPage() }
             return
         }
 
@@ -813,7 +836,7 @@ final class WebViewManager: NSObject {
         core.logger.d(Self.module, "handleInterfaceSizeChange", "the interface size changed and the page is re-laid out, frame: [\(filled.logValue)], containerSize: [\(containerSize.logValue)]")
         baseWebViewFrame = filled
         applySafeAreaPlacement()
-        reportSurfaceToPage()
+        if reportToPage { reportSurfaceToPage() }
     }
 
     /// The space a page's `{x, y, w, h}` is measured against.
@@ -2017,7 +2040,14 @@ final class WebViewController: UIViewController {
     /// Called when the interface size changes, which is the reliable rotation
     /// signal: the device orientation notification also fires for face up and face
     /// down, which do not change the layout.
-    var sizeChangeHandler: (() -> Void)?
+    ///
+    /// Called twice per rotation. First inside the transition's animation, with
+    /// `false`, so the page's new frame animates together with the application
+    /// instead of snapping into place once the rotation has finished. Then from the
+    /// completion, with `true`, when the window and its safe area have settled: a
+    /// frame worked out mid-transition from insets that had not yet changed is
+    /// corrected there, and the page is told about its new room only then.
+    var sizeChangeHandler: ((_ settled: Bool) -> Void)?
 
     var contentView: UIView? {
         didSet {
@@ -2036,9 +2066,11 @@ final class WebViewController: UIViewController {
 
     override func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
         super.viewWillTransition(to: size, with: coordinator)
-        coordinator.animate(alongsideTransition: nil) { [weak self] _ in
-            self?.sizeChangeHandler?()
-        }
+        coordinator.animate(alongsideTransition: { [weak self] _ in
+            self?.sizeChangeHandler?(false)
+        }, completion: { [weak self] _ in
+            self?.sizeChangeHandler?(true)
+        })
     }
 }
 #endif
