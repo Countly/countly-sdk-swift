@@ -133,4 +133,6 @@
 
 * Added the one-shot health check report sent at init, carrying the error and warning counts, the last failed request's status code and message, and the backoff counters, all carried across launches.
 
+* On watchOS the session follows the extension's active state on its own: resigning active ends it and becoming active begins the next, so the host no longer calls "suspend()" and "resume()" from its extension delegate.
+
 * Added support for iOS 15, tvOS 15, watchOS 9, macOS 12 and visionOS 1, the deployment floor of Xcode 27, from a single Swift package, also distributed as a CocoaPod with a separate "NotificationService" subspec.

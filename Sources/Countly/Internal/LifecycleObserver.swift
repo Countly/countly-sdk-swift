@@ -217,6 +217,26 @@ final class LifecycleObserver {
         add(NSApplication.didBecomeActiveNotification, event: "didBecomeActive") { [weak self] in
             self?.runCallback("onForeground", to: self?.onForeground)
         }
+        #elseif os(watchOS)
+        // The watch reports "resign active" when the wrist drops or another
+        // application comes up, and "did enter background" only later, if at all,
+        // so resigning is what closes the session here. That is the mapping the
+        // Objective-C watch sample drove by hand from its extension delegate; the
+        // extension notifications let the SDK do it itself. The first activation
+        // after launch is skipped by the sessions module, so init's session is not
+        // begun twice.
+        add(WKExtension.applicationDidBecomeActiveNotification, event: "didBecomeActive") { [weak self] in
+            self?.runCallback("onForeground", to: self?.onForeground)
+        }
+        add(WKExtension.applicationWillResignActiveNotification, event: "willResignActive") { [weak self] in
+            self?.runCallback("onWillResignActive", to: self?.onWillResignActive)
+            self?.runCallback("onBackground", to: self?.onBackground)
+        }
+        // Already suspended on resigning; observed so the state and the gathered
+        // log lines are flushed once more before the process can be frozen.
+        add(WKExtension.applicationDidEnterBackgroundNotification, event: "didEnterBackground") { [weak self] in
+            self?.runCallback("onBackground", to: self?.onBackground)
+        }
         #endif
 
         #if os(iOS)
