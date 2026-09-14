@@ -73,18 +73,15 @@ public final class CountlyContentConfig {
     /// own, since nothing the SDK can read will describe that.
     public var overlayCornerRadius: CGFloat?
 
-    /// Layout of the content and feedback web views. Default `.safeArea`.
+    /// Layout of the content and feedback web views. Default `.immersive`, except
+    /// `.safeArea` on macOS.
     ///
-    /// The safe area rather than the full screen, so what the SDK draws clears the
-    /// notch, the home indicator and, on macOS, the menu bar and the Dock. A page
-    /// laid out under any of those is a page with part of itself unreadable or
-    /// untappable, and the SDK cannot know which part matters.
-    ///
-    /// Note this differs from the Android SDK, which defaults to `IMMERSIVE`.
+    /// Immersive draws under the status bar and the home indicator, which is what
+    /// the Android and Objective-C SDKs do by default. A hardware cutout is always
+    /// kept clear whatever the option says. `.safeArea` keeps the page inside the
+    /// safe area instead. On macOS the option only names where the panel sits, so
+    /// it stays inside the visible frame, clear of the menu bar and the Dock.
     public var webViewDisplayOption: WebViewDisplayOption = {
-        // Immersive everywhere a screen has a safe area to ignore, matching the
-        // Android SDK's default. On macOS the option only names where the panel
-        // sits, so it stays inside the visible frame.
         #if os(macOS)
         return .safeArea
         #else

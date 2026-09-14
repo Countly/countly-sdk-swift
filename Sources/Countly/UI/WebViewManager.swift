@@ -139,6 +139,11 @@ final class WebViewManager: NSObject {
         #endif
     }
 
+    /// Whether the presented page fills the surface rather than being a card the
+    /// SDK sizes. Such a page states no size of its own, so nothing waits for one
+    /// and a placement that came with it means nothing.
+    private var fillsSurface: Bool { isFeedbackWidget && !Self.usesCardLayoutForWidgets }
+
     /// The deadline that shows a widget which never stated its size.
     private var pendingFirstFit: DispatchWorkItem?
 
@@ -197,6 +202,21 @@ final class WebViewManager: NSObject {
 
     /// Fires when a content page has not reported itself shown in time.
     private var stallTimer: Timer?
+
+    /// Fires when a content page has not reported `[CLY]_content_shown` within
+    /// `contentShownDeadline` of being presented, whatever else happened to it.
+    private var contentShownDeadlineTimer: Timer?
+
+    /// How long a content page has to report itself shown before it is closed.
+    ///
+    /// Absolute and armed once per presentation, unlike the stall timer, which
+    /// watches a single load and is re-armed on progress. A page that loads,
+    /// verifies good and is revealed may still have drawn nothing, and this is
+    /// the only detector that outlives the reveal. Closing is the only action it
+    /// takes: reloading a page the user can see would flash it away. The same
+    /// sixty seconds the Objective-C SDK uses; settable so a test does not wait
+    /// that long.
+    static var contentShownDeadline: TimeInterval = 60
 
     /// How many times a load has been retried after a critical resource failed.
     private var resourceRetryCount = 0
@@ -380,7 +400,6 @@ final class WebViewManager: NSObject {
         background.backgroundColor = .clear
         background.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         #endif
-        background.reportPortraitSizeOnly = isPinnedToPortrait
         controller.contentView = background
 
         let configuration = WKWebViewConfiguration()
@@ -419,13 +438,14 @@ final class WebViewManager: NSObject {
         // page authored to fill a phone: in landscape it arrived as 349x604 for an
         // 812x402 screen. The Objective-C SDK fills the window for every widget URL
         // on rotation, and filling from the start keeps the two placements agreeing.
-        let fillsSurface = isFeedbackWidget && !Self.usesCardLayoutForWidgets
         if fillsSurface, let frame {
             core.logger.d(Self.module, "present", "the placement that came with the widget is ignored, a widget fills the surface on this platform, ignoredFrame: [\(frame.logValue)]")
         }
+        // The placement to honour, once a page that ignores one has discarded it.
+        let placedFrame = fillsSurface ? nil : frame
         let targetFrame: CGRect
-        if let frame, !fillsSurface {
-            targetFrame = frame
+        if let placedFrame {
+            targetFrame = placedFrame
         } else if isFeedbackWidget, Self.usesCardLayoutForWidgets {
             isSDKPlacedWidget = true
             targetFrame = WidgetLayout.resolve(type: widgetType,
@@ -440,7 +460,7 @@ final class WebViewManager: NSObject {
         }
         baseWebViewFrame = targetFrame
         // A widget the SDK placed is placed, so a layout pass must not refill it.
-        hasExplicitPlacement = (frame != nil && !fillsSurface) || isSDKPlacedWidget
+        hasExplicitPlacement = placedFrame != nil || isSDKPlacedWidget
         frameRequestedByPage = false
         surfaceAtPlacement = surface
         core.logger.d(Self.module, "present", "the presentation frames were computed, webViewFrame: [\(targetFrame.logValue)], surface: [\(surface.logValue)], backgroundFrame: [\(background.bounds.logValue)]")
@@ -484,6 +504,7 @@ final class WebViewManager: NSObject {
         web.load(URLRequest(url: url))
 
         armStallTimerIfNeeded()
+        armContentShownDeadline()
     }
 
     #if os(macOS)
@@ -610,6 +631,7 @@ final class WebViewManager: NSObject {
             // Invalidated here rather than above: a `Timer` has to be invalidated on
             // the thread that scheduled it, and `close()` accepts calls from any.
             self.cancelStallTimer()
+            self.cancelContentShownDeadline()
             self.pendingReload?.cancel()
             self.pendingReload = nil
             self.pendingRotationReveal?.cancel()
@@ -707,6 +729,9 @@ final class WebViewManager: NSObject {
         // checks it before reloading, so a load that succeeded during the delay
         // window is never wiped by the retry the earlier failure scheduled.
         hasAppeared = true
+        // The load this timer watched is over once the page is on screen. Only the
+        // absolute content shown deadline outlives the reveal.
+        cancelStallTimer()
         applySafeAreaPlacement()
         webView?.isHidden = false
 
@@ -734,14 +759,33 @@ final class WebViewManager: NSObject {
         let configured = TimeInterval(core.config.content.contentReloadOnStallTimeout) / 1000.0
         let timeout = configured > 0 ? configured : Self.defaultStallTimeout
         stallTimer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
-            self?.attemptRecovery(reason: "the content did not report itself shown in time", fromDeadline: true)
+            self?.attemptRecovery(reason: "the content did not report itself shown in time")
         }
     }
 
-    /// Cancels the stall deadline once the page says it is showing something.
+    /// Cancels the stall deadline once the page is on screen or says it is showing
+    /// something.
     private func cancelStallTimer() {
         stallTimer?.invalidate()
         stallTimer = nil
+    }
+
+    /// Arms the absolute deadline for `[CLY]_content_shown`. Content only: a
+    /// feedback widget never reports the event, so arming it there would close
+    /// every widget a minute in.
+    private func armContentShownDeadline() {
+        guard !isFeedbackWidget else { return }
+        contentShownDeadlineTimer?.invalidate()
+        contentShownDeadlineTimer = Timer.scheduledTimer(withTimeInterval: Self.contentShownDeadline, repeats: false) { [weak self] _ in
+            guard let self, !self.isClosed else { return }
+            self.core.logger.w(Self.module, "contentShownDeadline", "the content never reported that it is shown, the web view is dismissed, deadlineSeconds: [\(Self.contentShownDeadline.logSeconds)], wasRevealed: [\(self.hasAppeared)]")
+            self.close()
+        }
+    }
+
+    private func cancelContentShownDeadline() {
+        contentShownDeadlineTimer?.invalidate()
+        contentShownDeadlineTimer = nil
     }
 
     // MARK: - Layout
@@ -907,7 +951,7 @@ final class WebViewManager: NSObject {
 
         // A widget fills the surface and never states a size, so there is nothing
         // to wait for: it is back as soon as it has been re-filled.
-        guard !isFeedbackWidget || Self.usesCardLayoutForWidgets else {
+        if fillsSurface {
             revealAfterRotation(reason: "the widget fills the surface")
             return
         }
@@ -981,7 +1025,7 @@ final class WebViewManager: NSObject {
 
         // The page states a card size, and a widget that fills the surface has no
         // card: the Objective-C SDK gives widgets no resize channel either.
-        if isFeedbackWidget, !Self.usesCardLayoutForWidgets {
+        if fillsSurface {
             core.logger.d(Self.module, "resize", "a feedback widget fills the surface on this platform, the size the page asked for is ignored, asked: [\(parameters.keys.sorted())]")
             return
         }
@@ -1165,6 +1209,7 @@ final class WebViewManager: NSObject {
             if key == "[CLY]_content_shown" {
                 core.logger.d(Self.module, "recordEvents", "the page reported that the content is shown, cancelling the content shown deadline")
                 cancelStallTimer()
+                cancelContentShownDeadline()
                 reportAppearance()
             }
 
@@ -1572,20 +1617,15 @@ final class WebViewManager: NSObject {
     /// for the whole page life, so a lazily loaded resource failing afterwards would
     /// otherwise flash the page away, re-fire its on-load event, or dismiss content
     /// the user is part way through.
-    /// `fromDeadline` is the stall deadline passing. A content revealed because its
-    /// load verified good may still have rendered nothing, and the deadline is the
-    /// only detector left for that, so it acts even on a page already on screen.
-    /// The other detectors stay non fatal after appearance: a lazily loaded
-    /// resource failing must not flash away a page the user is reading.
-    private func attemptRecovery(reason: String, fromDeadline: Bool = false) {
+    private func attemptRecovery(reason: String) {
         guard Thread.isMainThread else {
-            DispatchQueue.main.async { [weak self] in self?.attemptRecovery(reason: reason, fromDeadline: fromDeadline) }
+            DispatchQueue.main.async { [weak self] in self?.attemptRecovery(reason: reason) }
             return
         }
 
         guard !isClosed else { return }
 
-        if hasAppeared, !fromDeadline {
+        if hasAppeared {
             core.logger.d(Self.module, "attemptRecovery", "a failure arrived after the page was already visible, treating it as non fatal, reason: [\(reason)]")
             return
         }
@@ -1623,13 +1663,7 @@ final class WebViewManager: NSObject {
             guard let self else { return }
             self.pendingReload = nil
 
-            guard !self.isClosed, !self.hasAppeared || fromDeadline else { return }
-            // Hidden again for the retry, so the replacement load is revealed the
-            // same way the first one was, by verifying good.
-            if self.hasAppeared {
-                self.hasAppeared = false
-                self.webView?.isHidden = true
-            }
+            guard !self.isClosed, !self.hasAppeared else { return }
             self.webView?.reload()
             // Re-armed, so a reload that stalls in turn still has a deadline. Without
             // this the recovery attempt itself would leave the overlay with none.

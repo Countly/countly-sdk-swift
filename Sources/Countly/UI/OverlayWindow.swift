@@ -64,10 +64,6 @@ final class OverlayWindow: UIWindow {
 /// Background view of the overlay that only claims the touches its subviews want.
 final class PassThroughBackgroundView: UIView {
 
-    /// When set, the view reports portrait dimensions whatever the device
-    /// orientation is, which is how content pinned to portrait keeps its layout.
-    var reportPortraitSizeOnly = false
-
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         for subview in subviews.reversed() {
             let converted = convert(point, to: subview)
@@ -76,14 +72,6 @@ final class PassThroughBackgroundView: UIView {
             }
         }
         return nil
-    }
-
-    /// The size content should be laid out against.
-    var effectiveSize: CGSize {
-        guard reportPortraitSizeOnly else { return bounds.size }
-        let shorter = Swift.min(bounds.width, bounds.height)
-        let longer = Swift.max(bounds.width, bounds.height)
-        return CGSize(width: shorter, height: longer)
     }
 }
 
@@ -182,10 +170,6 @@ final class OverlayWindow: NSPanel {
 /// event, which is the one place the two platforms' hit testing genuinely differ.
 final class PassThroughBackgroundView: NSView {
 
-    /// When set, the view reports portrait dimensions whatever the window shape is,
-    /// which is how content pinned to portrait keeps its layout.
-    var reportPortraitSizeOnly = false
-
     /// Top-left origin, so the geometry a content page sends means the same thing
     /// here as it does on iOS. Without this every `resize_me` would be upside down.
     override var isFlipped: Bool { true }
@@ -214,14 +198,6 @@ final class PassThroughBackgroundView: NSView {
             if let hit = subview.hitTest(convert(local, to: superview)) { return hit }
         }
         return nil
-    }
-
-    /// The size content should be laid out against.
-    var effectiveSize: CGSize {
-        guard reportPortraitSizeOnly else { return bounds.size }
-        let shorter = Swift.min(bounds.width, bounds.height)
-        let longer = Swift.max(bounds.width, bounds.height)
-        return CGSize(width: shorter, height: longer)
     }
 }
 

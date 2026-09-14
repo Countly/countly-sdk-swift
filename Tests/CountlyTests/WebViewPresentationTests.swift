@@ -786,6 +786,9 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
             $0.content.enableContentReloadOnStall = true
             $0.content.contentReloadOnStallTimeout = 300
         }
+        let deadline = WebViewManager.contentShownDeadline
+        WebViewManager.contentShownDeadline = 1.0
+        defer { WebViewManager.contentShownDeadline = deadline }
 
         let dismissed = expectation(description: "the stalled page is taken down")
         dismissed.assertForOverFulfill = false
@@ -794,6 +797,33 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         present(countly, url: "https://example.com/o/sdk/content", dismiss: { dismissed.fulfill() })
 
         wait(for: [dismissed], timeout: TestUtils.webKitTimeout)
+    }
+
+    /// A page that loads and is revealed but never reports itself shown is not
+    /// reloaded behind the user's back: the stall timer ends with the reveal and
+    /// only the absolute deadline is left, which closes rather than flashes.
+    func testARevealedPageIsNotReloadedButClosedAtTheAbsoluteDeadline() {
+        let countly = startInstance {
+            $0.content.enableContentReloadOnStall = true
+            $0.content.contentReloadOnStallTimeout = 300
+        }
+        let deadline = WebViewManager.contentShownDeadline
+        WebViewManager.contentShownDeadline = 1.5
+        defer { WebViewManager.contentShownDeadline = deadline }
+
+        var dismissed = false
+        let manager = present(countly, url: "https://example.com/o/sdk/content", dismiss: { dismissed = true })
+        onMain { manager.handleScriptMessage(name: "resourceVerifyResult", body: ["results": []]) }
+        TestUtils.pump(0.2)
+        XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, false, "the verified page should be on screen")
+
+        // Past the stall timeout, twice over: the page must still be there and visible.
+        TestUtils.pump(0.7)
+        XCTAssertFalse(dismissed, "the revealed page was taken down by the stall timer")
+        XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, false, "the revealed page was hidden for a reload")
+
+        TestUtils.pump(1.0)
+        XCTAssertTrue(dismissed, "the absolute deadline did not close the page")
     }
 
     /// A feedback widget renders as soon as it loads and never sends a shown event,
@@ -859,6 +889,8 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
     /// Without the switch there is no deadline at all, which is the default: an
     /// application that has not asked for reloads keeps whatever the page does.
     func testWithoutTheReloadSwitchThereIsNoDeadline() {
+        // The reload switch governs the stall timer only. The absolute content
+        // shown deadline stays armed, and at its default is a minute away.
         let countly = startInstance { $0.content.enableContentReloadOnStall = false }
 
         var dismissed = false
