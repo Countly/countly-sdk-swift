@@ -81,7 +81,16 @@ public final class CountlyContentConfig {
     /// untappable, and the SDK cannot know which part matters.
     ///
     /// Note this differs from the Android SDK, which defaults to `IMMERSIVE`.
-    public var webViewDisplayOption: WebViewDisplayOption = .safeArea
+    public var webViewDisplayOption: WebViewDisplayOption = {
+        // Immersive everywhere a screen has a safe area to ignore, matching the
+        // Android SDK's default. On macOS the option only names where the panel
+        // sits, so it stays inside the visible frame.
+        #if os(macOS)
+        return .safeArea
+        #else
+        return .immersive
+        #endif
+    }()
 
     /// Reloads the content web view when a load stalls instead of closing it.
     ///
