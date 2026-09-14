@@ -699,7 +699,7 @@ final class WebViewManager: NSObject {
         let configured = TimeInterval(core.config.content.contentReloadOnStallTimeout) / 1000.0
         let timeout = configured > 0 ? configured : Self.defaultStallTimeout
         stallTimer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
-            self?.attemptRecovery(reason: "the content did not report itself shown in time")
+            self?.attemptRecovery(reason: "the content did not report itself shown in time", fromDeadline: true)
         }
     }
 
@@ -1437,15 +1437,20 @@ final class WebViewManager: NSObject {
     /// for the whole page life, so a lazily loaded resource failing afterwards would
     /// otherwise flash the page away, re-fire its on-load event, or dismiss content
     /// the user is part way through.
-    private func attemptRecovery(reason: String) {
+    /// `fromDeadline` is the stall deadline passing. A content revealed because its
+    /// load verified good may still have rendered nothing, and the deadline is the
+    /// only detector left for that, so it acts even on a page already on screen.
+    /// The other detectors stay non fatal after appearance: a lazily loaded
+    /// resource failing must not flash away a page the user is reading.
+    private func attemptRecovery(reason: String, fromDeadline: Bool = false) {
         guard Thread.isMainThread else {
-            DispatchQueue.main.async { [weak self] in self?.attemptRecovery(reason: reason) }
+            DispatchQueue.main.async { [weak self] in self?.attemptRecovery(reason: reason, fromDeadline: fromDeadline) }
             return
         }
 
         guard !isClosed else { return }
 
-        if hasAppeared {
+        if hasAppeared, !fromDeadline {
             core.logger.d(Self.module, "attemptRecovery", "a failure arrived after the page was already visible, treating it as non fatal, reason: [\(reason)]")
             return
         }
@@ -1483,7 +1488,13 @@ final class WebViewManager: NSObject {
             guard let self else { return }
             self.pendingReload = nil
 
-            guard !self.isClosed, !self.hasAppeared else { return }
+            guard !self.isClosed, !self.hasAppeared || fromDeadline else { return }
+            // Hidden again for the retry, so the replacement load is revealed the
+            // same way the first one was, by verifying good.
+            if self.hasAppeared {
+                self.hasAppeared = false
+                self.webView?.isHidden = true
+            }
             self.webView?.reload()
             // Re-armed, so a reload that stalls in turn still has a deadline. Without
             // this the recovery attempt itself would leave the overlay with none.
