@@ -413,8 +413,18 @@ final class WebViewManager: NSObject {
         // a 2130 tall screen at the bottom of a 1023 tall window, which is to say
         // ten points below it.
         let surface = containerSize
+        // A widget fills the surface on this platform whatever placement came with
+        // it. Journeys serve surveys and NPS widgets as content, with the server's
+        // own geometry attached, and that geometry is laid out for a card, not for a
+        // page authored to fill a phone: in landscape it arrived as 349x604 for an
+        // 812x402 screen. The Objective-C SDK fills the window for every widget URL
+        // on rotation, and filling from the start keeps the two placements agreeing.
+        let fillsSurface = isFeedbackWidget && !Self.usesCardLayoutForWidgets
+        if fillsSurface, let frame {
+            core.logger.d(Self.module, "present", "the placement that came with the widget is ignored, a widget fills the surface on this platform, ignoredFrame: [\(frame.logValue)]")
+        }
         let targetFrame: CGRect
-        if let frame {
+        if let frame, !fillsSurface {
             targetFrame = frame
         } else if isFeedbackWidget, Self.usesCardLayoutForWidgets {
             isSDKPlacedWidget = true
@@ -430,7 +440,7 @@ final class WebViewManager: NSObject {
         }
         baseWebViewFrame = targetFrame
         // A widget the SDK placed is placed, so a layout pass must not refill it.
-        hasExplicitPlacement = frame != nil || isSDKPlacedWidget
+        hasExplicitPlacement = (frame != nil && !fillsSurface) || isSDKPlacedWidget
         frameRequestedByPage = false
         surfaceAtPlacement = surface
         core.logger.d(Self.module, "present", "the presentation frames were computed, webViewFrame: [\(targetFrame.logValue)], surface: [\(surface.logValue)], backgroundFrame: [\(background.bounds.logValue)]")

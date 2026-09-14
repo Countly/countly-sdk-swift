@@ -228,6 +228,33 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         XCTAssertNil(WebViewManager.serverFrame(from: [:], for: CGSize(width: 402, height: 812)))
     }
 
+    /// A survey served through a journey arrives as content, with the server's
+    /// geometry attached, but its URL is a widget's and on iOS a widget fills the
+    /// surface: the geometry is ignored at presentation and stays ignored after a
+    /// rotation.
+    func testAWidgetServedAsContentFillsTheSurfaceDespiteTheServersPlacement() {
+        let countly = startInstance()
+        let manager = WebViewManager(core: core(of: countly))
+        self.manager = manager
+        let placement: [String: Any] = [
+            "p": ["x": 0, "y": 0, "w": 402, "h": 812],
+            "l": ["x": 16, "y": 0, "w": 349, "h": 604],
+        ]
+        onMain {
+            manager.present(url: URL(string: "https://example.com/feedback/survey?widget_id=w"),
+                            frame: CGRect(x: 16, y: 0, width: 349, height: 604),
+                            placement: placement,
+                            appear: nil, dismiss: nil)
+        }
+        let container = onMain { manager.containerSizeForTesting }
+        XCTAssertEqual(onMain { manager.placedFrameForTesting }, CGRect(origin: .zero, size: container),
+                       "the widget did not fill the surface at presentation")
+
+        onMain { manager.simulateInterfaceSizeChangeForTesting() }
+        XCTAssertEqual(onMain { manager.placedFrameForTesting }, CGRect(origin: .zero, size: container),
+                       "the widget did not fill the surface after a size change")
+    }
+
     /// A banner covers a strip of the screen, and the rest of it stays the
     /// application's: a tap beside the page falls through the overlay window.
     func testATapOutsideTheContentFallsThroughTheOverlay() {
@@ -945,7 +972,9 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         let countly = startInstance()
         let placement = CGRect(x: 16, y: 40, width: 435, height: 144)
 
-        let manager = present(countly, frame: placement)
+        // A content URL: a widget URL fills the surface on iOS whatever frame it
+        // came with, and this is about a page the server placed.
+        let manager = present(countly, url: "https://example.com/o/sdk/content", frame: placement)
         waitForLoad(manager)
 
         // The size change the platform delivers on its own during presentation, and
