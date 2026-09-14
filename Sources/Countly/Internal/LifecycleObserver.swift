@@ -56,9 +56,9 @@ enum AppState {
 
     /// Records the state the host application reported.
     ///
-    /// watchOS has no lifecycle notifications before watchOS 7, and the documented
-    /// integration there is for the host to call `suspend` and `resume`. Taking its
-    /// word beats a value seeded once at launch and never corrected.
+    /// The documented watchOS integration is for the host to call `suspend` and
+    /// `resume` as well as relying on the extension notifications. Taking its word
+    /// beats a value seeded once at launch and never corrected.
     static func setActive(_ active: Bool) {
         lock.lock()
         cachedIsActive = active
@@ -88,11 +88,9 @@ enum AppState {
         observe(NSApplication.didBecomeActiveNotification, foreground: true, active: true)
         observe(NSApplication.didResignActiveNotification, foreground: false, active: false)
         #elseif os(watchOS)
-        if #available(watchOS 7.0, *) {
-            observe(WKExtension.applicationDidBecomeActiveNotification, foreground: true, active: true)
-            observe(WKExtension.applicationWillResignActiveNotification, foreground: nil, active: false)
-            observe(WKExtension.applicationDidEnterBackgroundNotification, foreground: false, active: false)
-        }
+        observe(WKExtension.applicationDidBecomeActiveNotification, foreground: true, active: true)
+        observe(WKExtension.applicationWillResignActiveNotification, foreground: nil, active: false)
+        observe(WKExtension.applicationDidEnterBackgroundNotification, foreground: false, active: false)
         #endif
     }
 

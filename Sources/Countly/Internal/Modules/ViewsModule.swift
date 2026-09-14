@@ -682,15 +682,7 @@ final class ViewsModule: ModuleBase {
     /// Read from the interface rather than the device, because a device lying flat
     /// reports face up while the interface is still portrait or landscape.
     private func currentOrientationMode() -> String? {
-        var orientation: UIInterfaceOrientation?
-
-        if #available(iOS 13.0, *) {
-            orientation = ScreenReader.keyWindow?.windowScene?.interfaceOrientation
-        } else {
-            orientation = UIApplication.shared.statusBarOrientation
-        }
-
-        guard let orientation else { return nil }
+        guard let orientation = ScreenReader.keyWindow?.windowScene?.interfaceOrientation else { return nil }
         if orientation.isPortrait { return "portrait" }
         if orientation.isLandscape { return "landscape" }
         return nil

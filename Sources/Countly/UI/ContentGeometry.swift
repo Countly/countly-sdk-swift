@@ -140,10 +140,7 @@ enum ContentGeometry {
 
     private static var interfaceOrientation: UIInterfaceOrientation {
         #if os(iOS)
-        if #available(iOS 13.0, *) {
-            return window?.windowScene?.interfaceOrientation ?? .portrait
-        }
-        return UIApplication.shared.statusBarOrientation
+        return window?.windowScene?.interfaceOrientation ?? .portrait
         #else
         // visionOS has no device orientation, so a window is never rotated away
         // from the cutout-free case.

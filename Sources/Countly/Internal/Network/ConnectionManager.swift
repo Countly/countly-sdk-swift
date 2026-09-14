@@ -910,20 +910,12 @@ extension ConnectionManager: URLSessionDelegate {
 
     /// Whether the certificate chain itself is trustworthy.
     private static func evaluate(_ trust: SecTrust, error: inout CFError?) -> Bool {
-        if #available(iOS 12.0, tvOS 12.0, macOS 10.14, watchOS 5.0, *) {
-            return SecTrustEvaluateWithError(trust, &error)
-        }
-        var result = SecTrustResultType.invalid
-        guard SecTrustEvaluate(trust, &result) == errSecSuccess else { return false }
-        return result == .unspecified || result == .proceed
+        SecTrustEvaluateWithError(trust, &error)
     }
 
-    /// The public key of a trust object, across the deployment range.
+    /// The public key of a trust object.
     private static func publicKey(of trust: SecTrust) -> SecKey? {
-        if #available(iOS 14.0, tvOS 14.0, macOS 11.0, watchOS 7.0, *) {
-            return SecTrustCopyKey(trust)
-        }
-        return SecTrustCopyPublicKey(trust)
+        SecTrustCopyKey(trust)
     }
 
     /// Accepts the server only when its public key matches one of the bundled

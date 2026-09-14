@@ -20,28 +20,19 @@ final class OverlayWindow: UIWindow {
     /// Places the window on the active scene at just above normal level, so it
     /// covers the application but stays below system alerts.
     ///
-    /// A scene-less window is created on iOS 12, where scenes do not exist.
+    /// A scene-less window is created only when no scene is connected yet.
     init() {
-        #if os(visionOS)
         if let scene = OverlayWindow.activeWindowScene() {
             super.init(windowScene: scene)
         } else {
             super.init(frame: ScreenReader.screenBounds)
         }
-        #else
-        if #available(iOS 13.0, *), let scene = OverlayWindow.activeWindowScene() {
-            super.init(windowScene: scene)
-        } else {
-            super.init(frame: ScreenReader.screenBounds)
-        }
-        #endif
 
         backgroundColor = .clear
         windowLevel = .normal + 1
         isHidden = true
     }
 
-    @available(iOS 13.0, *)
     private static func activeWindowScene() -> UIWindowScene? {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         return scenes.first { $0.activationState == .foregroundActive } ?? scenes.first

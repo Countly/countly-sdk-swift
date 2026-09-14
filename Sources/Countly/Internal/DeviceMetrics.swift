@@ -121,7 +121,13 @@ enum DeviceMetrics {
         if #available(iOS 16.4, *) {
             return nil
         } else {
-            return CTTelephonyNetworkInfo().subscriberCellularProvider?.carrierName
+            // Read per service rather than through the single-SIM accessor, which
+            // is deprecated for the whole deployment range. Sorted by service key
+            // so a dual-SIM device reports the same carrier on every launch.
+            let providers = CTTelephonyNetworkInfo().serviceSubscriberCellularProviders ?? [:]
+            return providers.sorted { $0.key < $1.key }
+                .compactMap { $0.value.carrierName }
+                .first { !$0.isEmpty }
         }
         #else
         // CoreTelephony is not available on watchOS, tvOS, macOS or visionOS.
@@ -392,28 +398,17 @@ enum DeviceMetrics {
 enum ScreenReader {
 
     /// The window the application is presenting in, preferring the active scene.
-    ///
-    /// Scenes only exist from iOS 13; before that the application had a single
-    /// window list, which is what the fallback reads.
     static var keyWindow: UIWindow? {
-        if #available(iOS 13.0, tvOS 13.0, *) {
-            for scene in UIApplication.shared.connectedScenes {
-                guard let windowScene = scene as? UIWindowScene else { continue }
-                if let key = windowScene.windows.first(where: { $0.isKeyWindow }) {
-                    return key
-                }
-                if let first = windowScene.windows.first {
-                    return first
-                }
+        for scene in UIApplication.shared.connectedScenes {
+            guard let windowScene = scene as? UIWindowScene else { continue }
+            if let key = windowScene.windows.first(where: { $0.isKeyWindow }) {
+                return key
             }
-            return nil
+            if let first = windowScene.windows.first {
+                return first
+            }
         }
-
-        #if os(visionOS)
         return nil
-        #else
-        return UIApplication.shared.windows.first { $0.isKeyWindow } ?? UIApplication.shared.windows.first
-        #endif
     }
 
     /// Scale of the window the application is presenting in.

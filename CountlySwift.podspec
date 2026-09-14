@@ -10,10 +10,10 @@ Pod::Spec.new do |s|
   s.swift_version = '5.9'
   s.default_subspecs = 'Core'
 
-  s.ios.deployment_target = '12.0'
-  s.osx.deployment_target = '10.14'
-  s.watchos.deployment_target = '4.0'
-  s.tvos.deployment_target = '12.0'
+  s.ios.deployment_target = '15.0'
+  s.osx.deployment_target = '12.0'
+  s.watchos.deployment_target = '9.0'
+  s.tvos.deployment_target = '15.0'
   s.visionos.deployment_target = '1.0'
 
   s.subspec 'Core' do |core|
@@ -28,7 +28,7 @@ Pod::Spec.new do |s|
   # The notification service extension links this on its own, without the core.
   s.subspec 'NotificationService' do |ns|
     ns.source_files = 'Sources/CountlyNotificationService/**/*.swift'
-    ns.ios.deployment_target = '12.0'
+    ns.ios.deployment_target = '15.0'
     ns.visionos.deployment_target = '1.0'
     ns.ios.frameworks = ['Foundation', 'UserNotifications']
     ns.visionos.frameworks = ['Foundation', 'UserNotifications']

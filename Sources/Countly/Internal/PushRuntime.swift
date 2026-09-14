@@ -347,11 +347,7 @@ extension PushRuntime: UNUserNotificationCenterDelegate {
             return
         }
 
-        if #available(iOS 14.0, macOS 11.0, visionOS 1.0, *) {
-            completionHandler([.list, .banner])
-        } else {
-            completionHandler([.alert])
-        }
+        completionHandler([.list, .banner])
     }
 
     private func forward(to delegate: UNUserNotificationCenterDelegate?,

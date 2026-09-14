@@ -133,4 +133,4 @@
 
 * Added the one-shot health check report sent at init, carrying the error and warning counts, the last failed request's status code and message, and the backoff counters, all carried across launches.
 
-* Added support for iOS 12, tvOS 12, watchOS 4, macOS 10.14 and visionOS 1 from a single Swift package, also distributed as a CocoaPod with a separate "NotificationService" subspec.
+* Added support for iOS 15, tvOS 15, watchOS 9, macOS 12 and visionOS 1, the deployment floor of Xcode 27, from a single Swift package, also distributed as a CocoaPod with a separate "NotificationService" subspec.

@@ -118,11 +118,10 @@ final class CrashLogStore {
 
         // `FileHandle.write(_:)` raises an uncatchable Objective-C exception when
         // the write fails, which on a full disk would kill the application over a
-        // breadcrumb. The throwing form is used where it exists, and the older
-        // deployment targets fall back to rewriting the file, which reports a
-        // failure as an error rather than a trap.
-        if #available(iOS 13.4, macOS 10.15.4, tvOS 13.4, watchOS 6.2, *),
-           let handle = try? FileHandle(forWritingTo: url) {
+        // breadcrumb. The throwing form is used, and a file that cannot be opened
+        // for writing is rewritten whole instead, which reports a failure as an
+        // error rather than a trap.
+        if let handle = try? FileHandle(forWritingTo: url) {
             defer { try? handle.close() }
             do {
                 try handle.seekToEnd()
