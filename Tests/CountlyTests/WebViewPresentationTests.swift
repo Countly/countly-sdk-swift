@@ -286,8 +286,12 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
                        "a layout pass in the same orientation replaced the page's frame with the server's")
     }
 
+    #if os(iOS)
     /// A banner covers a strip of the screen, and the rest of it stays the
     /// application's: a tap beside the page falls through the overlay window.
+    ///
+    /// iOS only. visionOS hosts the overlay differently and its input is indirect,
+    /// so a synthetic point hit test there says nothing about the pass-through.
     func testATapOutsideTheContentFallsThroughTheOverlay() {
         let countly = startInstance()
         let banner = CGRect(x: 16, y: 16, width: 370, height: 144)
@@ -309,6 +313,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         XCTAssertNil(onMain { window.hitTest(below, with: nil) }, "a tap beside the banner was swallowed by the overlay")
         XCTAssertNotNil(onMain { window.hitTest(inside, with: nil) }, "a tap on the banner did not reach the page")
     }
+    #endif
     #endif
 
     #if os(macOS)

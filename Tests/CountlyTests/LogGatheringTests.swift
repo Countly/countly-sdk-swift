@@ -381,7 +381,7 @@ final class LogGatheringTests: CountlyBaseTestCase {
         XCTAssertEqual(lines.count, minBatchSize)
         XCTAssertEqual(lines.map { $0["m"] as? String }, (0..<minBatchSize).map { "\(harnessPrefix) \($0)" }, "oldest first")
         XCTAssertTrue(lines.allSatisfy { ($0["l"] as? String) == "e" })
-        XCTAssertTrue(lines.allSatisfy { TestUtils.int($0["t"]) ?? 0 > 1_600_000_000_000 })
+        XCTAssertTrue(lines.allSatisfy { TestUtils.int64($0["t"]) ?? 0 > 1_600_000_000_000 })
         XCTAssertNotEqual(transport.deliveryThreads.first, Thread.current, "the capturing thread may be inside a store write")
     }
 

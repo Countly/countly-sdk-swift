@@ -127,7 +127,7 @@ final class MultiInstanceTests: CountlyBaseTestCase {
         quiet.events.recordEvent("after-the-burst")
 
         guard let request = TestUtils.request(requestQueue(of: quiet), at: 0) else { return }
-        let timestamp = Int64(TestUtils.int(TestUtils.events(in: request)[0]["timestamp"]) ?? 0)
+        let timestamp = TestUtils.int64(TestUtils.events(in: request)[0]["timestamp"]) ?? 0
 
         XCTAssertLessThan(timestamp - before, 60_000,
                           "the quiet instance's clock should be near real time, not dragged forward")

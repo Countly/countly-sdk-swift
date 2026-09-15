@@ -463,8 +463,9 @@ final class ConnectionManager: NSObject {
         isBackingOff = true
         stateLock.unlock()
 
-        DispatchQueue.global(qos: .default).asyncAfter(deadline: .now() + .seconds(duration)) { [weak self] in
+        DispatchQueue.global(qos: .default).asyncAfter(deadline: .now() + .seconds(duration)) { [weak self, core] in
             guard let self else { return }
+            _ = core
             self.core.logger.d(Self.module, "startBackoffCountdown", "backoff countdown is finished, resuming queue processing on a background thread")
             self.stateLock.lock()
             self.isBackingOff = false
@@ -558,9 +559,10 @@ final class ConnectionManager: NSObject {
         core.logger.i(Self.module, "sendCrashReport", "sending crash report immediately, endpoint: [\(Endpoint.input)], method: [POST], bodySize: [\(request.httpBody?.count ?? 0)]")
 
         let semaphore = DispatchSemaphore(value: 0)
-        session().dataTask(with: request) { [weak self] data, response, error in
+        session().dataTask(with: request) { [weak self, core] data, response, error in
             defer { semaphore.signal() }
             guard let self else { return }
+            _ = core
 
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             if error != nil || !self.isRequestSuccessful(response: response, data: data, endpoint: Endpoint.input) {
@@ -1020,8 +1022,9 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
         let request = instantRequest(queryString: queryString, path: Endpoint.input)
         core.logger.d(Self.module, "sendHealthCheck", "health check request is prepared, method: [\(request.httpMethod ?? "GET")], queryLength: [\(queryString.count)]")
 
-        instantSession().dataTask(with: request) { [weak self] data, response, error in
+        instantSession().dataTask(with: request) { [weak self, core] data, response, error in
             guard let self else { return }
+            _ = core
 
             let wasAccepted = self.isRequestSuccessful(response: response, data: data, endpoint: Endpoint.input, quiet: true)
             self.core.logger.d(Self.module, "sendHealthCheck", "health check response received, accepted: [\(wasAccepted)], statusCode: [\((response as? HTTPURLResponse)?.statusCode ?? 0)], responseSize: [\(data?.count ?? 0)], errorDescription: [\(error?.localizedDescription ?? "none")]")
@@ -1039,7 +1042,8 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
         let request = instantRequest(queryString: queryString, path: Endpoint.output + Endpoint.sdk)
         core.logger.d(Self.module, "fetchServerConfig", "behavior settings request is prepared, method: [\(request.httpMethod ?? "GET")], queryLength: [\(queryString.count)]")
 
-        instantSession().dataTask(with: request) { [weak self] data, response, error in
+        instantSession().dataTask(with: request) { [weak self, core] data, response, error in
+            _ = core
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             self?.core.logger.d(Self.module, "fetchServerConfig", "behavior settings response received, statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], errorDescription: [\(error?.localizedDescription ?? "none")]")
             completion(data, statusCode, error)

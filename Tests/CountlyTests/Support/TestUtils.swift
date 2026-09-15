@@ -266,6 +266,21 @@ enum TestUtils {
         }
     }
 
+    /// Reads a value that does not fit an `Int` on every platform.
+    ///
+    /// `Int` is 32 bits on watchOS, and a millisecond epoch is not: `int(_:)`
+    /// truncates one there, and a literal to compare it against does not even
+    /// compile. Timestamps go through this instead.
+    static func int64(_ value: Any?) -> Int64? {
+        switch value {
+        case let number as Int64: return number
+        case let number as Int: return Int64(number)
+        case let number as NSNumber: return number.int64Value
+        case let text as String: return Int64(text)
+        default: return nil
+        }
+    }
+
     static func double(_ value: Any?) -> Double? {
         switch value {
         case let number as Double: return number

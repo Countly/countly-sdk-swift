@@ -153,7 +153,7 @@ final class ConnectionTestTests: CountlyBaseTestCase {
         XCTAssertEqual(rows(report).compactMap { $0["f"] as? String }, expectedFeatures)
         XCTAssertEqual((report["sdk"] as? [String: Any])?["name"] as? String, SDKIdentity.name)
         XCTAssertEqual((report["sdk"] as? [String: Any])?["version"] as? String, SDKIdentity.version)
-        XCTAssertGreaterThan(TestUtils.int(report["ts"]) ?? 0, 1_600_000_000_000)
+        XCTAssertGreaterThan(TestUtils.int64(report["ts"]) ?? 0, 1_600_000_000_000)
 
         // 16 parameterless GETs, marker and cache buster on each, host path joined once.
         let probes = probes()
