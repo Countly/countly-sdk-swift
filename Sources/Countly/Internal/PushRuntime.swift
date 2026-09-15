@@ -301,17 +301,62 @@ final class PushRuntime: NSObject {
     }
     #endif
 
+    // MARK: - Logging
+
+    private static let module = "PushRuntime"
+
+    /// The runtime is process wide and has no logger of its own, so its lines go
+    /// through every registered instance's logger. With no instance registered
+    /// there is nobody to tell, and the system delegate calls are not reached
+    /// anyway.
+    private func log(_ function: String, _ message: String, verbose: Bool = false) {
+        for module in subscribers.current() {
+            if verbose {
+                module.core.logger.v(Self.module, function, message)
+            } else {
+                module.core.logger.d(Self.module, function, message)
+            }
+        }
+    }
+
+    private func logInfo(_ function: String, _ message: String) {
+        for module in subscribers.current() {
+            module.core.logger.i(Self.module, function, message)
+        }
+    }
+
+    /// One line describing a notification, for the log.
+    private func describe(_ request: UNNotificationRequest) -> String {
+        let content = request.content
+        let payload = countlyPayload(in: content.userInfo)
+        let buttons = payload?[CountlyPushKey.buttons] as? [[String: Any]] ?? []
+        let attachment = payload?[CountlyPushKey.attachment] as? String ?? ""
+        let url = payload?[CountlyPushKey.defaultURL] as? String ?? ""
+        return "requestIdentifier: [\(request.identifier)], countlyID: [\(payload?[CountlyPushKey.notificationID] as? String ?? "none")], title: [\(content.title)], subtitle: [\(content.subtitle)], body: [\(content.body)], category: [\(content.categoryIdentifier)], buttonCount: [\(buttons.count)], buttonTitles: [\(buttons.map { $0[CountlyPushKey.actionButtonTitle] as? String ?? "" })], defaultURL: [\(url)], attachmentURL: [\(attachment)], attachmentCount: [\(content.attachments.count)], badge: [\(content.badge.map { "\($0)" } ?? "none")], sound: [\(content.sound != nil)]"
+    }
+
     // MARK: - Opening a URL
 
     /// Opens the URL a notification action carries.
     func openURL(_ urlString: String?) {
-        guard let urlString, !urlString.isEmpty, let url = URL(string: urlString) else { return }
+        guard let urlString, !urlString.isEmpty else {
+            log("openURL", "no URL to open, the notification action carries none")
+            return
+        }
+        guard let url = URL(string: urlString) else {
+            log("openURL", "the URL carried by the notification is not a valid URL, it is not opened, url: [\(urlString)]")
+            return
+        }
 
-        DispatchQueue.main.async {
+        logInfo("openURL", "opening the URL carried by the notification, url: [\(url.absoluteString)]")
+        DispatchQueue.main.async { [weak self] in
             #if os(iOS) || os(visionOS)
-            UIApplication.shared.open(url, options: [:], completionHandler: nil)
+            UIApplication.shared.open(url, options: [:]) { opened in
+                self?.log("openURL", "the system answered the open request, opened: [\(opened)], url: [\(url.absoluteString)]")
+            }
             #elseif os(macOS)
-            NSWorkspace.shared.open(url)
+            let opened = NSWorkspace.shared.open(url)
+            self?.log("openURL", "the system answered the open request, opened: [\(opened)], url: [\(url.absoluteString)]")
             #endif
         }
     }
@@ -333,8 +378,12 @@ extension PushRuntime: UNUserNotificationCenterDelegate {
                                 willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         let isCountlyNotification = countlyPayload(in: notification.request.content.userInfo) != nil
+        logInfo("willPresent", "a notification arrived while the application is in the foreground, isCountlyNotification: [\(isCountlyNotification)], chainedDelegatePresent: [\(chainedDelegate != nil)]")
+        log("willPresent", "foreground notification detail, \(describe(notification.request))")
+        log("willPresent", "foreground notification payload detail, userInfo: [\(notification.request.content.userInfo)]", verbose: true)
 
         guard isCountlyNotification else {
+            log("willPresent", "not a Countly notification, it is handed to the host application's delegate untouched")
             forward(to: chainedDelegate, center: center, willPresent: notification, completionHandler: completionHandler)
             return
         }
@@ -343,10 +392,12 @@ extension PushRuntime: UNUserNotificationCenterDelegate {
         let suppressed = !modules.isEmpty && modules.allSatisfy(\.suppressesForegroundAlert)
 
         guard !suppressed else {
+            log("willPresent", "the foreground alert is suppressed, every registered instance set doNotShowAlertForNotifications, instanceCount: [\(modules.count)]")
             completionHandler([])
             return
         }
 
+        log("willPresent", "the notification is shown as a banner and listed, instanceCount: [\(modules.count)]")
         completionHandler([.list, .banner])
     }
 
@@ -366,18 +417,25 @@ extension PushRuntime: UNUserNotificationCenterDelegate {
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
+        logInfo("didReceive", "the user acted on a notification, actionIdentifier: [\(response.actionIdentifier)], isCountlyNotification: [\(countlyPayload(in: response.notification.request.content.userInfo) != nil)]")
+        log("didReceive", "acted notification detail, \(describe(response.notification.request))")
+        log("didReceive", "acted notification payload detail, userInfo: [\(response.notification.request.content.userInfo)]", verbose: true)
+
         handle(response: response)
 
         if let chained = chainedDelegate,
            chained.responds(to: #selector(UNUserNotificationCenterDelegate.userNotificationCenter(_:didReceive:withCompletionHandler:))) {
+            log("didReceive", "the response is forwarded to the host application's delegate")
             chained.userNotificationCenter?(center, didReceive: response, withCompletionHandler: completionHandler)
         } else {
+            log("didReceive", "no host delegate takes notification responses, the completion is answered by the SDK")
             completionHandler()
         }
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 openSettingsFor notification: UNNotification?) {
+        log("openSettingsFor", "the user asked to open the notification settings, forwardedToHost: [\(chainedDelegate?.responds(to: #selector(UNUserNotificationCenterDelegate.userNotificationCenter(_:openSettingsFor:))) ?? false)]")
         guard let chained = chainedDelegate,
               chained.responds(to: #selector(UNUserNotificationCenterDelegate.userNotificationCenter(_:openSettingsFor:))) else { return }
         chained.userNotificationCenter?(center, openSettingsFor: notification)
@@ -390,7 +448,10 @@ extension PushRuntime: UNUserNotificationCenterDelegate {
     /// copies of a web page in front of them.
     private func handle(response: UNNotificationResponse) {
         let userInfo = response.notification.request.content.userInfo
-        guard let payload = countlyPayload(in: userInfo) else { return }
+        guard let payload = countlyPayload(in: userInfo) else {
+            log("handle", "not a Countly notification, no action is recorded and no URL is opened")
+            return
+        }
 
         // Swiping a notification away is the user saying no. Reporting it as a body
         // tap would inflate the click-through of every campaign, and following the
@@ -398,6 +459,7 @@ extension PushRuntime: UNUserNotificationCenterDelegate {
         // dismissed it. The reference matches neither branch for this identifier
         // and so records a tap with no URL; this SDK records nothing at all.
         guard response.actionIdentifier != UNNotificationDismissActionIdentifier else {
+            log("handle", "the notification was dismissed, nothing is recorded and no URL is opened, countlyID: [\(payload[CountlyPushKey.notificationID] as? String ?? "")]")
             return
         }
 
@@ -421,14 +483,20 @@ extension PushRuntime: UNUserNotificationCenterDelegate {
             url = payload[CountlyPushKey.defaultURL] as? String
         }
 
-        for module in subscribers.current() {
+        let modules = subscribers.current()
+        logInfo("handle", "notification action resolved, countlyID: [\(payload[CountlyPushKey.notificationID] as? String ?? "")], actionIdentifier: [\(response.actionIdentifier)], buttonIndex: [\(buttonIndex)], tappedBody: [\(buttonIndex == 0)], url: [\(url ?? "none")], instanceCount: [\(modules.count)]")
+
+        for module in modules {
             module.recordAction(for: userInfo, clickedButtonIndex: buttonIndex)
         }
 
         // Consent gates the URL as well as the event. Opening it is SDK initiated
         // behavior on a user who declined push, and the reference wraps both in the
         // same check.
-        guard hasAnyPushConsent else { return }
+        guard hasAnyPushConsent else {
+            log("handle", "no registered instance has push consent, the URL is not opened, url: [\(url ?? "none")]")
+            return
+        }
 
         openURL(url)
     }
