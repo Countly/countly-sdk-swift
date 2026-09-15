@@ -36,9 +36,18 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         manager.webView
     }
 
+    /// The absolute content shown deadline is a minute, and a loaded runner can
+    /// spend that long inside one of these cases, which would close the page
+    /// mid-test. The two cases that are about the deadline set their own.
+    override func setUp() {
+        super.setUp()
+        WebViewManager.contentShownDeadline = 600
+    }
+
     override func tearDown() {
         if let manager { onMain { manager.close() } }
         manager = nil
+        WebViewManager.contentShownDeadline = 60
         super.tearDown()
     }
 
@@ -822,9 +831,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
             $0.content.enableContentReloadOnStall = true
             $0.content.contentReloadOnStallTimeout = 300
         }
-        let deadline = WebViewManager.contentShownDeadline
         WebViewManager.contentShownDeadline = 1.0
-        defer { WebViewManager.contentShownDeadline = deadline }
 
         let dismissed = expectation(description: "the stalled page is taken down")
         dismissed.assertForOverFulfill = false
@@ -843,9 +850,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
             $0.content.enableContentReloadOnStall = true
             $0.content.contentReloadOnStallTimeout = 300
         }
-        let deadline = WebViewManager.contentShownDeadline
         WebViewManager.contentShownDeadline = 1.5
-        defer { WebViewManager.contentShownDeadline = deadline }
 
         var dismissed = false
         let manager = present(countly, url: "https://example.com/o/sdk/content", dismiss: { dismissed = true })

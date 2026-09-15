@@ -96,8 +96,12 @@ final class ConnectionTestTests: CountlyBaseTestCase {
         }
     }
 
+    /// The battery is sixteen sequential round trips, so this waits far longer than
+    /// the shared asynchronous timeout. A slow simulator spends seconds per probe
+    /// and the assertion is about what the battery reports, never about its speed.
     private func waitForReport(of instance: CountlyInstance) -> [String: Any]? {
-        TestUtils.waitUntil("a ct_results report reaches the request queue") { !queuedReports(of: instance).isEmpty }
+        TestUtils.waitUntil("a ct_results report reaches the request queue",
+                            timeout: 120) { !queuedReports(of: instance).isEmpty }
         return queuedReports(of: instance).first
     }
 
@@ -313,10 +317,15 @@ final class ConnectionTestTests: CountlyBaseTestCase {
 
         _ = try XCTUnwrap(waitForReport(of: countly))
         TestUtils.waitUntil("the battery finished") { !module(of: countly).isBatteryRunning }
+
+        // Counted the moment the battery ends. Every response this suite serves is
+        // armed, so a later behavior settings refresh starts a battery of its own
+        // and its probes would be counted into this one.
+        let probesRun = probes().count
         TestUtils.pump(0.3)
 
         XCTAssertEqual(queuedReports(of: countly).count, 1, "each delivery during a running battery must be dropped, not queued")
-        XCTAssertEqual(probes().count, expectedProbePaths.count)
+        XCTAssertEqual(probesRun, expectedProbePaths.count)
     }
 
     func testProbesCarryTheSDKCustomHeaders() throws {

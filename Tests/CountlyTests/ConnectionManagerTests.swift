@@ -57,6 +57,12 @@ final class ConnectionManagerTests: CountlyBaseTestCase {
         TestUtils.waitUntil("the first request is accepted") {
             self.requestQueue(of: countly).isEmpty
         }
+        // The queue empties inside the same response handling that starts the
+        // pause, so waiting for the pause itself is what makes the next record
+        // land during it rather than a moment before it.
+        TestUtils.waitUntil("the backoff is in effect") {
+            self.core(of: countly).network.isBackingOffForTesting
+        }
 
         // The drain is now paused for the backoff duration, so the next request
         // stays put rather than being sent straight after.

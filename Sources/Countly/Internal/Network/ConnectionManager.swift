@@ -28,6 +28,17 @@ final class ConnectionManager: NSObject {
     private let stateLock = NSLock()
     private var isProcessingQueue = false
     private var isBackingOff = false
+
+    /// Whether the drain is paused by the backoff mechanism.
+    ///
+    /// For the suite: the pause starts inside the response handling that also
+    /// empties the queue, so a test that infers it from an empty queue races the
+    /// flag and can see the next request leave.
+    var isBackingOffForTesting: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return isBackingOff
+    }
     private var currentTask: URLSessionTask?
 
     /// When the current drain of the queue started, used to time it and to decide
