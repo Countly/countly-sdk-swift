@@ -255,6 +255,37 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
                        "the widget did not fill the surface after a size change")
     }
 
+    /// A layout pass that does not change the orientation leaves the frame the page
+    /// asked for alone. macOS lays out on every panel resize, including the one the
+    /// page's own request caused, and re-applying the server's geometry there
+    /// snapped the page back to it.
+    func testALayoutPassInTheSameOrientationKeepsThePagesRequestedFrame() {
+        let countly = startInstance()
+        let manager = WebViewManager(core: core(of: countly))
+        self.manager = manager
+        let container = onMain { manager.containerSizeForTesting }
+        let serverFrame = CGRect(x: 16, y: 16, width: 370, height: 144)
+        let placement: [String: Any] = [
+            "p": ["x": 16, "y": 16, "w": 370, "h": 144],
+            "l": ["x": 16, "y": 16, "w": 370, "h": 144],
+        ]
+        onMain {
+            manager.present(url: URL(string: "https://example.com/o/sdk/content"),
+                            frame: serverFrame, placement: placement, appear: nil, dismiss: nil)
+            self.page(of: manager)?.loadHTMLString("<html><body>ok</body></html>", baseURL: URL(string: "https://example.com/"))
+        }
+        waitForLoad(manager)
+        _ = container
+
+        navigate(manager, to: #"https://countly_action_event?cly_x_action_event=1&action=resize_me&resize_me={"l":{"x":10,"y":10,"w":300,"h":120},"p":{"x":10,"y":10,"w":300,"h":120}}"#)
+        XCTAssertEqual(onMain { manager.placedFrameForTesting }, CGRect(x: 10, y: 10, width: 300, height: 120))
+
+        onMain { manager.simulateInterfaceSizeChangeForTesting() }
+        TestUtils.pump(0.3)
+        XCTAssertEqual(onMain { manager.placedFrameForTesting }, CGRect(x: 10, y: 10, width: 300, height: 120),
+                       "a layout pass in the same orientation replaced the page's frame with the server's")
+    }
+
     /// A banner covers a strip of the screen, and the rest of it stays the
     /// application's: a tap beside the page falls through the overlay window.
     func testATapOutsideTheContentFallsThroughTheOverlay() {

@@ -901,8 +901,14 @@ final class WebViewManager: NSObject {
         // here would throw the server's coordinates away before the page had even
         // been seen: a 435x144 banner became the whole 3840x2130 screen. Only a
         // page that asked to fill, which is every feedback widget, is re-filled.
+        // Only a change of orientation, not any layout pass. macOS runs this from
+        // `viewDidLayout`, which fires on every panel resize including the one the
+        // page's own `resize_me` caused, and re-applying the server's geometry there
+        // undid the size the page had just asked for.
+        let orientationChanged = Self.orientationDiffers(surfaceAtPlacement, containerSize)
+
         if hasExplicitPlacement {
-            if let placed = Self.serverFrame(from: serverPlacement, for: containerSize) {
+            if orientationChanged, let placed = Self.serverFrame(from: serverPlacement, for: containerSize) {
                 // The server laid the content out for this orientation too, so its
                 // geometry is applied straight away rather than the other
                 // orientation's frame being kept or squeezed. A full-screen survey
@@ -980,6 +986,17 @@ final class WebViewManager: NSObject {
         }
     }
     #endif
+
+    /// Whether two surfaces are of different orientation. Always false on macOS: a
+    /// window has no orientation to rotate into, a resize is handled by
+    /// `surfaceDidChange`, and the server's geometry is never re-applied there.
+    private static func orientationDiffers(_ from: CGSize, _ to: CGSize) -> Bool {
+        #if os(macOS)
+        return false
+        #else
+        return (from.height >= from.width) != (to.height >= to.width)
+        #endif
+    }
 
     /// The frame the server's placement gives a content on a surface of `container`,
     /// taken from the entry for that surface's orientation. Nil when the server
