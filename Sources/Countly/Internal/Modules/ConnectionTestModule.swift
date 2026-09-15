@@ -433,7 +433,17 @@ final class URLSessionProbeTransport: NSObject, ProbeTransport {
         defer { sessionLock.unlock() }
         if let session { return session }
 
-        let configuration = (core?.config.urlSessionConfiguration.copy() as? URLSessionConfiguration) ?? .default
+        let source = core?.config.urlSessionConfiguration
+        let configuration = (source?.copy() as? URLSessionConfiguration) ?? .default
+
+        // Carried over explicitly rather than trusted to `copy()`. An application
+        // that installs a `URLProtocol` expects the probes to go through it too,
+        // and whether a copied configuration keeps the list is platform behaviour,
+        // not a documented guarantee.
+        if let protocolClasses = source?.protocolClasses {
+            configuration.protocolClasses = protocolClasses
+        }
+
         configuration.timeoutIntervalForRequest = timeout
         configuration.timeoutIntervalForResource = timeout
         configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData

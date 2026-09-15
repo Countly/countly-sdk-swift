@@ -194,7 +194,10 @@ final class ConnectionTestTests: CountlyBaseTestCase {
         // Its own queue entry, with the base parameters, and nothing persisted.
         let request = try XCTUnwrap(TestUtils.requests(requestQueue(of: countly), carrying: "ct_results").first)
         TestUtils.assertBaseParameters(request)
-        XCTAssertFalse(module(of: countly).isBatteryRunning)
+
+        // The report is queued inside the battery and the flag is cleared on the
+        // line after, so this waits rather than asserting into that window.
+        TestUtils.waitUntil("the battery releases") { !self.module(of: countly).isBatteryRunning }
     }
 
     func testFaultyEndpointsAreGradedPerSpec() throws {
