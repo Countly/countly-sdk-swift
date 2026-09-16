@@ -391,14 +391,39 @@ extension PushRuntime: UNUserNotificationCenterDelegate {
         let modules = subscribers.current()
         let suppressed = !modules.isEmpty && modules.allSatisfy(\.suppressesForegroundAlert)
 
-        guard !suppressed else {
+        if suppressed {
             log("willPresent", "the foreground alert is suppressed, every registered instance set doNotShowAlertForNotifications, instanceCount: [\(modules.count)]")
             completionHandler([])
+        } else {
+            log("willPresent", "the notification is shown as a banner and listed, instanceCount: [\(modules.count)]")
+            completionHandler([.list, .banner])
+        }
+
+        notifyOfPresentation(notification, center: center)
+    }
+
+    /// Tells the host's delegate that a Countly notification is being presented,
+    /// after the SDK has already answered the system.
+    ///
+    /// The host is told rather than asked. The presentation options for a Countly
+    /// notification are the SDK's to decide, and `doNotShowAlertForNotifications`
+    /// is the setting that decides them, so the completion handler passed on is a
+    /// no-op and whatever the host answers with is discarded. The real handler has
+    /// already been called exactly once, which also means a host that never answers
+    /// cannot leave the notification hanging.
+    ///
+    /// Without this a foreground Countly notification never reached the host at
+    /// all, while a tap on the same notification did, because `didReceive` forwards
+    /// unconditionally. The reference SDK forwards here too.
+    private func notifyOfPresentation(_ notification: UNNotification, center: UNUserNotificationCenter) {
+        guard let chained = chainedDelegate,
+              chained.responds(to: #selector(UNUserNotificationCenterDelegate.userNotificationCenter(_:willPresent:withCompletionHandler:))) else {
+            log("willPresent", "no host delegate takes foreground notifications, nothing is forwarded")
             return
         }
 
-        log("willPresent", "the notification is shown as a banner and listed, instanceCount: [\(modules.count)]")
-        completionHandler([.list, .banner])
+        log("willPresent", "the host application's delegate is told the notification is being presented, its presentation options are not used")
+        chained.userNotificationCenter?(center, willPresent: notification) { _ in }
     }
 
     private func forward(to delegate: UNUserNotificationCenterDelegate?,
