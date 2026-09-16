@@ -238,14 +238,14 @@ public final class CountlyInstance {
         // Automatic session tracking is resolved through the behavior settings
         // chain, so the server can override the developer's manual choice.
         //
-        // The manual branch records orientation directly, because `beginSession`
-        // is what normally records it and the host may never call it. Android
-        // covers the same gap from `onActivityStarted`; this is the init-time half
-        // of that, and `applicationWillEnterForeground` is the other half.
+        // Nothing happens in the manual branch, which is what Android does. Its
+        // orientation comes from session start, from a rotation, and from an
+        // activity start; none of those is init itself. An application that starts
+        // an activity after init gets one from that, and the foreground hook in
+        // `ViewsModule` is the iOS equivalent. Recording here instead would put an
+        // orientation event in the queue before the host has begun its session.
         if core.serverConfig.automaticSessionTrackingEnabled {
             modules.sessions.beginSession()
-        } else {
-            modules.views.recordOrientation()
         }
 
         modules.push.applyInitialConfig()

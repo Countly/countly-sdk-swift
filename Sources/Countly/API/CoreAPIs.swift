@@ -82,37 +82,51 @@ public final class EventsAPI: CountlyAPIBase {
         core()?.modules.events.cancelEvent(key)
     }
 
-    /// Records one of the reserved events the SDK normally produces itself.
+    /// Records a reserved event, one of those the SDK normally produces itself.
     ///
     /// Reserved keys are how the server recognises orientation, views, feedback and
-    /// the rest, so `recordEvent` refuses them. This is the narrow way past that,
-    /// for a bridge SDK whose platform records one of these itself, and for a test
-    /// harness that needs a reserved event without driving the UI that produces it.
+    /// the rest, so `recordEvent` refuses them. This is the way past that, for a
+    /// bridge SDK whose platform records one of these itself, and for a test harness
+    /// that needs a reserved event without driving the UI that produces it.
     ///
-    /// Deliberately not a free-form key. `CountlyReservedEvent` lists only the
-    /// events a caller may legitimately produce, so `[CLY]_view` and
-    /// `[CLY]_push_action` stay unforgeable: a view event carries a duration the
-    /// server builds flow analysis from, and a synthetic one corrupts that for
-    /// everyone reading the dashboard.
-    public func recordReservedEvent(_ event: CountlyReservedEvent,
+    /// Any key is accepted, matching the reference SDK's
+    /// `recordReservedEvent:segmentation:`. That includes `[CLY]_view`, and a
+    /// synthetic view event carries a duration the server builds flow analysis
+    /// from, so a caller that forges one corrupts the dashboard for everyone
+    /// reading it. `CountlyReservedEvent` names the two keys a host has a
+    /// legitimate reason to record; prefer the overload that takes it.
+    public func recordReservedEvent(_ key: String,
                                     segmentation: [String: Any]? = nil,
                                     count: Int = 1,
                                     sum: Double = 0,
                                     duration: TimeInterval = 0) {
-        core()?.modules.events.recordReservedEvent(event.key,
+        core()?.modules.events.recordReservedEvent(key,
                                                    segmentation: segmentation,
                                                    count: count,
                                                    sum: sum,
                                                    duration: duration)
     }
+
+    /// Records a reserved event named by `CountlyReservedEvent` rather than by a
+    /// raw key, so the call site cannot misspell it or reach a key it should not.
+    public func recordReservedEvent(_ event: CountlyReservedEvent,
+                                    segmentation: [String: Any]? = nil,
+                                    count: Int = 1,
+                                    sum: Double = 0,
+                                    duration: TimeInterval = 0) {
+        recordReservedEvent(event.key,
+                            segmentation: segmentation,
+                            count: count,
+                            sum: sum,
+                            duration: duration)
+    }
 }
 
-/// The reserved events a host may record through `EventsAPI.recordReservedEvent`.
+/// The reserved events a host has a legitimate reason to record itself.
 ///
-/// An allow list rather than a string, so the set of forgeable reserved keys is
-/// visible in one place and reviewed when it changes. The raw values are the wire
-/// keys, so a bridge can map a key it received over its channel with
-/// `CountlyReservedEvent(rawValue:)` and get nil for anything not on the list.
+/// Not a restriction: `recordReservedEvent` also takes a plain string, as the
+/// reference SDK does. This names the safe subset so a call site can say what it
+/// means. The raw values are the wire keys.
 public enum CountlyReservedEvent: String, CaseIterable, Sendable {
 
     /// Interface orientation, segmented by `mode`.
