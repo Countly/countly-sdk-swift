@@ -692,6 +692,12 @@ final class ViewsModule: ModuleBase {
     // MARK: - Lifecycle
 
     func applicationWillEnterForeground() {
+        // Android re-reads the orientation on every activity start, not only at
+        // launch, so a device rotated while the app was away is reported on the way
+        // back in. The dedup against the last recorded mode keeps this quiet when
+        // nothing changed.
+        recordOrientation()
+
         #if os(iOS) || os(tvOS)
         if !isAutoViewTrackingActive, isManualViewRestartActive {
             logD("applicationWillEnterForeground", "app entered foreground with manual view restart active, stopped views will be started automatically")

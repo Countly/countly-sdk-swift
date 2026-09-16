@@ -371,9 +371,15 @@ struct LimitsEnforcer {
     }
 
     /// Truncates every key, and every string value, of a segmentation dictionary.
+    ///
+    /// Walked in sorted key order rather than the dictionary's own order, because
+    /// two keys can truncate to the same string and only one value can survive.
+    /// Swift seeds its hashing per process, so an unordered walk would pick a
+    /// different survivor on every launch and send a different value each time.
+    /// Sorted, the later key wins, and it wins the same way on every run.
     func truncated(_ dictionary: [String: Any], _ explanation: String) -> [String: Any] {
         var result: [String: Any] = [:]
-        for (key, value) in dictionary {
+        for (key, value) in dictionary.sorted(by: { $0.key < $1.key }) {
             let newKey = truncatedKey(key, explanation + " key")
             if let stringValue = value as? String {
                 result[newKey] = truncatedValue(stringValue, explanation + " value")
@@ -385,8 +391,11 @@ struct LimitsEnforcer {
     }
 
     /// Drops entries past the configured maximum segmentation count.
+    ///
+    /// Sorted for the same reason the truncation walk is: which keys survive the
+    /// cut has to be the same on every run, and a dictionary's own order is not.
     func limited(_ dictionary: [String: Any], _ explanation: String) -> [String: Any] {
-        let keys = Array(dictionary.keys)
+        let keys = dictionary.keys.sorted()
         guard keys.count > limits.maxSegmentationValues else { return dictionary }
 
         let kept = Set(keys.prefix(limits.maxSegmentationValues))
