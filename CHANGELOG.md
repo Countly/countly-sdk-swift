@@ -20,6 +20,7 @@
   * "recordEvent(key, segmentation, count, sum, duration)"
   * "startEvent(key)" / "endEvent(key, segmentation, count, sum)" / "cancelEvent(key)"
   * "recordedEvents()", the events buffered and not yet moved into the request queue
+  * "recordReservedEvent(event, segmentation, count, sum, duration)", records one of the reserved events the SDK normally produces itself. Takes a "CountlyReservedEvent" rather than a key, which allows only "[CLY]_orientation" and "[CLY]_star_rating"
 
 * Added the views API on "countly.views":
   * "startView(name, segmentation)" / "startAutoStoppedView(name, segmentation)"

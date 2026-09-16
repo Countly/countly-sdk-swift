@@ -81,6 +81,48 @@ public final class EventsAPI: CountlyAPIBase {
     public func cancelEvent(_ key: String) {
         core()?.modules.events.cancelEvent(key)
     }
+
+    /// Records one of the reserved events the SDK normally produces itself.
+    ///
+    /// Reserved keys are how the server recognises orientation, views, feedback and
+    /// the rest, so `recordEvent` refuses them. This is the narrow way past that,
+    /// for a bridge SDK whose platform records one of these itself, and for a test
+    /// harness that needs a reserved event without driving the UI that produces it.
+    ///
+    /// Deliberately not a free-form key. `CountlyReservedEvent` lists only the
+    /// events a caller may legitimately produce, so `[CLY]_view` and
+    /// `[CLY]_push_action` stay unforgeable: a view event carries a duration the
+    /// server builds flow analysis from, and a synthetic one corrupts that for
+    /// everyone reading the dashboard.
+    public func recordReservedEvent(_ event: CountlyReservedEvent,
+                                    segmentation: [String: Any]? = nil,
+                                    count: Int = 1,
+                                    sum: Double = 0,
+                                    duration: TimeInterval = 0) {
+        core()?.modules.events.recordReservedEvent(event.key,
+                                                   segmentation: segmentation,
+                                                   count: count,
+                                                   sum: sum,
+                                                   duration: duration)
+    }
+}
+
+/// The reserved events a host may record through `EventsAPI.recordReservedEvent`.
+///
+/// An allow list rather than a string, so the set of forgeable reserved keys is
+/// visible in one place and reviewed when it changes. The raw values are the wire
+/// keys, so a bridge can map a key it received over its channel with
+/// `CountlyReservedEvent(rawValue:)` and get nil for anything not on the list.
+public enum CountlyReservedEvent: String, CaseIterable, Sendable {
+
+    /// Interface orientation, segmented by `mode`.
+    case orientation = "[CLY]_orientation"
+
+    /// Result of a rating widget. The wire key is historical.
+    case ratingWidget = "[CLY]_star_rating"
+
+    /// The wire key, for a caller that needs it.
+    public var key: String { rawValue }
 }
 
 // MARK: - Sessions
