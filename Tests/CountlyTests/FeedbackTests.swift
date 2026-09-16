@@ -462,4 +462,47 @@ final class FeedbackTests: CountlyBaseTestCase {
         XCTAssertEqual(FeedbackWidgetType.nps.wireName, "nps")
         XCTAssertEqual(FeedbackWidgetType.rating.wireName, "rating")
     }
+
+    // MARK: - Rebuilding a widget a caller already holds
+
+    /// A bridge SDK keeps its widget list on its own side, so the widget comes back
+    /// as the dictionary the server sent rather than as an object this SDK handed
+    /// out. Rebuilt that way it has to be the same widget: same fields, and a result
+    /// recorded on it lands as the same reserved event.
+    func testAWidgetRebuiltFromItsDescriptionRecordsTheSameResultAsAFetchedOne() {
+        let countly = startInstance { $0.eventSendThreshold = 1 }
+
+        let widget = countly.feedback.widget(from: [
+            "_id": "w1",
+            "type": "survey",
+            "name": "Onboarding survey",
+            "tg": ["signup"],
+            "wv": "2",
+        ])
+
+        XCTAssertEqual(widget?.id, "w1")
+        XCTAssertEqual(widget?.type, .survey)
+        XCTAssertEqual(widget?.name, "Onboarding survey")
+        XCTAssertEqual(widget?.tags, ["signup"])
+        XCTAssertEqual(widget?.widgetVersion, "2")
+
+        widget?.recordResult(["answer": "yes"])
+
+        let recorded = events(of: countly).first { $0["key"] as? String == "[CLY]_survey" }
+        XCTAssertNotNil(recorded, "a rebuilt widget reports through the instance that built it")
+        XCTAssertEqual((recorded?["segmentation"] as? [String: Any])?["answer"] as? String, "yes")
+        XCTAssertEqual((recorded?["segmentation"] as? [String: Any])?["widget_id"] as? String, "w1")
+    }
+
+    /// The dictionary crosses a bridge, so it is whatever the other side stored. A
+    /// description that cannot name a widget produces nothing rather than a widget
+    /// that reports against an empty ID.
+    func testADescriptionThatNamesNoWidgetIsRefused() {
+        let countly = startInstance()
+
+        XCTAssertNil(countly.feedback.widget(from: ["type": "survey", "name": "no id"]))
+        XCTAssertNil(countly.feedback.widget(from: ["_id": "w9", "name": "no type"]))
+        XCTAssertNil(countly.feedback.widget(from: ["_id": "w8", "type": "not-a-real-type"]))
+        XCTAssertNotNil(countly.feedback.widget(from: ["_id": "w7", "type": "rating"]))
+    }
 }

@@ -81,6 +81,7 @@
   * "getAvailableFeedbackWidgets(completion:)"
   * "presentNPS(nameIDOrTag, callback:)" / "presentSurvey(...)" / "presentRating(...)"
   * "recordRatingWidget(id:rating:email:comment:userCanBeContacted:)"
+  * "widget(from:)", rebuilds a widget from the description a caller already holds, for presenting or reporting it without fetching the list again
 
 * Added the content API on "countly.content":
   * "enterContentZone(tags:)" / "exitContentZone()" / "refreshContentZone()"

@@ -67,8 +67,9 @@ public final class CountlyFeedbackWidget {
     public private(set) var data: [String: Any] = [:]
 
     /// Set when the server offers a newer widget rendering. Its presence switches
-    /// presentation to the full screen web view.
-    let widgetVersion: String?
+    /// presentation to the full screen web view. Public because a bridge SDK passes
+    /// the widget list across to its own layer and has to carry this field with it.
+    public let widgetVersion: String?
 
     /// The widget's `appearance.position`, such as `bLeft` or `bRight`, or `nil`
     /// when the dashboard did not set one. Only a survey is placed by it; an NPS is

@@ -274,6 +274,24 @@ public final class FeedbackAPI: CountlyAPIBase {
         core()?.modules.feedback.present(type: .rating, nameIDOrTag: nameIDOrTag, callback: callback)
     }
 
+    /// Builds a widget from a description the host application already holds, so it
+    /// can be presented or reported without fetching the list again.
+    ///
+    /// Public because a bridge SDK keeps its widget list on the other side of the
+    /// bridge: the widget comes back as the plain dictionary the JavaScript or Dart
+    /// layer stored, not as an object this SDK handed out. Without this every bridge
+    /// would have to refetch the list to turn an ID back into a widget, and a widget
+    /// the user already saw would go unreported whenever that fetch failed.
+    ///
+    /// - Parameter dictionary: The widget as the server described it. `_id` and
+    ///   `type` are required; `name`, `tg`, `wv` and `appearance` are read when present.
+    /// - Returns: The widget, or `nil` when `_id` or `type` is missing, or the type is
+    ///   one this SDK does not know.
+    public func widget(from dictionary: [String: Any]) -> CountlyFeedbackWidget? {
+        guard let core = core() else { return nil }
+        return CountlyFeedbackWidget(dictionary: dictionary, module: core.modules.feedback)
+    }
+
     /// Records the result of a rating widget the host application presented itself.
     public func recordRatingWidget(id widgetID: String,
                                    rating: Int,
