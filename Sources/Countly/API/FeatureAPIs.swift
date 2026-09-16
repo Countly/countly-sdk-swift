@@ -142,12 +142,12 @@ public final class RemoteConfigAPI: CountlyAPIBase {
     // MARK: Testing helpers
 
     /// Every variant from the last testing download.
-    public func testingGetAllVariants() -> [String: Any] {
+    public func testingGetAllVariants() -> [String: [String]] {
         core()?.modules.remoteConfig.testingGetAllVariants() ?? [:]
     }
 
     /// The variants of one key from the last testing download.
-    public func testingGetVariants(forKey key: String) -> [Any] {
+    public func testingGetVariants(forKey key: String) -> [String] {
         core()?.modules.remoteConfig.testingGetVariants(forKey: key) ?? []
     }
 

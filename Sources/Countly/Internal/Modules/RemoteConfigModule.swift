@@ -28,6 +28,8 @@ final class RemoteConfigModule: ModuleBase {
         /// Key the experiment array is nested under in the server's answer.
         static let experimentArray = "jsonArray"
         static let variant = "variant"
+        /// Key each variant object carries its name under.
+        static let variantName = "name"
         static let key = "key"
         static let remoteConfig = "rc"
         static let autoOptIn = "oi"
@@ -47,7 +49,7 @@ final class RemoteConfigModule: ModuleBase {
     private let stateLock = NSLock()
 
     /// A/B variants from the last testing download.
-    private var localCachedVariants: [String: Any] = [:]
+    private var localCachedVariants: [String: [String]] = [:]
 
     /// Experiment information from the last testing download.
     private var localCachedExperiments: [String: CountlyExperimentInformation] = [:]
@@ -486,8 +488,46 @@ final class RemoteConfigModule: ModuleBase {
         return core.network.builder.appendChecksum(queryString)
     }
 
+    /// Reduces the server's variant payload to the variant names per key.
+    ///
+    /// The server sends `{"key": [{"name": "A", ...}, ...]}`, and every SDK caches
+    /// only the names: Android's `convertVariantsJsonToMap` and the reference SDK's
+    /// equivalent both do this walk. Doing it here rather than in each bridge keeps
+    /// one copy of the shape, which is how the push payload keys ended up
+    /// duplicated.
+    ///
+    /// An entry that is already a string is kept, as the reference SDK does.
+    /// Android drops those, but the server does not send them, so accepting them
+    /// costs nothing and losing data a previous integration kept is the worse of
+    /// the two risks.
+    private static func variantNames(from payload: [String: Any], logger: Logger?) -> [String: [String]] {
+        var result: [String: [String]] = [:]
+
+        for (key, value) in payload.sorted(by: { $0.key < $1.key }) {
+            guard let entries = value as? [Any] else {
+                logger?.d(moduleName, "variantNames", "skipping a variant entry whose value is not an array, key: [\(key)], receivedType: [\(type(of: value))]")
+                continue
+            }
+
+            var names: [String] = []
+            for entry in entries {
+                if let name = (entry as? [String: Any])?[Key.variantName] as? String {
+                    names.append(name)
+                } else if let name = entry as? String {
+                    names.append(name)
+                } else {
+                    logger?.d(moduleName, "variantNames", "skipping a variant with no name, key: [\(key)], receivedType: [\(type(of: entry))]")
+                }
+            }
+
+            result[key] = names
+        }
+
+        return result
+    }
+
     /// Every variant from the last testing download.
-    func testingGetAllVariants() -> [String: Any] {
+    func testingGetAllVariants() -> [String: [String]] {
         logI("testingGetAllVariants", "all locally cached A/B variants are requested")
 
         stateLock.lock()
@@ -497,12 +537,12 @@ final class RemoteConfigModule: ModuleBase {
     }
 
     /// The variants of one key from the last testing download.
-    func testingGetVariants(forKey key: String) -> [Any] {
+    func testingGetVariants(forKey key: String) -> [String] {
         logI("testingGetVariants", "the locally cached A/B variants of a key are requested, key: [\(key)]")
 
         stateLock.lock()
         defer { stateLock.unlock() }
-        let variants = (localCachedVariants[key] as? [Any]) ?? []
+        let variants = localCachedVariants[key] ?? []
         logD("testingGetVariants", "locally cached variants are read for a key, key: [\(key)], variantCount: [\(variants.count)], keyIsKnown: [\(localCachedVariants[key] != nil)]")
         return variants
     }
@@ -544,10 +584,12 @@ final class RemoteConfigModule: ModuleBase {
                 return
             }
 
+            let flattened = Self.variantNames(from: variants, logger: self.log)
+
             self.stateLock.lock()
-            self.localCachedVariants = variants
+            self.localCachedVariants = flattened
             self.stateLock.unlock()
-            self.logD("testingDownloadVariantInformation", "variants request successfully completed, the locally cached variants are replaced, variantKeyCount: [\(variants.count)], variantKeys: [\(Self.describe(variants.keys))]")
+            self.logD("testingDownloadVariantInformation", "variants request successfully completed, the locally cached variants are replaced, variantKeyCount: [\(flattened.count)], variantKeys: [\(Self.describe(flattened.keys))]")
             DispatchQueue.main.async { completion(.success, nil) }
         }.resume()
     }
