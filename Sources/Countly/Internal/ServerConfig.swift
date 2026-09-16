@@ -156,7 +156,9 @@ final class ServerConfig {
     private(set) var limitBreadcrumb = 0
     private(set) var limitTraceLine = 0
     private(set) var limitTraceLength = 0
-    private(set) var dropOldRequestTime = 0
+    /// Nil when the server said nothing. Zero means "stop dropping by age", so it
+    /// cannot double as the absent marker.
+    private(set) var dropOldRequestTime: Int?
     private(set) var contentZoneInterval = 0
 
     private(set) var userPropertyCacheLimit = 100
@@ -558,7 +560,9 @@ final class ServerConfig {
         readBool(&section, Key.enterContentZone, &enterContentZone, &applied)
         readInt(&section, Key.contentZoneInterval, &contentZoneInterval, min: 16, &applied)
         readBool(&section, Key.consentRequired, &consentRequired, &applied)
-        readInt(&section, Key.dropOldRequestTime, &dropOldRequestTime, min: 0, &applied)
+        var dropAge = -1
+        readInt(&section, Key.dropOldRequestTime, &dropAge, min: 0, &applied)
+        dropOldRequestTime = dropAge >= 0 ? dropAge : nil
         readInt(&section, Key.serverConfigUpdateInterval, &serverConfigUpdateInterval, min: 1, &applied)
         readBool(&section, Key.locationTracking, &locationTrackingEnabled, &applied)
         readBool(&section, Key.refreshContentZone, &refreshContentZoneEnabled, &applied)
@@ -622,7 +626,13 @@ final class ServerConfig {
         apply("maxStackTraceLinesPerThread", &limits.maxStackTraceLinesPerThread, limitTraceLine)
 
         apply("eventSendThreshold", &config.eventSendThreshold, eventQueueSize)
-        apply("requestDropAgeHours", &config.requestDropAgeHours, dropOldRequestTime)
+        // Its own path because the shared `apply` reads zero as absent.
+        if let dropAge = dropOldRequestTime {
+            if config.requestDropAgeHours != dropAge {
+                overrides.append("requestDropAgeHours: \(config.requestDropAgeHours) to \(dropAge)")
+            }
+            config.requestDropAgeHours = dropAge
+        }
         apply("storedRequestsLimit", &config.storedRequestsLimit, requestQueueSize)
 
         if sessionInterval > 0 {

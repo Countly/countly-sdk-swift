@@ -473,10 +473,8 @@ final class UserProfileModule: ModuleBase {
 
         var custom: [String: Any] = [:]
         if !customProperties.isEmpty {
-            // Capped by the server's user property limit rather than the
-            // segmentation one: they are configured separately and a profile can
-            // legitimately carry more properties than an event carries dimensions.
-            custom.merge(cappedCustomProperties()) { _, new in new }
+            // Both limits apply here; the modifiers below take neither, on either reference.
+            custom.merge(core.limits.limited(cappedCustomProperties(), "user details custom properties")) { _, new in new }
         }
         if !customModifications.isEmpty {
             custom.merge(customModifications) { _, new in new }

@@ -333,29 +333,17 @@ struct LimitsEnforcer {
         return value.countlyPrefix(limits.maxValueSize)
     }
 
-    /// Applies the two stack trace limits: each frame is truncated to
-    /// `maxStackTraceLineLength`, and at most `maxStackTraceLinesPerThread` frames
-    /// are kept.
+    /// Truncates every frame of a stack trace to `maxStackTraceLineLength`.
     ///
-    /// The reference SDK accepts both settings and logs that they are placeholders
-    /// it does not apply. Android applies them, and a configuration knob that
-    /// promises behavior the SDK does not perform is worse than no knob, so this
-    /// SDK applies them too.
-    ///
-    /// The frames nearest the crash are the ones that explain it, so the cap keeps
-    /// the top of the trace and drops the tail, which is where Android cuts as
-    /// well.
+    /// The frame count is deliberately not capped. Android applies
+    /// `maxStackTraceLinesPerThread` only to the supplementary other-threads dump,
+    /// never to the exception's own trace, and this SDK records no such dump. The
+    /// crash filters read the trace after this runs, so capping it would silently
+    /// stop a filter written against a deep frame from matching.
     func truncatedStackTrace(_ frames: [String], _ explanation: String) -> [String] {
         let lineLimit = max(1, limits.maxStackTraceLineLength)
-        let frameLimit = max(1, limits.maxStackTraceLinesPerThread)
 
-        var kept = frames
-        if kept.count > frameLimit {
-            logger?.d(Self.module, "truncatedStackTrace", "stack trace exceeds the SDK stack trace line count limit and will be shortened, target: [\(explanation)], lineCount: [\(kept.count)], truncatedTo: [\(frameLimit)]")
-            kept = Array(kept.prefix(frameLimit))
-        }
-
-        return kept.map { line in
+        return frames.map { line in
             guard line.countlyLength > lineLimit else { return line }
             logger?.d(Self.module, "truncatedStackTrace", "stack trace line exceeds the SDK stack trace line length limit and will be truncated, target: [\(explanation)], lineLength: [\(line.countlyLength)], truncatedTo: [\(lineLimit)]")
             return line.countlyPrefix(lineLimit)

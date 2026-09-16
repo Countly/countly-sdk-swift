@@ -6,6 +6,7 @@
 //  Please visit www.count.ly for more information.
 //
 
+import CoreLocation
 import XCTest
 @testable import Countly
 
@@ -54,6 +55,30 @@ final class ConsentTests: CountlyBaseTestCase {
 
         XCTAssertTrue(TestUtils.requests(requestQueue(of: countly), carrying: "consent").isEmpty)
         XCTAssertTrue(countly.consent.hasConsent(for: .events))
+    }
+
+    // MARK: - Withdrawal closes what it opened
+
+    /// A coordinate left in memory across a withdrawal is re-sent on re-grant.
+    func testWithdrawingLocationConsentForgetsTheStoredLocation() {
+        let countly = startInstance {
+            $0.requiresConsent = true
+            $0.consents = [.location]
+        }
+
+        countly.location.recordLocation(CLLocationCoordinate2D(latitude: 41.0082, longitude: 28.9784),
+                                        city: "Istanbul", isoCountryCode: "TR", ipAddress: "10.2.33.12")
+        countly.consent.cancelConsent(for: .location)
+
+        // Only what the re-grant itself enqueues; earlier requests had consent.
+        let beforeRegrant = requestQueue(of: countly).count
+        countly.consent.giveConsent(for: .location)
+
+        let sentAfterRegrant = requestQueue(of: countly)
+            .dropFirst(beforeRegrant)
+            .filter { $0.contains("41.008") || $0.contains("Istanbul") }
+        XCTAssertTrue(sentAfterRegrant.isEmpty,
+                      "the location withdrawn from should not be transmitted after the re-grant, got: \(sentAfterRegrant)")
     }
 
     // MARK: - Requiring consent

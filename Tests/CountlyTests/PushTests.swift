@@ -7,6 +7,9 @@
 //
 
 import XCTest
+#if canImport(UserNotifications)
+import UserNotifications
+#endif
 @testable import Countly
 
 /// Reporting the device token and what the user did with a notification.
@@ -384,6 +387,101 @@ final class PushTests: CountlyBaseTestCase {
         #endif
     }
 
+    // MARK: - A response forwarded by the host
+
+    /// A body tap forwarded through the public entry point is recorded the same as
+    /// one the SDK's own delegate saw, and carries the notification's ID.
+    func testAForwardedBodyTapIsRecordedAsButtonZero() throws {
+        #if !(canImport(UserNotifications) && (os(iOS) || os(visionOS) || os(macOS)))
+        throw XCTSkip("the push runtime only exists on iOS, visionOS and macOS")
+        #else
+        let countly = startInstance {
+            $0.eventSendThreshold = 1
+            $0.features = [.pushNotifications]
+            $0.disableAutomaticPushHandling = true
+        }
+
+        Countly.handleNotificationResponse(try response(id: "n-10", url: "https://count.ly"))
+
+        let recorded = events(of: countly).filter { $0["key"] as? String == "[CLY]_push_action" }
+        XCTAssertEqual(recorded.count, 1)
+
+        let segmentation = (recorded.first?["segmentation"] as? [String: Any]) ?? [:]
+        XCTAssertEqual(segmentation[CountlyPushKey.notificationID] as? String, "n-10")
+        XCTAssertEqual(TestUtils.int(segmentation[CountlyPushKey.actionButtonIndex]), 0)
+        #endif
+    }
+
+    /// The button index is read off the action identifier the SDK registered, so a
+    /// bridge forwarding the response reports the same index the native path would.
+    func testAForwardedActionButtonCarriesItsIndex() throws {
+        #if !(canImport(UserNotifications) && (os(iOS) || os(visionOS) || os(macOS)))
+        throw XCTSkip("the push runtime only exists on iOS, visionOS and macOS")
+        #else
+        let countly = startInstance {
+            $0.eventSendThreshold = 1
+            $0.features = [.pushNotifications]
+            $0.disableAutomaticPushHandling = true
+        }
+
+        let notification = try response(id: "n-11",
+                                        buttons: [["t": "Open", "l": "https://count.ly/one"],
+                                                  ["t": "Later", "l": "https://count.ly/two"]],
+                                        actionIdentifier: CountlyPushKey.actionIdentifierPrefix + "2")
+        Countly.handleNotificationResponse(notification)
+
+        let segmentation = (events(of: countly).first?["segmentation"] as? [String: Any]) ?? [:]
+        XCTAssertEqual(TestUtils.int(segmentation[CountlyPushKey.actionButtonIndex]), 2)
+        #endif
+    }
+
+    /// Swiping a notification away is the user declining it. Reporting it as a tap
+    /// would inflate the click-through of every campaign.
+    func testADismissedNotificationRecordsNothing() throws {
+        #if !(canImport(UserNotifications) && (os(iOS) || os(visionOS) || os(macOS)))
+        throw XCTSkip("the push runtime only exists on iOS, visionOS and macOS")
+        #else
+        let countly = startInstance {
+            $0.eventSendThreshold = 1
+            $0.features = [.pushNotifications]
+            $0.disableAutomaticPushHandling = true
+        }
+
+        Countly.handleNotificationResponse(try response(id: "n-12",
+                                                        url: "https://count.ly",
+                                                        actionIdentifier: UNNotificationDismissActionIdentifier))
+
+        XCTAssertTrue(events(of: countly).isEmpty)
+        #endif
+    }
+
+    /// A host can forward every response without filtering: one that carries no
+    /// Countly payload, or an unusable ID, is ignored. An identifier the SDK never
+    /// registered is still a user acting on a Countly notification, so it is
+    /// reported as a body tap rather than dropped.
+    func testAForwardedResponseIsIgnoredUnlessItIsCountlys() throws {
+        #if !(canImport(UserNotifications) && (os(iOS) || os(visionOS) || os(macOS)))
+        throw XCTSkip("the push runtime only exists on iOS, visionOS and macOS")
+        #else
+        let countly = startInstance {
+            $0.eventSendThreshold = 1
+            $0.features = [.pushNotifications]
+            $0.disableAutomaticPushHandling = true
+        }
+
+        Countly.handleNotificationResponse(try response(userInfo: ["something": "else"]))
+        Countly.handleNotificationResponse(try response(id: ""))
+        XCTAssertTrue(events(of: countly).isEmpty)
+
+        Countly.handleNotificationResponse(try response(id: "n-13", actionIdentifier: "SomeOtherSDKAction"))
+
+        let segmentation = (events(of: countly).first?["segmentation"] as? [String: Any]) ?? [:]
+        XCTAssertEqual(segmentation[CountlyPushKey.notificationID] as? String, "n-13")
+        XCTAssertEqual(TestUtils.int(segmentation[CountlyPushKey.actionButtonIndex]), 0,
+                       "an unregistered identifier is still a body tap")
+        #endif
+    }
+
     // MARK: - Opening a URL
 
     /// A URL that is missing, empty or not a URL at all is not opened, and must not
@@ -398,4 +496,60 @@ final class PushTests: CountlyBaseTestCase {
         PushRuntime.shared.openURL("   ")
         #endif
     }
+
+    #if canImport(UserNotifications) && (os(iOS) || os(visionOS) || os(macOS))
+    /// A `UNNotificationResponse` carrying `userInfo`.
+    ///
+    /// Neither `UNNotification` nor `UNNotificationResponse` has a public
+    /// initializer, and both are the input to the entry point under test, so they
+    /// are decoded from a coder that answers with the values they ask for.
+    private func response(userInfo: [AnyHashable: Any],
+                          actionIdentifier: String = UNNotificationDefaultActionIdentifier) throws -> UNNotificationResponse {
+        let content = UNMutableNotificationContent()
+        content.userInfo = userInfo
+        let request = UNNotificationRequest(identifier: "request", content: content, trigger: nil)
+
+        let notification = try XCTUnwrap(UNNotification(coder: DecodedFromValues([
+            "date": Date(),
+            "request": request,
+            "sourceIdentifier": "",
+        ])))
+        return try XCTUnwrap(UNNotificationResponse(coder: DecodedFromValues([
+            "notification": notification,
+            "actionIdentifier": actionIdentifier,
+        ])))
+    }
+
+    /// The same, for a Countly payload built by ``notification(id:buttons:url:)``.
+    private func response(id: String,
+                          buttons: [[String: Any]] = [],
+                          url: String? = nil,
+                          actionIdentifier: String = UNNotificationDefaultActionIdentifier) throws -> UNNotificationResponse {
+        try response(userInfo: notification(id: id, buttons: buttons, url: url),
+                     actionIdentifier: actionIdentifier)
+    }
+    #endif
 }
+
+#if canImport(UserNotifications) && (os(iOS) || os(visionOS) || os(macOS))
+/// A keyed coder that hands back a fixed table, so a class whose initializer is
+/// private to the framework can still be built in a test.
+private final class DecodedFromValues: NSCoder {
+    private let values: [String: Any]
+
+    init(_ values: [String: Any]) {
+        self.values = values
+        super.init()
+    }
+
+    override var allowsKeyedCoding: Bool { true }
+    override var requiresSecureCoding: Bool { false }
+    override func containsValue(forKey key: String) -> Bool { values[key] != nil }
+    override func decodeObject(forKey key: String) -> Any? { values[key] }
+    override func decodeBool(forKey key: String) -> Bool { values[key] as? Bool ?? false }
+    override func decodeInt64(forKey key: String) -> Int64 { values[key] as? Int64 ?? 0 }
+    override func decodeInt32(forKey key: String) -> Int32 { values[key] as? Int32 ?? 0 }
+    override func decodeDouble(forKey key: String) -> Double { values[key] as? Double ?? 0 }
+    override func failWithError(_: Error) {}
+}
+#endif

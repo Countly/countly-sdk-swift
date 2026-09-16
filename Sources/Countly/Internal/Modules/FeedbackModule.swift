@@ -340,6 +340,19 @@ final class FeedbackModule: ModuleBase {
     func fetchWidgetData(for widget: CountlyFeedbackWidget, completion: @escaping ([String: Any]?, Error?) -> Void) {
         logI("fetchWidgetData", "widget data fetch requested, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
 
+        guard core.serverConfig.networkingEnabled else {
+            logD("fetchWidgetData", "widget data fetch is dropped, networking is disabled by server config, widgetID: [\(widget.id)]")
+            completion(nil, nil)
+            return
+        }
+
+        // The request sends `shown=1`, so the server counts an impression.
+        guard core.modules.consent.hasConsent(for: .feedback) else {
+            logD("fetchWidgetData", "no feedback consent given, widget data is not fetched, widgetID: [\(widget.id)]")
+            completion(nil, nil)
+            return
+        }
+
         var queryString = [
             "\(QS.sdkName)=\(core.sdkName)",
             "\(QS.sdkVersion)=\(core.sdkVersion)",
@@ -400,13 +413,25 @@ final class FeedbackModule: ModuleBase {
         recordWidgetEvent(segmentation: [Key.closed: 1], for: widget)
     }
 
+    /// Truncates every string value, leaving the keys alone because they are the
+    /// widget's question identifiers.
+    private func truncatedStringValues(_ segmentation: [String: Any], _ explanation: String) -> [String: Any] {
+        var result = segmentation
+        for (key, value) in segmentation {
+            guard let text = value as? String else { continue }
+            result[key] = core.limits.truncatedValue(text, explanation + " value")
+        }
+        return result
+    }
+
     private func recordWidgetEvent(segmentation: [String: Any], for widget: CountlyFeedbackWidget) {
         guard core.modules.consent.hasConsent(for: .feedback) else {
             logD("recordWidgetEvent", "no feedback consent given, widget result event is not recorded")
             return
         }
 
-        var payload = segmentation
+        // End user text, so the reserved event path's "SDK-built" premise does not hold.
+        var payload = truncatedStringValues(segmentation, "recordWidgetEvent")
         payload[Key.platform] = DeviceMetrics.osName
         payload[Key.appVersion] = DeviceMetrics.appVersion
         payload[Key.widgetID] = widget.id
@@ -444,8 +469,8 @@ final class FeedbackModule: ModuleBase {
         segmentation[Key.appVersion] = DeviceMetrics.appVersion
         segmentation[Key.rating] = rating
         segmentation[Key.widgetID] = widgetID
-        segmentation[Key.email] = email
-        segmentation[Key.comment] = comment
+        segmentation[Key.email] = email.map { core.limits.truncatedValue($0, "rating widget email") }
+        segmentation[Key.comment] = comment.map { core.limits.truncatedValue($0, "rating widget comment") }
         segmentation[Key.contactMe] = userCanBeContacted
 
         // The rating, the comment and the email are what the end user typed.
