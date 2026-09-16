@@ -58,6 +58,23 @@ public final class CountlyConfig {
     /// Extra metrics merged into the metrics dictionary sent with sessions.
     public var customMetrics: [String: String] = [:]
 
+    // MARK: - SDK identity
+
+    /// Name this SDK reports as, on `sdk_name`. Leave nil for the built-in value.
+    ///
+    /// For a bridge SDK, not for an application. A Flutter, React Native or Unity
+    /// integration wraps this SDK and has to report itself, or every request from
+    /// it is attributed to the native SDK and the dashboard cannot tell the two
+    /// apart. The Objective-C SDK exposes the same through `CountlyCommon.SDKName`
+    /// and Android through `Countly.COUNTLY_SDK_NAME`.
+    ///
+    /// Blank or whitespace is ignored, since a name is required on the wire.
+    public var sdkName: String?
+
+    /// Version this SDK reports as, on `sdk_version`. Leave nil for the built-in
+    /// value. A bridge sets its own version here, the counterpart to ``sdkName``.
+    public var sdkVersion: String?
+
     // MARK: - Views
 
     /// Reports a view every time a view controller appears.

@@ -84,7 +84,14 @@ public enum ConsentFeature: Int, CaseIterable, Sendable {
         }
     }
 
-    init?(wireName: String) {
+    /// The feature a wire name refers to, or nil for a name this SDK does not know.
+    ///
+    /// Public because a bridge SDK receives consent as the wire strings its own
+    /// users wrote, and both references accept those directly: Android takes
+    /// `giveConsent(String[])` and the Objective-C SDK takes an array of names.
+    /// Without this every bridge would carry a duplicate of the table above, which
+    /// is exactly how the two drift apart.
+    public init?(wireName: String) {
         guard let match = ConsentFeature.allCases.first(where: { $0.wireName == wireName }) else { return nil }
         self = match
     }

@@ -21,6 +21,17 @@ final class ConsentTests: CountlyBaseTestCase {
 
     /// An application that never opts into consent gets an SDK that just works.
     /// Every feature reports as consented, and nothing is gated.
+    /// Every wire name maps back to its feature, and an unknown one is refused
+    /// rather than guessed. Bridge SDKs receive consent as these strings.
+    func testAWireNameMapsBackToItsFeature() {
+        for feature in ConsentFeature.allCases {
+            XCTAssertEqual(ConsentFeature(wireName: feature.wireName), feature, feature.wireName)
+        }
+        XCTAssertNil(ConsentFeature(wireName: "not-a-feature"))
+        XCTAssertNil(ConsentFeature(wireName: ""))
+        XCTAssertNil(ConsentFeature(wireName: "Sessions"), "the wire is lowercase and the match is exact")
+    }
+
     func testWithoutRequiresConsentEverythingIsAllowed() {
         let countly = startInstance { $0.eventSendThreshold = 1 }
 

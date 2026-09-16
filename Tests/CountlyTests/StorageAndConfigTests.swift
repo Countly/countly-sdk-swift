@@ -254,4 +254,91 @@ final class StorageAndConfigTests: CountlyBaseTestCase {
         XCTAssertTrue(again.isStarted)
         XCTAssertTrue(first === again, "the registry hands back the same instance")
     }
+
+    // MARK: - SDK identity
+
+    /// A bridge SDK reports itself, or every request it makes is attributed to the
+    /// native SDK and the dashboard cannot tell a Flutter app from a native one.
+    func testABridgeCanReportItsOwnNameAndVersion() {
+        let countly = startInstance {
+            $0.sdkName = "dart-flutterb-ios"
+            $0.sdkVersion = "26.1.1"
+        }
+        countly.events.recordEvent("bridged")
+        countly.requestQueue.attemptToSendStoredRequests()
+
+        guard let request = TestUtils.request(requestQueue(of: countly), at: 0) else {
+            XCTFail("nothing was queued")
+            return
+        }
+        XCTAssertEqual(request["sdk_name"] as? String, "dart-flutterb-ios")
+        XCTAssertEqual(request["sdk_version"] as? String, "26.1.1")
+    }
+
+    /// Without an override the SDK reports itself, and a blank one is not an
+    /// override: both fields are required on the wire.
+    func testTheBuiltInIdentityIsUsedWhenNoneIsSuppliedOrItIsBlank() {
+        let plain = startInstance()
+        plain.events.recordEvent("plain")
+        plain.requestQueue.attemptToSendStoredRequests()
+        if let request = TestUtils.request(requestQueue(of: plain), at: 0) {
+            XCTAssertEqual(request["sdk_name"] as? String, SDKIdentity.name)
+            XCTAssertEqual(request["sdk_version"] as? String, SDKIdentity.version)
+        } else {
+            XCTFail("nothing was queued for the plain instance")
+        }
+
+        let blank = startInstance {
+            $0.instanceName = self.uniqueInstanceName()
+            $0.sdkName = "   "
+            $0.sdkVersion = ""
+        }
+        blank.events.recordEvent("blank")
+        blank.requestQueue.attemptToSendStoredRequests()
+        if let request = TestUtils.request(requestQueue(of: blank), at: 0) {
+            XCTAssertEqual(request["sdk_name"] as? String, SDKIdentity.name)
+            XCTAssertEqual(request["sdk_version"] as? String, SDKIdentity.version)
+        } else {
+            XCTFail("nothing was queued for the blank instance")
+        }
+    }
+
+    // MARK: - Diagnostic queue access
+
+    /// A bridge SDK's integration suite asserts on what the SDK queued. Android
+    /// exposes the same three through `CountlyStore`.
+    func testTheQueuesCanBeReadAndARequestStoredVerbatim() {
+        let countly = startInstance { $0.eventSendThreshold = 100 }
+
+        countly.events.recordEvent("first", segmentation: ["a": 1])
+        countly.events.recordEvent("second")
+
+        let events = countly.events.recordedEvents()
+        XCTAssertEqual(events.count, 2, "both events are still buffered below the send threshold")
+        XCTAssertTrue(events[0].contains("\"first\""), "oldest first")
+        XCTAssertTrue(events[1].contains("\"second\""))
+
+        let before = countly.requestQueue.queuedRequests()
+        countly.requestQueue.store("app_key=crafted&device_id=forged&custom=1")
+        let after = countly.requestQueue.queuedRequests()
+
+        XCTAssertEqual(after.count, before.count + 1)
+        XCTAssertEqual(after.last, "app_key=crafted&device_id=forged&custom=1",
+                       "a stored request reaches the queue exactly as written")
+        XCTAssertEqual(countly.requestQueue.count, after.count)
+    }
+
+    /// Reading must not mutate, and an empty request is not queued.
+    func testReadingTheQueueLeavesItAloneAndAnEmptyStoreIsRefused() {
+        let countly = startInstance()
+        countly.requestQueue.store("app_key=one")
+
+        let first = countly.requestQueue.queuedRequests()
+        let second = countly.requestQueue.queuedRequests()
+        XCTAssertEqual(first, second, "reading the queue changed it")
+
+        countly.requestQueue.store("")
+        XCTAssertEqual(countly.requestQueue.queuedRequests().count, first.count,
+                       "an empty request was queued")
+    }
 }

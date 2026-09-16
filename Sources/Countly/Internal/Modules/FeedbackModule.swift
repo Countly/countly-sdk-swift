@@ -120,8 +120,8 @@ final class FeedbackModule: ModuleBase {
             "\(QS.method)=\(Key.feedback)",
             "\(QS.appKey)=\(core.config.appKey.urlEscaped)",
             "\(QS.deviceID)=\(core.modules.deviceID.deviceID.urlEscaped)",
-            "\(QS.sdkName)=\(SDKIdentity.name)",
-            "\(QS.sdkVersion)=\(SDKIdentity.version)",
+            "\(QS.sdkName)=\(core.sdkName)",
+            "\(QS.sdkVersion)=\(core.sdkVersion)",
         ].joined(separator: "&")
 
         queryString += "&\(QS.appVersion)=\(DeviceMetrics.appVersion)"
@@ -263,8 +263,8 @@ final class FeedbackModule: ModuleBase {
         var queryItems = [
             "\(QS.appKey)=\(core.config.appKey.urlEscaped)",
             "\(QS.deviceID)=\(core.modules.deviceID.deviceID.urlEscaped)",
-            "\(QS.sdkName)=\(SDKIdentity.name)",
-            "\(QS.sdkVersion)=\(SDKIdentity.version)",
+            "\(QS.sdkName)=\(core.sdkName)",
+            "\(QS.sdkVersion)=\(core.sdkVersion)",
             "\(Key.appVersion)=\(DeviceMetrics.appVersion)",
             "\(Key.platform)=\(DeviceMetrics.osName ?? "")",
             "\(Key.widgetID)=\(widget.id)",
@@ -341,8 +341,8 @@ final class FeedbackModule: ModuleBase {
         logI("fetchWidgetData", "widget data fetch requested, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
 
         var queryString = [
-            "\(QS.sdkName)=\(SDKIdentity.name)",
-            "\(QS.sdkVersion)=\(SDKIdentity.version)",
+            "\(QS.sdkName)=\(core.sdkName)",
+            "\(QS.sdkVersion)=\(core.sdkVersion)",
             "\(Key.appVersion)=\(DeviceMetrics.appVersion)",
             "\(Key.platform)=\(DeviceMetrics.osName ?? "")",
             "\(Key.shown)=1",

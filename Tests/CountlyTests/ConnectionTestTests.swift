@@ -55,6 +55,20 @@ final class ConnectionTestTests: CountlyBaseTestCase {
     /// the status table (400 by default, 200 on the strict rows), fails the listed
     /// probes with a transport error, and leaves every queued request failing so
     /// it stays in the queue.
+    /// The battery is armed by the response to the first behavior settings fetch,
+    /// which lands inside `startInstance`, so the deadline has to be in place
+    /// before that. Held open here: these cases grade what the mock answered, and
+    /// a probe that stalls on a loaded runner would otherwise be graded a timeout.
+    override func setUp() {
+        super.setUp()
+        ConnectionTestModule.defaultPerRequestTimeout = 60
+    }
+
+    override func tearDown() {
+        ConnectionTestModule.defaultPerRequestTimeout = 10
+        super.tearDown()
+    }
+
     private func installHandler(scResponse: String,
                                 probeStatus: [String: Int] = [:],
                                 probeErrors: [String: URLError.Code] = [:],

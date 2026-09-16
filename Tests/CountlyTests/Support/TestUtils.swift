@@ -24,7 +24,12 @@ enum TestUtils {
     /// soon as its condition holds, so a large timeout costs nothing when things
     /// work, and stops a loaded CI simulator, which is far slower than a developer
     /// machine, from tripping over a value tuned on one.
-    static let asyncTimeout: TimeInterval = 20
+    /// How long a `waitUntil` gives its condition.
+    ///
+    /// Generous on purpose. A wait returns as soon as the condition holds, so this
+    /// only bounds a genuine failure, and the hosted simulators are slow enough
+    /// that real work was overrunning a tighter bound and reporting as a defect.
+    static let asyncTimeout: TimeInterval = 60
 
     /// The ceiling for waits that depend on WebKit, which are the only ones whose
     /// slowest step is a process launch rather than work the SDK does.

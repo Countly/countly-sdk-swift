@@ -20,7 +20,10 @@ final class ConnectionTestModule: ModuleBase {
 
     override class var moduleName: String { "ConnectionTest" }
 
-    static let defaultPerRequestTimeout: TimeInterval = 10
+    /// Deadline for one probe. A `var` so the suite can hold it open: a probe that
+    /// stalls on a loaded machine would otherwise be graded as a timeout rather
+    /// than on the status the server gave it.
+    static var defaultPerRequestTimeout: TimeInterval = 10
     static let defaultBatteryCapExtra: TimeInterval = 30
     static let maxRows = 32
     static let maxReportBytes = 8 * 1024
@@ -340,7 +343,7 @@ final class ConnectionTestModule: ModuleBase {
     private func serializedReport(_ results: [[String: Any]]) -> String {
         let report: [String: Any] = [
             ReportKey.timestamp: Int64(Date().timeIntervalSince1970 * 1000),
-            ReportKey.sdk: [ReportKey.sdkName: SDKIdentity.name, ReportKey.sdkVersion: SDKIdentity.version],
+            ReportKey.sdk: [ReportKey.sdkName: core.sdkName, ReportKey.sdkVersion: core.sdkVersion],
             ReportKey.results: results,
         ]
         return CountlyJSON.string(from: report, logger: log) ?? "{}"

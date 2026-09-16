@@ -33,6 +33,8 @@ public class CountlyAPIBase {
 /// Records custom events.
 public final class EventsAPI: CountlyAPIBase {
 
+    private static let module = "Events"
+
     /// Records an event.
     ///
     /// - Parameters:
@@ -51,6 +53,18 @@ public final class EventsAPI: CountlyAPIBase {
     }
 
     /// Starts timing an event. End it with `endEvent` to record the elapsed time.
+    /// The recorded events not yet moved into the request queue, oldest first, each
+    /// serialized the way it will be sent.
+    ///
+    /// Diagnostic surface, for a test asserting on what the SDK buffered before a
+    /// flush. Android exposes the same through `CountlyStore.getEvents`.
+    public func recordedEvents() -> [String] {
+        guard let core = core() else { return [] }
+        let events = core.modules.events.recordedEventsJSON
+        core.logger.d(Self.module, "recordedEvents", "the event queue contents were read through the public API, pendingEventCount: [\(events.count)]")
+        return events
+    }
+
     public func startEvent(_ key: String) {
         core()?.modules.events.startEvent(key)
     }
@@ -424,6 +438,32 @@ public final class RequestQueueAPI: CountlyAPIBase {
     }
 
     /// Sends everything that is waiting, right now.
+    /// Every queued request, oldest first, as the query strings they will be sent as.
+    ///
+    /// Diagnostic surface, for a test asserting on what the SDK actually queued.
+    /// Android exposes the same through `CountlyStore.getRequests`. Reading it does
+    /// not change the queue.
+    public func queuedRequests() -> [String] {
+        guard let core = core() else { return [] }
+        let queued = core.requestQueueStore.all
+        core.logger.d(Self.module, "queuedRequests", "the request queue contents were read through the public API, queuedRequestCount: [\(queued.count)]")
+        return queued
+    }
+
+    /// Appends a request to the queue exactly as given.
+    ///
+    /// Diagnostic surface, the counterpart to ``queuedRequests()`` and the mirror
+    /// of `CountlyStore.addRequest` on Android. Unlike a recorded event this skips
+    /// the app version stamping and the tracking check, so the string reaches the
+    /// wire as written, which is the point for a test. The queue's size and age
+    /// limits still apply.
+    public func store(_ queryString: String) {
+        guard let core = core() else { return }
+        core.logger.i(Self.module, "store", "a request is being stored verbatim through the public API, queryStringLength: [\(queryString.count)]")
+        core.requestQueueStore.appendVerbatim(queryString)
+        core.requestQueueStore.saveSync()
+    }
+
     public func attemptToSendStoredRequests() {
         guard let core = core() else { return }
         core.logger.i(Self.module, "attemptToSendStoredRequests", "an immediate drain of the request queue was requested, queuedRequestCount: [\(core.requestQueueStore.count)]")

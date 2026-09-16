@@ -193,7 +193,7 @@ public final class CountlyInstance {
 
         modules.consent.requiresConsent = config.requiresConsent
 
-        logger.i(Self.module, "start", "initializing, appKey: [\(config.appKey)], serverUrl: [\(config.normalizedHost)], instanceName: [\(name)], sdkName: [\(SDKIdentity.name)], sdkVersion: [\(SDKIdentity.version)], device: [\(DeviceMetrics.device)], osName: [\(DeviceMetrics.osName ?? "")], osVersion: [\(DeviceMetrics.osVersion ?? "")]")
+        logger.i(Self.module, "start", "initializing, appKey: [\(config.appKey)], serverUrl: [\(config.normalizedHost)], instanceName: [\(name)], sdkName: [\(core.sdkName)], sdkVersion: [\(core.sdkVersion)], sdkIdentityOverridden: [\(core.sdkName != SDKIdentity.name || core.sdkVersion != SDKIdentity.version)], device: [\(DeviceMetrics.device)], osName: [\(DeviceMetrics.osName ?? "")], osVersion: [\(DeviceMetrics.osVersion ?? "")]")
 
         // Logged after the stored behavior settings were merged in, so these are
         // the values the SDK will actually run with rather than the ones the

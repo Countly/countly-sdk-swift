@@ -19,6 +19,7 @@
 * Added the events API on "countly.events":
   * "recordEvent(key, segmentation, count, sum, duration)"
   * "startEvent(key)" / "endEvent(key, segmentation, count, sum)" / "cancelEvent(key)"
+  * "recordedEvents()", the events buffered and not yet moved into the request queue
 
 * Added the views API on "countly.views":
   * "startView(name, segmentation)" / "startAutoStoppedView(name, segmentation)"
@@ -46,6 +47,10 @@
   * "cancelConsent(for:)" for one feature or an array / "cancelAllConsents()"
   * "hasConsent(for:)"
   * Init-time configuration via "CountlyConfig.requiresConsent", "consents" and "enableAllConsents"
+
+* Added the surface a bridge SDK needs to wrap this one:
+  * "CountlyConfig.sdkName" and "CountlyConfig.sdkVersion", reported on "sdk_name" and "sdk_version" in place of this SDK's own, so a Flutter, React Native or Unity integration is attributed to itself
+  * "ConsentFeature(wireName:)", which maps a consent name as written on the wire onto its feature and returns nil for one this SDK does not know
 
 * Added the device ID API on "countly.deviceID":
   * "current" / "type" / "isTemporaryIDMode"
@@ -94,6 +99,7 @@
   * "count" / "attemptToSendStoredRequests()" / "flushQueues()"
   * "replaceAllAppKeysInQueueWithCurrentAppKey()" / "removeDifferentAppKeysFromQueue()"
   * "addQueueFlushRunnable(runnable)" / "clearQueueFlushRunnables()"
+  * "queuedRequests()" and "store(queryString)", which read the queue and append a request verbatim
 
 * Added the push API on "countly.push":
   * "askForNotificationPermission(options:completion:)"
@@ -135,4 +141,4 @@
 
 * On watchOS the session follows the extension's active state on its own: resigning active ends it and becoming active begins the next, so the host no longer calls "suspend()" and "resume()" from its extension delegate.
 
-* Added support for iOS 15, tvOS 15, watchOS 9, macOS 12 and visionOS 1, the deployment floor of Xcode 27, from a single Swift package, also distributed as a CocoaPod with a separate "NotificationService" subspec.
+* Added support for iOS 15, tvOS 15, watchOS 9, macOS 12 and visionOS 1, the deployment floor of Xcode 27, from a single Swift package.

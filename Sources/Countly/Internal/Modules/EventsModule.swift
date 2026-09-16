@@ -36,6 +36,19 @@ final class EventsModule: ModuleBase {
     /// How many events accumulate before they are sent.
     private var sendThreshold: Int { max(1, core.config.eventSendThreshold) }
 
+    /// The recorded events not yet moved into the request queue, each serialized
+    /// the way it will be sent. Oldest first.
+    ///
+    /// Diagnostic surface. Android's `CountlyStore.getEvents` returns the same
+    /// thing as JSON strings and its Flutter bridge forwards them straight to the
+    /// integration suite.
+    var recordedEventsJSON: [String] {
+        eventLock.lock()
+        let snapshot = recordedEvents
+        eventLock.unlock()
+        return snapshot.compactMap { CountlyJSON.string(from: $0.dictionaryRepresentation, logger: core.logger) }
+    }
+
     /// Events sitting in memory and not yet moved into the request queue. Read by
     /// the user profile module, which has to report the queue depth it is about to
     /// flush.

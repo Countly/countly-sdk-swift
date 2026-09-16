@@ -50,8 +50,8 @@ final class RequestBuilder {
             "\(QS.hourOfDay)=\(core.clock.hourOfDay())",
             "\(QS.dayOfWeek)=\(core.clock.dayOfWeek())",
             "\(QS.timeZone)=\(core.clock.timeZoneOffsetMinutes())",
-            "\(QS.sdkVersion)=\(SDKIdentity.version)",
-            "\(QS.sdkName)=\(SDKIdentity.name)",
+            "\(QS.sdkVersion)=\(core.sdkVersion)",
+            "\(QS.sdkName)=\(core.sdkName)",
         ].joined(separator: "&")
     }
 
