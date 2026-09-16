@@ -51,24 +51,27 @@ final class ConnectionTestTests: CountlyBaseTestCase {
         MockURLProtocol.requests.filter(isProbe)
     }
 
-    /// Answers the behavior settings fetch with `scResponse`, answers probes from
-    /// the status table (400 by default, 200 on the strict rows), fails the listed
-    /// probes with a transport error, and leaves every queued request failing so
-    /// it stays in the queue.
     /// The battery is armed by the response to the first behavior settings fetch,
     /// which lands inside `startInstance`, so the deadline has to be in place
     /// before that. Held open here: these cases grade what the mock answered, and
     /// a probe that stalls on a loaded runner would otherwise be graded a timeout.
+    private var originalPerRequestTimeout: TimeInterval = 0
+
     override func setUp() {
         super.setUp()
+        originalPerRequestTimeout = ConnectionTestModule.defaultPerRequestTimeout
         ConnectionTestModule.defaultPerRequestTimeout = 60
     }
 
     override func tearDown() {
-        ConnectionTestModule.defaultPerRequestTimeout = 10
+        ConnectionTestModule.defaultPerRequestTimeout = originalPerRequestTimeout
         super.tearDown()
     }
 
+    /// Answers the behavior settings fetch with `scResponse`, answers probes from
+    /// the status table (400 by default, 200 on the strict rows), fails the listed
+    /// probes with a transport error, and leaves every queued request failing so
+    /// it stays in the queue.
     private func installHandler(scResponse: String,
                                 probeStatus: [String: Int] = [:],
                                 probeErrors: [String: URLError.Code] = [:],

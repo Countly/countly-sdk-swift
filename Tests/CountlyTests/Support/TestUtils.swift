@@ -20,10 +20,6 @@ enum TestUtils {
 
     // MARK: - Waiting
 
-    /// Generous ceiling for every wait in the suite. A satisfied wait returns as
-    /// soon as its condition holds, so a large timeout costs nothing when things
-    /// work, and stops a loaded CI simulator, which is far slower than a developer
-    /// machine, from tripping over a value tuned on one.
     /// How long a `waitUntil` gives its condition.
     ///
     /// Generous on purpose. A wait returns as soon as the condition holds, so this

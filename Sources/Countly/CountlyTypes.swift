@@ -92,9 +92,13 @@ public enum ConsentFeature: Int, CaseIterable, Sendable {
     /// Without this every bridge would carry a duplicate of the table above, which
     /// is exactly how the two drift apart.
     public init?(wireName: String) {
-        guard let match = ConsentFeature.allCases.first(where: { $0.wireName == wireName }) else { return nil }
+        guard let match = ConsentFeature.byWireName[wireName] else { return nil }
         self = match
     }
+
+    /// Built once, because a bridge translates a whole consent list a name at a time.
+    private static let byWireName: [String: ConsentFeature] =
+        Dictionary(uniqueKeysWithValues: allCases.map { ($0.wireName, $0) })
 }
 
 // MARK: - Device ID

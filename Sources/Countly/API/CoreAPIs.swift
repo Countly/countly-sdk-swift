@@ -52,7 +52,6 @@ public final class EventsAPI: CountlyAPIBase {
         core()?.modules.events.recordEvent(key, segmentation: segmentation, count: count, sum: sum, duration: duration)
     }
 
-    /// Starts timing an event. End it with `endEvent` to record the elapsed time.
     /// The recorded events not yet moved into the request queue, oldest first, each
     /// serialized the way it will be sent.
     ///
@@ -65,6 +64,7 @@ public final class EventsAPI: CountlyAPIBase {
         return events
     }
 
+    /// Starts timing an event. End it with `endEvent` to record the elapsed time.
     public func startEvent(_ key: String) {
         core()?.modules.events.startEvent(key)
     }
@@ -437,7 +437,6 @@ public final class RequestQueueAPI: CountlyAPIBase {
         return queued
     }
 
-    /// Sends everything that is waiting, right now.
     /// Every queued request, oldest first, as the query strings they will be sent as.
     ///
     /// Diagnostic surface, for a test asserting on what the SDK actually queued.
@@ -445,7 +444,7 @@ public final class RequestQueueAPI: CountlyAPIBase {
     /// not change the queue.
     public func queuedRequests() -> [String] {
         guard let core = core() else { return [] }
-        let queued = core.requestQueueStore.all
+        let queued = core.requestQueueStore.snapshot
         core.logger.d(Self.module, "queuedRequests", "the request queue contents were read through the public API, queuedRequestCount: [\(queued.count)]")
         return queued
     }
@@ -464,6 +463,7 @@ public final class RequestQueueAPI: CountlyAPIBase {
         core.requestQueueStore.saveSync()
     }
 
+    /// Sends everything that is waiting, right now.
     public func attemptToSendStoredRequests() {
         guard let core = core() else { return }
         core.logger.i(Self.module, "attemptToSendStoredRequests", "an immediate drain of the request queue was requested, queuedRequestCount: [\(core.requestQueueStore.count)]")

@@ -446,7 +446,7 @@ extension PushRuntime: UNUserNotificationCenterDelegate {
     /// The URL is opened once even when several instances are registered: the
     /// action is one user gesture, and opening the same URL twice would put two
     /// copies of a web page in front of them.
-    private func handle(response: UNNotificationResponse) {
+    func handle(response: UNNotificationResponse) {
         let userInfo = response.notification.request.content.userInfo
         guard let payload = countlyPayload(in: userInfo) else {
             log("handle", "not a Countly notification, no action is recorded and no URL is opened")

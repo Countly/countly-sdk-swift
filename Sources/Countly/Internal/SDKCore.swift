@@ -74,10 +74,10 @@ final class SDKCore {
     /// Resolved here rather than at each of the seven read sites, so a bridge that
     /// overrides it cannot be reported inconsistently across requests, feedback
     /// widget URLs and the connection test report.
-    lazy var sdkName: String = Self.resolvedIdentity(config.sdkName, fallback: SDKIdentity.name)
+    let sdkName: String
 
     /// The version reported on the wire, the counterpart to ``sdkName``.
-    lazy var sdkVersion: String = Self.resolvedIdentity(config.sdkVersion, fallback: SDKIdentity.version)
+    let sdkVersion: String
 
     /// A blank override is no override: the wire requires both fields.
     private static func resolvedIdentity(_ override: String?, fallback: String) -> String {
@@ -88,6 +88,8 @@ final class SDKCore {
     init(instanceName: String, config: CountlyConfig) {
         self.instanceName = instanceName
         self.config = config
+        self.sdkName = Self.resolvedIdentity(config.sdkName, fallback: SDKIdentity.name)
+        self.sdkVersion = Self.resolvedIdentity(config.sdkVersion, fallback: SDKIdentity.version)
         self.namespace = StorageNamespace(instanceName: instanceName)
 
         let isDefault = namespace.isDefault

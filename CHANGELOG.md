@@ -106,6 +106,10 @@
   * "recordPushNotificationToken()" / "clearPushNotificationToken()"
   * "recordAction(for:clickedButtonIndex:)"
 
+* Added "Countly.handleNotificationResponse(response)", which hands the SDK a notification the user acted on and applies the same rules the SDK applies to one it receives itself: a dismissal is ignored, the action button and its URL are resolved from the Countly payload, every running instance records the action, and the URL is opened once subject to push consent. For a host or bridge SDK that owns the "UNUserNotificationCenter" delegate, and the way to replay a tap that arrived before the SDK was started.
+
+* Made "CountlyPushKey" public in the main module, so a host reading the Countly push payload itself uses the same keys the SDK does rather than a copy.
+
 * Added automatic push notification handling. The SDK installs itself on the "UNUserNotificationCenter" delegate and on the two remote notification registration callbacks, chaining to whatever the host application already has, so the device token is reported and a tapped notification records its action event and opens its URL without any host code. Opt out with "CountlyConfig.disableAutomaticPushHandling" and forward "Countly.didRegisterForRemoteNotifications(deviceToken:)" instead.
 
 * Added the "CountlyNotificationService" product for notification service extensions. One call adds a notification's action buttons and downloads its media attachment, preserving any notification categories the host application registered.

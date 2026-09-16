@@ -136,21 +136,11 @@ final class RequestQueueStore {
         requests.removeFirst(removeCount)
     }
 
-    /// Every queued request, oldest first. A copy, so holding it cannot mutate the
-    /// queue.
-    var all: [String] {
-        lock.lock()
-        defer { lock.unlock() }
-        return requests
-    }
-
     /// Appends a request exactly as given, skipping the app version stamping and
     /// the tracking check `enqueue` applies.
     ///
-    /// For a test that crafts a request and expects it on the wire unchanged. The
-    /// size and age trimming still applies, because a queue that ignores its own
-    /// limit is not the queue under test. Mirrors `CountlyStore.addRequest` on
-    /// Android, which its Flutter bridge calls directly.
+    /// The size and age trimming still applies. See ``RequestQueueAPI/store(_:)``
+    /// for why this path exists.
     func appendVerbatim(_ queryString: String) {
         guard !queryString.isEmpty else {
             logger?.d(Self.module, "appendVerbatim", "an empty request was not stored")

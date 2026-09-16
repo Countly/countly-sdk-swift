@@ -39,14 +39,12 @@ final class EventsModule: ModuleBase {
     /// The recorded events not yet moved into the request queue, each serialized
     /// the way it will be sent. Oldest first.
     ///
-    /// Diagnostic surface. Android's `CountlyStore.getEvents` returns the same
-    /// thing as JSON strings and its Flutter bridge forwards them straight to the
-    /// integration suite.
+    /// Diagnostic surface. See ``EventsAPI/recordedEvents()``.
     var recordedEventsJSON: [String] {
         eventLock.lock()
         let snapshot = recordedEvents
         eventLock.unlock()
-        return snapshot.compactMap { CountlyJSON.string(from: $0.dictionaryRepresentation, logger: core.logger) }
+        return snapshot.compactMap { CountlyJSON.string(from: $0.dictionaryRepresentation, logger: log) }
     }
 
     /// Events sitting in memory and not yet moved into the request queue. Read by

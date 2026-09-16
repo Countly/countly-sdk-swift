@@ -8,6 +8,10 @@
 
 import Foundation
 
+#if canImport(UserNotifications)
+import UserNotifications
+#endif
+
 /// Entry point of the SDK and registry of its instances.
 ///
 /// Most applications only ever need `Countly.shared`. An application that reports
@@ -147,5 +151,15 @@ public enum Countly {
     public static func didFailToRegisterForRemoteNotifications(error: Error) {
         PushRuntime.shared.didFailToRegisterForRemoteNotifications()
     }
+
+    #if canImport(UserNotifications)
+    /// Reports a notification the user acted on, as if the SDK had received the
+    /// response itself. Needed only when something else owns the
+    /// `UNUserNotificationCenter` delegate, or to replay a tap that arrived before
+    /// `start(with:)`. A response without a Countly payload is ignored.
+    public static func handleNotificationResponse(_ response: UNNotificationResponse) {
+        PushRuntime.shared.handle(response: response)
+    }
+    #endif
     #endif
 }
