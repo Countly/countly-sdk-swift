@@ -511,6 +511,9 @@ public final class CountlyInstance {
         lifecycleObserver?.deregister()
         lifecycleObserver = nil
 
+        // First, so a module's halt-time flush lands in the queue and is not sent.
+        core.network.halt()
+
         // Reverse registry order, so a module is torn down before whatever it
         // depends on.
         for module in core.modules.all.reversed() {
@@ -519,7 +522,6 @@ public final class CountlyInstance {
 
         core.serverConfig.stop()
         core.logGatherer.halt()
-        core.network.halt()
 
         if clearStorage {
             core.requestQueueStore.flush()

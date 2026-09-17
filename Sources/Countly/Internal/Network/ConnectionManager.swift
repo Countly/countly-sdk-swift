@@ -820,6 +820,9 @@ final class ConnectionManager: NSObject {
     ///
     /// `reset()` on its own is what a configuration change does, and sending has
     /// to work again after that, so it cannot be the thing that closes the door.
+    /// Runs before the modules halt: their flushes then land in the queue for the
+    /// next start instead of racing the session teardown, which could put a
+    /// request on the wire that is also kept and sent again.
     func halt() {
         sessionLock.lock()
         isHalted = true
