@@ -23,6 +23,9 @@ final class FeedbackModule: ModuleBase {
         static let appVersion = "app_version"
         static let rating = "rating"
         static let widgetID = "widget_id"
+
+        /// The origin the page compares an incoming `resize` message against.
+        static let origin = "origin"
         static let feedback = "feedback"
         static let email = "email"
         static let comment = "comment"
@@ -75,7 +78,7 @@ final class FeedbackModule: ModuleBase {
         let request = widgetListRequest()
         logD("getAvailableFeedbackWidgets", "feedback widget list request is started, path: [\(request.url?.path ?? "")]")
 
-        core.network.instantSession().dataTask(with: request) { [weak self] data, response, error in
+        core.network.instantTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
@@ -109,7 +112,7 @@ final class FeedbackModule: ModuleBase {
             }
 
             DispatchQueue.main.async { completion(widgets, nil) }
-        }.resume()
+        }?.resume()
     }
 
     private func widgetListRequest() -> URLRequest {
@@ -117,8 +120,8 @@ final class FeedbackModule: ModuleBase {
             "\(QS.method)=\(Key.feedback)",
             "\(QS.appKey)=\(core.config.appKey.urlEscaped)",
             "\(QS.deviceID)=\(core.modules.deviceID.deviceID.urlEscaped)",
-            "\(QS.sdkName)=\(SDKIdentity.name)",
-            "\(QS.sdkVersion)=\(SDKIdentity.version)",
+            "\(QS.sdkName)=\(core.sdkName)",
+            "\(QS.sdkVersion)=\(core.sdkVersion)",
         ].joined(separator: "&")
 
         queryString += "&\(QS.appVersion)=\(DeviceMetrics.appVersion)"
@@ -187,7 +190,12 @@ final class FeedbackModule: ModuleBase {
 
             // Built on the main thread: the URL carries the resolved theme, and
             // resolving it reads interface state that is only safe to touch there.
-            let url = self.widgetURL(for: widget)
+            // Read here rather than inside the builder so the URL carries the same
+            // surface the overlay is about to be given.
+            let surface = ContentGeometry.windowSize(
+                displayOption: self.core.config.content.webViewDisplayOption,
+                withinApp: self.core.config.content.showWidgetsWithinApp)
+            let url = self.widgetURL(for: widget, surface: surface)
 
             // Retained for the lifetime of the presentation. Nothing else holds
             // it: the web view's navigation delegate is weak, so without this the
@@ -200,6 +208,8 @@ final class FeedbackModule: ModuleBase {
             // would close the cycle and leak the web view, the overlay window and
             // the module itself for the life of the process.
             manager.present(url: url,
+                            widgetType: widget.type,
+                            widgetPosition: widget.position,
                             appear: { [weak self] in
                                 self?.logI("present", "widget shown, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
                                 callback?(.appeared)
@@ -243,18 +253,30 @@ final class FeedbackModule: ModuleBase {
     }
 
     /// The URL the widget web view loads.
-    private func widgetURL(for widget: CountlyFeedbackWidget) -> URL? {
+    ///
+    /// - Parameter surface: the size the widget will be shown in. It goes into
+    ///   `custom` because the widget templates lay themselves out from it, not from
+    ///   anything they can measure on their own.
+    private func widgetURL(for widget: CountlyFeedbackWidget, surface: CGSize) -> URL? {
         var urlString = "\(core.config.normalizedHost)\(Endpoint.feedback)/\(widget.type.wireName)"
 
         var queryItems = [
             "\(QS.appKey)=\(core.config.appKey.urlEscaped)",
             "\(QS.deviceID)=\(core.modules.deviceID.deviceID.urlEscaped)",
-            "\(QS.sdkName)=\(SDKIdentity.name)",
-            "\(QS.sdkVersion)=\(SDKIdentity.version)",
+            "\(QS.sdkName)=\(core.sdkName)",
+            "\(QS.sdkVersion)=\(core.sdkVersion)",
             "\(Key.appVersion)=\(DeviceMetrics.appVersion)",
             "\(Key.platform)=\(DeviceMetrics.osName ?? "")",
             "\(Key.widgetID)=\(widget.id)",
             "\(QS.appVersion)=\(DeviceMetrics.appVersion)",
+            // What the page checks a `resize` message against.
+            //
+            // The widget's own listener compares `event.origin` to the `origin`
+            // query parameter and ignores anything that does not match, without
+            // logging or erroring. Omit this and the page never answers the SDK's
+            // surface message, so it never states the size it wants and every
+            // widget is shown at the maximum its type allows.
+            "\(Key.origin)=\(core.config.normalizedHost.urlEscaped)",
         ].joined(separator: "&")
 
         queryItems = core.network.builder.appendChecksum(queryItems)
@@ -262,11 +284,8 @@ final class FeedbackModule: ModuleBase {
 
         // Tells the page it is being shown inside the SDK's own container, and for
         // a newer widget version that it should render its own close control.
-        var custom: [String: String] = ["tc": "1"]
-        if widget.widgetVersion != nil {
-            custom["rw"] = "1"
-            custom["xb"] = "1"
-        }
+        let custom = Self.customParameters(rendersOwnCloseControl: widget.widgetVersion != nil,
+                                           surface: surface)
         urlString += "&custom=\(CountlyJSON.escapedString(from: custom, logger: log))"
 
         let finalURL = DeviceMetrics.urlStringByAppendingThemeMode(urlString)
@@ -281,15 +300,62 @@ final class FeedbackModule: ModuleBase {
         return url
     }
 
+    /// The `custom` object the widget templates read their layout from.
+    ///
+    /// - Parameter rendersOwnCloseControl: whether the widget is new enough to draw
+    ///   its own close button rather than relying on the SDK's.
+    /// - Parameter surface: the area the widget will be shown in.
+    ///
+    /// The dimensions are not decoration. A template picks its breakpoint from
+    /// `width` and `height` and works out where to put the card by subtracting the
+    /// card's height from theirs. Send neither and it falls through to its largest
+    /// breakpoint, caps the card at that breakpoint's maximum whatever the real
+    /// screen is, and places the card at the top because the number it subtracts
+    /// from is undefined. What the user sees is a short card in the wrong corner
+    /// with its content scrolling inside it, which looks like anything except a
+    /// missing query parameter.
+    static func customParameters(rendersOwnCloseControl: Bool, surface: CGSize) -> [String: Any] {
+        var custom: [String: Any] = ["tc": "1"]
+        if rendersOwnCloseControl {
+            custom["rw"] = "1"
+            custom["xb"] = "1"
+        }
+        // Numbers, not strings. The template decides orientation with
+        // `custom.width > custom.height` on the parsed values, and two JSON strings
+        // compare character by character: "1440" > "900" is false, so a landscape
+        // window would be laid out as a portrait one. The web SDK sends numbers.
+        //
+        // Omitted rather than sent as zero when there is no surface to report: a
+        // zero is a dimension the template will believe and lay out against.
+        if surface.width > 0, surface.height > 0 {
+            custom["width"] = Int(surface.width.rounded())
+            custom["height"] = Int(surface.height.rounded())
+        }
+        return custom
+    }
+
     // MARK: - Widget data
 
     /// Fetches one widget's definition.
     func fetchWidgetData(for widget: CountlyFeedbackWidget, completion: @escaping ([String: Any]?, Error?) -> Void) {
         logI("fetchWidgetData", "widget data fetch requested, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
 
+        guard core.serverConfig.networkingEnabled else {
+            logD("fetchWidgetData", "widget data fetch is dropped, networking is disabled by server config, widgetID: [\(widget.id)]")
+            completion(nil, CountlyError.networkingDisabled)
+            return
+        }
+
+        // The request sends `shown=1`, so the server counts an impression.
+        guard core.modules.consent.hasConsent(for: .feedback) else {
+            logD("fetchWidgetData", "no feedback consent given, widget data is not fetched, widgetID: [\(widget.id)]")
+            completion(nil, CountlyError.feedbackConsentNotGiven)
+            return
+        }
+
         var queryString = [
-            "\(QS.sdkName)=\(SDKIdentity.name)",
-            "\(QS.sdkVersion)=\(SDKIdentity.version)",
+            "\(QS.sdkName)=\(core.sdkName)",
+            "\(QS.sdkVersion)=\(core.sdkVersion)",
             "\(Key.appVersion)=\(DeviceMetrics.appVersion)",
             "\(Key.platform)=\(DeviceMetrics.osName ?? "")",
             "\(Key.shown)=1",
@@ -303,7 +369,7 @@ final class FeedbackModule: ModuleBase {
         let request = core.network.instantRequest(queryString: queryString, path: path)
         logD("fetchWidgetData", "widget data request is started, widgetID: [\(widget.id)], path: [\(path)]")
 
-        core.network.instantSession().dataTask(with: request) { [weak self] data, response, error in
+        core.network.instantTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
@@ -320,7 +386,7 @@ final class FeedbackModule: ModuleBase {
 
             self.logD("fetchWidgetData", "widget data fetched, widgetID: [\(widget.id)], fieldCount: [\(widgetData.count)], fields: [\(widgetData.keys.sorted().joined(separator: ", "))]")
             DispatchQueue.main.async { completion(widgetData, nil) }
-        }.resume()
+        }?.resume()
     }
 
     // MARK: - Recording results
@@ -347,13 +413,25 @@ final class FeedbackModule: ModuleBase {
         recordWidgetEvent(segmentation: [Key.closed: 1], for: widget)
     }
 
+    /// Truncates every string value, leaving the keys alone because they are the
+    /// widget's question identifiers.
+    private func truncatedStringValues(_ segmentation: [String: Any], _ explanation: String) -> [String: Any] {
+        var result = segmentation
+        for (key, value) in segmentation {
+            guard let text = value as? String else { continue }
+            result[key] = core.limits.truncatedValue(text, explanation + " value")
+        }
+        return result
+    }
+
     private func recordWidgetEvent(segmentation: [String: Any], for widget: CountlyFeedbackWidget) {
         guard core.modules.consent.hasConsent(for: .feedback) else {
             logD("recordWidgetEvent", "no feedback consent given, widget result event is not recorded")
             return
         }
 
-        var payload = segmentation
+        // End user text, so the reserved event path's "SDK-built" premise does not hold.
+        var payload = truncatedStringValues(segmentation, "recordWidgetEvent")
         payload[Key.platform] = DeviceMetrics.osName
         payload[Key.appVersion] = DeviceMetrics.appVersion
         payload[Key.widgetID] = widget.id
@@ -391,8 +469,8 @@ final class FeedbackModule: ModuleBase {
         segmentation[Key.appVersion] = DeviceMetrics.appVersion
         segmentation[Key.rating] = rating
         segmentation[Key.widgetID] = widgetID
-        segmentation[Key.email] = email
-        segmentation[Key.comment] = comment
+        segmentation[Key.email] = email.map { core.limits.truncatedValue($0, "rating widget email") }
+        segmentation[Key.comment] = comment.map { core.limits.truncatedValue($0, "rating widget comment") }
         segmentation[Key.contactMe] = userCanBeContacted
 
         // The rating, the comment and the email are what the end user typed.

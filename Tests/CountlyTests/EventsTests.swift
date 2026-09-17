@@ -255,6 +255,42 @@ final class EventsTests: CountlyBaseTestCase {
         XCTAssertEqual(TestUtils.events(in: recorded[0])[0]["key"] as? String, "allowed")
     }
 
+    func testAHostRecordedReservedEventAnswersToItsOwnFeatureConsentAndTheLimits() {
+        let countly = startInstance {
+            $0.eventSendThreshold = 1
+            $0.requiresConsent = true
+            $0.sdkInternalLimits.maxValueSize = 5
+        }
+
+        // Feedback consent is missing, so the rating widget event is dropped even though it is reserved.
+        countly.events.recordReservedEvent(.ratingWidget, segmentation: ["comment": "kept short"])
+        XCTAssertTrue(TestUtils.requests(requestQueue(of: countly), carrying: "events").isEmpty)
+
+        countly.consent.giveConsent(for: .feedback)
+        countly.events.recordReservedEvent(.ratingWidget, segmentation: ["comment": "kept short"])
+
+        let recorded = TestUtils.requests(requestQueue(of: countly), carrying: "events")
+        XCTAssertEqual(recorded.count, 1)
+        let event = TestUtils.events(in: recorded[0])[0]
+        XCTAssertEqual(event["key"] as? String, CountlyReservedEvent.ratingWidget.rawValue)
+        // The segmentation went through the SDK limits like any other event's.
+        XCTAssertEqual((event["segmentation"] as? [String: Any])?["comment"] as? String, "kept ")
+    }
+
+    func testAHostRecordedKeyThatIsNotReservedIsAnOrdinaryEvent() {
+        let countly = startInstance {
+            $0.eventSendThreshold = 1
+            $0.requiresConsent = true
+        }
+
+        countly.events.recordReservedEvent("custom_key")
+        XCTAssertTrue(TestUtils.requests(requestQueue(of: countly), carrying: "events").isEmpty)
+
+        countly.consent.giveConsent(for: .events)
+        countly.events.recordReservedEvent("custom_key")
+        XCTAssertEqual(TestUtils.requests(requestQueue(of: countly), carrying: "events").count, 1)
+    }
+
     // MARK: - Server config
 
     func testTheServerCanSwitchCustomEventTrackingOff() {

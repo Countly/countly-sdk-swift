@@ -26,6 +26,11 @@ final class SDKCore {
     let namespace: StorageNamespace
 
     let logger: Logger
+
+    /// Holds the logger's lines for the server while a gather is armed or not yet
+    /// decided. Created with the logger, so the very first init lines are held.
+    let logGatherer: LogGatherer
+
     let clock: MonotonicClock
 
     /// The config this instance was started with. Mutated in place by behavior
@@ -64,9 +69,28 @@ final class SDKCore {
     /// starting.
     var isTerminating = false
 
+    /// The name reported on the wire: the bridge's if it set one, else this SDK's.
+    ///
+    /// Resolved here rather than at each of the seven read sites, so a bridge that
+    /// overrides it cannot be reported inconsistently across requests, feedback
+    /// widget URLs and the connection test report.
+    let sdkName: String
+
+    /// The version reported on the wire, the counterpart to ``sdkName``.
+    let sdkVersion: String
+
+    /// A blank override is no override: the wire requires both fields.
+    private static func resolvedIdentity(_ override: String?, fallback: String) -> String {
+        let trimmed = override?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // The value is interpolated into every query string as is, so it has to be escaped once here.
+        return trimmed.isEmpty ? fallback : trimmed.urlEscaped
+    }
+
     init(instanceName: String, config: CountlyConfig) {
         self.instanceName = instanceName
         self.config = config
+        self.sdkName = Self.resolvedIdentity(config.sdkName, fallback: SDKIdentity.name)
+        self.sdkVersion = Self.resolvedIdentity(config.sdkVersion, fallback: SDKIdentity.version)
         self.namespace = StorageNamespace(instanceName: instanceName)
 
         let isDefault = namespace.isDefault
@@ -74,6 +98,9 @@ final class SDKCore {
         logger.enableDebug = config.enableDebug
         logger.level = config.internalLogLevel
         logger.delegate = config.loggerDelegate
+
+        self.logGatherer = LogGatherer(logger: logger)
+        logger.gatherer = logGatherer
 
         self.clock = MonotonicClock()
         self.limits = LimitsEnforcer(limits: config.sdkInternalLimits, logger: logger)
@@ -92,6 +119,7 @@ final class SDKCore {
     func attach(network: ConnectionManager, modules: ModuleRegistry) {
         self.network = network
         self.modules = modules
+        logGatherer.transport = self
     }
 
     /// Rebuilds the limit enforcer after behavior settings changed the limits.
@@ -116,6 +144,25 @@ final class SDKCore {
     }
 }
 
+/// The core is what the log gatherer delivers through, rather than the
+/// connection manager directly: a delivery in flight holds its transport strongly,
+/// and holding the core keeps everything the send touches alive across a `halt`.
+/// Holding only the manager would leave it reading a released core.
+extension SDKCore: LogGatheringTransport {
+
+    var isTrackingEnabled: Bool {
+        serverConfig.trackingEnabled
+    }
+
+    var hasAnyConsent: Bool {
+        modules.consent.hasAnyConsent
+    }
+
+    func sendSdkLogs(_ payload: String) -> Bool {
+        network.sendSdkLogs(payload)
+    }
+}
+
 /// Strong references to every module of one instance.
 ///
 /// A class rather than a struct so the core can hold it after the modules were
@@ -136,6 +183,7 @@ final class ModuleRegistry {
     let feedback: FeedbackModule
     let content: ContentModule
     let push: PushModule
+    let connectionTest: ConnectionTestModule
 
     init(consent: ConsentModule,
          deviceID: DeviceIDModule,
@@ -150,7 +198,8 @@ final class ModuleRegistry {
          apm: APMModule,
          feedback: FeedbackModule,
          content: ContentModule,
-         push: PushModule) {
+         push: PushModule,
+         connectionTest: ConnectionTestModule) {
         self.consent = consent
         self.deviceID = deviceID
         self.events = events
@@ -165,12 +214,13 @@ final class ModuleRegistry {
         self.feedback = feedback
         self.content = content
         self.push = push
+        self.connectionTest = connectionTest
     }
 
     /// Every module, for operations that fan out over all of them.
     var all: [ModuleBase] {
         [consent, deviceID, events, sessions, views, userProfile, location,
-         crashes, remoteConfig, attribution, apm, feedback, content, push]
+         crashes, remoteConfig, attribution, apm, feedback, content, push, connectionTest]
     }
 }
 

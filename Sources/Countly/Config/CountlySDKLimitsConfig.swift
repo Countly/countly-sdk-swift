@@ -36,6 +36,10 @@ public final class CountlySDKLimitsConfig {
     public var maxStackTraceLineLength: Int = DefaultLimits.maxStackTraceLineLength
 
     /// Maximum number of stack trace lines kept per thread. Default 30.
+    ///
+    /// Accepted for configuration parity with the other SDKs. This SDK reports the
+    /// crashed thread only and applies `maxStackTraceLineLength` to it, so the
+    /// value is not consulted.
     public var maxStackTraceLinesPerThread: Int = DefaultLimits.maxStackTraceLinesPerThread
 
     public init() {}

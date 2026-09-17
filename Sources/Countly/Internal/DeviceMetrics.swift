@@ -121,7 +121,13 @@ enum DeviceMetrics {
         if #available(iOS 16.4, *) {
             return nil
         } else {
-            return CTTelephonyNetworkInfo().subscriberCellularProvider?.carrierName
+            // Read per service rather than through the single-SIM accessor, which
+            // is deprecated for the whole deployment range. Sorted by service key
+            // so a dual-SIM device reports the same carrier on every launch.
+            let providers = CTTelephonyNetworkInfo().serviceSubscriberCellularProviders ?? [:]
+            return providers.sorted { $0.key < $1.key }
+                .compactMap { $0.value.carrierName }
+                .first { !$0.isEmpty }
         }
         #else
         // CoreTelephony is not available on watchOS, tvOS, macOS or visionOS.
@@ -392,28 +398,17 @@ enum DeviceMetrics {
 enum ScreenReader {
 
     /// The window the application is presenting in, preferring the active scene.
-    ///
-    /// Scenes only exist from iOS 13; before that the application had a single
-    /// window list, which is what the fallback reads.
     static var keyWindow: UIWindow? {
-        if #available(iOS 13.0, tvOS 13.0, *) {
-            for scene in UIApplication.shared.connectedScenes {
-                guard let windowScene = scene as? UIWindowScene else { continue }
-                if let key = windowScene.windows.first(where: { $0.isKeyWindow }) {
-                    return key
-                }
-                if let first = windowScene.windows.first {
-                    return first
-                }
+        for scene in UIApplication.shared.connectedScenes {
+            guard let windowScene = scene as? UIWindowScene else { continue }
+            if let key = windowScene.windows.first(where: { $0.isKeyWindow }) {
+                return key
             }
-            return nil
+            if let first = windowScene.windows.first {
+                return first
+            }
         }
-
-        #if os(visionOS)
         return nil
-        #else
-        return UIApplication.shared.windows.first { $0.isKeyWindow } ?? UIApplication.shared.windows.first
-        #endif
     }
 
     /// Scale of the window the application is presenting in.
@@ -451,12 +446,96 @@ enum ScreenReader {
     /// The overlay sets `canBecomeMain = false`, so testing that flag skips the
     /// overlay itself along with any other utility panel. Without it the answer
     /// changes once content is on screen, because the overlay can become key.
-    private static var hostWindow: NSWindow? {
+    static var hostWindow: NSWindow? {
         let application = NSApplication.shared
-        if let key = application.keyWindow, key.canBecomeMain { return key }
-        if let main = application.mainWindow { return main }
-        return application.windows.first { $0.isVisible && $0.canBecomeMain }
+
+        // A window worth measuring against: on screen, big enough to be real, and
+        // not a panel. `NSPanel` covers the SDK's own overlay along with every
+        // inspector, tooltip and menu AppKit puts in `windows`, and `canBecomeMain`
+        // alone lets some of those through. A window smaller than a hundred points
+        // either way is a helper of some kind, not the application.
+        func isHost(_ window: NSWindow) -> Bool {
+            guard window.isVisible, !(window is NSPanel), window.canBecomeMain else { return false }
+            return window.frame.width >= 100 && window.frame.height >= 100
+        }
+
+        // `mainWindow` first, because that is AppKit's own answer to "which window
+        // is this application", and it stays right while a sheet, a popover or the
+        // SDK's overlay holds key. Asking `keyWindow` first meant that whatever had
+        // focus at the moment content appeared decided the surface.
+        if let main = application.mainWindow, isHost(main) { return main }
+        if let key = application.keyWindow, isHost(key) { return key }
+
+        // Largest rather than first: `windows` is in no order worth relying on, and
+        // when nothing is main or key the biggest window is the application.
+        return application.windows
+            .filter(isHost)
+            .max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
     }
+
+    /// The corner radius of the application's own window, in points.
+    ///
+    /// Read from the window rather than assumed, because the value is not a
+    /// constant: it has changed across macOS releases and differs again for
+    /// full-screen and sheet-style windows. An overlay masked to the wrong radius
+    /// is visibly wrong either way, and wrong in the direction that matters when it
+    /// rounds too little, leaving square wedges of page backdrop outside the
+    /// window.
+    ///
+    /// The whole layer tree of the window's frame view is searched, not just that
+    /// view's own layer. AppKit does not consistently put the radius there: it may
+    /// sit on a mask, or on a backing sublayer, and which one it is has moved
+    /// between releases. Those views are AppKit's own, but reaching them is
+    /// ordinary public API and reading a layer property is not a call into them.
+    static func hostWindowCornerRadius(fallback: CGFloat) -> CGFloat {
+        guard let frameView = hostWindow?.contentView?.superview,
+              let root = frameView.layer else {
+            return fallback
+        }
+        let radius = windowCornerRadius(in: root, matching: frameView.bounds.size, depth: 0)
+        return radius > 0 ? radius : fallback
+    }
+
+    /// The radius the overlay should be masked to.
+    ///
+    /// The configured value is not a hint to be reconciled with what the window
+    /// says: an application that sets it has a window shape the SDK cannot see, so
+    /// there is nothing to reconcile it against and reading the window would only
+    /// overrule the one party that knows.
+    static func overlayCornerRadius(configured: CGFloat?, fallback: CGFloat) -> CGFloat {
+        configured ?? hostWindowCornerRadius(fallback: fallback)
+    }
+
+    /// Largest corner radius on any layer that is shaped like the window itself.
+    ///
+    /// The size match is what makes the answer trustworthy. A layer tree holds
+    /// rounded things that are not the window, and the largest radius found without
+    /// that check would just as happily be a button's.
+    static func windowCornerRadius(in layer: CALayer, matching size: CGSize, depth: Int) -> CGFloat {
+        // The radius is near the top of the tree wherever it turns out to live, and
+        // an unbounded walk of a whole window's layers is not worth it to find out.
+        guard depth <= 4 else { return 0 }
+
+        let bounds = layer.bounds.size
+        let isWindowShaped = abs(bounds.width - size.width) <= cornerRadiusSizeTolerance
+            && abs(bounds.height - size.height) <= cornerRadiusSizeTolerance
+        var largest = isWindowShaped ? layer.cornerRadius : 0
+
+        if let mask = layer.mask {
+            largest = Swift.max(largest, windowCornerRadius(in: mask, matching: size, depth: depth + 1))
+        }
+        for sublayer in layer.sublayers ?? [] {
+            largest = Swift.max(largest, windowCornerRadius(in: sublayer, matching: size, depth: depth + 1))
+        }
+        return largest
+    }
+
+    /// How far a layer may differ from the window and still be taken for it.
+    ///
+    /// Loose enough for the shadow and border insets AppKit puts between the frame
+    /// view and the layer that carries the shape, tight enough to exclude anything
+    /// that is merely large.
+    private static let cornerRadiusSizeTolerance: CGFloat = 12
 
     /// The screen carrying the application's own window.
     ///
@@ -498,6 +577,40 @@ enum ScreenReader {
     /// while the application was on another.
     static var overlayFrame: CGRect {
         activeScreen?.visibleFrame ?? .zero
+    }
+
+    /// The area content is laid out and shown in, for the configured surface.
+    ///
+    /// The window's *frame* rather than its content rect: the overlay is a panel of
+    /// its own sitting over the application, not a view inside it, so what matters
+    /// is the region of desktop the application occupies.
+    ///
+    /// Falls back to the screen when the application has no window, which is an
+    /// agent or a menu bar application, and when the window is degenerate. A zero
+    /// sized surface would place content nowhere at all, and the screen is the
+    /// answer the SDK gave before this was configurable.
+    static func surfaceFrame(withinApp: Bool) -> CGRect {
+        guard withinApp else { return overlayFrame }
+        guard let window = hostWindow, window.frame.width > 1, window.frame.height > 1 else {
+            return overlayFrame
+        }
+        return window.frame
+    }
+
+    /// What the surface resolved to and why, for a log line.
+    ///
+    /// The choice is a guess about which window is "the application", and when it
+    /// guesses wrong the only symptom is content in the wrong place, so the guess
+    /// is reported rather than left to be inferred.
+    static func surfaceDescription(withinApp: Bool) -> String {
+        let requested = withinApp ? "withinApp" : "screen"
+        guard withinApp else {
+            return "requested: [\(requested)], screen: [\(overlayFrame.logValue)]"
+        }
+        guard let window = hostWindow else {
+            return "requested: [\(requested)], resolved: [screen, no host window found], screen: [\(overlayFrame.logValue)]"
+        }
+        return "requested: [\(requested)], hostWindow: [\(window.title)], windowFrame: [\(window.frame.logValue)], isMain: [\(window === NSApplication.shared.mainWindow)], isKey: [\(window === NSApplication.shared.keyWindow)], windowCount: [\(NSApplication.shared.windows.count)]"
     }
 }
 #endif

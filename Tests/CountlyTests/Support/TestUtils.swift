@@ -20,11 +20,12 @@ enum TestUtils {
 
     // MARK: - Waiting
 
-    /// Generous ceiling for every wait in the suite. A satisfied wait returns as
-    /// soon as its condition holds, so a large timeout costs nothing when things
-    /// work, and stops a loaded CI simulator, which is far slower than a developer
-    /// machine, from tripping over a value tuned on one.
-    static let asyncTimeout: TimeInterval = 20
+    /// How long a `waitUntil` gives its condition.
+    ///
+    /// Generous on purpose. A wait returns as soon as the condition holds, so this
+    /// only bounds a genuine failure, and the hosted simulators are slow enough
+    /// that real work was overrunning a tighter bound and reporting as a defect.
+    static let asyncTimeout: TimeInterval = 60
 
     /// The ceiling for waits that depend on WebKit, which are the only ones whose
     /// slowest step is a process launch rather than work the SDK does.
@@ -262,6 +263,21 @@ enum TestUtils {
         case let number as Int: return number
         case let number as NSNumber: return number.intValue
         case let text as String: return Int(text)
+        default: return nil
+        }
+    }
+
+    /// Reads a value that does not fit an `Int` on every platform.
+    ///
+    /// `Int` is 32 bits on watchOS, and a millisecond epoch is not: `int(_:)`
+    /// truncates one there, and a literal to compare it against does not even
+    /// compile. Timestamps go through this instead.
+    static func int64(_ value: Any?) -> Int64? {
+        switch value {
+        case let number as Int64: return number
+        case let number as Int: return Int64(number)
+        case let number as NSNumber: return number.int64Value
+        case let text as String: return Int64(text)
         default: return nil
         }
     }

@@ -8,6 +8,10 @@
 
 import Foundation
 
+#if canImport(UserNotifications)
+import UserNotifications
+#endif
+
 /// Entry point of the SDK and registry of its instances.
 ///
 /// Most applications only ever need `Countly.shared`. An application that reports
@@ -96,6 +100,35 @@ public enum Countly {
         }
     }
 
+    /// Stops a named instance and drops it from the registry.
+    ///
+    /// The next `instance(named:)` under the same name hands back a fresh,
+    /// unstarted instance. Stored data is kept: deregistering must not throw away
+    /// what the instance recorded but has not sent yet, so a caller who wants it
+    /// gone calls `halt(clearStorage: true)` on the instance first. The default
+    /// instance cannot be removed; `halt()` resets it.
+    public static func removeInstance(named name: String?) {
+        guard let name, !name.isEmpty, name != defaultInstanceName else {
+            Logger.print("[Warning] [Countly] removeInstance, the default instance can not be removed, use halt() to reset it, the call is ignored")
+            return
+        }
+
+        // Deregistered under the same lock `instance(named:)` creates under, and
+        // before the halt, so a concurrent creation gets a fresh object rather than
+        // the one being torn down.
+        lock.lock()
+        let removed = instances.removeValue(forKey: name)
+        lock.unlock()
+
+        guard let removed else {
+            Logger.print("[Debug] [Countly] removeInstance, no instance is registered under the name, nothing to remove, name: [\(name)]")
+            return
+        }
+
+        // Outside the lock: the halt does real work and must not block creation.
+        removed.halt(clearStorage: false)
+    }
+
     // MARK: - Push notification plumbing
 
     #if os(iOS) || os(visionOS) || os(macOS)
@@ -118,5 +151,15 @@ public enum Countly {
     public static func didFailToRegisterForRemoteNotifications(error: Error) {
         PushRuntime.shared.didFailToRegisterForRemoteNotifications()
     }
+
+    #if canImport(UserNotifications)
+    /// Reports a notification the user acted on, as if the SDK had received the
+    /// response itself. Needed only when something else owns the
+    /// `UNUserNotificationCenter` delegate, or to replay a tap that arrived before
+    /// `start(with:)`. A response without a Countly payload is ignored.
+    public static func handleNotificationResponse(_ response: UNNotificationResponse) {
+        PushRuntime.shared.handle(response: response)
+    }
+    #endif
     #endif
 }

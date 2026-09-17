@@ -32,6 +32,18 @@ final class ServerConfig {
         static let timestamp = "t"
         static let version = "v"
         static let config = "c"
+
+        /// Log gathering directive, a sibling of `c`. Read from a live response
+        /// only and never stored: a stored directive decides nothing.
+        static let logGathering = "lg"
+
+        /// Connection test flag, a sibling of `c`. Read from a live response only,
+        /// stripped before the response is validated or cached, never persisted.
+        static let connectionTest = "ct"
+
+        /// The only top level keys that reach storage. Anything else, the two
+        /// operator armed keys above included, must not survive into the cache.
+        static let stored: Set<String> = [timestamp, version, config]
     }
 
     /// Keys inside the `c` section.
@@ -144,7 +156,9 @@ final class ServerConfig {
     private(set) var limitBreadcrumb = 0
     private(set) var limitTraceLine = 0
     private(set) var limitTraceLength = 0
-    private(set) var dropOldRequestTime = 0
+    /// Nil when the server said nothing. Zero means "stop dropping by age", so it
+    /// cannot double as the absent marker.
+    private(set) var dropOldRequestTime: Int?
     private(set) var contentZoneInterval = 0
 
     private(set) var userPropertyCacheLimit = 100
@@ -185,6 +199,14 @@ final class ServerConfig {
     /// Performs the fetch. Weak for the same reason.
     weak var transport: ServerConfigTransport?
 
+    /// Receives the `lg` directive of every live response, and the decision that
+    /// no response can arrive this run. Weak: the core owns it.
+    weak var logGatherer: LogGatherer?
+
+    /// Runs the probe battery when a live response carries `ct`. Weak: the
+    /// module registry owns it.
+    weak var connectionTest: ConnectionTestModule?
+
     init(store: KeyValueStore, logger: Logger?) {
         self.store = store
         self.logger = logger
@@ -203,6 +225,9 @@ final class ServerConfig {
     func disableUpdates() {
         logger?.i(Self.module, "disableUpdates", "behavior settings updates are being disabled")
         updatesDisabled = true
+        // Without fetches no directive can ever arrive or be renewed, which spares
+        // the logger a buffer that would never be adopted.
+        logGatherer?.decideOffIfUndecided("behavior settings updates are disabled, no directive can ever arrive")
     }
 
     // MARK: - Layer 2 and 3: developer config and stored settings
@@ -290,43 +315,86 @@ final class ServerConfig {
 
         guard !updatesDisabled else {
             logger?.d(Self.module, "fetch", "fetch aborted, behavior settings updates are disabled")
+            logGatherer?.decideOffIfUndecided("behavior settings updates are disabled, no directive can ever arrive")
             return
         }
 
         guard let transport, !transport.isDeviceIDTemporary else {
             logger?.d(Self.module, "fetch", "fetch aborted, sdk is in temporary device ID mode")
+            logGatherer?.decideOffIfUndecided("temporary device ID mode, no server response this run")
             return
         }
 
         lastFetchTimestamp = Int64(Date().timeIntervalSince1970 * 1000)
         scheduleRefreshTimerIfNeeded(config: config)
 
+        let fetchStart = Date()
         transport.fetchServerConfig { [weak self] data, statusCode, error in
             guard let self else { return }
+
+            // Wall clock of the whole fetch, reported by the connection test as its
+            // `sc` row.
+            let fetchLatencyMs = Int64(Date().timeIntervalSince(fetchStart) * 1000)
 
             if let error {
                 let failure = error as NSError
                 self.logger?.d(Self.module, "fetch", "the behavior settings request failed at the transport level, the stored settings stay in effect, statusCode: [\(statusCode)], errorDomain: [\(failure.domain)], errorCode: [\(failure.code)], error: [\(failure.localizedDescription)]")
+                self.logGatherer?.decideOffIfUndecided("server config fetch failed")
                 return
             }
 
             guard statusCode == 200 else {
                 self.logger?.d(Self.module, "fetch", "the server refused the behavior settings request, the stored settings stay in effect, statusCode: [\(statusCode)], responseLength: [\(data?.count ?? 0)]")
+                self.logGatherer?.decideOffIfUndecided("server config fetch was refused")
                 return
             }
 
-            guard let response = CountlyJSON.object(from: data, logger: self.logger) as? [String: Any],
-                  response[DocKey.config] != nil else {
+            guard var response = CountlyJSON.object(from: data, logger: self.logger) as? [String: Any] else {
+                self.logger?.d(Self.module, "fetch", "the behavior settings response is not a JSON object, previously stored behavior settings will be kept, responseLength: [\(data?.count ?? 0)]")
+                self.logGatherer?.decideOffIfUndecided("server config response is not usable")
+                return
+            }
+
+            // Read only here, from a live response, and removed before anything
+            // below sees the response so it can never be cached.
+            let connectionTestArmed = Self.extractConnectionTestFlag(&response)
+
+            if response[DocKey.config] != nil {
+                var stored = self.store.serverConfig ?? [:]
+                self.merge(&stored, incoming: response)
+                self.populate(&stored, config: config, source: .serverFetch)
+                self.store.serverConfig = stored
+                self.logger?.d(Self.module, "fetch", "fetched behavior settings were merged and persisted, responseLength: [\(data?.count ?? 0)], storedEntryCount: [\(stored.count)]")
+            } else {
                 self.logger?.d(Self.module, "fetch", "no config section in the response, previously stored behavior settings will be kept, responseLength: [\(data?.count ?? 0)]")
-                return
             }
 
-            var stored = self.store.serverConfig ?? [:]
-            self.merge(&stored, incoming: response)
-            self.populate(&stored, config: config, source: .serverFetch)
-            self.store.serverConfig = stored
-            self.logger?.d(Self.module, "fetch", "fetched behavior settings were merged and persisted, responseLength: [\(data?.count ?? 0)], storedEntryCount: [\(stored.count)]")
+            // Only a live response decides log gathering, never a stored document. A
+            // live response without a usable directive decides against it.
+            self.logGatherer?.apply(LogGatheringDirective.parse(response[DocKey.logGathering], logger: self.logger),
+                                    source: "server response")
+
+            if connectionTestArmed {
+                self.connectionTest?.startBattery(serverConfigLatencyMs: fetchLatencyMs)
+            }
         }
+    }
+
+    /// Reads and removes the top level `ct` flag from a live response, so it can
+    /// never be cached and re-arm from storage.
+    ///
+    /// Truthy numbers, booleans and non-empty strings other than `"0"` and
+    /// `"false"` arm the test; any other non-null value does too.
+    static func extractConnectionTestFlag(_ response: inout [String: Any]) -> Bool {
+        guard let value = response.removeValue(forKey: DocKey.connectionTest) else { return false }
+
+        if value is NSNull { return false }
+        if let number = value as? NSNumber { return number.doubleValue != 0 }
+        if let text = value as? String {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !trimmed.isEmpty && trimmed != "0" && trimmed.lowercased() != "false"
+        }
+        return true
     }
 
     private func scheduleRefreshTimerIfNeeded(config: CountlyConfig) {
@@ -354,21 +422,19 @@ final class ServerConfig {
     /// Folds an incoming document into the stored one.
     ///
     /// The server sends only what changed, so keys that are absent must keep their
-    /// stored values. A document that is not shaped like `{t, v, c}` is discarded
-    /// whole rather than partially applied.
+    /// stored values. A document without a `c` dictionary, a version and a
+    /// timestamp is discarded whole rather than partially applied. Top level keys
+    /// beyond those three, such as the operator armed `lg` and `ct`, are ignored
+    /// here and never reach the cache. An empty `c` is a valid answer meaning the
+    /// server has nothing to override.
     private func merge(_ base: inout [String: Any], incoming: [String: Any]) {
-        guard incoming.count == 3, let incomingConfig = incoming[DocKey.config] as? [String: Any] else {
-            logger?.w(Self.module, "merge", "incoming behavior settings will be ignored, expected 3 entries including a config section, entryCount: [\(incoming.count)], entryKeys: [\(sortedKeyList(of: incoming))]")
+        guard let incomingConfig = incoming[DocKey.config] as? [String: Any] else {
+            logger?.w(Self.module, "merge", "incoming behavior settings will be ignored, the config section is missing or not a dictionary, entryKeys: [\(sortedKeyList(of: incoming))]")
             return
         }
 
         guard incoming[DocKey.version] != nil, incoming[DocKey.timestamp] != nil else {
             logger?.w(Self.module, "merge", "incoming behavior settings will be ignored, version or timestamp entry is missing, entryKeys: [\(sortedKeyList(of: incoming))]")
-            return
-        }
-
-        guard !incomingConfig.isEmpty else {
-            logger?.w(Self.module, "merge", "incoming behavior settings will be ignored, config section is empty or not a dictionary")
             return
         }
 
@@ -425,6 +491,16 @@ final class ServerConfig {
             logger?.d(Self.module, "populate", "the configured request timeout is not a usable duration and was raised, requestTimeoutDuration: [\(config.requestTimeoutDuration.logSeconds)]")
         }
         requestTimeoutDuration = config.requestTimeoutDuration
+
+        // A developer supplied document may carry the operator armed top level
+        // keys; they decide nothing here and must not be written to the cache.
+        let strayKeys = document.keys.filter { !DocKey.stored.contains($0) }
+        if !strayKeys.isEmpty {
+            logger?.d(Self.module, "populate", "top level behavior settings keys that are never stored are dropped, keys: [\(strayKeys.sorted().joined(separator: ", "))]")
+            for key in strayKeys {
+                document.removeValue(forKey: key)
+            }
+        }
 
         // Applied whatever the server sent: an explicit local opt-out must hold
         // against a server that says nothing at all, not only against one that
@@ -484,7 +560,9 @@ final class ServerConfig {
         readBool(&section, Key.enterContentZone, &enterContentZone, &applied)
         readInt(&section, Key.contentZoneInterval, &contentZoneInterval, min: 16, &applied)
         readBool(&section, Key.consentRequired, &consentRequired, &applied)
-        readInt(&section, Key.dropOldRequestTime, &dropOldRequestTime, min: 0, &applied)
+        var dropAge = -1
+        readInt(&section, Key.dropOldRequestTime, &dropAge, min: 0, &applied)
+        dropOldRequestTime = dropAge >= 0 ? dropAge : nil
         readInt(&section, Key.serverConfigUpdateInterval, &serverConfigUpdateInterval, min: 1, &applied)
         readBool(&section, Key.locationTracking, &locationTrackingEnabled, &applied)
         readBool(&section, Key.refreshContentZone, &refreshContentZoneEnabled, &applied)
@@ -548,7 +626,13 @@ final class ServerConfig {
         apply("maxStackTraceLinesPerThread", &limits.maxStackTraceLinesPerThread, limitTraceLine)
 
         apply("eventSendThreshold", &config.eventSendThreshold, eventQueueSize)
-        apply("requestDropAgeHours", &config.requestDropAgeHours, dropOldRequestTime)
+        // Its own path because the shared `apply` reads zero as absent.
+        if let dropAge = dropOldRequestTime {
+            if config.requestDropAgeHours != dropAge {
+                overrides.append("requestDropAgeHours: \(config.requestDropAgeHours) to \(dropAge)")
+            }
+            config.requestDropAgeHours = dropAge
+        }
         apply("storedRequestsLimit", &config.storedRequestsLimit, requestQueueSize)
 
         if sessionInterval > 0 {

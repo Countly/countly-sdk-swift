@@ -143,6 +143,17 @@ final class LocationModule: ModuleBase {
         sendLocationRequest()
     }
 
+    /// Drops the stored fields without setting `isLocationInfoDisabled`, so a
+    /// location supplied later is still honoured.
+    func forgetStoredLocation() {
+        logD("forgetStoredLocation", "dropping all stored location fields, coordinateWasStored: [\(locationCoordinate != nil)], cityWasStored: [\(city != nil)], countryCodeWasStored: [\(isoCountryCode != nil)], IPWasStored: [\(ipAddress != nil)]")
+
+        locationCoordinate = nil
+        city = nil
+        isoCountryCode = nil
+        ipAddress = nil
+    }
+
     /// Clears the stored fields without sending anything.
     func disableLocation() {
         logD("disableLocation", "clearing all stored location fields, coordinateWasStored: [\(locationCoordinate != nil)], cityWasStored: [\(city != nil)], countryCodeWasStored: [\(isoCountryCode != nil)], IPWasStored: [\(ipAddress != nil)]")

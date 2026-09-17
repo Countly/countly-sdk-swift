@@ -127,7 +127,7 @@ final class MultiInstanceTests: CountlyBaseTestCase {
         quiet.events.recordEvent("after-the-burst")
 
         guard let request = TestUtils.request(requestQueue(of: quiet), at: 0) else { return }
-        let timestamp = Int64(TestUtils.int(TestUtils.events(in: request)[0]["timestamp"]) ?? 0)
+        let timestamp = TestUtils.int64(TestUtils.events(in: request)[0]["timestamp"]) ?? 0
 
         XCTAssertLessThan(timestamp - before, 60_000,
                           "the quiet instance's clock should be near real time, not dragged forward")
@@ -169,6 +169,29 @@ final class MultiInstanceTests: CountlyBaseTestCase {
 
         XCTAssertFalse(countly.isStarted)
         countly.events.recordEvent("after the halt")
+    }
+
+    /// Removing an instance stops it and forgets the name, so the next request under
+    /// that name gets a fresh, unstarted instance. Stored data is kept.
+    func testRemoveInstanceStopsAndForgetsANamedInstance() {
+        let countly = startInstance { $0.eventSendThreshold = 1 }
+        let name = countly.name
+        countly.events.recordEvent("before removal")
+
+        Countly.removeInstance(named: name)
+
+        XCTAssertFalse(countly.isStarted)
+        XCTAssertNil(Countly.getInstance(named: name))
+        XCTAssertFalse(Countly.instance(named: name) === countly, "the name now yields a new instance")
+    }
+
+    func testTheDefaultInstanceCannotBeRemoved() {
+        let shared = Countly.shared
+
+        Countly.removeInstance(named: Countly.defaultInstanceName)
+        Countly.removeInstance(named: nil)
+
+        XCTAssertTrue(Countly.getInstance(named: Countly.defaultInstanceName) === shared)
     }
 
     /// A halt with `clearStorage` has to leave the next start looking like a first

@@ -107,6 +107,43 @@ final class DeviceIDTests: CountlyBaseTestCase {
         XCTAssertEqual(second.deviceID.current, "second")
     }
 
+    /// An application that knows who the user is does not want them held as
+    /// anonymous, so a provided ID wins over temporary mode at init.
+    func testAProvidedIDWinsOverTemporaryModeAtInit() {
+        let countly = startInstance {
+            $0.temporaryDeviceIDMode = true
+            $0.deviceID = "known-user"
+        }
+
+        XCTAssertFalse(countly.deviceID.isTemporaryIDMode)
+        XCTAssertEqual(countly.deviceID.current, "known-user")
+        XCTAssertEqual(countly.deviceID.type, .developerSupplied)
+    }
+
+    /// A run that ended in temporary mode followed by one that provides an ID
+    /// leaves the placeholder, so what was held is rewritten to the real identity.
+    func testAProvidedIDLeavesAStoredTemporaryMode() {
+        let name = uniqueInstanceName()
+
+        let firstConfig = baseConfig(instanceName: name)
+        firstConfig.temporaryDeviceIDMode = true
+        firstConfig.deviceID = nil
+        firstConfig.eventSendThreshold = 1
+        let first = start(firstConfig)
+        first.events.recordEvent("recorded-while-anonymous")
+        first.halt()
+
+        let secondConfig = baseConfig(instanceName: name)
+        secondConfig.deviceID = "finally-known"
+        let second = start(secondConfig)
+
+        XCTAssertFalse(second.deviceID.isTemporaryIDMode)
+        XCTAssertEqual(second.deviceID.current, "finally-known")
+        for request in requestQueue(of: second).map(TestUtils.parseQuery) {
+            XCTAssertEqual(request["device_id"] as? String, "finally-known", "nothing may still carry the placeholder")
+        }
+    }
+
     // MARK: - Changing the ID
 
     /// A merge tells the server the two identities are the same person, so the old
@@ -190,6 +227,7 @@ final class DeviceIDTests: CountlyBaseTestCase {
     func testTemporaryModeHoldsEverythingUnderThePlaceholder() {
         let countly = startInstance {
             $0.temporaryDeviceIDMode = true
+            $0.deviceID = nil
             $0.eventSendThreshold = 1
         }
 
@@ -211,6 +249,7 @@ final class DeviceIDTests: CountlyBaseTestCase {
     func testLeavingTemporaryModeRewritesEverythingThatWasHeld() {
         let countly = startInstance {
             $0.temporaryDeviceIDMode = true
+            $0.deviceID = nil
             $0.eventSendThreshold = 1
         }
 

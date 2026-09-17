@@ -166,13 +166,16 @@ public final class CountlyInstance {
             apm: APMModule(core: core),
             feedback: FeedbackModule(core: core),
             content: ContentModule(core: core),
-            push: PushModule(core: core))
+            push: PushModule(core: core),
+            connectionTest: ConnectionTestModule(core: core))
 
         core.attach(network: network, modules: modules)
 
         core.healthTracker.transport = network
         core.serverConfig.transport = network
         core.serverConfig.delegate = self
+        core.serverConfig.logGatherer = core.logGatherer
+        core.serverConfig.connectionTest = modules.connectionTest
     }
 
     /// Applies the config in the order the features depend on each other.
@@ -190,7 +193,7 @@ public final class CountlyInstance {
 
         modules.consent.requiresConsent = config.requiresConsent
 
-        logger.i(Self.module, "start", "initializing, appKey: [\(config.appKey)], serverUrl: [\(config.normalizedHost)], instanceName: [\(name)], sdkName: [\(SDKIdentity.name)], sdkVersion: [\(SDKIdentity.version)], device: [\(DeviceMetrics.device)], osName: [\(DeviceMetrics.osName ?? "")], osVersion: [\(DeviceMetrics.osVersion ?? "")]")
+        logger.i(Self.module, "start", "initializing, appKey: [\(config.appKey)], serverUrl: [\(config.normalizedHost)], instanceName: [\(name)], sdkName: [\(core.sdkName)], sdkVersion: [\(core.sdkVersion)], sdkIdentityOverridden: [\(core.sdkName != SDKIdentity.name || core.sdkVersion != SDKIdentity.version)], device: [\(DeviceMetrics.device)], osName: [\(DeviceMetrics.osName ?? "")], osVersion: [\(DeviceMetrics.osVersion ?? "")]")
 
         // Logged after the stored behavior settings were merged in, so these are
         // the values the SDK will actually run with rather than the ones the
@@ -234,10 +237,15 @@ public final class CountlyInstance {
 
         // Automatic session tracking is resolved through the behavior settings
         // chain, so the server can override the developer's manual choice.
+        //
+        // Nothing happens in the manual branch, which is what Android does. Its
+        // orientation comes from session start, from a rotation, and from an
+        // activity start; none of those is init itself. An application that starts
+        // an activity after init gets one from that, and the foreground hook in
+        // `ViewsModule` is the iOS equivalent. Recording here instead would put an
+        // orientation event in the queue before the host has begun its session.
         if core.serverConfig.automaticSessionTrackingEnabled {
             modules.sessions.beginSession()
-        } else {
-            modules.views.recordOrientation()
         }
 
         modules.push.applyInitialConfig()
@@ -300,6 +308,10 @@ public final class CountlyInstance {
 
         core.hasFinishedInit = true
 
+        // The request queue is usable from here on, so this is the first chance
+        // for the lines gathered during init to go out.
+        core.logGatherer.sdkInitFinished()
+
         for module in modules.all {
             module.didInit()
         }
@@ -324,6 +336,9 @@ public final class CountlyInstance {
         observer.onBackground = { [weak self] in
             guard let self, let core = self.core else { return }
             for module in core.modules.all { module.didEnterBackground() }
+            // Nothing about the gathered lines is persisted, so the only way the
+            // tail survives the app going away is getting it into the queue now.
+            core.logGatherer.flushNow()
         }
 
         observer.onWillResignActive = { [weak self] in
@@ -351,6 +366,9 @@ public final class CountlyInstance {
         core.isTerminating = true
         core.modules.views.applicationWillTerminate()
         core.modules.events.sendEventsWithSaveIfNeeded()
+        // The queue is not drained while terminating, but a queued tail survives to
+        // the next launch through the sync save below.
+        core.logGatherer.flushNow()
         core.modules.apm.endBackgroundTrace()
         core.requestQueueStore.saveSync()
     }
@@ -493,6 +511,9 @@ public final class CountlyInstance {
         lifecycleObserver?.deregister()
         lifecycleObserver = nil
 
+        // First, so a module's halt-time flush lands in the queue and is not sent.
+        core.network.halt()
+
         // Reverse registry order, so a module is torn down before whatever it
         // depends on.
         for module in core.modules.all.reversed() {
@@ -500,7 +521,7 @@ public final class CountlyInstance {
         }
 
         core.serverConfig.stop()
-        core.network.reset()
+        core.logGatherer.halt()
 
         if clearStorage {
             core.requestQueueStore.flush()

@@ -31,6 +31,10 @@ final class DeviceIDModule: ModuleBase {
         return .sdkGenerated
     }
 
+    /// The ID temporary mode is left for once init finishes, when a launch found the
+    /// stored placeholder and a provided ID at the same time.
+    private var temporaryExitAfterInit: String?
+
     // MARK: - Init
 
     /// Resolves the ID for this launch.
@@ -42,14 +46,33 @@ final class DeviceIDModule: ModuleBase {
 
         logI("initialize", "resolving the device ID for this launch, storedIDPresent: [\(stored != nil)], configIDProvided: [\(!(config.deviceID ?? "").isEmpty)], temporaryModeRequested: [\(config.temporaryDeviceIDMode)], resetStoredIDRequested: [\(config.resetStoredDeviceID)]")
 
+        let provided = (config.deviceID ?? "").isEmpty ? nil : config.deviceID
+
         if stored == nil || config.resetStoredDeviceID {
-            let requested = config.temporaryDeviceIDMode ? TemporaryDeviceID.value : config.deviceID
+            // Temporary mode only applies when no ID was provided: an application
+            // that knows who the user is does not want them held as anonymous.
+            var requested = provided
+            if config.temporaryDeviceIDMode {
+                if provided == nil {
+                    requested = TemporaryDeviceID.value
+                } else {
+                    logW("initialize", "temporary device ID mode is requested together with a device ID, the provided ID wins and temporary mode is not entered")
+                }
+            }
             storeCustomDeviceIDState(requested)
             apply(requested)
         } else {
             deviceID = stored ?? ""
             logD("initialize", "device ID restored from storage, valueLength: [\(deviceID.count)]")
             logV("initialize", "restored device ID value detail, deviceID: [\(deviceID)]")
+
+            // The previous run ended in temporary mode and this one knows the user:
+            // leave the placeholder once init is complete, so the held requests are
+            // rewritten to the real identity.
+            if isTemporary, let provided {
+                logI("initialize", "a device ID is provided while the stored one is the temporary placeholder, temporary mode will be left after init")
+                temporaryExitAfterInit = provided
+            }
         }
 
         logI("initialize", "device ID resolved, type: [\(deviceIDType)], typeValue: [\(deviceIDType.wireValue)], isTemporary: [\(isTemporary)]")
@@ -226,6 +249,13 @@ final class DeviceIDModule: ModuleBase {
     }
 
     // MARK: - Lifecycle
+
+    override func didInit() {
+        guard let provided = temporaryExitAfterInit else { return }
+        temporaryExitAfterInit = nil
+        logD("didInit", "leaving the temporary device ID mode found in storage with the ID provided at init")
+        changeDeviceID(provided, onServer: false)
+    }
 
     override func halt(clearStorage: Bool) {
         if clearStorage {

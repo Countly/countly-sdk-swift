@@ -44,7 +44,7 @@ enum QS {
     static let location = "location"
     static let locationCity = "city"
     static let locationCountry = "country_code"
-    static let locationIP = "ip_address"
+    static let locationIP = "ip"
 
     static let attributionID = "aid"
     static let idfa = "idfa"
@@ -71,6 +71,11 @@ enum QS {
     static let rcOmitKeys = "omit_keys"
     static let abOptIn = "ab"
     static let abOptOut = "ab_opt_out"
+
+    /// One batch of the SDK's own gathered log lines, see `LogGatherer`.
+    static let sdkLogs = "sdk_logs"
+    /// The connection test report, see `ConnectionTestModule`.
+    static let connectionTestResults = "ct_results"
 
     static let newEndPoint = "new_end_point"
     static let endPointOverrideTag = "&new_end_point="
@@ -107,36 +112,39 @@ enum ReservedEventKey {
 
 /// Keys of the Countly payload carried inside a push notification.
 ///
-/// The notification service extension target has its own copy of these, because
-/// it is a separate process that does not link the main SDK. Both are the wire
-/// contract with the server, so neither side gets to change one alone.
-enum CountlyPushKey {
+/// Keys of the Countly push payload, and the wire contract with the server.
+///
+/// Public so a host that handles notifications itself reads the same payload the
+/// SDK does. The notification service extension target has its own copy, because
+/// it is a separate process that does not link the main SDK; neither side gets to
+/// change one alone.
+public enum CountlyPushKey {
     /// The Countly payload, nested under this key in `userInfo`.
-    static let countlyPayload = "c"
+    public static let countlyPayload = "c"
     /// Server side ID of the notification.
-    static let notificationID = "i"
+    public static let notificationID = "i"
     /// Array of action button descriptors.
-    static let buttons = "b"
+    public static let buttons = "b"
     /// URL opened when the notification body itself is tapped.
-    static let defaultURL = "l"
+    public static let defaultURL = "l"
     /// URL of a media attachment to download and attach.
-    static let attachment = "a"
+    public static let attachment = "a"
     /// Index of the tapped action button, as reported in the action event.
-    static let actionButtonIndex = "b"
+    public static let actionButtonIndex = "b"
     /// Title of an action button.
-    static let actionButtonTitle = "t"
+    public static let actionButtonTitle = "t"
     /// URL opened when an action button is tapped.
-    static let actionButtonURL = "l"
+    public static let actionButtonURL = "l"
     /// Platform the action was taken on, as reported in the action event.
-    static let platform = "p"
+    public static let platform = "p"
 
     /// Prefix of the action identifiers the notification service extension
     /// registers, followed by the one based index of the button.
-    static let actionIdentifierPrefix = "CountlyActionIdentifier"
+    public static let actionIdentifierPrefix = "CountlyActionIdentifier"
 
     /// Prefix of the notification category the extension registers, followed by
     /// the notification ID, so two notifications never share a button set.
-    static let categoryIdentifierPrefix = "CountlyCategoryIdentifier"
+    public static let categoryIdentifierPrefix = "CountlyCategoryIdentifier"
 }
 
 /// Segmentation keys the SDK owns. A host application setting one of these has

@@ -187,6 +187,75 @@ final class WebViewActionTests: XCTestCase {
         XCTAssertEqual(parsed["close"] as? String, "1")
         XCTAssertEqual(parsed["link"] as? String, "https://example.com/p?q=")
     }
+
+    // MARK: - Links the web view cannot open itself
+
+    /// A content page linking to `mailto:`, `tel:` or an application's own scheme is
+    /// asking the system to take over, and often asks for the content to close in
+    /// the same URL.
+    ///
+    /// None of this used to happen. The navigation matched neither the action prefix
+    /// nor the external marker, so it fell through to `.allow`; a web view cannot
+    /// load a `mailto:`, so the mail client never opened, the `close` was never
+    /// read, and the content sat there having done nothing.
+    ///
+    /// The flag is read from the raw string rather than `URLComponents`, which
+    /// reports no query at all for these opaque schemes.
+    func testTheCloseFlagIsReadFromASchemeTheWebViewCannotOpen() {
+        XCTAssertTrue(WebViewManager.closeRequested(in: "mailto:a@b.com?close=1"))
+        XCTAssertTrue(WebViewManager.closeRequested(in: "mailto://asdkalsnd?close=1"))
+        XCTAssertTrue(WebViewManager.closeRequested(in: "tel:+15551234?close=true"))
+        XCTAssertTrue(WebViewManager.closeRequested(in: "sms:+15551234?close=yes"))
+        XCTAssertTrue(WebViewManager.closeRequested(in: "myapp://deep/link?close=1"))
+    }
+
+    /// `close` is only one parameter among several, and it is not always first.
+    func testTheCloseFlagIsFoundAlongsideTheSchemesOwnParameters() {
+        XCTAssertTrue(WebViewManager.closeRequested(in: "mailto:a@b.com?subject=Hi&close=1"))
+        XCTAssertTrue(WebViewManager.closeRequested(in: "mailto:a@b.com?close=1&subject=Hi"))
+        XCTAssertTrue(WebViewManager.closeRequested(in: "mailto:a@b.com?subject=Hi&body=Yo&close=1"))
+    }
+
+    /// Absent, or explicitly off, leaves the content where it is. A link the user
+    /// followed by accident should not also destroy what they were looking at.
+    func testAbsentOrFalsyCloseLeavesTheContentUp() {
+        XCTAssertFalse(WebViewManager.closeRequested(in: "mailto:a@b.com"))
+        XCTAssertFalse(WebViewManager.closeRequested(in: "mailto:a@b.com?close=0"))
+        XCTAssertFalse(WebViewManager.closeRequested(in: "mailto:a@b.com?close=false"))
+        XCTAssertFalse(WebViewManager.closeRequested(in: "tel:+15551234"))
+        // A key that merely ends in "close" is not the close flag.
+        XCTAssertFalse(WebViewManager.closeRequested(in: "mailto:a@b.com?autoclose=1"))
+    }
+
+
+    /// The SDK's own `close` never reaches the scheme handler.
+    ///
+    /// `mailto:` defines only `subject`, `body`, `cc`, `bcc` and `to`, and a mail
+    /// client is entitled to refuse a URL carrying anything else rather than
+    /// ignoring it, which shows up as the compose window simply never appearing.
+    /// Stripped for every scheme: an application's own deep link has no more reason
+    /// to receive a Countly parameter than Mail does.
+    func testTheCloseFlagIsStrippedBeforeTheLinkIsHandedToTheSystem() {
+        XCTAssertEqual(WebViewManager.withoutCloseParameter("mailto:a@b.com?close=1"),
+                       "mailto:a@b.com")
+        XCTAssertEqual(WebViewManager.withoutCloseParameter("tel:+15551234?close=true"),
+                       "tel:+15551234")
+
+        // The scheme's own parameters survive, whichever side of `close` they sit on.
+        XCTAssertEqual(WebViewManager.withoutCloseParameter("mailto:a@b.com?subject=Hi&close=1"),
+                       "mailto:a@b.com?subject=Hi")
+        XCTAssertEqual(WebViewManager.withoutCloseParameter("mailto:a@b.com?close=1&subject=Hi"),
+                       "mailto:a@b.com?subject=Hi")
+        XCTAssertEqual(WebViewManager.withoutCloseParameter("myapp://x?close=1&a=2"),
+                       "myapp://x?a=2")
+
+        // Nothing to strip leaves the URL exactly as it was.
+        XCTAssertEqual(WebViewManager.withoutCloseParameter("mailto:a@b.com?subject=Hi"),
+                       "mailto:a@b.com?subject=Hi")
+        XCTAssertEqual(WebViewManager.withoutCloseParameter("mailto:a@b.com"),
+                       "mailto:a@b.com")
+    }
+
 }
 
 #endif

@@ -7,6 +7,7 @@
   * "Countly.instance(named:)", returns the instance for a name, creating it if needed. Getting a handle never starts it; the caller always calls "start(with:)".
   * "Countly.getInstance(named:)" / "Countly.listInstances()"
   * "Countly.haltAllInstances(clearStorage:)"
+  * "Countly.removeInstance(named:)", stops a named instance and drops it from the registry, keeping its stored data.
   * Each instance owns its own app key, server, request queue, device ID, logger, monotonic clock and storage namespace. Named instances get their own files and user defaults keys; the default instance keeps the legacy ones.
 
 * Added instance lifecycle on "CountlyInstance":
@@ -18,6 +19,8 @@
 * Added the events API on "countly.events":
   * "recordEvent(key, segmentation, count, sum, duration)"
   * "startEvent(key)" / "endEvent(key, segmentation, count, sum)" / "cancelEvent(key)"
+  * "recordedEvents()", the events buffered and not yet moved into the request queue
+  * "recordReservedEvent(key, segmentation, count, sum, duration)", records one of the reserved events the SDK normally produces itself. An overload takes a "CountlyReservedEvent" instead of a key, naming the reserved events a host has a reason to record
 
 * Added the views API on "countly.views":
   * "startView(name, segmentation)" / "startAutoStoppedView(name, segmentation)"
@@ -45,6 +48,10 @@
   * "cancelConsent(for:)" for one feature or an array / "cancelAllConsents()"
   * "hasConsent(for:)"
   * Init-time configuration via "CountlyConfig.requiresConsent", "consents" and "enableAllConsents"
+
+* Added the surface a bridge SDK needs to wrap this one:
+  * "CountlyConfig.sdkName" and "CountlyConfig.sdkVersion", reported on "sdk_name" and "sdk_version" in place of this SDK's own, so a Flutter, React Native or Unity integration is attributed to itself
+  * "ConsentFeature(wireName:)", which maps a consent name as written on the wire onto its feature and returns nil for one this SDK does not know
 
 * Added the device ID API on "countly.deviceID":
   * "current" / "type" / "isTemporaryIDMode"
@@ -75,6 +82,7 @@
   * "getAvailableFeedbackWidgets(completion:)"
   * "presentNPS(nameIDOrTag, callback:)" / "presentSurvey(...)" / "presentRating(...)"
   * "recordRatingWidget(id:rating:email:comment:userCanBeContacted:)"
+  * "widget(from:)", rebuilds a widget from the description a caller already holds, for presenting or reporting it without fetching the list again
 
 * Added the content API on "countly.content":
   * "enterContentZone(tags:)" / "exitContentZone()" / "refreshContentZone()"
@@ -93,11 +101,16 @@
   * "count" / "attemptToSendStoredRequests()" / "flushQueues()"
   * "replaceAllAppKeysInQueueWithCurrentAppKey()" / "removeDifferentAppKeysFromQueue()"
   * "addQueueFlushRunnable(runnable)" / "clearQueueFlushRunnables()"
+  * "queuedRequests()" and "store(queryString)", which read the queue and append a request verbatim
 
 * Added the push API on "countly.push":
   * "askForNotificationPermission(options:completion:)"
   * "recordPushNotificationToken()" / "clearPushNotificationToken()"
   * "recordAction(for:clickedButtonIndex:)"
+
+* Added "Countly.handleNotificationResponse(response)", which hands the SDK a notification the user acted on and applies the same rules the SDK applies to one it receives itself: a dismissal is ignored, the action button and its URL are resolved from the Countly payload, every running instance records the action, and the URL is opened once subject to push consent. For a host or bridge SDK that owns the "UNUserNotificationCenter" delegate, and the way to replay a tap that arrived before the SDK was started.
+
+* Made "CountlyPushKey" public in the main module, so a host reading the Countly push payload itself uses the same keys the SDK does rather than a copy.
 
 * Added automatic push notification handling. The SDK installs itself on the "UNUserNotificationCenter" delegate and on the two remote notification registration callbacks, chaining to whatever the host application already has, so the device token is reported and a tapped notification records its action event and opens its URL without any host code. Opt out with "CountlyConfig.disableAutomaticPushHandling" and forward "Countly.didRegisterForRemoteNotifications(deviceToken:)" instead.
 
@@ -112,6 +125,9 @@
   * Event and request queue size limits, key and value length limits, and the segmentation value cap
   * Event, user property and view segmentation allow and block lists
   * Developer-supplied settings via "CountlyConfig.sdkBehaviorSettings", and "disableSDKBehaviorSettingsUpdates" to pin them
+
+* Added support for server requested SDK log gathering. When the server asks for it, the SDK uploads its own internal log lines, even if logging is disabled.
+* Added support for the SDK connection test. When the server asks for it, the SDK checks that it can reach every endpoint it depends on and reports the results.
 
 * Added networking configuration on "CountlyConfig":
   * "addCustomNetworkRequestHeaders(headers)" and "customNetworkRequestHeaders"
@@ -129,4 +145,6 @@
 
 * Added the one-shot health check report sent at init, carrying the error and warning counts, the last failed request's status code and message, and the backoff counters, all carried across launches.
 
-* Added support for iOS 12, tvOS 12, watchOS 4, macOS 10.14 and visionOS 1 from a single Swift package, also distributed as a CocoaPod with a separate "NotificationService" subspec.
+* On watchOS the session follows the extension's active state on its own: resigning active ends it and becoming active begins the next, so the host no longer calls "suspend()" and "resume()" from its extension delegate.
+
+* Added support for iOS 15, tvOS 15, watchOS 9, macOS 12 and visionOS 1, the deployment floor of Xcode 27, from a single Swift package.

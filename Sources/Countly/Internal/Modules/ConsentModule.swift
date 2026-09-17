@@ -135,9 +135,8 @@ final class ConsentModule: ModuleBase {
         let stateBeforeChange = Self.describe(granted)
         let requested = Set(features)
         for feature in Self.revokeOrder where requested.contains(feature) && granted.contains(feature) {
-            // The side effect runs before the flag is cleared for sessions, so the
-            // end-session request still passes its own consent check.
-            if feature == .sessions {
+            // Clearing the flag first would make a gated side effect a silent no-op.
+            if Self.closesBeforeFlagClears.contains(feature) {
                 applySideEffect(of: feature, granted: false)
                 granted.remove(feature)
             } else {
@@ -171,6 +170,10 @@ final class ConsentModule: ModuleBase {
     }
 
     // MARK: - Side effects
+
+    /// Features whose withdrawal side effect has to run while their consent is
+    /// still granted, because what it does is itself gated on that consent.
+    private static let closesBeforeFlagClears: Set<ConsentFeature> = [.sessions, .viewTracking]
 
     /// Starts or stops whatever the feature owns.
     ///
@@ -238,6 +241,8 @@ final class ConsentModule: ModuleBase {
                 // server inferring one, and the consent it would be gated on has
                 // just been withdrawn.
                 modules?.location.sendLocationRequest()
+                // Held values would otherwise be re-sent on a later re-grant.
+                modules?.location.forgetStoredLocation()
             }
 
         case .viewTracking:

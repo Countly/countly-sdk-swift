@@ -36,9 +36,18 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         manager.webView
     }
 
+    /// The absolute content shown deadline is a minute, and a loaded runner can
+    /// spend that long inside one of these cases, which would close the page
+    /// mid-test. The two cases that are about the deadline set their own.
+    override func setUp() {
+        super.setUp()
+        WebViewManager.contentShownDeadline = 600
+    }
+
     override func tearDown() {
         if let manager { onMain { manager.close() } }
         manager = nil
+        WebViewManager.contentShownDeadline = 60
         super.tearDown()
     }
 
@@ -105,6 +114,397 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
             guard let page = self.page(of: manager) else { return false }
             return !page.isLoading
         }
+    }
+
+    /// Presents a widget of a known type, so the type's layout rules apply.
+    @discardableResult
+    private func presentWidget(_ countly: CountlyInstance, type: FeedbackWidgetType) -> WebViewManager {
+        let manager = WebViewManager(core: core(of: countly))
+        self.manager = manager
+        onMain {
+            manager.present(url: URL(string: "https://example.com/feedback/\(type.wireName)"),
+                            widgetType: type, widgetPosition: nil, appear: nil, dismiss: nil)
+            self.page(of: manager)?.loadHTMLString("<html><body>ok</body></html>",
+                                                   baseURL: URL(string: "https://example.com/"))
+        }
+        waitForLoad(manager)
+        return manager
+    }
+
+    /// Delivers what the in-page observer would post about the card.
+    private func reportCard(_ manager: WebViewManager, height: Double, reason: String) {
+        onMain {
+            manager.handleScriptMessage(name: "cardSize",
+                                        body: ["w": 480, "h": height, "via": "#nps-comments", "reason": reason])
+        }
+        TestUtils.pump(0.3)
+    }
+
+    private func placedHeight(_ manager: WebViewManager) -> CGFloat? {
+        onMain { manager.placedFrameForTesting?.height }
+    }
+
+    // MARK: - Measured card
+
+    #if !os(macOS)
+    /// A widget page was authored for a phone viewport, so on iOS it fills the
+    /// surface as the Objective-C SDK presents it, ignores any size it announces,
+    /// and appears as soon as it has loaded.
+    func testAWidgetFillsTheSurfaceAndIgnoresAnnouncedSizes() {
+        let countly = startInstance()
+        let manager = presentWidget(countly, type: .nps)
+        let container = onMain { manager.containerSizeForTesting }
+
+        guard let placed = onMain({ manager.placedFrameForTesting }) else {
+            XCTFail("the widget should have been placed")
+            return
+        }
+        XCTAssertEqual(placed.origin, .zero)
+        XCTAssertEqual(placed.size.width, container.width, accuracy: 1, "a widget fills the surface on iOS")
+        XCTAssertEqual(placed.size.height, container.height, accuracy: 1, "a widget fills the surface on iOS")
+
+        navigate(manager, to: #"https://countly_action_event?cly_x_action_event=1&action=resize_me&resize_me={"l":{"x":0,"y":0,"w":480,"h":300},"p":{"x":0,"y":0,"w":480,"h":300}}"#)
+        reportCard(manager, height: 320, reason: "mutation")
+        TestUtils.pump(0.6)
+
+        XCTAssertEqual(onMain { manager.placedFrameForTesting }?.size.height ?? 0, container.height, accuracy: 1,
+                       "neither an announced nor a measured size shrinks a filling widget")
+        // The load completing is delivered by hand: the helper's HTML load races the
+        // presentation's own navigation, so the delegate is not reliably told here.
+        onMain {
+            guard let page = self.page(of: manager) else { return }
+            manager.webView(page, didFinish: nil)
+        }
+        XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, false, "the widget is visible as soon as it loaded")
+    }
+
+    /// A visible content is taken off screen for the rotation and comes back only
+    /// once it has been fitted to the new orientation, so it is never seen landing
+    /// at its old size and then jumping to the new one.
+    func testAContentIsConcealedForARotationUntilItAsksForItsNewSize() {
+        let countly = startInstance()
+        let manager = present(countly, url: "https://example.com/o/sdk/content",
+                              frame: CGRect(x: 16, y: 16, width: 370, height: 144))
+        waitForLoad(manager)
+        onMain { manager.handleScriptMessage(name: "resourceVerifyResult", body: ["results": []]) }
+        TestUtils.pump(0.2)
+        XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, false, "the content should be on screen before the rotation")
+
+        onMain { manager.simulateInterfaceSizeChangeForTesting(settled: false) }
+        XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, true, "the content stays visible while rotating")
+
+        onMain { manager.simulateInterfaceSizeChangeForTesting(settled: true) }
+        XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, true, "the content came back before the page answered with a size")
+
+        navigate(manager, to: #"https://countly_action_event?cly_x_action_event=1&action=resize_me&resize_me={"l":{"x":10,"y":10,"w":300,"h":120},"p":{"x":10,"y":10,"w":300,"h":120}}"#)
+
+        // Waited for rather than asserted after a fixed pump: the reveal deadline is
+        // short, and a loaded runner can take longer than it to deliver the
+        // navigation, which would reveal at the old frame first.
+        TestUtils.waitUntil("the page is refitted to the new orientation") {
+            self.onMain { manager.placedFrameForTesting } == CGRect(x: 10, y: 10, width: 300, height: 120)
+        }
+        XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, false, "the fitted content is not shown again")
+    }
+
+    /// Every action event URL is answered with `.cancel`, and WebKit reports that
+    /// as a failed navigation. Closing for it would tear down a page that was only
+    /// asking to be resized; a real failure still closes.
+    func testACancelledNavigationDoesNotCloseThePage() {
+        let countly = startInstance()
+        let manager = present(countly, url: "https://example.com/o/sdk/content",
+                              frame: CGRect(x: 16, y: 16, width: 370, height: 144))
+        waitForLoad(manager)
+
+        let page = onMain { self.page(of: manager) }
+        onMain { manager.webView(page!, didFailProvisionalNavigation: nil, withError: URLError(.cancelled)) }
+        XCTAssertNotNil(onMain { self.page(of: manager) }, "a cancelled navigation must not close the page")
+
+        onMain { manager.webView(page!, didFail: nil, withError: URLError(.cancelled)) }
+        XCTAssertNotNil(onMain { self.page(of: manager) }, "a cancelled committed navigation must not close the page either")
+
+        onMain { manager.webView(page!, didFailProvisionalNavigation: nil, withError: URLError(.cannotFindHost)) }
+        XCTAssertNil(onMain { self.page(of: manager) }, "a genuine load failure still dismisses the page")
+    }
+
+    /// A page that never answers the new surface is shown again anyway, after the
+    /// same wait a first presentation gives that answer.
+    func testAConcealedContentComesBackAfterTheDeadlineWithoutAnAnswer() {
+        let countly = startInstance()
+        let manager = present(countly, url: "https://example.com/o/sdk/content",
+                              frame: CGRect(x: 16, y: 16, width: 370, height: 144))
+        waitForLoad(manager)
+        onMain { manager.handleScriptMessage(name: "resourceVerifyResult", body: ["results": []]) }
+        TestUtils.pump(0.2)
+
+        onMain { manager.simulateInterfaceSizeChangeForTesting(settled: false) }
+        onMain { manager.simulateInterfaceSizeChangeForTesting(settled: true) }
+        XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, true)
+
+        TestUtils.pump(0.8)
+        XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, false, "the content never came back")
+    }
+
+    /// The server places a content for both orientations, and a rotation takes the
+    /// geometry for the orientation the surface now has, never the other one's.
+    func testTheServersPlacementForTheNewOrientationIsTakenOnRotation() {
+        let placement: [String: Any] = [
+            "p": ["x": 0, "y": 0, "w": 402, "h": 812],
+            "l": ["x": 0, "y": 0, "w": 812, "h": 402],
+        ]
+        XCTAssertEqual(WebViewManager.serverFrame(from: placement, for: CGSize(width: 402, height: 812)),
+                       CGRect(x: 0, y: 0, width: 402, height: 812))
+        XCTAssertEqual(WebViewManager.serverFrame(from: placement, for: CGSize(width: 812, height: 402)),
+                       CGRect(x: 0, y: 0, width: 812, height: 402))
+        XCTAssertNil(WebViewManager.serverFrame(from: ["p": ["x": 16, "y": 16, "w": 370, "h": 144]],
+                                                for: CGSize(width: 812, height: 402)),
+                     "a placement the server did not give is not invented from the other orientation")
+        XCTAssertNil(WebViewManager.serverFrame(from: [:], for: CGSize(width: 402, height: 812)))
+    }
+
+    /// A survey served through a journey arrives as content, with the server's
+    /// geometry attached, but its URL is a widget's and on iOS a widget fills the
+    /// surface: the geometry is ignored at presentation and stays ignored after a
+    /// rotation.
+    func testAWidgetServedAsContentFillsTheSurfaceDespiteTheServersPlacement() {
+        let countly = startInstance()
+        let manager = WebViewManager(core: core(of: countly))
+        self.manager = manager
+        let placement: [String: Any] = [
+            "p": ["x": 0, "y": 0, "w": 402, "h": 812],
+            "l": ["x": 16, "y": 0, "w": 349, "h": 604],
+        ]
+        onMain {
+            manager.present(url: URL(string: "https://example.com/feedback/survey?widget_id=w"),
+                            frame: CGRect(x: 16, y: 0, width: 349, height: 604),
+                            placement: placement,
+                            appear: nil, dismiss: nil)
+        }
+        let container = onMain { manager.containerSizeForTesting }
+        XCTAssertEqual(onMain { manager.placedFrameForTesting }, CGRect(origin: .zero, size: container),
+                       "the widget did not fill the surface at presentation")
+
+        onMain { manager.simulateInterfaceSizeChangeForTesting() }
+        XCTAssertEqual(onMain { manager.placedFrameForTesting }, CGRect(origin: .zero, size: container),
+                       "the widget did not fill the surface after a size change")
+    }
+
+    /// A layout pass that does not change the orientation leaves the frame the page
+    /// asked for alone. macOS lays out on every panel resize, including the one the
+    /// page's own request caused, and re-applying the server's geometry there
+    /// snapped the page back to it.
+    func testALayoutPassInTheSameOrientationKeepsThePagesRequestedFrame() {
+        let countly = startInstance()
+        let manager = WebViewManager(core: core(of: countly))
+        self.manager = manager
+        let container = onMain { manager.containerSizeForTesting }
+        let serverFrame = CGRect(x: 16, y: 16, width: 370, height: 144)
+        let placement: [String: Any] = [
+            "p": ["x": 16, "y": 16, "w": 370, "h": 144],
+            "l": ["x": 16, "y": 16, "w": 370, "h": 144],
+        ]
+        onMain {
+            manager.present(url: URL(string: "https://example.com/o/sdk/content"),
+                            frame: serverFrame, placement: placement, appear: nil, dismiss: nil)
+            self.page(of: manager)?.loadHTMLString("<html><body>ok</body></html>", baseURL: URL(string: "https://example.com/"))
+        }
+        waitForLoad(manager)
+        _ = container
+
+        navigate(manager, to: #"https://countly_action_event?cly_x_action_event=1&action=resize_me&resize_me={"l":{"x":10,"y":10,"w":300,"h":120},"p":{"x":10,"y":10,"w":300,"h":120}}"#)
+        XCTAssertEqual(onMain { manager.placedFrameForTesting }, CGRect(x: 10, y: 10, width: 300, height: 120))
+
+        onMain { manager.simulateInterfaceSizeChangeForTesting() }
+        TestUtils.pump(0.3)
+        XCTAssertEqual(onMain { manager.placedFrameForTesting }, CGRect(x: 10, y: 10, width: 300, height: 120),
+                       "a layout pass in the same orientation replaced the page's frame with the server's")
+    }
+
+    #if os(iOS)
+    /// A banner covers a strip of the screen, and the rest of it stays the
+    /// application's: a tap beside the page falls through the overlay window.
+    ///
+    /// iOS only. visionOS hosts the overlay differently and its input is indirect,
+    /// so a synthetic point hit test there says nothing about the pass-through.
+    func testATapOutsideTheContentFallsThroughTheOverlay() {
+        let countly = startInstance()
+        let banner = CGRect(x: 16, y: 16, width: 370, height: 144)
+        let manager = present(countly, url: "https://example.com/o/sdk/content", frame: banner)
+
+        onMain {
+            manager.handleScriptMessage(name: "resourceVerifyResult", body: ["results": []])
+        }
+        TestUtils.pump(0.3)
+
+        guard let page = onMain({ self.page(of: manager) }), let window = onMain({ page.window }) else {
+            XCTFail("the content should be on a window")
+            return
+        }
+
+        let inside = onMain { window.convert(CGPoint(x: page.bounds.midX, y: page.bounds.midY), from: page) }
+        let below = onMain { CGPoint(x: window.bounds.midX, y: page.frame.maxY + 200) }
+
+        XCTAssertNil(onMain { window.hitTest(below, with: nil) }, "a tap beside the banner was swallowed by the overlay")
+        XCTAssertNotNil(onMain { window.hitTest(inside, with: nil) }, "a tap on the banner did not reach the page")
+    }
+    #endif
+    #endif
+
+    #if os(macOS)
+    /// The page announces a size on every screen switch, but measures before the
+    /// incoming screen has laid out, and clamps what it measures to its own
+    /// breakpoint. The comment step of an NPS therefore arrives short and scrolls
+    /// inside its card. The observer's measurement is the page's own formula read
+    /// after layout, and it is trusted past the type's maximum.
+    func testAMeasuredCardMayGrowTheBoxPastTheTypeMaximum() {
+        let manager = presentWidget(startInstance(), type: .nps)
+        XCTAssertEqual(placedHeight(manager), WidgetLayout.npsMaximumHeight, "an NPS starts at its maximum")
+
+        reportCard(manager, height: 500, reason: "mutation")
+
+        guard let frame = onMain({ manager.placedFrameForTesting }) else {
+            XCTFail("the widget should have been placed")
+            return
+        }
+        XCTAssertEqual(frame.height, 500, accuracy: 1, "the measured step is given the room it needs")
+        XCTAssertGreaterThan(frame.origin.y, 0, "and stays anchored to the bottom rather than the top")
+    }
+
+    /// The fit budget stops one screen's measurement chasing itself. It must not
+    /// freeze the card at the first screen's size: a new screen starts it over.
+    func testTheFitBudgetIsRenewedWhenTheScreenChanges() {
+        let manager = presentWidget(startInstance(), type: .nps)
+
+        reportCard(manager, height: 300, reason: "resize")
+        reportCard(manager, height: 320, reason: "resize")
+        reportCard(manager, height: 340, reason: "resize")
+        XCTAssertEqual(placedHeight(manager) ?? 0, 340, accuracy: 1)
+
+        // The budget is spent, so a fourth measurement of the same screen is ignored.
+        reportCard(manager, height: 400, reason: "resize")
+        XCTAssertEqual(placedHeight(manager) ?? 0, 340, accuracy: 1, "a spent budget still let a fit through")
+
+        // A new screen is a fresh budget.
+        reportCard(manager, height: 400, reason: "mutation")
+        XCTAssertEqual(placedHeight(manager) ?? 0, 400, accuracy: 1, "a new screen was held to the old screen's budget")
+    }
+
+    /// The page repeats its announcement every time the surface is reported. If it
+    /// outranked the measurement, every window move would shrink a fitted comment
+    /// step back to the clamp, and the observer, seeing no change in the card,
+    /// would never put it right again.
+    func testAStaleAnnouncementCannotUndoAMeasuredFit() {
+        let manager = presentWidget(startInstance(), type: .nps)
+        reportCard(manager, height: 500, reason: "mutation")
+        XCTAssertEqual(placedHeight(manager) ?? 0, 500, accuracy: 1)
+
+        navigate(manager, to: #"https://countly_action_event?cly_x_action_event=1&action=resize_me&resize_me={"l":{"x":0,"y":0,"w":480,"h":300},"p":{"x":0,"y":0,"w":480,"h":300}}"#)
+        TestUtils.pump(0.6)
+
+        XCTAssertEqual(placedHeight(manager) ?? 0, 500, accuracy: 1, "the page's clamped announcement undid the measured fit")
+    }
+
+    /// A wrapper caught mid layout measures as a sliver. It is not the card.
+    func testAMeasurementTooSmallToBeTheCardIsIgnored() {
+        let manager = presentWidget(startInstance(), type: .nps)
+
+        reportCard(manager, height: 50, reason: "mutation")
+
+        XCTAssertEqual(placedHeight(manager), WidgetLayout.npsMaximumHeight, "a sliver was taken for the card")
+    }
+    #endif
+
+
+    // MARK: - One overlay at a time
+
+    /// Two overlays would fight for the same edge of the same screen, so the second
+    /// is refused, as Android does. The refused caller hears at once.
+    func testASecondOverlayIsRefusedWhileTheFirstIsUp() {
+        let countly = startInstance()
+        let first = present(countly)
+        waitForLoad(first)
+
+        var refusedDismissed = false
+        let second = WebViewManager(core: core(of: countly))
+        onMain {
+            second.present(url: URL(string: "https://example.com/feedback/nps"),
+                           appear: nil, dismiss: { refusedDismissed = true })
+        }
+
+        XCTAssertTrue(refusedDismissed, "the refused caller was left waiting for a dismissal that is not coming")
+        XCTAssertNil(onMain { self.page(of: second) }, "the refused presentation built a web view anyway")
+        XCTAssertNotNil(onMain { self.page(of: first) }, "refusing the second took the first down")
+    }
+
+    /// A content block on screen blocks a feedback widget, not only another content.
+    func testAFeedbackWidgetIsRefusedWhileContentIsUp() {
+        let countly = startInstance()
+        let content = present(countly, url: "https://example.com/o/content/abc",
+                              frame: CGRect(x: 0, y: 0, width: 300, height: 200))
+        waitForLoad(content)
+
+        var refused = false
+        let widget = WebViewManager(core: core(of: countly))
+        onMain {
+            widget.present(url: URL(string: "https://example.com/feedback/nps"),
+                           widgetType: .nps, widgetPosition: nil, appear: nil, dismiss: { refused = true })
+        }
+
+        XCTAssertTrue(refused, "a widget was shown on top of a content block")
+        XCTAssertNil(onMain { self.page(of: widget) })
+        XCTAssertNotNil(onMain { self.page(of: content) }, "the content was taken down by the refused widget")
+    }
+
+    /// A caller may present again from inside its own dismiss callback.
+    ///
+    /// Two things make that true, and either alone would do: `close()` marks the
+    /// manager closed before anything else, and the gate treats a closed holder as
+    /// free; and the gate is released explicitly before the callback runs. What is
+    /// asserted is the behaviour, not the mechanism: a presentation started from
+    /// inside the callback actually builds its web view.
+    func testACallerMayPresentAgainFromInsideItsDismissCallback() {
+        let countly = startInstance()
+        var next: WebViewManager?
+        var refused = false
+        let manager = present(countly, dismiss: {
+            let again = WebViewManager(core: self.core(of: countly))
+            // A refused presentation fires its dismiss callback at once, so a flag
+            // set here separates "refused by the gate" from any other reason for
+            // the web view to be missing.
+            again.present(url: URL(string: "https://example.com/feedback/nps"), appear: nil, dismiss: { refused = true })
+            // Loaded from a string, as the helper does: a real load fails in the
+            // sandbox at once and the page closes itself through recovery, which
+            // would look exactly like a refusal.
+            again.webView?.loadHTMLString("<html><body>ok</body></html>", baseURL: URL(string: "https://example.com/"))
+            next = again
+        })
+        waitForLoad(manager)
+
+        onMain { manager.close() }
+        TestUtils.pump(0.3)
+
+        guard let next else {
+            XCTFail("the dismiss callback did not run")
+            return
+        }
+        XCTAssertFalse(refused, "the gate refused a presentation started from the dismiss callback")
+        XCTAssertNotNil(onMain { self.page(of: next) }, "the presentation started from the dismiss callback has no web view")
+        onMain { next.close() }
+    }
+
+    /// A survey served through the content queue reads `origin`; a content block
+    /// ignores it. Without it the hosted survey never hears the surface changed.
+    func testTheContentURLCarriesThePagesOwnOrigin() {
+        let url = ContentModule.appendingOrigin(to: URL(string: "https://cdn.example.com:8443/content/abc?theme=dark")!)
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+
+        XCTAssertEqual(items.first { $0.name == "origin" }?.value, "https://cdn.example.com:8443")
+        XCTAssertEqual(items.first { $0.name == "theme" }?.value, "dark", "an existing parameter was lost")
+    }
+
+    func testAnExistingOriginIsLeftAlone() {
+        let original = URL(string: "https://cdn.example.com/content/abc?origin=https://other.example.com")!
+        XCTAssertEqual(ContentModule.appendingOrigin(to: original), original)
     }
 
     // MARK: - Presentation
@@ -262,6 +662,45 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         wait(for: [appeared], timeout: TestUtils.webKitTimeout)
     }
 
+    /// A content page whose stylesheets and scripts verified good is revealed
+    /// there and then, the way the Objective-C SDK does it. Waiting for the page's
+    /// own shown report would hide a template that only reports once it is visible.
+    func testAContentPageIsRevealedOnceItsResourcesVerifyGood() {
+        let countly = startInstance { $0.eventSendThreshold = 1 }
+
+        let appeared = expectation(description: "the content is reported visible")
+        appeared.assertForOverFulfill = false
+        let manager = present(countly,
+                              url: "https://example.com/o/sdk/content",
+                              appear: { appeared.fulfill() })
+
+        onMain {
+            manager.handleScriptMessage(name: "resourceVerifyResult",
+                                        body: ["results": [["tag": "LINK", "url": "https://example.com/a.css", "status": 200]]])
+        }
+
+        wait(for: [appeared], timeout: TestUtils.webKitTimeout)
+        XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, false, "the verified page is on screen")
+    }
+
+    /// A verification that finds a failed resource does not reveal the page.
+    func testAContentPageStaysHiddenWhenAResourceVerifiedAsFailed() {
+        let countly = startInstance { $0.eventSendThreshold = 1 }
+
+        var appearCount = 0
+        let manager = present(countly,
+                              url: "https://example.com/o/sdk/content",
+                              appear: { appearCount += 1 })
+
+        onMain {
+            manager.handleScriptMessage(name: "resourceVerifyResult",
+                                        body: ["results": [["tag": "SCRIPT", "url": "https://example.com/a.js", "status": 404]]])
+        }
+        TestUtils.pump(0.3)
+
+        XCTAssertEqual(appearCount, 0, "a failed verification is not an appearance")
+    }
+
     /// An events payload that is not an array is ignored rather than crashing or
     /// recording nonsense.
     func testAMalformedEventsPayloadIsIgnored() {
@@ -294,7 +733,10 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
     func testAResizeRequestMovesTheWebView() {
         let countly = startInstance()
 
-        let manager = present(countly)
+        // Content, not a widget. Both are resized by this path, but only content is
+        // obeyed exactly: a widget states a size and the SDK decides where it goes,
+        // so asserting an exact rect there would be asserting the wrong rule.
+        let manager = present(countly, url: "https://example.com/_external/content")
         waitForLoad(manager)
 
         let before = onMain { self.page(of: manager)?.frame }
@@ -313,7 +755,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
     func testAResizeWithOnlyTheOtherOrientationStillApplies() {
         let countly = startInstance()
 
-        let manager = present(countly)
+        let manager = present(countly, url: "https://example.com/_external/content")
         waitForLoad(manager)
 
         let before = onMain { self.page(of: manager)?.frame }
@@ -414,6 +856,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
             $0.content.enableContentReloadOnStall = true
             $0.content.contentReloadOnStallTimeout = 300
         }
+        WebViewManager.contentShownDeadline = 1.0
 
         let dismissed = expectation(description: "the stalled page is taken down")
         dismissed.assertForOverFulfill = false
@@ -422,6 +865,31 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         present(countly, url: "https://example.com/o/sdk/content", dismiss: { dismissed.fulfill() })
 
         wait(for: [dismissed], timeout: TestUtils.webKitTimeout)
+    }
+
+    /// A page that loads and is revealed but never reports itself shown is not
+    /// reloaded behind the user's back: the stall timer ends with the reveal and
+    /// only the absolute deadline is left, which closes rather than flashes.
+    func testARevealedPageIsNotReloadedButClosedAtTheAbsoluteDeadline() {
+        let countly = startInstance {
+            $0.content.enableContentReloadOnStall = true
+            $0.content.contentReloadOnStallTimeout = 300
+        }
+        WebViewManager.contentShownDeadline = 1.5
+
+        var dismissed = false
+        let manager = present(countly, url: "https://example.com/o/sdk/content", dismiss: { dismissed = true })
+        onMain { manager.handleScriptMessage(name: "resourceVerifyResult", body: ["results": []]) }
+        TestUtils.pump(0.2)
+        XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, false, "the verified page should be on screen")
+
+        // Past the stall timeout, twice over: the page must still be there and visible.
+        TestUtils.pump(0.7)
+        XCTAssertFalse(dismissed, "the revealed page was taken down by the stall timer")
+        XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, false, "the revealed page was hidden for a reload")
+
+        TestUtils.pump(1.0)
+        XCTAssertTrue(dismissed, "the absolute deadline did not close the page")
     }
 
     /// A feedback widget renders as soon as it loads and never sends a shown event,
@@ -487,6 +955,8 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
     /// Without the switch there is no deadline at all, which is the default: an
     /// application that has not asked for reloads keeps whatever the page does.
     func testWithoutTheReloadSwitchThereIsNoDeadline() {
+        // The reload switch governs the stall timer only. The absolute content
+        // shown deadline stays armed, and at its default is a minute away.
         let countly = startInstance { $0.content.enableContentReloadOnStall = false }
 
         var dismissed = false
@@ -574,7 +1044,7 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
         guard let screen = ScreenReader.activeScreen else {
             throw XCTSkip("no screen attached")
         }
-        let overlay = OverlayWindow()
+        let overlay = OverlayWindow(surfaceFrame: ScreenReader.surfaceFrame(withinApp: false))
         defer { overlay.close() }
 
         // `NSWindow` may inset the frame it was asked for, so intersection is the
@@ -584,6 +1054,201 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
                       "the overlay opened away from the application's screen")
     }
     #endif
+
+
+    // MARK: - A placed page keeps its placement
+
+    /// The server places content deliberately: it returns a rect, and a banner that
+    /// was laid out as 435x144 in the corner has to stay 435x144 in the corner.
+    ///
+    /// Regression test. A re-layout used to replace that rect with one filling the
+    /// whole window, because the fill is what a feedback widget wants and the two
+    /// shared a path. On iOS the re-layout only runs on rotation so it was never
+    /// seen; on macOS `viewDidLayout` runs during the presentation itself, so a
+    /// placed banner was blown up to the full screen before it was ever displayed.
+    func testAPageTheServerPlacedIsNotResizedToFillTheWindow() {
+        let countly = startInstance()
+        let placement = CGRect(x: 16, y: 40, width: 435, height: 144)
+
+        // A content URL: a widget URL fills the surface on iOS whatever frame it
+        // came with, and this is about a page the server placed.
+        let manager = present(countly, url: "https://example.com/o/sdk/content", frame: placement)
+        waitForLoad(manager)
+
+        // The size change the platform delivers on its own during presentation, and
+        // again on any later layout pass.
+        onMain { manager.simulateInterfaceSizeChangeForTesting() }
+        TestUtils.pump(0.3)
+
+        guard let size = onMain({ self.page(of: manager)?.frame.size }) else {
+            XCTFail("the page should still be present")
+            return
+        }
+        XCTAssertEqual(size.width, placement.width, accuracy: 1,
+                       "the placed page was resized to fill the window")
+        XCTAssertEqual(size.height, placement.height, accuracy: 1,
+                       "the placed page was resized to fill the window")
+    }
+
+    /// The counterpart: a page with no placement of its own still fills the window
+    /// and must keep doing so, which is what distinguishes it from a placed page.
+    ///
+    /// Content rather than a widget, because the two now differ: a feedback widget
+    /// is placed by `WidgetLayout` and so counts as placed, while a content the
+    /// server sent no geometry for is the only thing left that fills.
+    func testAContentWithNoPlacementStillFillsTheWindow() {
+        let countly = startInstance()
+
+        let manager = present(countly, url: "https://example.com/_external/content")
+        waitForLoad(manager)
+
+        let container = onMain { manager.containerSizeForTesting }
+        onMain { manager.simulateInterfaceSizeChangeForTesting() }
+        TestUtils.pump(0.3)
+
+        guard let size = onMain({ self.page(of: manager)?.frame.size }) else {
+            XCTFail("the page should still be present")
+            return
+        }
+        XCTAssertEqual(size.width, container.width, accuracy: 1,
+                       "a page with no placement fills the window")
+    }
+
+
+    // MARK: - A link that also asks to close
+
+    /// A call to action that opens something and dismisses itself carries `close`
+    /// inside the link, not beside it: the page appends it to the address, so the
+    /// URL reads `mailto:a@b.com?close=1`.
+    ///
+    /// Regression test. Only a top-level `close` parameter used to be honoured, so
+    /// the mail client opened and the content stayed on screen behind it forever.
+    /// The query parser is not at fault and is deliberately left alone: it splits on
+    /// `&close=`, and this is a `?close=` that belongs to the URL.
+    func testALinkCarryingCloseInsideItDismissesTheContent() {
+        let countly = startInstance()
+        var handed: URL?
+        core(of: countly).config.content.contentURLHandler = { url in
+            handed = url
+            return true
+        }
+
+        var dismissed = false
+        let manager = present(countly, dismiss: { dismissed = true })
+        waitForLoad(manager)
+
+        navigate(manager, to: "https://countly_action_event?cly_x_action_event=1&action=link&link=mailto:a@b.com?close=1")
+
+        TestUtils.waitUntil("the content is taken down", timeout: TestUtils.webKitTimeout) { dismissed }
+
+        // And the flag is Countly's, so it does not travel on to the mail client.
+        XCTAssertEqual(handed?.absoluteString, "mailto:a@b.com")
+    }
+
+    /// The same link without the flag opens and leaves the content up, which is what
+    /// makes the flag mean something.
+    func testALinkWithoutCloseLeavesTheContentUp() {
+        let countly = startInstance()
+        var handed: URL?
+        core(of: countly).config.content.contentURLHandler = { url in
+            handed = url
+            return true
+        }
+
+        var dismissed = false
+        let manager = present(countly, dismiss: { dismissed = true })
+        waitForLoad(manager)
+
+        navigate(manager, to: "https://countly_action_event?cly_x_action_event=1&action=link&link=mailto:a@b.com")
+
+        TestUtils.waitUntil("the link is handed over", timeout: TestUtils.webKitTimeout) { handed != nil }
+        TestUtils.pump(0.4)
+
+        XCTAssertEqual(handed?.absoluteString, "mailto:a@b.com")
+        XCTAssertFalse(dismissed, "nothing asked for the content to close")
+    }
+
+
+    // MARK: - Resizing
+
+    /// The page's geometry is applied exactly as given. The SDK adds no placement
+    /// rule of its own: whatever the page or the server asked for is what it gets.
+    func testAResizeIsAppliedExactlyAsThePageAskedFor() {
+        let countly = startInstance()
+        let manager = present(countly, url: "https://example.com/content")
+        waitForLoad(manager)
+
+        navigate(manager, to: #"https://countly_action_event?cly_x_action_event=1&action=resize_me&resize_me={"l":{"x":16,"y":40,"w":400,"h":300},"p":{"x":16,"y":40,"w":400,"h":300}}"#)
+        TestUtils.pump(0.5)
+
+        guard let frame = onMain({ manager.placedFrameForTesting }) else {
+            XCTFail("the page should have been placed")
+            return
+        }
+        XCTAssertEqual(frame.origin.x, 16, accuracy: 1)
+        XCTAssertEqual(frame.origin.y, 40, accuracy: 1)
+    }
+
+    // MARK: - What a widget's own answer may and may not change
+
+    /// A widget reports where it sits inside its own viewport, which is the origin,
+    /// because it has no idea where the SDK put its box on the desktop. Taking that
+    /// literally drops the widget in the top left.
+    ///
+    /// Regression test. This did not bite while the page's answers were never
+    /// reaching the SDK; the moment the message bridge started working and the
+    /// answers arrived, every widget jumped to the corner. Java has the same rule:
+    /// its log reads "putting the nps at {x=-2160, y=542} (it asked for {x=0, y=0})".
+    #if os(macOS)
+    func testAWidgetsRequestedSizeIsTakenButItsPositionIsNot() {
+        let countly = startInstance()
+        let manager = present(countly, url: "https://example.com/feedback/nps")
+        waitForLoad(manager)
+
+        // A size at the origin, which is what these pages actually send.
+        navigate(manager, to: #"https://countly_action_event?cly_x_action_event=1&action=resize_me&resize_me={"l":{"x":0,"y":0,"w":480,"h":300},"p":{"x":0,"y":0,"w":480,"h":300}}"#)
+        TestUtils.pump(0.6)
+
+        guard let frame = onMain({ manager.placedFrameForTesting }) else {
+            XCTFail("the widget should have been placed")
+            return
+        }
+
+        // Asserted against the frame itself rather than against a separately read
+        // container: the surface is resolved from whichever screen the process is
+        // associated with, and reading it a second time in a test process can
+        // answer differently. What must hold is that the reported origin was not
+        // taken, which is the regression, and that the anchor survived.
+        XCTAssertEqual(frame.height, 300, accuracy: 1, "the size it asked for is honoured")
+        XCTAssertNotEqual(frame.origin, .zero, "but not the origin it reported")
+        XCTAssertGreaterThan(frame.origin.y, 0, "an NPS is pushed down to its anchor, not left at the top")
+        // Centred means in from the left only when there is room: on a phone the
+        // widget is as wide as the surface and a centred origin of zero is right.
+        let container = onMain { manager.containerSizeForTesting }
+        if frame.width < container.width {
+            XCTAssertGreaterThan(frame.origin.x, 0, "and in from the left, because it is centred")
+        }
+    }
+    #endif
+
+    /// Content is the opposite: the server placed it deliberately and its
+    /// coordinates mean something, so a geometry it sends is applied exactly.
+    func testContentKeepsTheExactGeometryItWasSent() {
+        let countly = startInstance()
+        let manager = present(countly, url: "https://example.com/_external/content")
+        waitForLoad(manager)
+
+        navigate(manager, to: #"https://countly_action_event?cly_x_action_event=1&action=resize_me&resize_me={"l":{"x":16,"y":40,"w":435,"h":144},"p":{"x":16,"y":40,"w":435,"h":144}}"#)
+        TestUtils.pump(0.6)
+
+        guard let frame = onMain({ manager.placedFrameForTesting }) else {
+            XCTFail("the content should have been placed")
+            return
+        }
+        XCTAssertEqual(frame.origin.x, 16, accuracy: 1)
+        XCTAssertEqual(frame.origin.y, 40, accuracy: 1)
+        XCTAssertEqual(frame.width, 435, accuracy: 1)
+    }
 
 }
 
@@ -629,5 +1294,163 @@ private final class DummyTransitionCoordinator: NSObject, UIViewControllerTransi
     func notifyWhenInteractionChanges(_ handler: @escaping (UIViewControllerTransitionCoordinatorContext) -> Void) {}
 }
 #endif
+
+#endif
+
+#if os(macOS)
+
+/// Whether the overlay lets the window it covers still be resized and still look
+/// like itself.
+///
+/// Sized to the application's own window, the panel lies exactly over the window's
+/// border. Everything the user does to a window happens at that border: dragging it
+/// to resize, and seeing its rounded corners. A page that paints a full-surface
+/// backdrop takes both away, and neither loss is anything the SDK is entitled to
+/// cause: the content is a guest on someone else's window.
+final class OverlayEdgeTests: XCTestCase {
+
+    private func makeBackground(margin: CGFloat) -> PassThroughBackgroundView {
+        let background = PassThroughBackgroundView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        background.passThroughEdgeMargin = margin
+        let page = NSView(frame: background.bounds)
+        background.addSubview(page)
+        return background
+    }
+
+    func testTheWindowBorderIsLeftToTheWindow() {
+        let background = makeBackground(margin: 4)
+
+        // Each of the four borders, at the point the user actually grabs.
+        XCTAssertNil(background.hitTest(NSPoint(x: 1, y: 150)), "the left border was claimed by the overlay")
+        XCTAssertNil(background.hitTest(NSPoint(x: 399, y: 150)), "the right border was claimed by the overlay")
+        XCTAssertNil(background.hitTest(NSPoint(x: 200, y: 1)), "the bottom border was claimed by the overlay")
+        XCTAssertNil(background.hitTest(NSPoint(x: 200, y: 299)), "the top border was claimed by the overlay")
+    }
+
+    func testThePageStillReceivesEverythingInsideTheBorder() {
+        let background = makeBackground(margin: 4)
+
+        XCTAssertNotNil(background.hitTest(NSPoint(x: 200, y: 150)), "the middle of the page stopped receiving clicks")
+        // Just inside the strip: the margin has to be narrow enough that a close
+        // button in the corner is still reachable.
+        XCTAssertNotNil(background.hitTest(NSPoint(x: 6, y: 6)), "the margin reaches further in than it should")
+    }
+
+    func testTheOverlayIsOrderedWithTheWindowItCovers() {
+        let host = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 600, height: 400),
+                            styleMask: [.titled, .resizable],
+                            backing: .buffered,
+                            defer: false)
+        let overlay = OverlayWindow(surfaceFrame: host.frame)
+
+        // Floating out of the box, which is what puts it above other applications.
+        XCTAssertEqual(overlay.level, .floating)
+
+        overlay.bind(to: host)
+
+        XCTAssertTrue(overlay.parent === host, "the overlay was not attached to the window it covers")
+        XCTAssertEqual(overlay.level, .normal, "the overlay still outranks every other window")
+        XCTAssertFalse(overlay.collectionBehavior.contains(.canJoinAllSpaces),
+                       "the overlay still follows the user off the window's space")
+
+        overlay.unbind()
+
+        XCTAssertNil(overlay.parent, "the overlay stayed attached and would return with the window")
+    }
+
+    private func layer(size: CGSize, radius: CGFloat) -> CALayer {
+        let layer = CALayer()
+        layer.bounds = CGRect(origin: .zero, size: size)
+        layer.cornerRadius = radius
+        return layer
+    }
+
+    func testTheWindowRadiusIsFoundWhereverAppKitKeepsIt() {
+        let windowSize = CGSize(width: 600, height: 400)
+        let root = layer(size: windowSize, radius: 0)
+
+        // The radius on a mask rather than the view's own layer, which is the shape
+        // that made the first attempt read zero.
+        let masked = layer(size: windowSize, radius: 0)
+        masked.mask = layer(size: windowSize, radius: 26)
+        root.addSublayer(masked)
+
+        XCTAssertEqual(ScreenReader.windowCornerRadius(in: root, matching: windowSize, depth: 0), 26)
+    }
+
+    func testSomethingMerelyRoundedIsNotMistakenForTheWindow() {
+        let windowSize = CGSize(width: 600, height: 400)
+        let root = layer(size: windowSize, radius: 0)
+        // A pill-shaped control: a large radius on a layer nothing like the window.
+        root.addSublayer(layer(size: CGSize(width: 80, height: 24), radius: 12))
+
+        XCTAssertEqual(ScreenReader.windowCornerRadius(in: root, matching: windowSize, depth: 0), 0,
+                       "a control's corner radius was taken for the window's")
+    }
+
+    func testAWindowThatRoundsNothingReportsNothing() {
+        let windowSize = CGSize(width: 600, height: 400)
+
+        XCTAssertEqual(ScreenReader.windowCornerRadius(in: layer(size: windowSize, radius: 0),
+                                                       matching: windowSize,
+                                                       depth: 0), 0)
+    }
+
+    func testAConfiguredRadiusOverrulesTheWindow() {
+        // A value the window could not plausibly report, so the assertion cannot
+        // pass by coincidence of whatever window this test process happens to own.
+        XCTAssertEqual(ScreenReader.overlayCornerRadius(configured: 33, fallback: 16), 33)
+    }
+
+    func testTheRadiusIsLeftToTheWindowWhenNoneIsConfigured() {
+        // Nothing configured and, in a test process, no host window to read either,
+        // so the fallback is what an application gets rather than a zero radius
+        // that would put the square corners straight back.
+        XCTAssertEqual(ScreenReader.overlayCornerRadius(configured: nil, fallback: 16), 16)
+    }
+
+    func testNoRadiusIsConfiguredByDefault() {
+        XCTAssertNil(CountlyContentConfig().overlayCornerRadius,
+                     "the SDK stopped reading the radius from the window by default")
+    }
+
+    func testTheSurfaceIsSentToTheWidgetTemplate() {
+        let custom = FeedbackModule.customParameters(rendersOwnCloseControl: true,
+                                                     surface: CGSize(width: 1440, height: 900))
+
+        // The template picks its breakpoint and its card position from these two,
+        // and decides orientation by comparing them, which only works on numbers.
+        XCTAssertEqual(custom["width"] as? Int, 1440)
+        XCTAssertEqual(custom["height"] as? Int, 900)
+        XCTAssertEqual(custom["tc"] as? String, "1")
+        XCTAssertEqual(custom["xb"] as? String, "1")
+    }
+
+    func testFractionalSurfacesAreSentAsWholePoints() {
+        let custom = FeedbackModule.customParameters(rendersOwnCloseControl: false,
+                                                     surface: CGSize(width: 1439.6, height: 899.4))
+
+        XCTAssertEqual(custom["width"] as? Int, 1440)
+        XCTAssertEqual(custom["height"] as? Int, 899)
+        XCTAssertNil(custom["xb"], "an older widget was told to draw its own close control")
+    }
+
+    func testNoSurfaceIsSentRatherThanAZeroOne() {
+        let custom = FeedbackModule.customParameters(rendersOwnCloseControl: true, surface: .zero)
+
+        // A zero is a dimension the template would believe and lay out against,
+        // which is worse than the fallback it uses when the key is absent.
+        XCTAssertNil(custom["width"])
+        XCTAssertNil(custom["height"])
+        XCTAssertEqual(custom["tc"] as? String, "1")
+    }
+
+    func testCoveringTheWholeScreenKeepsEveryPoint() {
+        // No window border underneath, so nothing to hand back.
+        let background = makeBackground(margin: 0)
+
+        XCTAssertNotNil(background.hitTest(NSPoint(x: 0, y: 150)), "the overlay gave away a click with no window to give it to")
+    }
+}
 
 #endif

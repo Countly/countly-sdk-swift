@@ -84,10 +84,21 @@ public enum ConsentFeature: Int, CaseIterable, Sendable {
         }
     }
 
-    init?(wireName: String) {
-        guard let match = ConsentFeature.allCases.first(where: { $0.wireName == wireName }) else { return nil }
+    /// The feature a wire name refers to, or nil for a name this SDK does not know.
+    ///
+    /// Public because a bridge SDK receives consent as the wire strings its own
+    /// users wrote, and both references accept those directly: Android takes
+    /// `giveConsent(String[])` and the Objective-C SDK takes an array of names.
+    /// Without this every bridge would carry a duplicate of the table above, which
+    /// is exactly how the two drift apart.
+    public init?(wireName: String) {
+        guard let match = ConsentFeature.byWireName[wireName] else { return nil }
         self = match
     }
+
+    /// Built once, because a bridge translates a whole consent list a name at a time.
+    private static let byWireName: [String: ConsentFeature] =
+        Dictionary(uniqueKeysWithValues: allCases.map { ($0.wireName, $0) })
 }
 
 // MARK: - Device ID
@@ -182,6 +193,8 @@ public enum RequestResult: Int, Sendable {
 public enum CountlyError: Int, Error, Sendable {
     case feedbackWidgetNotAvailable = 10001
     case feedbackWidgetNotTargetedForDevice = 10002
+    case feedbackConsentNotGiven = 10003
+    case networkingDisabled = 10004
     case remoteConfigGeneralAPIError = 10011
     case feedbacksGeneralAPIError = 10012
     case serverConfigGeneralAPIError = 10013
@@ -192,6 +205,8 @@ public enum CountlyError: Int, Error, Sendable {
         switch self {
         case .feedbackWidgetNotAvailable: return "Feedback widget is not available."
         case .feedbackWidgetNotTargetedForDevice: return "Feedback widget is not targeted for this device."
+        case .feedbackConsentNotGiven: return "Consent is not granted."
+        case .networkingDisabled: return "Networking is disabled by the server configuration."
         case .remoteConfigGeneralAPIError: return "Remote Config general API error."
         case .feedbacksGeneralAPIError: return "Feedbacks general API error."
         case .serverConfigGeneralAPIError: return "Server Config general API error."

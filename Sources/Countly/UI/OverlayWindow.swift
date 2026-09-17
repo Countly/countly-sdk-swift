@@ -20,28 +20,19 @@ final class OverlayWindow: UIWindow {
     /// Places the window on the active scene at just above normal level, so it
     /// covers the application but stays below system alerts.
     ///
-    /// A scene-less window is created on iOS 12, where scenes do not exist.
+    /// A scene-less window is created only when no scene is connected yet.
     init() {
-        #if os(visionOS)
         if let scene = OverlayWindow.activeWindowScene() {
             super.init(windowScene: scene)
         } else {
             super.init(frame: ScreenReader.screenBounds)
         }
-        #else
-        if #available(iOS 13.0, *), let scene = OverlayWindow.activeWindowScene() {
-            super.init(windowScene: scene)
-        } else {
-            super.init(frame: ScreenReader.screenBounds)
-        }
-        #endif
 
         backgroundColor = .clear
         windowLevel = .normal + 1
         isHidden = true
     }
 
-    @available(iOS 13.0, *)
     private static func activeWindowScene() -> UIWindowScene? {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         return scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
@@ -56,18 +47,22 @@ final class OverlayWindow: UIWindow {
     ///
     /// Without this the whole screen would be captured by a widget occupying a
     /// corner of it.
+    ///
+    /// A window returning nil hands the touch to the next window down. Both the
+    /// window itself and its root view have to be filtered: when no subview claims
+    /// the point `UIView.hitTest` answers with the deepest view that contains it,
+    /// and for a screen sized window with a pass-through root that is the window.
+    /// Filtering only the root view left the window as the hit, and every tap
+    /// beside a banner went nowhere.
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         let hit = super.hitTest(point, with: event)
-        return hit === rootViewController?.view ? nil : hit
+        if hit === self || hit === rootViewController?.view { return nil }
+        return hit
     }
 }
 
 /// Background view of the overlay that only claims the touches its subviews want.
 final class PassThroughBackgroundView: UIView {
-
-    /// When set, the view reports portrait dimensions whatever the device
-    /// orientation is, which is how content pinned to portrait keeps its layout.
-    var reportPortraitSizeOnly = false
 
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         for subview in subviews.reversed() {
@@ -77,14 +72,6 @@ final class PassThroughBackgroundView: UIView {
             }
         }
         return nil
-    }
-
-    /// The size content should be laid out against.
-    var effectiveSize: CGSize {
-        guard reportPortraitSizeOnly else { return bounds.size }
-        let shorter = Swift.min(bounds.width, bounds.height)
-        let longer = Swift.max(bounds.width, bounds.height)
-        return CGSize(width: shorter, height: longer)
     }
 }
 
@@ -102,11 +89,12 @@ import AppKit
 /// what keeps the application's own window key while content is on screen.
 final class OverlayWindow: NSPanel {
 
-    init() {
-        // `overlayFrame` rather than `screenBounds`: this rect positions the panel
-        // on the desktop, so it has to carry the active screen's origin or the panel
-        // lands on whichever display owns the global origin.
-        super.init(contentRect: ScreenReader.overlayFrame,
+    /// - Parameter surfaceFrame: the desktop region content is shown in, which is
+    ///   the screen or the application's own window depending on configuration.
+    ///   This rect positions the panel on the desktop, so it has to carry a real
+    ///   origin or the panel lands on whichever display owns the global origin.
+    init(surfaceFrame: CGRect) {
+        super.init(contentRect: surfaceFrame,
                    styleMask: [.borderless, .nonactivatingPanel],
                    backing: .buffered,
                    defer: false)
@@ -134,6 +122,35 @@ final class OverlayWindow: NSPanel {
     /// content is up.
     override var canBecomeMain: Bool { false }
 
+    /// Ties the overlay to the window it is covering.
+    ///
+    /// A floating panel sits above every application on the desktop, which is right
+    /// for content shown over the whole screen and wrong for content shown over one
+    /// window: bring another application forward and the overlay stays on top of
+    /// it, dimming a window it has nothing to do with.
+    ///
+    /// A child window is ordered with its parent instead. It stays above the window
+    /// it belongs to, goes behind whatever the user brings in front of that window,
+    /// and follows it between spaces and across the desktop.
+    func bind(to host: NSWindow?) {
+        guard let host else { return }
+        // Ordered with the parent from here on, so the level that lifted it above
+        // everything has to come back down or it would still win.
+        level = .normal
+        // A child window already follows its parent between spaces, and claiming
+        // all of them fights that.
+        collectionBehavior = [.fullScreenAuxiliary]
+        host.addChildWindow(self, ordered: .above)
+    }
+
+    /// Releases the overlay from the window it was bound to.
+    ///
+    /// A parent keeps its children alive and on screen, so a panel left attached
+    /// after it is closed comes back the next time that window is ordered front.
+    func unbind() {
+        parent?.removeChildWindow(self)
+    }
+
     /// AppKit's counterpart of the iOS window's `isHidden`, so the shared
     /// presentation code reads the same on both platforms.
     var isHidden: Bool {
@@ -153,28 +170,34 @@ final class OverlayWindow: NSPanel {
 /// event, which is the one place the two platforms' hit testing genuinely differ.
 final class PassThroughBackgroundView: NSView {
 
-    /// When set, the view reports portrait dimensions whatever the window shape is,
-    /// which is how content pinned to portrait keeps its layout.
-    var reportPortraitSizeOnly = false
-
     /// Top-left origin, so the geometry a content page sends means the same thing
     /// here as it does on iOS. Without this every `resize_me` would be upside down.
     override var isFlipped: Bool { true }
 
+    /// How far in from the edge clicks are handed back to whatever is underneath.
+    ///
+    /// Non-zero only when the overlay is sized to the application's own window,
+    /// where the panel lies exactly over the window's resize edges. A page drawing
+    /// a full-surface backdrop otherwise claims those few points and the user can
+    /// no longer grab the window border to resize it while content is up.
+    var passThroughEdgeMargin: CGFloat = 0
+
+    /// Whether a point falls in the border strip reserved for window resizing.
+    private func isOnResizeEdge(_ point: NSPoint) -> Bool {
+        let margin = passThroughEdgeMargin
+        return point.x <= bounds.minX + margin
+            || point.x >= bounds.maxX - margin
+            || point.y <= bounds.minY + margin
+            || point.y >= bounds.maxY - margin
+    }
+
     override func hitTest(_ point: NSPoint) -> NSView? {
         let local = convert(point, from: superview)
+        if passThroughEdgeMargin > 0, isOnResizeEdge(local) { return nil }
         for subview in subviews.reversed() {
             if let hit = subview.hitTest(convert(local, to: superview)) { return hit }
         }
         return nil
-    }
-
-    /// The size content should be laid out against.
-    var effectiveSize: CGSize {
-        guard reportPortraitSizeOnly else { return bounds.size }
-        let shorter = Swift.min(bounds.width, bounds.height)
-        let longer = Swift.max(bounds.width, bounds.height)
-        return CGSize(width: shorter, height: longer)
     }
 }
 
@@ -184,7 +207,10 @@ final class PassThroughBackgroundView: NSView {
 /// which is the same signal for the same purpose.
 final class WebViewController: NSViewController {
 
-    var sizeChangeHandler: (() -> Void)?
+    /// A macOS layout pass is already settled when it reports, so this is always
+    /// called with `true`; the parameter exists so both platforms' controllers can
+    /// be wired the same way.
+    var sizeChangeHandler: ((_ settled: Bool) -> Void)?
 
     var contentView: NSView? {
         didSet {
@@ -197,7 +223,11 @@ final class WebViewController: NSViewController {
     }
 
     override func loadView() {
-        let background = PassThroughBackgroundView(frame: ScreenReader.screenBounds)
+        // Not read from `view`: `loadView` is what creates it, so touching it here
+        // calls straight back into this method. The window resizes the content view
+        // to itself as soon as it is installed, and the autoresizing mask keeps it
+        // that way, so this initial frame only has to be non-degenerate.
+        let background = PassThroughBackgroundView(frame: ScreenReader.overlayFrame)
         background.wantsLayer = true
         background.layer?.backgroundColor = NSColor.clear.cgColor
         background.autoresizingMask = [NSView.AutoresizingMask.width, .height]
@@ -206,7 +236,7 @@ final class WebViewController: NSViewController {
 
     override func viewDidLayout() {
         super.viewDidLayout()
-        sizeChangeHandler?()
+        sizeChangeHandler?(true)
     }
 }
 #endif

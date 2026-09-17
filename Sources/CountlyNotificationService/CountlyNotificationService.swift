@@ -94,7 +94,7 @@ public enum CountlyNotificationService {
 
     public static func didReceive(_ request: UNNotificationRequest,
                                   withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void) {
-        log("didReceive, handling a notification request")
+        log("didReceive, handling a notification request, requestIdentifier: [\(request.identifier)], title: [\(request.content.title)], subtitle: [\(request.content.subtitle)], body: [\(request.content.body)], category: [\(request.content.categoryIdentifier)], userInfoKeys: [\(request.content.userInfo.keys.map { "\($0)" }.sorted())]")
 
         guard let countlyPayload = request.content.userInfo[CountlyPushKey.countlyPayload] as? [String: Any],
               let notificationID = countlyPayload[CountlyPushKey.notificationID] as? String,
@@ -103,6 +103,10 @@ public enum CountlyNotificationService {
             contentHandler(request.content)
             return
         }
+
+        let buttonTitles = (countlyPayload[CountlyPushKey.buttons] as? [[String: Any]] ?? []).map { $0[CountlyPushKey.actionButtonTitle] as? String ?? "" }
+        let buttonURLs = (countlyPayload[CountlyPushKey.buttons] as? [[String: Any]] ?? []).map { $0[CountlyPushKey.actionButtonURL] as? String ?? "" }
+        log("didReceive, Countly payload detail, countlyID: [\(notificationID)], defaultURL: [\(countlyPayload[CountlyPushKey.defaultURL] as? String ?? "none")], buttonTitles: [\(buttonTitles)], buttonURLs: [\(buttonURLs)], attachmentURL: [\(countlyPayload[CountlyPushKey.attachment] as? String ?? "none")], payload: [\(countlyPayload)]")
 
         guard let content = request.content.mutableCopy() as? UNMutableNotificationContent else {
             log("didReceive, the notification content could not be copied, passing it through unchanged")
@@ -117,9 +121,13 @@ public enum CountlyNotificationService {
 
         // Whatever has been assembled by the deadline is what gets delivered.
         // Buttons but no image beats the system giving up and delivering neither.
+        // The system reuses the extension process between notifications, so this
+        // fires for requests that went out long ago as well; those are no-ops and
+        // stay out of the log.
         DispatchQueue.global().asyncAfter(deadline: .now() + Self.overallTimeout) {
-            log("didReceive, the deadline passed, delivering whatever is ready")
-            gate.deliver()
+            if gate.deliver() {
+                log("didReceive, the deadline passed, delivering whatever is ready")
+            }
         }
 
         let buttons = countlyPayload[CountlyPushKey.buttons] as? [[String: Any]] ?? []
@@ -132,6 +140,7 @@ public enum CountlyNotificationService {
 
         registerCategory(for: buttons, notificationID: notificationID) { categoryIdentifier in
             gate.mutate { $0.categoryIdentifier = categoryIdentifier }
+            log("didReceive, the notification now carries its action buttons, category: [\(categoryIdentifier)]")
             finish(gate: gate,
                    attachmentURL: countlyPayload[CountlyPushKey.attachment] as? String,
                    notificationID: notificationID)
@@ -216,13 +225,19 @@ public enum CountlyNotificationService {
     private static func finish(gate: DeliveryGate,
                                attachmentURL: String?,
                                notificationID: String) {
-        guard let attachmentURL, !attachmentURL.isEmpty, let url = URL(string: attachmentURL) else {
+        guard let attachmentURL, !attachmentURL.isEmpty else {
             log("finish, no attachment specified in the Countly payload")
             gate.deliver()
             return
         }
 
-        log("finish, downloading the attachment specified in the Countly payload")
+        guard let url = resolveAttachmentURL(attachmentURL) else {
+            log("finish, the attachment URL in the Countly payload is not a URL, url: [\(attachmentURL)]")
+            gate.deliver()
+            return
+        }
+
+        log("finish, downloading the attachment specified in the Countly payload, url: [\(url.absoluteString)]")
 
         // A dedicated ephemeral session rather than a shared one: this runs in the
         // extension's own short lived process, and a cached or cookie carrying
@@ -238,7 +253,8 @@ public enum CountlyNotificationService {
             }
 
             if let error {
-                log("finish, attachment download failed: \(error.localizedDescription)")
+                let nsError = error as NSError
+                log("finish, attachment download failed, url: [\(url.absoluteString)], domain: [\(nsError.domain)], code: [\(nsError.code)], error: [\(error.localizedDescription)]")
                 return
             }
 
@@ -265,6 +281,29 @@ public enum CountlyNotificationService {
             }
         }
         task.resume()
+    }
+
+    /// The URL to download the attachment from, or nil when the payload's string
+    /// cannot be made into one.
+    ///
+    /// The dashboard accepts the media address as typed, and a value without a
+    /// scheme parses as a URL yet is refused by the session as unsupported, so
+    /// `https` is assumed for it. Spaces and other characters a URL cannot carry
+    /// are percent encoded as a last resort.
+    static func resolveAttachmentURL(_ string: String) -> URL? {
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let withScheme = trimmed.range(of: "://") == nil ? "https://" + trimmed : trimmed
+        if let url = URL(string: withScheme), url.host != nil {
+            return url
+        }
+
+        guard let encoded = withScheme.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: encoded), url.host != nil else {
+            return nil
+        }
+        return url
     }
 
     // MARK: - Helpers
@@ -300,19 +339,22 @@ public enum CountlyNotificationService {
             change(content)
         }
 
-        /// Hands the content to the system, at most once.
+        /// Hands the content to the system, at most once. Returns whether this call
+        /// was the one that delivered it.
         ///
         /// The content is copied under the lock, so a mutation that starts after
         /// this returns cannot touch the object the system received.
-        func deliver() {
+        @discardableResult
+        func deliver() -> Bool {
             lock.lock()
             let alreadyDelivered = delivered
             delivered = true
             let snapshot = alreadyDelivered ? nil : content.copy() as? UNNotificationContent
             lock.unlock()
 
-            guard let snapshot else { return }
+            guard let snapshot else { return false }
             contentHandler(snapshot)
+            return true
         }
     }
 

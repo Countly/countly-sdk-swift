@@ -333,29 +333,17 @@ struct LimitsEnforcer {
         return value.countlyPrefix(limits.maxValueSize)
     }
 
-    /// Applies the two stack trace limits: each frame is truncated to
-    /// `maxStackTraceLineLength`, and at most `maxStackTraceLinesPerThread` frames
-    /// are kept.
+    /// Truncates every frame of a stack trace to `maxStackTraceLineLength`.
     ///
-    /// The reference SDK accepts both settings and logs that they are placeholders
-    /// it does not apply. Android applies them, and a configuration knob that
-    /// promises behavior the SDK does not perform is worse than no knob, so this
-    /// SDK applies them too.
-    ///
-    /// The frames nearest the crash are the ones that explain it, so the cap keeps
-    /// the top of the trace and drops the tail, which is where Android cuts as
-    /// well.
+    /// The frame count is deliberately not capped. Android applies
+    /// `maxStackTraceLinesPerThread` only to the supplementary other-threads dump,
+    /// never to the exception's own trace, and this SDK records no such dump. The
+    /// crash filters read the trace after this runs, so capping it would silently
+    /// stop a filter written against a deep frame from matching.
     func truncatedStackTrace(_ frames: [String], _ explanation: String) -> [String] {
         let lineLimit = max(1, limits.maxStackTraceLineLength)
-        let frameLimit = max(1, limits.maxStackTraceLinesPerThread)
 
-        var kept = frames
-        if kept.count > frameLimit {
-            logger?.d(Self.module, "truncatedStackTrace", "stack trace exceeds the SDK stack trace line count limit and will be shortened, target: [\(explanation)], lineCount: [\(kept.count)], truncatedTo: [\(frameLimit)]")
-            kept = Array(kept.prefix(frameLimit))
-        }
-
-        return kept.map { line in
+        return frames.map { line in
             guard line.countlyLength > lineLimit else { return line }
             logger?.d(Self.module, "truncatedStackTrace", "stack trace line exceeds the SDK stack trace line length limit and will be truncated, target: [\(explanation)], lineLength: [\(line.countlyLength)], truncatedTo: [\(lineLimit)]")
             return line.countlyPrefix(lineLimit)
@@ -371,9 +359,15 @@ struct LimitsEnforcer {
     }
 
     /// Truncates every key, and every string value, of a segmentation dictionary.
+    ///
+    /// Walked in sorted key order rather than the dictionary's own order, because
+    /// two keys can truncate to the same string and only one value can survive.
+    /// Swift seeds its hashing per process, so an unordered walk would pick a
+    /// different survivor on every launch and send a different value each time.
+    /// Sorted, the later key wins, and it wins the same way on every run.
     func truncated(_ dictionary: [String: Any], _ explanation: String) -> [String: Any] {
         var result: [String: Any] = [:]
-        for (key, value) in dictionary {
+        for (key, value) in dictionary.sorted(by: { $0.key < $1.key }) {
             let newKey = truncatedKey(key, explanation + " key")
             if let stringValue = value as? String {
                 result[newKey] = truncatedValue(stringValue, explanation + " value")
@@ -385,8 +379,11 @@ struct LimitsEnforcer {
     }
 
     /// Drops entries past the configured maximum segmentation count.
+    ///
+    /// Sorted for the same reason the truncation walk is: which keys survive the
+    /// cut has to be the same on every run, and a dictionary's own order is not.
     func limited(_ dictionary: [String: Any], _ explanation: String) -> [String: Any] {
-        let keys = Array(dictionary.keys)
+        let keys = dictionary.keys.sorted()
         guard keys.count > limits.maxSegmentationValues else { return dictionary }
 
         let kept = Set(keys.prefix(limits.maxSegmentationValues))

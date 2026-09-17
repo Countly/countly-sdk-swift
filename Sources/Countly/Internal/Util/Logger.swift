@@ -44,6 +44,12 @@ final class Logger {
     /// because those counters are wire data (`el` / `wl` in the health check).
     weak var healthTracker: HealthTracker?
 
+    /// Gathers lines for the server when a live behavior settings response asks
+    /// for them. Weak: the core owns both. Capture sits above the console and
+    /// delegate gates, so an operator can read the log of a build that has
+    /// debugging off.
+    weak var gatherer: LogGatherer?
+
     /// Empty for the default instance, the instance name otherwise.
     private let instanceTag: String
 
@@ -55,10 +61,18 @@ final class Logger {
         }
     }
 
-    /// Whether a line at `level` would be emitted anywhere.
+    /// Whether a line at `level` reaches the console or the delegate. Capture is
+    /// not part of this, so it keeps its developer facing meaning.
     func isEnabled(_ requested: CountlyLogLevel) -> Bool {
         guard enableDebug || delegate != nil else { return false }
         return requested.rawValue <= level.rawValue
+    }
+
+    /// Whether anything at all wants a line at `level`: a developer facing sink,
+    /// or the log gathering capture. This is the predicate a caller consults
+    /// before building something expensive to log.
+    func isWanted(_ requested: CountlyLogLevel) -> Bool {
+        isEnabled(requested) || (gatherer?.isCapturing ?? false)
     }
 
     // MARK: - Level entry points
@@ -91,9 +105,21 @@ final class Logger {
                       _ module: String,
                       _ function: String,
                       _ message: () -> String) {
-        guard isEnabled(requested) else { return }
+        let wantsConsole = isEnabled(requested)
+        let wantsCapture = gatherer?.isCapturing ?? false
+        guard wantsConsole || wantsCapture else { return }
 
-        let line = "[\(requested.label)] \(instanceTag)[\(module)] \(function), \(message())"
+        let body = "\(instanceTag)[\(module)] \(function), \(message())"
+
+        // Captured before the level prefix is added: a gathered line carries its
+        // level in its own field and the dashboard renders it from there.
+        if wantsCapture {
+            gatherer?.capture(body, level: requested)
+        }
+
+        guard wantsConsole else { return }
+
+        let line = "[\(requested.label)] " + body
 
         // Runtime gated only. A `#if DEBUG` here would compile the console sink out
         // of every release build of the SDK, so a developer who set `enableDebug`

@@ -288,15 +288,23 @@ final class UserProfileModule: ModuleBase {
         lock.lock()
         defer { lock.unlock() }
 
-        if modifier.accumulates, let existing = customModifications[truncatedKey]?[modifier.rawValue] {
-            var accumulated = (existing as? [Any]) ?? [existing]
-            if let list = stored as? [Any] {
-                accumulated.append(contentsOf: list)
+        if modifier.accumulates {
+            // A list operation joins whatever is already staged for the key instead
+            // of replacing it, so a push followed by a pull sends both.
+            var staged = customModifications[truncatedKey] ?? [:]
+            if let existing = staged[modifier.rawValue] {
+                var accumulated = (existing as? [Any]) ?? [existing]
+                if let list = stored as? [Any] {
+                    accumulated.append(contentsOf: list)
+                } else {
+                    accumulated.append(stored)
+                }
+                staged[modifier.rawValue] = accumulated
+                logD("modify", "the operand is merged into the modification already staged for the key, modifier: [\(modifier.rawValue)], key: [\(truncatedKey)], accumulatedOperandCount: [\(accumulated.count)]")
             } else {
-                accumulated.append(stored)
+                staged[modifier.rawValue] = stored
             }
-            customModifications[truncatedKey] = [modifier.rawValue: accumulated]
-            logD("modify", "the operand is merged into the modification already staged for the key, modifier: [\(modifier.rawValue)], key: [\(truncatedKey)], accumulatedOperandCount: [\(accumulated.count)]")
+            customModifications[truncatedKey] = staged
         } else {
             if let replaced = customModifications[truncatedKey], !replaced.isEmpty {
                 logD("modify", "the modification already staged for the key is replaced and will not reach the server, key: [\(truncatedKey)], replacedModifiers: [\(replaced.keys.sorted())], modifier: [\(modifier.rawValue)]")
@@ -465,10 +473,8 @@ final class UserProfileModule: ModuleBase {
 
         var custom: [String: Any] = [:]
         if !customProperties.isEmpty {
-            // Capped by the server's user property limit rather than the
-            // segmentation one: they are configured separately and a profile can
-            // legitimately carry more properties than an event carries dimensions.
-            custom.merge(cappedCustomProperties()) { _, new in new }
+            // Both limits apply here; the modifiers below take neither, on either reference.
+            custom.merge(core.limits.limited(cappedCustomProperties(), "user details custom properties")) { _, new in new }
         }
         if !customModifications.isEmpty {
             custom.merge(customModifications) { _, new in new }

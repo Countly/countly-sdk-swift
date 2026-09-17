@@ -60,6 +60,11 @@ final class ContentModule: ModuleBase {
     /// Set from the moment the zone is entered, before the polling timer exists.
     private var isZoneEntered = false
 
+    /// Set while a journey trigger's retry series is running, so a second trigger
+    /// arriving during it does not start a series of its own. Cleared when a
+    /// content is shown or the attempts run out.
+    private var isJourneyRetrying = false
+
     /// Bumped on every enter and every clear, so work scheduled by one visit to
     /// the zone cannot land after a later exit. The initial fetch is delayed by up
     /// to `contentInitialDelay` seconds, which is a long time for an application to
@@ -196,8 +201,23 @@ final class ContentModule: ModuleBase {
             return
         }
 
+        stateLock.lock()
+        if isJourneyRetrying {
+            stateLock.unlock()
+            logD("refreshContentZoneForJourneyTrigger", "a journey content fetch is already retrying, skipping this trigger")
+            return
+        }
+        isJourneyRetrying = true
+        stateLock.unlock()
+
         clearContentState()
         fetchForJourney(attempt: 1)
+    }
+
+    private func endJourneyRetry() {
+        stateLock.lock()
+        isJourneyRetrying = false
+        stateLock.unlock()
     }
 
     private func fetchForJourney(attempt: Int) {
@@ -218,6 +238,7 @@ final class ContentModule: ModuleBase {
                 }
             } else {
                 self.logD("fetchForJourney", "the journey content fetch exhausted every attempt, re-entering the content zone")
+                self.endJourneyRetry()
                 DispatchQueue.main.async { [weak self] in self?.enterContentZone() }
             }
         }
@@ -276,6 +297,7 @@ final class ContentModule: ModuleBase {
 
         guard !isContentShown else { return (false, presentationSequence) }
         isContentShown = true
+        isJourneyRetrying = false
         presentationSequence &+= 1
         return (true, presentationSequence)
     }
@@ -370,7 +392,7 @@ final class ContentModule: ModuleBase {
 
         let request = fetchRequest(contentID: contentID)
 
-        core.network.instantSession().dataTask(with: request) { [weak self] data, response, error in
+        core.network.instantTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
 
             defer {
@@ -404,7 +426,7 @@ final class ContentModule: ModuleBase {
 
             self.logD("fetchContents", "the content details response carries a content, will present it")
             self.showContent(urlString: html, placement: payload["geo"] as? [String: Any] ?? [:])
-        }.resume()
+        }?.resume()
     }
 
     private func fetchRequest(contentID: String?) -> URLRequest {
@@ -473,7 +495,8 @@ final class ContentModule: ModuleBase {
     /// is actually going to be given. See `ContentGeometry`.
     private func windowSize() -> CGSize {
         let displayOption = core.config.content.webViewDisplayOption
-        let size = ContentGeometry.windowSize(displayOption: displayOption)
+        let size = ContentGeometry.windowSize(displayOption: displayOption,
+                                              withinApp: core.config.content.showWidgetsWithinApp)
 
         // Every part of the sum, not just its result. A page laid out against the
         // wrong size is the failure this path causes, and the result on its own
@@ -484,6 +507,31 @@ final class ContentModule: ModuleBase {
     #endif
 
     // MARK: - Presentation
+
+    /// Adds the `origin` the page's own message listener checks against.
+    ///
+    /// The server's content URL does not carry one. A content block never reads
+    /// it, but a survey served through the content queue does: its listener
+    /// accepts the host's `resize` message only when `event.origin` matches this
+    /// parameter, and silently drops it otherwise. Without it a hosted survey is
+    /// never told the surface changed and never re-anchors itself.
+    ///
+    /// The value is the page's own origin, because that is what `event.origin`
+    /// reports for a message the page posts to itself through the SDK's bridge.
+    static func appendingOrigin(to url: URL) -> URL {
+        // `URLComponents` is read only here. Writing the query back through it
+        // re-encodes every existing value, and the server's content URL is taken
+        // as given, so the parameter is appended to the string the way the theme
+        // is, leaving what was already there byte for byte.
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme, let host = components.host,
+              !(components.queryItems ?? []).contains(where: { $0.name == "origin" }) else { return url }
+
+        let port = components.port.map { ":\($0)" } ?? ""
+        let origin = "\(scheme)://\(host)\(port)".urlEscaped
+        let separator = url.query == nil ? "?" : "&"
+        return URL(string: "\(url.absoluteString)\(separator)origin=\(origin)") ?? url
+    }
 
     private func showContent(urlString: String, placement: [String: Any]) {
         #if os(iOS) || os(visionOS) || os(macOS)
@@ -518,7 +566,8 @@ final class ContentModule: ModuleBase {
 
             // The theme is resolved here, on the main thread, where reading the
             // trait collection is safe.
-            let themedURL = URL(string: DeviceMetrics.urlStringByAppendingThemeMode(urlString)) ?? url
+            let themed = DeviceMetrics.urlStringByAppendingThemeMode(urlString)
+            let themedURL = Self.appendingOrigin(to: URL(string: themed) ?? url)
 
             self.logI("showContent", "showing a content, host: [\(themedURL.host ?? "")], path: [\(themedURL.path)], frame: [\(frame.logValue)], isLandscape: [\(isLandscape)], rotationDisabled: [\(self.core.config.content.disableRotation)]")
             self.logD("showContent", "shown content placement detail, orientationKey: [\(isLandscape ? "l" : "p")], x: [\(frame.origin.x.logValue)], y: [\(frame.origin.y.logValue)], width: [\(frame.width.logValue)], height: [\(frame.height.logValue)], windowSize: [\(windowSize.logValue)]")
@@ -530,6 +579,7 @@ final class ContentModule: ModuleBase {
 
             manager.present(url: themedURL,
                             frame: frame,
+                            placement: placement,
                             appear: { [weak self] in
                                 self?.logI("showContent", "the content web view appeared on screen")
                             },

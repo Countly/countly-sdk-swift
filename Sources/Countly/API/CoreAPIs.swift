@@ -33,6 +33,8 @@ public class CountlyAPIBase {
 /// Records custom events.
 public final class EventsAPI: CountlyAPIBase {
 
+    private static let module = "Events"
+
     /// Records an event.
     ///
     /// - Parameters:
@@ -48,6 +50,18 @@ public final class EventsAPI: CountlyAPIBase {
                             sum: Double = 0,
                             duration: TimeInterval = 0) {
         core()?.modules.events.recordEvent(key, segmentation: segmentation, count: count, sum: sum, duration: duration)
+    }
+
+    /// The recorded events not yet moved into the request queue, oldest first, each
+    /// serialized the way it will be sent.
+    ///
+    /// Diagnostic surface, for a test asserting on what the SDK buffered before a
+    /// flush. Android exposes the same through `CountlyStore.getEvents`.
+    public func recordedEvents() -> [String] {
+        guard let core = core() else { return [] }
+        let events = core.modules.events.recordedEventsJSON
+        core.logger.d(Self.module, "recordedEvents", "the event queue contents were read through the public API, pendingEventCount: [\(events.count)]")
+        return events
     }
 
     /// Starts timing an event. End it with `endEvent` to record the elapsed time.
@@ -67,6 +81,65 @@ public final class EventsAPI: CountlyAPIBase {
     public func cancelEvent(_ key: String) {
         core()?.modules.events.cancelEvent(key)
     }
+
+    /// Records a reserved event, one of those the SDK normally produces itself.
+    ///
+    /// Reserved keys are how the server recognises orientation, views, feedback and
+    /// the rest. This is the way for a bridge SDK whose platform records one of
+    /// these itself, and for a test harness that needs a reserved event without
+    /// driving the UI that produces it. The event answers to the consent of the
+    /// feature it belongs to, and its segmentation is held to the SDK limits, as
+    /// the Android SDK does for every reserved key. A key that is not reserved is
+    /// recorded as an ordinary event.
+    ///
+    /// Any key is accepted, matching the reference SDK's
+    /// `recordReservedEvent:segmentation:`. That includes `[CLY]_view`, and a
+    /// synthetic view event carries a duration the server builds flow analysis
+    /// from, so a caller that forges one corrupts the dashboard for everyone
+    /// reading it. `CountlyReservedEvent` names the two keys a host has a
+    /// legitimate reason to record; prefer the overload that takes it.
+    public func recordReservedEvent(_ key: String,
+                                    segmentation: [String: Any]? = nil,
+                                    count: Int = 1,
+                                    sum: Double = 0,
+                                    duration: TimeInterval = 0) {
+        core()?.modules.events.recordReservedEventFromHost(key,
+                                                           segmentation: segmentation,
+                                                           count: count,
+                                                           sum: sum,
+                                                           duration: duration)
+    }
+
+    /// Records a reserved event named by `CountlyReservedEvent` rather than by a
+    /// raw key, so the call site cannot misspell it or reach a key it should not.
+    public func recordReservedEvent(_ event: CountlyReservedEvent,
+                                    segmentation: [String: Any]? = nil,
+                                    count: Int = 1,
+                                    sum: Double = 0,
+                                    duration: TimeInterval = 0) {
+        recordReservedEvent(event.key,
+                            segmentation: segmentation,
+                            count: count,
+                            sum: sum,
+                            duration: duration)
+    }
+}
+
+/// The reserved events a host has a legitimate reason to record itself.
+///
+/// Not a restriction: `recordReservedEvent` also takes a plain string, as the
+/// reference SDK does. This names the safe subset so a call site can say what it
+/// means. The raw values are the wire keys.
+public enum CountlyReservedEvent: String, CaseIterable, Sendable {
+
+    /// Interface orientation, segmented by `mode`.
+    case orientation = "[CLY]_orientation"
+
+    /// Result of a rating widget. The wire key is historical.
+    case ratingWidget = "[CLY]_star_rating"
+
+    /// The wire key, for a caller that needs it.
+    public var key: String { rawValue }
 }
 
 // MARK: - Sessions
@@ -91,6 +164,10 @@ public final class SessionsAPI: CountlyAPIBase {
     /// Reports the time elapsed since the last update.
     public func updateSession() {
         guard let core = core(), allowed(core, "updateSession") else { return }
+        guard !core.config.enableManualSessionControlHybridMode else {
+            core.logger.w(Self.module, "updateSession", "the call will be ignored since manual session control hybrid mode is enabled, session updates are sent by the timer")
+            return
+        }
         core.logger.i(Self.module, "updateSession", "a session update was requested through the manual sessions API")
         core.modules.sessions.updateSession()
     }
@@ -417,6 +494,37 @@ public final class RequestQueueAPI: CountlyAPIBase {
         let queued = core.requestQueueStore.count
         core.logger.d(Self.module, "count", "the request queue size was read through the public API, queuedRequestCount: [\(queued)]")
         return queued
+    }
+
+    /// Every queued request, oldest first, as the query strings they will be sent as.
+    ///
+    /// Diagnostic surface, for a test asserting on what the SDK actually queued.
+    /// Android exposes the same through `CountlyStore.getRequests`. Reading it does
+    /// not change the queue.
+    public func queuedRequests() -> [String] {
+        guard let core = core() else { return [] }
+        let queued = core.requestQueueStore.snapshot
+        core.logger.d(Self.module, "queuedRequests", "the request queue contents were read through the public API, queuedRequestCount: [\(queued.count)]")
+        return queued
+    }
+
+    /// Appends a request to the queue exactly as given.
+    ///
+    /// Diagnostic surface, the counterpart to ``queuedRequests()`` and the mirror
+    /// of `CountlyStore.addRequest` on Android. Unlike a recorded event this skips
+    /// the app version stamping, so the string reaches the wire as written, which
+    /// is the point for a test. The queue's size and age limits still apply, and
+    /// like every other request it is refused while the server has tracking
+    /// disabled.
+    public func store(_ queryString: String) {
+        guard let core = core() else { return }
+        guard core.serverConfig.trackingEnabled else {
+            core.logger.w(Self.module, "store", "tracking is disabled by the server config, the request is not stored")
+            return
+        }
+        core.logger.i(Self.module, "store", "a request is being stored verbatim through the public API, queryStringLength: [\(queryString.count)]")
+        core.requestQueueStore.appendVerbatim(queryString)
+        core.requestQueueStore.saveSync()
     }
 
     /// Sends everything that is waiting, right now.

@@ -25,6 +25,8 @@ final class MockURLProtocol: URLProtocol {
         let url: URL
         let method: String
         let body: String
+        /// Every header on the request, the session's additional headers included.
+        let headers: [String: String]
 
         /// Everything after the `?`, or the body for a POST. Every test that looks
         /// at what went over the wire reads this.
@@ -39,6 +41,10 @@ final class MockURLProtocol: URLProtocol {
     /// Answers one request. Returning `nil` falls through to the default failure.
     typealias Handler = (Captured) -> (status: Int, body: Data)?
 
+    /// Fails one request with a specific transport error. Returning `nil` lets the
+    /// response handlers answer instead.
+    typealias FailureHandler = (Captured) -> URLError.Code?
+
     /// How long the next answers take to arrive.
     ///
     /// The SDK measures how long a request took and backs off when the server is
@@ -48,6 +54,7 @@ final class MockURLProtocol: URLProtocol {
 
     private static let lock = NSLock()
     private static var handlers: [Handler] = []
+    private static var failureHandlers: [FailureHandler] = []
     private static var captured: [Captured] = []
 
     // MARK: - Test API
@@ -58,6 +65,14 @@ final class MockURLProtocol: URLProtocol {
         lock.lock()
         defer { lock.unlock() }
         handlers.insert(handler, at: 0)
+    }
+
+    /// Fails the requests this handler recognizes with the error code it returns,
+    /// for tests that need a timeout or a refused connection rather than a status.
+    static func fail(with handler: @escaping FailureHandler) {
+        lock.lock()
+        defer { lock.unlock() }
+        failureHandlers.insert(handler, at: 0)
     }
 
     /// Answers every request whose path contains `pathFragment` with `json`.
@@ -96,6 +111,7 @@ final class MockURLProtocol: URLProtocol {
         lock.lock()
         defer { lock.unlock() }
         handlers.removeAll()
+        failureHandlers.removeAll()
         captured.removeAll()
         responseDelay = 0
     }
@@ -128,17 +144,25 @@ final class MockURLProtocol: URLProtocol {
 
         let captured = Captured(url: request.url ?? URL(string: "about:blank")!,
                                 method: request.httpMethod ?? "GET",
-                                body: body)
+                                body: body,
+                                headers: request.allHTTPHeaderFields ?? [:])
 
         MockURLProtocol.lock.lock()
         MockURLProtocol.captured.append(captured)
         let handlers = MockURLProtocol.handlers
+        let failureHandlers = MockURLProtocol.failureHandlers
         MockURLProtocol.lock.unlock()
 
         // Sleeping on the protocol's own loading thread rather than hopping, so the
         // SDK sees one slow request rather than an out-of-order one.
         let delay = MockURLProtocol.responseDelay
         if delay > 0 { Thread.sleep(forTimeInterval: delay) }
+
+        for handler in failureHandlers {
+            guard let code = handler(captured) else { continue }
+            client?.urlProtocol(self, didFailWithError: URLError(code))
+            return
+        }
 
         for handler in handlers {
             guard let (status, data) = handler(captured) else { continue }

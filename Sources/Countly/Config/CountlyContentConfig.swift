@@ -60,8 +60,34 @@ public final class CountlyContentConfig {
     /// The shortest polling interval the SDK accepts, in seconds.
     static let minimumZoneTimerInterval = 15
 
-    /// Layout of the content and feedback web views. Default `.immersive`.
-    public var webViewDisplayOption: WebViewDisplayOption = .immersive
+    /// Corner radius of the overlay, in points, or `nil` to take the window's own.
+    ///
+    /// Only has an effect alongside `showWidgetsWithinApp`, where the overlay is
+    /// sized to the application's window and has to be shaped like it: a page that
+    /// paints a full-surface backdrop otherwise draws square corners over the
+    /// window's curved ones.
+    ///
+    /// Left `nil`, the SDK reads the radius from the window at presentation time,
+    /// which is right for a standard window on any macOS version and needs no
+    /// configuration. Set it when the application gives its window a shape of its
+    /// own, since nothing the SDK can read will describe that.
+    public var overlayCornerRadius: CGFloat?
+
+    /// Layout of the content and feedback web views. Default `.immersive`, except
+    /// `.safeArea` on macOS.
+    ///
+    /// Immersive draws under the status bar and the home indicator, which is what
+    /// the Android and Objective-C SDKs do by default. A hardware cutout is always
+    /// kept clear whatever the option says. `.safeArea` keeps the page inside the
+    /// safe area instead. On macOS the option only names where the panel sits, so
+    /// it stays inside the visible frame, clear of the menu bar and the Dock.
+    public var webViewDisplayOption: WebViewDisplayOption = {
+        #if os(macOS)
+        return .safeArea
+        #else
+        return .immersive
+        #endif
+    }()
 
     /// Reloads the content web view when a load stalls instead of closing it.
     ///
@@ -87,6 +113,19 @@ public final class CountlyContentConfig {
     /// Lets the host application take over links opened from the content web
     /// view, which is how an app routes its own deep links.
     public var contentURLHandler: ContentURLHandler?
+
+    /// Shows content and feedback widgets inside the application's own window
+    /// rather than over the whole screen.
+    ///
+    /// Off by default, which lays everything out against the screen the application
+    /// is on, minus the menu bar and the Dock. Turn it on to keep everything the
+    /// SDK draws within the application, so it moves with the window and never
+    /// paints over anything else. Falls back to the screen when the application has
+    /// no window to measure, which is an agent or a menu bar application.
+    ///
+    /// Has no effect where the application already fills the screen, which is every
+    /// platform except macOS.
+    public var showWidgetsWithinApp: Bool = false
 
     public init() {}
 }

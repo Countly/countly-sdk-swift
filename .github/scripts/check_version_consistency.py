@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Fails the build when the SDK version is not the same in all three places that carry it.
+"""Fails the build when the SDK version is not the same in both places that carry it.
 
 The version travels to the server as `sdk_version` on every request, so the value in the
-sources is the one that matters. The podspec and the changelog are separate hand maintained
-copies of it, and a release where they disagree is a release where the dashboard reports a
-version nobody shipped.
+sources is the one that matters. The changelog is a separate hand maintained copy of it, and
+a release where they disagree is a release where the dashboard reports a version nobody
+shipped.
 """
 
 import re
@@ -14,7 +14,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 SOURCE = ROOT / "Sources/Countly/Internal/CountlyConsts.swift"
-PODSPEC = ROOT / "CountlySwift.podspec"
 CHANGELOG = ROOT / "CHANGELOG.md"
 
 
@@ -37,11 +36,6 @@ def main():
         r'static\s+let\s+version\s*=\s*"([^"]+)"',
         read(SOURCE), SOURCE, "SDK version",
     )
-    # `s.version = '26.8.0'`
-    podspec = find(
-        r"""\.version\s*=\s*['"]([^'"]+)['"]""",
-        read(PODSPEC), PODSPEC, "pod version",
-    )
     # The newest changelog heading, which is the version being prepared or just released.
     changelog = find(
         r"^##\s*([0-9]+\.[0-9]+\.[0-9]+)\s*$",
@@ -50,7 +44,6 @@ def main():
 
     found = {
         "Sources/Countly/Internal/CountlyConsts.swift": source,
-        "CountlySwift.podspec": podspec,
         "CHANGELOG.md": changelog,
     }
 
@@ -63,7 +56,7 @@ def main():
             % ", ".join("%s=%s" % item for item in found.items())
         )
 
-    print("\nAll three agree on %s." % source)
+    print("\nBoth agree on %s." % source)
 
 
 if __name__ == "__main__":

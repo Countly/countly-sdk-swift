@@ -24,11 +24,11 @@ enum ContentGeometry {
 
 #if os(macOS)
 
-    /// The overlay is a panel of its own and `ScreenReader.screenBounds` is already
-    /// the screen's visible frame, with the menu bar and the Dock taken out, so
-    /// there is nothing further to subtract.
-    static func windowSize(displayOption: WebViewDisplayOption) -> CGSize {
-        ScreenReader.screenBounds.size
+    /// The overlay is a panel of its own and the surface frame already has the menu
+    /// bar and the Dock taken out, so there is nothing further to subtract.
+    static func windowSize(displayOption: WebViewDisplayOption,
+                           withinApp: Bool = false) -> CGSize {
+        ScreenReader.surfaceFrame(withinApp: withinApp).size
     }
 
     /// Nothing to clear: the size above had nothing removed from it.
@@ -63,7 +63,13 @@ enum ContentGeometry {
         return "top=\(insets.top.logValue) left=\(insets.left.logValue) bottom=\(insets.bottom.logValue) right=\(insets.right.logValue)"
     }
 
-    static func windowSize(displayOption: WebViewDisplayOption) -> CGSize {
+    /// - Parameter withinApp: accepted and ignored. On these platforms the
+    ///   application's window is the screen, so there is no distinction to draw
+    ///   between showing content over one and over the other. It is in the
+    ///   signature so that callers shared with macOS need no conditional of their
+    ///   own, which is what left this build broken once already.
+    static func windowSize(displayOption: WebViewDisplayOption,
+                           withinApp: Bool = false) -> CGSize {
         // Falls back to the screen when there is no window to read, which is the
         // one case where the insets are unknowable. Reporting a zero size instead
         // would have the server lay the content out against nothing.
@@ -134,10 +140,7 @@ enum ContentGeometry {
 
     private static var interfaceOrientation: UIInterfaceOrientation {
         #if os(iOS)
-        if #available(iOS 13.0, *) {
-            return window?.windowScene?.interfaceOrientation ?? .portrait
-        }
-        return UIApplication.shared.statusBarOrientation
+        return window?.windowScene?.interfaceOrientation ?? .portrait
         #else
         // visionOS has no device orientation, so a window is never rotated away
         // from the cutout-free case.

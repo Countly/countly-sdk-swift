@@ -38,19 +38,7 @@ This SDK supports the following features:
 .package(url: "https://github.com/Countly/countly-sdk-swift.git", from: "26.8.0")
 ```
 
-### CocoaPods
-
-```ruby
-pod 'CountlySwift', '~> 26.8'
-```
-
-Rich push notifications need the notification service extension subspec in your extension target:
-
-```ruby
-target 'YourNotificationServiceExtension' do
-  pod 'CountlySwift/NotificationService', '~> 26.8'
-end
-```
+Rich push notifications need the `CountlyNotificationService` library linked into your notification service extension target, alongside `Countly` in the app target.
 
 ## Minimal integration
 
@@ -117,7 +105,7 @@ class NotificationService: UNNotificationServiceExtension {
 
 ## Requirements
 
-iOS 12, tvOS 12, watchOS 4, macOS 10.14, visionOS 1. Swift 5.9.
+iOS 15, tvOS 15, watchOS 9, macOS 12, visionOS 1. Swift 5.9. These are the oldest deployment targets Xcode 27 builds for.
 
 ## Security
 

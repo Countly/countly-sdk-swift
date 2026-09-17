@@ -522,7 +522,7 @@ final class RemoteConfigTests: CountlyBaseTestCase {
     /// In temporary mode the SDK does not know who the user is, so it must not ask
     /// the server anything about them or write anything against them.
     func testNothingReachesTheNetworkInTemporaryDeviceIDMode() {
-        let countly = startInstance { $0.temporaryDeviceIDMode = true }
+        let countly = startInstance { $0.temporaryDeviceIDMode = true; $0.deviceID = nil }
 
         expectCompletion("the download reports back") { done in
             countly.remoteConfig.downloadKeys { result, _, _, _ in

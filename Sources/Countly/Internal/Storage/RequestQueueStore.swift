@@ -117,21 +117,42 @@ final class RequestQueueStore {
         lock.lock()
         defer { lock.unlock() }
 
-        if requests.count >= storedRequestsLimit {
-            removeOldAgeRequestsLocked()
-
-            if requests.count >= storedRequestsLimit {
-                // Drop at most one loop limit's worth per pass, plus the one slot
-                // this request needs.
-                let exceeded = requests.count - storedRequestsLimit
-                let removeCount = min(min(exceeded, Self.removalLoopLimit) + 1, requests.count)
-                logger?.d(Self.module, "enqueue", "the oldest queued requests are dropped because the queue is over its limit, queuedRequestCount: [\(requests.count)], storedRequestsLimit: [\(storedRequestsLimit)], droppedRequestCount: [\(removeCount)], exceededBy: [\(exceeded)]")
-                requests.removeFirst(removeCount)
-            }
-        }
-
+        trimToLimitLocked()
         requests.append(stamped)
         logger?.d(Self.module, "enqueue", "request is stored in the queue, queryStringLength: [\(stamped.count)], queuedRequestCount: [\(requests.count)], storedRequestsLimit: [\(storedRequestsLimit)]")
+    }
+
+    /// Makes room for one more request, dropping the oldest when the queue is at
+    /// its limit. The caller holds the lock.
+    private func trimToLimitLocked() {
+        guard requests.count >= storedRequestsLimit else { return }
+
+        removeOldAgeRequestsLocked()
+        guard requests.count >= storedRequestsLimit else { return }
+
+        let exceeded = requests.count - storedRequestsLimit
+        let removeCount = min(min(exceeded, Self.removalLoopLimit) + 1, requests.count)
+        logger?.d(Self.module, "trimToLimitLocked", "the oldest queued requests are dropped because the queue is over its limit, queuedRequestCount: [\(requests.count)], storedRequestsLimit: [\(storedRequestsLimit)], droppedRequestCount: [\(removeCount)], exceededBy: [\(exceeded)]")
+        requests.removeFirst(removeCount)
+    }
+
+    /// Appends a request exactly as given, skipping the app version stamping and
+    /// the tracking check `enqueue` applies.
+    ///
+    /// The size and age trimming still applies. See ``RequestQueueAPI/store(_:)``
+    /// for why this path exists.
+    func appendVerbatim(_ queryString: String) {
+        guard !queryString.isEmpty else {
+            logger?.d(Self.module, "appendVerbatim", "an empty request was not stored")
+            return
+        }
+
+        lock.lock()
+        defer { lock.unlock() }
+
+        trimToLimitLocked()
+        requests.append(queryString)
+        logger?.d(Self.module, "appendVerbatim", "a request was stored verbatim, queryStringLength: [\(queryString.count)], queuedRequestCount: [\(requests.count)]")
     }
 
     /// Removes the request at the head of the queue, but only if it still is the

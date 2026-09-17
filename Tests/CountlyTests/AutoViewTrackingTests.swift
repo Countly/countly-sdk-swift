@@ -73,6 +73,45 @@ final class AutoViewTrackingTests: CountlyBaseTestCase {
         }
     }
 
+    // MARK: - Consent withdrawal
+
+    /// Withdrawing view consent reports the screen open at the time, which only
+    /// works while the consent flag still stands.
+    func testWithdrawingViewConsentReportsTheScreenThatWasOpen() {
+        let countly = trackingInstance {
+            $0.requiresConsent = true
+            $0.consents = [.events, .viewTracking]
+        }
+
+        appear(TitledViewController(named: "OpenWhenConsentWentAway"))
+        XCTAssertEqual(names(of: countly), ["OpenWhenConsentWentAway"], "the screen should have opened")
+
+        countly.consent.cancelConsent(for: .viewTracking)
+
+        let closed = viewEvents(of: countly).filter {
+            ($0["segmentation"] as? [String: Any])?[SegKey.name] as? String == "OpenWhenConsentWentAway"
+        }
+        XCTAssertEqual(closed.count, 2, "the open screen should be closed and reported while consent still stands")
+    }
+
+    /// A re-grant must not report the same screen again with a duration covering
+    /// the opted-out window.
+    func testRegrantingViewConsentDoesNotReportAScreenFromTheOptedOutWindow() {
+        let countly = trackingInstance {
+            $0.requiresConsent = true
+            $0.consents = [.events, .viewTracking]
+        }
+
+        appear(TitledViewController(named: "OpenedBeforeTheWithdrawal"))
+        countly.consent.cancelConsent(for: .viewTracking)
+        let afterWithdrawal = viewEvents(of: countly).count
+
+        countly.consent.giveConsent(for: .viewTracking)
+
+        XCTAssertEqual(viewEvents(of: countly).count, afterWithdrawal,
+                       "re-granting consent must not report a screen that spans the opted out window")
+    }
+
     // MARK: - Naming a screen
 
     func testAScreenIsNamedByItsTitle() {

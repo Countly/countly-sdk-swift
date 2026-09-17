@@ -642,7 +642,9 @@ final class ViewsModule: ModuleBase {
     ///
     /// Deduplicated: rotation notifications fire more often than the orientation
     /// actually changes, and a repeated event would inflate the numbers.
-    func recordOrientation() {
+    /// Records the interface orientation when it changed, or whenever `force` is set,
+    /// which a session start uses so every `begin_session` carries one.
+    func recordOrientation(force: Bool = false) {
         #if os(iOS)
         guard core.config.enableOrientationTracking else {
             logD("recordOrientation", "orientation tracking is disabled by the init config, orientation recording will be ignored")
@@ -659,7 +661,7 @@ final class ViewsModule: ModuleBase {
             return
         }
 
-        guard mode != lastInterfaceOrientation else {
+        guard force || mode != lastInterfaceOrientation else {
             logV("recordOrientation", "interface orientation did not change, orientation event will be skipped, mode: [\(mode)]")
             return
         }
@@ -682,15 +684,7 @@ final class ViewsModule: ModuleBase {
     /// Read from the interface rather than the device, because a device lying flat
     /// reports face up while the interface is still portrait or landscape.
     private func currentOrientationMode() -> String? {
-        var orientation: UIInterfaceOrientation?
-
-        if #available(iOS 13.0, *) {
-            orientation = ScreenReader.keyWindow?.windowScene?.interfaceOrientation
-        } else {
-            orientation = UIApplication.shared.statusBarOrientation
-        }
-
-        guard let orientation else { return nil }
+        guard let orientation = ScreenReader.keyWindow?.windowScene?.interfaceOrientation else { return nil }
         if orientation.isPortrait { return "portrait" }
         if orientation.isLandscape { return "landscape" }
         return nil
@@ -700,6 +694,12 @@ final class ViewsModule: ModuleBase {
     // MARK: - Lifecycle
 
     func applicationWillEnterForeground() {
+        // Android re-reads the orientation on every activity start, not only at
+        // launch, so a device rotated while the app was away is reported on the way
+        // back in. The dedup against the last recorded mode keeps this quiet when
+        // nothing changed.
+        recordOrientation()
+
         #if os(iOS) || os(tvOS)
         if !isAutoViewTrackingActive, isManualViewRestartActive {
             logD("applicationWillEnterForeground", "app entered foreground with manual view restart active, stopped views will be started automatically")

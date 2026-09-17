@@ -28,6 +28,28 @@ final class ConnectionManager: NSObject {
     private let stateLock = NSLock()
     private var isProcessingQueue = false
     private var isBackingOff = false
+
+    /// Whether the drain is paused by the backoff mechanism.
+    ///
+    /// For the suite: the pause starts inside the response handling that also
+    /// empties the queue, so a test that infers it from an empty queue races the
+    /// flag and can see the next request leave.
+    var isBackingOffForTesting: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return isBackingOff
+    }
+
+    /// Whether a drain is in progress.
+    ///
+    /// For the suite: a drain asked for while a send is in flight is refused, so a
+    /// test has to let that send settle before installing the answer the next one
+    /// should get.
+    var isProcessingQueueForTesting: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return isProcessingQueue
+    }
     private var currentTask: URLSessionTask?
 
     /// When the current drain of the queue started, used to time it and to decide
@@ -216,7 +238,20 @@ final class ConnectionManager: NSObject {
         releaseProcessing()
     }
 
+    /// Sends the head of the queue.
+    ///
+    /// Lines logged while sending a gathered log batch are not gathered, or every
+    /// tick would upload a batch about the last one. The caller may already be
+    /// marked, since the delivery loop lands here synchronously, so the mark is
+    /// restored on the way out.
     private func send(head: String) {
+        let isSdkLogsTransport = head.contains("&\(QS.sdkLogs)=")
+        core.logGatherer.markingTransportWork(isSdkLogsTransport) {
+            sendMarked(head: head, isSdkLogsTransport: isSdkLogsTransport)
+        }
+    }
+
+    private func sendMarked(head: String, isSdkLogsTransport: Bool) {
         var queryString = head
         var endpoint = Endpoint.input
 
@@ -236,8 +271,9 @@ final class ConnectionManager: NSObject {
         queryString = builder.appendRemainingRequestCount(queryString)
 
         // Checked with a substring first: resolving it means decoding the whole
-        // query, and only a profile picture save ever carries one.
-        let pictureUpload = queryString.contains(QS.userDetails) ? pictureUploadData(for: queryString) : nil
+        // query, and only a profile picture save ever carries one. The key is
+        // matched as a parameter, because a gathered log batch can quote its name.
+        let pictureUpload = queryString.contains("&\(QS.userDetails)=") ? pictureUploadData(for: queryString) : nil
         if pictureUpload == nil {
             queryString = builder.appendChecksum(queryString)
         }
@@ -248,11 +284,7 @@ final class ConnectionManager: NSObject {
         // The core is captured strongly for the life of the callback: it is held
         // `unowned` on this class, and `halt()` can release it while a request is
         // still in flight.
-        // Held from here until the completion has finished dealing with the
-        // response, which is where the head is removed and the queue written.
-        BackgroundTaskGuard.shared.begin()
-
-        let task = session().dataTask(with: request) { [weak self, core] data, response, error in
+        let completion: (Data?, URLResponse?, Error?) -> Void = { [weak self, core] data, response, error in
             defer { BackgroundTaskGuard.shared.end() }
             guard let self else { return }
             _ = core
@@ -260,34 +292,49 @@ final class ConnectionManager: NSObject {
             self.currentTask = nil
             self.stateLock.unlock()
 
-            let elapsed = Date().timeIntervalSince(startedAt)
-            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            // The completion runs on a session thread of its own, which has to be
+            // marked in turn while it deals with a gathered log batch.
+            self.core.logGatherer.markingTransportWork(isSdkLogsTransport) {
+                let elapsed = Date().timeIntervalSince(startedAt)
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
-            if response != nil {
-                self.core.logger.d(Self.module, "proceedOnQueue", "response received, endpoint: [\(request.url?.path ?? "")], statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], duration: [\(elapsed.logSeconds)]")
-            }
+                if response != nil {
+                    self.core.logger.d(Self.module, "proceedOnQueue", "response received, endpoint: [\(request.url?.path ?? "")], statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], duration: [\(elapsed.logSeconds)]")
+                }
 
-            if let error {
-                self.handleTransportFailure(error: error, request: request, callback: callback, callbackID: callbackID)
-                return
-            }
+                if let error {
+                    self.handleTransportFailure(error: error, request: request, callback: callback, callbackID: callbackID)
+                    return
+                }
 
-            if self.isRequestSuccessful(response: response, data: data, endpoint: endpoint) {
-                self.handleSuccess(head: head,
-                                   queryString: queryString,
-                                   elapsed: elapsed,
-                                   request: request,
-                                   callback: callback,
-                                   callbackID: callbackID,
-                                   response: response)
-            } else {
-                self.handleServerFailure(statusCode: statusCode,
-                                         data: data,
-                                         request: request,
-                                         callback: callback,
-                                         callbackID: callbackID)
+                if self.isRequestSuccessful(response: response, data: data, endpoint: endpoint) {
+                    self.handleSuccess(head: head,
+                                       queryString: queryString,
+                                       elapsed: elapsed,
+                                       request: request,
+                                       callback: callback,
+                                       callbackID: callbackID,
+                                       response: response)
+                } else {
+                    self.handleServerFailure(statusCode: statusCode,
+                                             data: data,
+                                             request: request,
+                                             callback: callback,
+                                             callbackID: callbackID)
+                }
             }
         }
+
+        guard let task = queuedTask(with: request, completionHandler: completion) else {
+            core.logger.d(Self.module, "proceedOnQueue", "the request at the head of the queue is not sent, the connection manager was halted while the drain was running, endpoint: [\(request.url?.path ?? "")]")
+            drainStartTime = nil
+            releaseProcessing()
+            return
+        }
+
+        // Held from here until the completion has finished dealing with the
+        // response, which is where the head is removed and the queue written.
+        BackgroundTaskGuard.shared.begin()
 
         stateLock.lock()
         currentTask = task
@@ -445,14 +492,39 @@ final class ConnectionManager: NSObject {
         isBackingOff = true
         stateLock.unlock()
 
-        DispatchQueue.global(qos: .default).asyncAfter(deadline: .now() + .seconds(duration)) { [weak self] in
+        DispatchQueue.global(qos: .default).asyncAfter(deadline: .now() + .seconds(duration)) { [weak self, core] in
             guard let self else { return }
+            _ = core
             self.core.logger.d(Self.module, "startBackoffCountdown", "backoff countdown is finished, resuming queue processing on a background thread")
             self.stateLock.lock()
             self.isBackingOff = false
             self.stateLock.unlock()
             self.proceedOnQueue()
         }
+    }
+
+    // MARK: - Operator armed diagnostics
+
+    /// Queues one connection test report as its own request.
+    ///
+    /// No consent gate, by cross SDK rule: the report describes the network the
+    /// device is on, not the user, and the health check bypasses consent on the
+    /// same grounds. The queue's own rules still govern it.
+    func sendConnectionTestResults(_ resultsJSON: String) {
+        guard enqueueDiagnostic(key: QS.connectionTestResults, payload: resultsJSON) else {
+            core.logger.d(Self.module, "sendConnectionTestResults", "the connection test report is dropped, the instance is halted or tracking is disabled, reportLength: [\(resultsJSON.count)]")
+            return
+        }
+        core.logger.d(Self.module, "sendConnectionTestResults", "the connection test report is queued, reportLength: [\(resultsJSON.count)]")
+    }
+
+    /// Queues one operator armed diagnostic payload as its own request and starts
+    /// a drain. Returns whether the store took it: a halted instance and tracking
+    /// switched off are the two reasons it would not.
+    private func enqueueDiagnostic(key: String, payload: String) -> Bool {
+        guard core.hasStarted, core.serverConfig.trackingEnabled else { return false }
+        enqueueAndProceed("\(builder.queryEssentials())&\(key)=\(payload.urlEscaped)")
+        return true
     }
 
     // MARK: - Crash reports
@@ -485,15 +557,10 @@ final class ConnectionManager: NSObject {
             return
         }
 
-        // Stops the event and end-session requests below from starting a drain
-        // that would race the crash report out of order.
+        // Stops anything else from starting a drain that would race the crash
+        // report. Only the crash leaves at crash time: recorded events and the
+        // running session stay on disk and are reported on the next launch.
         core.isCrashing = true
-
-        core.modules.events.sendEventsWithSaveIfNeeded()
-
-        if core.serverConfig.automaticSessionTrackingEnabled {
-            core.modules.sessions.endSession()
-        }
 
         if core.modules.deviceID.isTemporary {
             core.logger.d(Self.module, "sendCrashReport", "crash report is stored to be sent later, reason: device ID is the temporary device ID, crashReportLength: [\(report.count)]")
@@ -521,9 +588,10 @@ final class ConnectionManager: NSObject {
         core.logger.i(Self.module, "sendCrashReport", "sending crash report immediately, endpoint: [\(Endpoint.input)], method: [POST], bodySize: [\(request.httpBody?.count ?? 0)]")
 
         let semaphore = DispatchSemaphore(value: 0)
-        session().dataTask(with: request) { [weak self] data, response, error in
+        let completion: (Data?, URLResponse?, Error?) -> Void = { [weak self, core] data, response, error in
             defer { semaphore.signal() }
             guard let self else { return }
+            _ = core
 
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             if error != nil || !self.isRequestSuccessful(response: response, data: data, endpoint: Endpoint.input) {
@@ -533,7 +601,15 @@ final class ConnectionManager: NSObject {
             } else {
                 self.core.logger.d(Self.module, "sendCrashReport", "immediate crash report request completed successfully, endpoint: [\(request.url?.path ?? "")], responseSize: [\(data?.count ?? 0)]")
             }
-        }.resume()
+        }
+
+        guard let task = queuedTask(with: request, completionHandler: completion) else {
+            core.logger.d(Self.module, "sendCrashReport", "the connection manager is halted, the crash report is queued instead")
+            enqueue(queryString)
+            core.requestQueueStore.saveSync()
+            return
+        }
+        task.resume()
 
         logRequest(request)
         semaphore.wait()
@@ -644,7 +720,9 @@ final class ConnectionManager: NSObject {
     /// Used for the two parameters that are instructions to the SDK rather than
     /// data for the server: the endpoint override and the callback ID.
     private func extractAndRemoveParameter(_ queryString: inout String, parameter: String) -> String? {
-        guard queryString.contains(parameter) else { return nil }
+        // Matched as a parameter, not as text: a gathered log batch can quote the
+        // parameter's name, and a false match here would raise a warning per batch.
+        guard queryString.contains("&\(parameter)=") else { return nil }
 
         guard let value = queryString.valueForQueryStringKey(parameter) else {
             core.logger.w(Self.module, "extractAndRemoveParameter", "parameter is present in the query string but its value could not be extracted, parameter: [\(parameter)]")
@@ -732,6 +810,57 @@ final class ConnectionManager: NSObject {
         core.logger.v(Self.module, "logRequest", "request detail, method: [\(request.httpMethod ?? "GET")], URL: [\(request.url?.absoluteString ?? "")], body: [\(request.httpBody.flatMap { String(data: $0, encoding: .utf8) } ?? "binary picture upload data")]")
     }
 
+    // MARK: - Tasks
+
+    /// Set by ``halt()`` and never cleared, unlike the sessions `reset()` drops and
+    /// `session()` rebuilds. Guarded by `sessionLock`.
+    private var isHalted = false
+
+    /// Refuses every further send, then resets.
+    ///
+    /// `reset()` on its own is what a configuration change does, and sending has
+    /// to work again after that, so it cannot be the thing that closes the door.
+    /// Runs before the modules halt: their flushes then land in the queue for the
+    /// next start instead of racing the session teardown, which could put a
+    /// request on the wire that is also kept and sent again.
+    func halt() {
+        sessionLock.lock()
+        isHalted = true
+        sessionLock.unlock()
+        reset()
+    }
+
+    /// A task on the queued-requests session, or nil once this manager is halted.
+    ///
+    /// Created under `sessionLock`: a session looked up and handed back can be
+    /// invalidated by `discardSessions()` before the task is made, and `URLSession`
+    /// answers that with an exception nothing in Swift can catch. A battery or a
+    /// backoff countdown finishing on a background queue after `halt()` is how that
+    /// happened.
+    func queuedTask(with request: URLRequest,
+                    completionHandler: @escaping (Data?, URLResponse?, Error?) -> Void) -> URLSessionDataTask? {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        guard !isHalted else {
+            core.logger.d(Self.module, "queuedTask", "the request is not sent, the connection manager is halted, endpoint: [\(request.url?.path ?? "")]")
+            return nil
+        }
+        return queuedSessionLocked().dataTask(with: request, completionHandler: completionHandler)
+    }
+
+    /// The counterpart of ``queuedTask(with:completionHandler:)`` on the instant
+    /// session, for the requests that skip the queue.
+    func instantTask(with request: URLRequest,
+                     completionHandler: @escaping (Data?, URLResponse?, Error?) -> Void) -> URLSessionDataTask? {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        guard !isHalted else {
+            core.logger.d(Self.module, "instantTask", "the request is not sent, the connection manager is halted, endpoint: [\(request.url?.path ?? "")]")
+            return nil
+        }
+        return instantSessionLocked().dataTask(with: request, completionHandler: completionHandler)
+    }
+
     // MARK: - Sessions
 
     /// The session used for queued requests. Rebuilt when the configuration
@@ -739,7 +868,11 @@ final class ConnectionManager: NSObject {
     func session() -> URLSession {
         sessionLock.lock()
         defer { sessionLock.unlock() }
+        return queuedSessionLocked()
+    }
 
+    /// Returns or builds the queued session. The caller holds `sessionLock`.
+    private func queuedSessionLocked() -> URLSession {
         if let urlSession { return urlSession }
 
         let configuration = core.config.urlSessionConfiguration
@@ -764,7 +897,11 @@ final class ConnectionManager: NSObject {
     func instantSession() -> URLSession {
         sessionLock.lock()
         defer { sessionLock.unlock() }
+        return instantSessionLocked()
+    }
 
+    /// Returns or builds the instant session. The caller holds `sessionLock`.
+    private func instantSessionLocked() -> URLSession {
         if let immediateSession { return immediateSession }
 
         let configuration = URLSessionConfiguration.default
@@ -871,20 +1008,12 @@ extension ConnectionManager: URLSessionDelegate {
 
     /// Whether the certificate chain itself is trustworthy.
     private static func evaluate(_ trust: SecTrust, error: inout CFError?) -> Bool {
-        if #available(iOS 12.0, tvOS 12.0, macOS 10.14, watchOS 5.0, *) {
-            return SecTrustEvaluateWithError(trust, &error)
-        }
-        var result = SecTrustResultType.invalid
-        guard SecTrustEvaluate(trust, &result) == errSecSuccess else { return false }
-        return result == .unspecified || result == .proceed
+        SecTrustEvaluateWithError(trust, &error)
     }
 
-    /// The public key of a trust object, across the deployment range.
+    /// The public key of a trust object.
     private static func publicKey(of trust: SecTrust) -> SecKey? {
-        if #available(iOS 14.0, tvOS 14.0, macOS 11.0, watchOS 7.0, *) {
-            return SecTrustCopyKey(trust)
-        }
-        return SecTrustCopyPublicKey(trust)
+        SecTrustCopyKey(trust)
     }
 
     /// Accepts the server only when its public key matches one of the bundled
@@ -952,6 +1081,25 @@ extension ConnectionManager: URLSessionDelegate {
     }
 }
 
+// MARK: - Log gathering
+
+extension ConnectionManager {
+
+    /// Queues one `sdk_logs` batch as its own request. Consent is the caller's
+    /// business, which holds the lines back until it is given.
+    ///
+    /// Returns `false` when the store would drop it, so the caller keeps what it
+    /// was about to send.
+    func sendSdkLogs(_ payload: String) -> Bool {
+        guard enqueueDiagnostic(key: QS.sdkLogs, payload: payload) else {
+            core.logger.d(Self.module, "sendSdkLogs", "the gathered log batch is not queued, the instance is halted or tracking is disabled, payloadLength: [\(payload.count)]")
+            return false
+        }
+        core.logger.d(Self.module, "sendSdkLogs", "a gathered log batch is queued, payloadLength: [\(payload.count)]")
+        return true
+    }
+}
+
 // MARK: - Instant requests
 
 extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
@@ -970,13 +1118,14 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
         let request = instantRequest(queryString: queryString, path: Endpoint.input)
         core.logger.d(Self.module, "sendHealthCheck", "health check request is prepared, method: [\(request.httpMethod ?? "GET")], queryLength: [\(queryString.count)]")
 
-        instantSession().dataTask(with: request) { [weak self] data, response, error in
+        instantTask(with: request) { [weak self, core] data, response, error in
             guard let self else { return }
+            _ = core
 
             let wasAccepted = self.isRequestSuccessful(response: response, data: data, endpoint: Endpoint.input, quiet: true)
             self.core.logger.d(Self.module, "sendHealthCheck", "health check response received, accepted: [\(wasAccepted)], statusCode: [\((response as? HTTPURLResponse)?.statusCode ?? 0)], responseSize: [\(data?.count ?? 0)], errorDescription: [\(error?.localizedDescription ?? "none")]")
             completion(wasAccepted, error)
-        }.resume()
+        }?.resume()
     }
 
     /// Fetches behavior settings outside the queue.
@@ -989,11 +1138,12 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
         let request = instantRequest(queryString: queryString, path: Endpoint.output + Endpoint.sdk)
         core.logger.d(Self.module, "fetchServerConfig", "behavior settings request is prepared, method: [\(request.httpMethod ?? "GET")], queryLength: [\(queryString.count)]")
 
-        instantSession().dataTask(with: request) { [weak self] data, response, error in
+        instantTask(with: request) { [weak self, core] data, response, error in
+            _ = core
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             self?.core.logger.d(Self.module, "fetchServerConfig", "behavior settings response received, statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], errorDescription: [\(error?.localizedDescription ?? "none")]")
             completion(data, statusCode, error)
-        }.resume()
+        }?.resume()
     }
 
     /// Builds a GET or POST request depending on length, the same rule the queued

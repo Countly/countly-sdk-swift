@@ -112,36 +112,15 @@ jobs:
             -destination 'generic/platform=${{ matrix.env.platform }}' \
             CODE_SIGNING_ALLOWED=NO
 
-  # The package builds cleanly, but the podspec is a second, independently maintained
-  # description of the same sources. A source file added to the package and not to the podspec
-  # only shows up as a broken CocoaPods install, which is why this is checked on every run.
-  podspec:
-    name: Validate the podspec
-    needs: package
-    runs-on: macos-15
-    steps:
-      - name: Checkout SDK code
-        uses: actions/checkout@v4
-
-      - name: Set up Xcode
-        run: sudo xcode-select -switch /Applications/Xcode_16.4.app
-
-      # `--quick` skips the build and install, which needs a full CocoaPods sandbox and is far
-      # slower than the rest of this workflow put together. It still catches a malformed
-      # manifest and a missing file pattern.
-      - name: Lint the podspec
-        run: pod lib lint CountlySwift.podspec --quick --allow-warnings
-
   # The SDK version travels in every request as `sdk_version`, and it is also written into the
-  # podspec and the changelog. Those three drifting apart is silent on the wire but wrong in
-  # the dashboard, so it is checked mechanically.
+  # changelog. Those two drifting apart is silent on the wire but wrong in the dashboard, so it
+  # is checked mechanically.
   version-consistency:
     name: SDK version is consistent
-    needs: package
     runs-on: ubuntu-latest
     steps:
       - name: Checkout SDK code
         uses: actions/checkout@v4
 
-      - name: Compare the version in the sources, the podspec and the changelog
+      - name: Compare the version in the sources and the changelog
         run: python3 .github/scripts/check_version_consistency.py

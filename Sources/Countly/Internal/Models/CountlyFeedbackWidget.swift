@@ -67,8 +67,14 @@ public final class CountlyFeedbackWidget {
     public private(set) var data: [String: Any] = [:]
 
     /// Set when the server offers a newer widget rendering. Its presence switches
-    /// presentation to the full screen web view.
-    let widgetVersion: String?
+    /// presentation to the full screen web view. Public because a bridge SDK passes
+    /// the widget list across to its own layer and has to carry this field with it.
+    public let widgetVersion: String?
+
+    /// The widget's `appearance.position`, such as `bLeft` or `bRight`, or `nil`
+    /// when the dashboard did not set one. Only a survey is placed by it; an NPS is
+    /// always centred. The web and Java SDKs read the same field.
+    let position: String?
 
     /// The instance this widget was fetched through. Weak: a widget object must
     /// not keep an instance alive.
@@ -84,6 +90,7 @@ public final class CountlyFeedbackWidget {
         self.name = (dictionary["name"] as? String) ?? ""
         self.tags = (dictionary["tg"] as? [String]) ?? []
         self.widgetVersion = dictionary["wv"] as? String
+        self.position = (dictionary["appearance"] as? [String: Any])?["position"] as? String
         self.module = module
     }
 

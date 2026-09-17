@@ -267,7 +267,10 @@ final class CrashTests: CountlyBaseTestCase {
 
     // MARK: - Limits
 
-    func testStackTraceLinesAreTruncatedToTheConfiguredLength() {
+    /// Every frame is shortened to the configured length, and the trace keeps all
+    /// of its frames: `maxStackTraceLinesPerThread` is accepted but not applied to
+    /// the exception's own trace, which is what the crash filters read.
+    func testStackTraceLinesAreTruncatedToTheConfiguredLengthButNoFramesAreDropped() {
         let countly = startInstance {
             $0.sdkInternalLimits.maxStackTraceLineLength = 10
             $0.sdkInternalLimits.maxStackTraceLinesPerThread = 2
@@ -276,12 +279,13 @@ final class CrashTests: CountlyBaseTestCase {
         countly.crashes.recordError("Long trace", isFatal: false, stackTrace: [
             "a line that is considerably longer than ten characters",
             "another long line here",
-            "a third one that should be dropped",
+            "a third one that is kept",
+            "deepest frame a filter might match",
         ])
 
         let trace = lastCrash(of: countly)?["_error"] as? String ?? ""
         let lines = trace.split(separator: "\n").map(String.init)
-        XCTAssertLessThanOrEqual(lines.count, 2)
+        XCTAssertEqual(lines.count, 4, "no frame is dropped")
         for line in lines {
             XCTAssertLessThanOrEqual(line.count, 10, "line was: \(line)")
         }
