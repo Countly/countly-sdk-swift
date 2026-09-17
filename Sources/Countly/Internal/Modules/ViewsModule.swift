@@ -642,7 +642,9 @@ final class ViewsModule: ModuleBase {
     ///
     /// Deduplicated: rotation notifications fire more often than the orientation
     /// actually changes, and a repeated event would inflate the numbers.
-    func recordOrientation() {
+    /// Records the interface orientation when it changed, or whenever `force` is set,
+    /// which a session start uses so every `begin_session` carries one.
+    func recordOrientation(force: Bool = false) {
         #if os(iOS)
         guard core.config.enableOrientationTracking else {
             logD("recordOrientation", "orientation tracking is disabled by the init config, orientation recording will be ignored")
@@ -659,7 +661,7 @@ final class ViewsModule: ModuleBase {
             return
         }
 
-        guard mode != lastInterfaceOrientation else {
+        guard force || mode != lastInterfaceOrientation else {
             logV("recordOrientation", "interface orientation did not change, orientation event will be skipped, mode: [\(mode)]")
             return
         }

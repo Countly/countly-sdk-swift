@@ -82,7 +82,8 @@ final class SDKCore {
     /// A blank override is no override: the wire requires both fields.
     private static func resolvedIdentity(_ override: String?, fallback: String) -> String {
         let trimmed = override?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return trimmed.isEmpty ? fallback : trimmed
+        // The value is interpolated into every query string as is, so it has to be escaped once here.
+        return trimmed.isEmpty ? fallback : trimmed.urlEscaped
     }
 
     init(instanceName: String, config: CountlyConfig) {

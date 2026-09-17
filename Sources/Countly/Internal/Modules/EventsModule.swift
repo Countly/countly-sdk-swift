@@ -116,6 +116,35 @@ final class EventsModule: ModuleBase {
                timestamp: core.clock.now())
     }
 
+    /// Records a reserved event on behalf of the host application.
+    ///
+    /// The SDK's own callers resolve consent and build well formed segmentation
+    /// before calling ``recordReservedEvent(_:segmentation:count:sum:duration:id:timestamp:)``,
+    /// so a host reaching the same path gets those gates applied here: the owning
+    /// feature's consent, as the Android SDK applies to every reserved key, and the
+    /// SDK limits on the segmentation. A key that is not reserved is an ordinary
+    /// event and takes the ordinary path, with its own consent and filters.
+    func recordReservedEventFromHost(_ key: String,
+                                     segmentation: [String: Any]?,
+                                     count: Int,
+                                     sum: Double,
+                                     duration: TimeInterval) {
+        guard let reservedConsent = consentForReservedEvent(key) else {
+            logD("recordReservedEventFromHost", "the key is not reserved, it is recorded as a regular event, key: [\(key)]")
+            recordEvent(key, segmentation: segmentation, count: count, sum: sum, duration: duration)
+            return
+        }
+        guard reservedConsent else {
+            logD("recordReservedEventFromHost", "no consent for the feature owning the reserved event, it is not recorded, key: [\(key)]")
+            return
+        }
+        recordReservedEvent(key,
+                            segmentation: core.limits.sanitized(segmentation, "Reserved event segmentation"),
+                            count: count,
+                            sum: sum,
+                            duration: duration)
+    }
+
     /// Records an event the SDK owns, skipping the event consent gate.
     ///
     /// Reserved events belong to another feature, so they answer to that feature's

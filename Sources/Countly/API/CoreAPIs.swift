@@ -85,9 +85,12 @@ public final class EventsAPI: CountlyAPIBase {
     /// Records a reserved event, one of those the SDK normally produces itself.
     ///
     /// Reserved keys are how the server recognises orientation, views, feedback and
-    /// the rest, so `recordEvent` refuses them. This is the way past that, for a
-    /// bridge SDK whose platform records one of these itself, and for a test harness
-    /// that needs a reserved event without driving the UI that produces it.
+    /// the rest. This is the way for a bridge SDK whose platform records one of
+    /// these itself, and for a test harness that needs a reserved event without
+    /// driving the UI that produces it. The event answers to the consent of the
+    /// feature it belongs to, and its segmentation is held to the SDK limits, as
+    /// the Android SDK does for every reserved key. A key that is not reserved is
+    /// recorded as an ordinary event.
     ///
     /// Any key is accepted, matching the reference SDK's
     /// `recordReservedEvent:segmentation:`. That includes `[CLY]_view`, and a
@@ -100,11 +103,11 @@ public final class EventsAPI: CountlyAPIBase {
                                     count: Int = 1,
                                     sum: Double = 0,
                                     duration: TimeInterval = 0) {
-        core()?.modules.events.recordReservedEvent(key,
-                                                   segmentation: segmentation,
-                                                   count: count,
-                                                   sum: sum,
-                                                   duration: duration)
+        core()?.modules.events.recordReservedEventFromHost(key,
+                                                           segmentation: segmentation,
+                                                           count: count,
+                                                           sum: sum,
+                                                           duration: duration)
     }
 
     /// Records a reserved event named by `CountlyReservedEvent` rather than by a
@@ -509,11 +512,16 @@ public final class RequestQueueAPI: CountlyAPIBase {
     ///
     /// Diagnostic surface, the counterpart to ``queuedRequests()`` and the mirror
     /// of `CountlyStore.addRequest` on Android. Unlike a recorded event this skips
-    /// the app version stamping and the tracking check, so the string reaches the
-    /// wire as written, which is the point for a test. The queue's size and age
-    /// limits still apply.
+    /// the app version stamping, so the string reaches the wire as written, which
+    /// is the point for a test. The queue's size and age limits still apply, and
+    /// like every other request it is refused while the server has tracking
+    /// disabled.
     public func store(_ queryString: String) {
         guard let core = core() else { return }
+        guard core.serverConfig.trackingEnabled else {
+            core.logger.w(Self.module, "store", "tracking is disabled by the server config, the request is not stored")
+            return
+        }
         core.logger.i(Self.module, "store", "a request is being stored verbatim through the public API, queryStringLength: [\(queryString.count)]")
         core.requestQueueStore.appendVerbatim(queryString)
         core.requestQueueStore.saveSync()

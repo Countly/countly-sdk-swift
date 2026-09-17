@@ -193,6 +193,8 @@ public enum RequestResult: Int, Sendable {
 public enum CountlyError: Int, Error, Sendable {
     case feedbackWidgetNotAvailable = 10001
     case feedbackWidgetNotTargetedForDevice = 10002
+    case feedbackConsentNotGiven = 10003
+    case networkingDisabled = 10004
     case remoteConfigGeneralAPIError = 10011
     case feedbacksGeneralAPIError = 10012
     case serverConfigGeneralAPIError = 10013
@@ -203,6 +205,8 @@ public enum CountlyError: Int, Error, Sendable {
         switch self {
         case .feedbackWidgetNotAvailable: return "Feedback widget is not available."
         case .feedbackWidgetNotTargetedForDevice: return "Feedback widget is not targeted for this device."
+        case .feedbackConsentNotGiven: return "Consent is not granted."
+        case .networkingDisabled: return "Networking is disabled by the server configuration."
         case .remoteConfigGeneralAPIError: return "Remote Config general API error."
         case .feedbacksGeneralAPIError: return "Feedbacks general API error."
         case .serverConfigGeneralAPIError: return "Server Config general API error."

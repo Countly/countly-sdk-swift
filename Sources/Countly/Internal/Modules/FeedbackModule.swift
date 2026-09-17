@@ -342,14 +342,14 @@ final class FeedbackModule: ModuleBase {
 
         guard core.serverConfig.networkingEnabled else {
             logD("fetchWidgetData", "widget data fetch is dropped, networking is disabled by server config, widgetID: [\(widget.id)]")
-            completion(nil, nil)
+            completion(nil, CountlyError.networkingDisabled)
             return
         }
 
         // The request sends `shown=1`, so the server counts an impression.
         guard core.modules.consent.hasConsent(for: .feedback) else {
             logD("fetchWidgetData", "no feedback consent given, widget data is not fetched, widgetID: [\(widget.id)]")
-            completion(nil, nil)
+            completion(nil, CountlyError.feedbackConsentNotGiven)
             return
         }
 

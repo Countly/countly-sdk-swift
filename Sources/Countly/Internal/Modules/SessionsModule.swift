@@ -168,7 +168,7 @@ final class SessionsModule: ModuleBase {
         logD("beginSession", "session opened, the begin session request will be queued, isForeground: [\(AppState.isForeground)]")
 
         core.network.enqueue(queryString)
-        core.modules.views.recordOrientation()
+        core.modules.views.recordOrientation(force: true)
         core.network.proceedOnQueue()
     }
 
