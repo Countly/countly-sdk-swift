@@ -392,7 +392,7 @@ final class ContentModule: ModuleBase {
 
         let request = fetchRequest(contentID: contentID)
 
-        core.network.instantSession().dataTask(with: request) { [weak self] data, response, error in
+        core.network.instantTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
 
             defer {
@@ -426,7 +426,7 @@ final class ContentModule: ModuleBase {
 
             self.logD("fetchContents", "the content details response carries a content, will present it")
             self.showContent(urlString: html, placement: payload["geo"] as? [String: Any] ?? [:])
-        }.resume()
+        }?.resume()
     }
 
     private func fetchRequest(contentID: String?) -> URLRequest {

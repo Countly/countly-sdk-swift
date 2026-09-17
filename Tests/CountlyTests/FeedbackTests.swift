@@ -358,7 +358,7 @@ final class FeedbackTests: CountlyBaseTestCase {
             if state == .closed { closed.fulfill() }
         })
 
-        wait(for: [closed], timeout: TestUtils.asyncTimeout)
+        wait(for: [closed], timeout: TestUtils.webKitTimeout)
         #endif
     }
 
@@ -379,7 +379,7 @@ final class FeedbackTests: CountlyBaseTestCase {
         dismissed.assertForOverFulfill = false
         widget.present(appearBlock: nil, dismissBlock: { dismissed.fulfill() })
 
-        wait(for: [dismissed], timeout: TestUtils.asyncTimeout)
+        wait(for: [dismissed], timeout: TestUtils.webKitTimeout)
         #endif
     }
 
@@ -401,7 +401,7 @@ final class FeedbackTests: CountlyBaseTestCase {
         widget.present(callback: { state in
             if state == .closed { closed.fulfill() }
         })
-        wait(for: [closed], timeout: TestUtils.asyncTimeout)
+        wait(for: [closed], timeout: TestUtils.webKitTimeout)
 
         TestUtils.waitUntil("the dismissal is recorded") {
             self.events(of: countly).contains { $0["key"] as? String == "[CLY]_survey" }

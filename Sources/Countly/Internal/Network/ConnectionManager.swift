@@ -39,6 +39,17 @@ final class ConnectionManager: NSObject {
         defer { stateLock.unlock() }
         return isBackingOff
     }
+
+    /// Whether a drain is in progress.
+    ///
+    /// For the suite: a drain asked for while a send is in flight is refused, so a
+    /// test has to let that send settle before installing the answer the next one
+    /// should get.
+    var isProcessingQueueForTesting: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return isProcessingQueue
+    }
     private var currentTask: URLSessionTask?
 
     /// When the current drain of the queue started, used to time it and to decide
@@ -273,11 +284,7 @@ final class ConnectionManager: NSObject {
         // The core is captured strongly for the life of the callback: it is held
         // `unowned` on this class, and `halt()` can release it while a request is
         // still in flight.
-        // Held from here until the completion has finished dealing with the
-        // response, which is where the head is removed and the queue written.
-        BackgroundTaskGuard.shared.begin()
-
-        let task = session().dataTask(with: request) { [weak self, core] data, response, error in
+        let completion: (Data?, URLResponse?, Error?) -> Void = { [weak self, core] data, response, error in
             defer { BackgroundTaskGuard.shared.end() }
             guard let self else { return }
             _ = core
@@ -317,6 +324,17 @@ final class ConnectionManager: NSObject {
                 }
             }
         }
+
+        guard let task = queuedTask(with: request, completionHandler: completion) else {
+            core.logger.d(Self.module, "proceedOnQueue", "the request at the head of the queue is not sent, the connection manager was halted while the drain was running, endpoint: [\(request.url?.path ?? "")]")
+            drainStartTime = nil
+            releaseProcessing()
+            return
+        }
+
+        // Held from here until the completion has finished dealing with the
+        // response, which is where the head is removed and the queue written.
+        BackgroundTaskGuard.shared.begin()
 
         stateLock.lock()
         currentTask = task
@@ -570,7 +588,7 @@ final class ConnectionManager: NSObject {
         core.logger.i(Self.module, "sendCrashReport", "sending crash report immediately, endpoint: [\(Endpoint.input)], method: [POST], bodySize: [\(request.httpBody?.count ?? 0)]")
 
         let semaphore = DispatchSemaphore(value: 0)
-        session().dataTask(with: request) { [weak self, core] data, response, error in
+        let completion: (Data?, URLResponse?, Error?) -> Void = { [weak self, core] data, response, error in
             defer { semaphore.signal() }
             guard let self else { return }
             _ = core
@@ -583,7 +601,15 @@ final class ConnectionManager: NSObject {
             } else {
                 self.core.logger.d(Self.module, "sendCrashReport", "immediate crash report request completed successfully, endpoint: [\(request.url?.path ?? "")], responseSize: [\(data?.count ?? 0)]")
             }
-        }.resume()
+        }
+
+        guard let task = queuedTask(with: request, completionHandler: completion) else {
+            core.logger.d(Self.module, "sendCrashReport", "the connection manager is halted, the crash report is queued instead")
+            enqueue(queryString)
+            core.requestQueueStore.saveSync()
+            return
+        }
+        task.resume()
 
         logRequest(request)
         semaphore.wait()
@@ -784,6 +810,54 @@ final class ConnectionManager: NSObject {
         core.logger.v(Self.module, "logRequest", "request detail, method: [\(request.httpMethod ?? "GET")], URL: [\(request.url?.absoluteString ?? "")], body: [\(request.httpBody.flatMap { String(data: $0, encoding: .utf8) } ?? "binary picture upload data")]")
     }
 
+    // MARK: - Tasks
+
+    /// Set by ``halt()`` and never cleared, unlike the sessions `reset()` drops and
+    /// `session()` rebuilds. Guarded by `sessionLock`.
+    private var isHalted = false
+
+    /// Refuses every further send, then resets.
+    ///
+    /// `reset()` on its own is what a configuration change does, and sending has
+    /// to work again after that, so it cannot be the thing that closes the door.
+    func halt() {
+        sessionLock.lock()
+        isHalted = true
+        sessionLock.unlock()
+        reset()
+    }
+
+    /// A task on the queued-requests session, or nil once this manager is halted.
+    ///
+    /// Created under `sessionLock`: a session looked up and handed back can be
+    /// invalidated by `discardSessions()` before the task is made, and `URLSession`
+    /// answers that with an exception nothing in Swift can catch. A battery or a
+    /// backoff countdown finishing on a background queue after `halt()` is how that
+    /// happened.
+    func queuedTask(with request: URLRequest,
+                    completionHandler: @escaping (Data?, URLResponse?, Error?) -> Void) -> URLSessionDataTask? {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        guard !isHalted else {
+            core.logger.d(Self.module, "queuedTask", "the request is not sent, the connection manager is halted, endpoint: [\(request.url?.path ?? "")]")
+            return nil
+        }
+        return queuedSessionLocked().dataTask(with: request, completionHandler: completionHandler)
+    }
+
+    /// The counterpart of ``queuedTask(with:completionHandler:)`` on the instant
+    /// session, for the requests that skip the queue.
+    func instantTask(with request: URLRequest,
+                     completionHandler: @escaping (Data?, URLResponse?, Error?) -> Void) -> URLSessionDataTask? {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        guard !isHalted else {
+            core.logger.d(Self.module, "instantTask", "the request is not sent, the connection manager is halted, endpoint: [\(request.url?.path ?? "")]")
+            return nil
+        }
+        return instantSessionLocked().dataTask(with: request, completionHandler: completionHandler)
+    }
+
     // MARK: - Sessions
 
     /// The session used for queued requests. Rebuilt when the configuration
@@ -791,7 +865,11 @@ final class ConnectionManager: NSObject {
     func session() -> URLSession {
         sessionLock.lock()
         defer { sessionLock.unlock() }
+        return queuedSessionLocked()
+    }
 
+    /// Returns or builds the queued session. The caller holds `sessionLock`.
+    private func queuedSessionLocked() -> URLSession {
         if let urlSession { return urlSession }
 
         let configuration = core.config.urlSessionConfiguration
@@ -816,7 +894,11 @@ final class ConnectionManager: NSObject {
     func instantSession() -> URLSession {
         sessionLock.lock()
         defer { sessionLock.unlock() }
+        return instantSessionLocked()
+    }
 
+    /// Returns or builds the instant session. The caller holds `sessionLock`.
+    private func instantSessionLocked() -> URLSession {
         if let immediateSession { return immediateSession }
 
         let configuration = URLSessionConfiguration.default
@@ -1033,14 +1115,14 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
         let request = instantRequest(queryString: queryString, path: Endpoint.input)
         core.logger.d(Self.module, "sendHealthCheck", "health check request is prepared, method: [\(request.httpMethod ?? "GET")], queryLength: [\(queryString.count)]")
 
-        instantSession().dataTask(with: request) { [weak self, core] data, response, error in
+        instantTask(with: request) { [weak self, core] data, response, error in
             guard let self else { return }
             _ = core
 
             let wasAccepted = self.isRequestSuccessful(response: response, data: data, endpoint: Endpoint.input, quiet: true)
             self.core.logger.d(Self.module, "sendHealthCheck", "health check response received, accepted: [\(wasAccepted)], statusCode: [\((response as? HTTPURLResponse)?.statusCode ?? 0)], responseSize: [\(data?.count ?? 0)], errorDescription: [\(error?.localizedDescription ?? "none")]")
             completion(wasAccepted, error)
-        }.resume()
+        }?.resume()
     }
 
     /// Fetches behavior settings outside the queue.
@@ -1053,12 +1135,12 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
         let request = instantRequest(queryString: queryString, path: Endpoint.output + Endpoint.sdk)
         core.logger.d(Self.module, "fetchServerConfig", "behavior settings request is prepared, method: [\(request.httpMethod ?? "GET")], queryLength: [\(queryString.count)]")
 
-        instantSession().dataTask(with: request) { [weak self, core] data, response, error in
+        instantTask(with: request) { [weak self, core] data, response, error in
             _ = core
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             self?.core.logger.d(Self.module, "fetchServerConfig", "behavior settings response received, statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], errorDescription: [\(error?.localizedDescription ?? "none")]")
             completion(data, statusCode, error)
-        }.resume()
+        }?.resume()
     }
 
     /// Builds a GET or POST request depending on length, the same rule the queued

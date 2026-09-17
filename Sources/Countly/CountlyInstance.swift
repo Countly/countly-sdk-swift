@@ -519,7 +519,7 @@ public final class CountlyInstance {
 
         core.serverConfig.stop()
         core.logGatherer.halt()
-        core.network.reset()
+        core.network.halt()
 
         if clearStorage {
             core.requestQueueStore.flush()

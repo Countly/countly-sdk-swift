@@ -349,10 +349,17 @@ final class ConnectionManagerTests: CountlyBaseTestCase {
 
     // MARK: - Sending stored requests on demand
 
+    /// Recording already fires a send, which the mock refuses because nothing
+    /// answers yet. A drain asked for while that send is in flight is refused, so
+    /// it has to settle before the answer is installed, or the test only passes
+    /// when the main thread beats the mock's loading thread.
     func testAttemptToSendStoredRequestsDrainsWhatIsWaiting() {
         let countly = startInstance { $0.eventSendThreshold = 1 }
         countly.events.recordEvent("waiting")
         XCTAssertFalse(requestQueue(of: countly).isEmpty)
+        TestUtils.waitUntil("the unanswered send settles") {
+            !self.core(of: countly).network.isProcessingQueueForTesting
+        }
 
         MockURLProtocol.respondToEverything(json: Self.accepted)
         countly.requestQueue.attemptToSendStoredRequests()
@@ -363,21 +370,62 @@ final class ConnectionManagerTests: CountlyBaseTestCase {
     // MARK: - Suspend and resume
 
     /// Suspending flushes everything to disk, because the process may not come
-    /// back. Resuming picks the drain back up.
+    /// back. Resuming starts no drain of its own: under manual sessions nothing is
+    /// begun, and an automatic session is refused while `AppState` reads
+    /// background, which an earlier suite can leave behind. The next trigger is
+    /// what sends the batch suspend queued, so that is what is asked for.
     func testSuspendingFlushesAndResumingCarriesOn() {
         let countly = startInstance { $0.eventSendThreshold = 100 }
 
         countly.events.recordEvent("recorded-before-suspend")
         countly.suspend()
 
-        XCTAssertFalse(requestQueue(of: countly).isEmpty,
-                       "the in-memory batch should have been pushed into the queue")
+        XCTAssertTrue(requestQueue(of: countly).contains { $0.contains("recorded-before-suspend") },
+                      "the in-memory batch should have been pushed into the queue")
+        TestUtils.waitUntil("the unanswered send settles") {
+            !self.core(of: countly).network.isProcessingQueueForTesting
+        }
 
         MockURLProtocol.respondToEverything(json: Self.accepted)
         countly.resume()
+        countly.requestQueue.attemptToSendStoredRequests()
 
         TestUtils.waitUntil("the queue drains after resuming") {
             self.requestQueue(of: countly).isEmpty
         }
+    }
+
+    // MARK: - After halt
+
+    /// A send that lands after `halt()`, which a connection test battery or a
+    /// backoff countdown finishing on a background queue can do, is refused. It
+    /// used to reach a session `halt()` had invalidated, and `URLSession` answers
+    /// that with an exception that takes the host application down.
+    func testNothingIsSentAfterHalt() {
+        let countly = startInstance { $0.eventSendThreshold = 1 }
+        let core = core(of: countly)
+        countly.events.recordEvent("left-behind")
+        TestUtils.waitUntil("the unanswered send settles") { !core.network.isProcessingQueueForTesting }
+        XCTAssertFalse(core.requestQueueStore.snapshot.isEmpty)
+        // Startup traffic is asynchronous too; a task resumed before the halt may land after it.
+        TestUtils.waitUntil("the behavior settings fetch goes out") {
+            MockURLProtocol.requests.contains { $0.query.contains("method=sc") }
+        }
+        TestUtils.pump(0.3)
+        let sentBeforeHalt = MockURLProtocol.requests.map(\.url.absoluteString)
+
+        countly.halt()
+        MockURLProtocol.respondToEverything(json: Self.accepted)
+
+        core.network.proceedOnQueue()
+        let probe = URLRequest(url: URL(string: "\(Self.host)/o/sdk?method=sc")!)
+        XCTAssertNil(core.network.instantTask(with: probe) { _, _, _ in XCTFail("a halted instance completed a request") })
+        TestUtils.pump(0.3)
+
+        let sentAfterHalt = MockURLProtocol.requests.map(\.url.absoluteString)
+        XCTAssertEqual(sentAfterHalt.count, sentBeforeHalt.count,
+                       "a halted instance sent: \(Array(sentAfterHalt.dropFirst(sentBeforeHalt.count)))")
+        XCTAssertFalse(core.network.isProcessingQueueForTesting, "the refused drain must release the queue")
+        XCTAssertFalse(core.requestQueueStore.snapshot.isEmpty, "the queue is kept for the next start")
     }
 }

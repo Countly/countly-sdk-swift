@@ -78,7 +78,7 @@ final class FeedbackModule: ModuleBase {
         let request = widgetListRequest()
         logD("getAvailableFeedbackWidgets", "feedback widget list request is started, path: [\(request.url?.path ?? "")]")
 
-        core.network.instantSession().dataTask(with: request) { [weak self] data, response, error in
+        core.network.instantTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
@@ -112,7 +112,7 @@ final class FeedbackModule: ModuleBase {
             }
 
             DispatchQueue.main.async { completion(widgets, nil) }
-        }.resume()
+        }?.resume()
     }
 
     private func widgetListRequest() -> URLRequest {
@@ -369,7 +369,7 @@ final class FeedbackModule: ModuleBase {
         let request = core.network.instantRequest(queryString: queryString, path: path)
         logD("fetchWidgetData", "widget data request is started, widgetID: [\(widget.id)], path: [\(path)]")
 
-        core.network.instantSession().dataTask(with: request) { [weak self] data, response, error in
+        core.network.instantTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
@@ -386,7 +386,7 @@ final class FeedbackModule: ModuleBase {
 
             self.logD("fetchWidgetData", "widget data fetched, widgetID: [\(widget.id)], fieldCount: [\(widgetData.count)], fields: [\(widgetData.keys.sorted().joined(separator: ", "))]")
             DispatchQueue.main.async { completion(widgetData, nil) }
-        }.resume()
+        }?.resume()
     }
 
     // MARK: - Recording results

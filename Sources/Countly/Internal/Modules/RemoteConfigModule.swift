@@ -349,7 +349,7 @@ final class RemoteConfigModule: ModuleBase {
         let request = buildRequest(keys: keys, omitKeys: omitKeys, isLegacy: isLegacy)
         logD("fetch", "remote config request is started, method: [\(request.httpMethod ?? "GET")], path: [\(request.url?.path ?? "")], keyCount: [\(keys?.count ?? 0)], omitKeyCount: [\(omitKeys?.count ?? 0)]")
 
-        core.network.instantSession().dataTask(with: request) { [weak self] data, response, transportError in
+        core.network.instantTask(with: request) { [weak self] data, response, transportError in
             guard let self else { return }
 
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -385,7 +385,7 @@ final class RemoteConfigModule: ModuleBase {
                     completion(parsed, nil)
                 }
             }
-        }.resume()
+        }?.resume()
     }
 
     private func buildRequest(keys: [String]?, omitKeys: [String]?, isLegacy: Bool) -> URLRequest {
@@ -571,7 +571,7 @@ final class RemoteConfigModule: ModuleBase {
 
         logD("testingDownloadVariantInformation", "variants download is starting, path: [\(request.url?.path ?? "")]")
 
-        core.network.instantSession().dataTask(with: request) { [weak self] data, response, error in
+        core.network.instantTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
@@ -591,7 +591,7 @@ final class RemoteConfigModule: ModuleBase {
             self.stateLock.unlock()
             self.logD("testingDownloadVariantInformation", "variants request successfully completed, the locally cached variants are replaced, variantKeyCount: [\(flattened.count)], variantKeys: [\(Self.describe(flattened.keys))]")
             DispatchQueue.main.async { completion(.success, nil) }
-        }.resume()
+        }?.resume()
     }
 
     /// Downloads the experiments this device is part of.
@@ -608,7 +608,7 @@ final class RemoteConfigModule: ModuleBase {
 
         logD("testingDownloadExperimentInformation", "experiment download is starting, path: [\(request.url?.path ?? "")]")
 
-        core.network.instantSession().dataTask(with: request) { [weak self] data, response, error in
+        core.network.instantTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
@@ -664,7 +664,7 @@ final class RemoteConfigModule: ModuleBase {
 
             self.logD("testingDownloadExperimentInformation", "experiment request successfully completed, the locally cached experiments are replaced, responseShape: [\(responseShape)], experimentCount: [\(experiments.count)], experimentIDs: [\(Self.describe(experiments.keys))]")
             DispatchQueue.main.async { completion(.success, nil) }
-        }.resume()
+        }?.resume()
     }
 
     /// Forces this device into a named variant.
@@ -695,7 +695,7 @@ final class RemoteConfigModule: ModuleBase {
 
         logD("testingEnrollIntoVariant", "variant enrollment is starting, key: [\(key)], variantName: [\(variantName)], path: [\(request.url?.path ?? "")]")
 
-        core.network.instantSession().dataTask(with: request) { [weak self] data, response, error in
+        core.network.instantTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
@@ -714,7 +714,7 @@ final class RemoteConfigModule: ModuleBase {
             self.clearCachedRemoteConfig()
             self.downloadRemoteConfigAutomatically()
             DispatchQueue.main.async { completion(.success, nil) }
-        }.resume()
+        }?.resume()
     }
 
     // MARK: - Callbacks
