@@ -198,8 +198,33 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
 
         navigate(manager, to: #"https://countly_action_event?cly_x_action_event=1&action=resize_me&resize_me={"l":{"x":10,"y":10,"w":300,"h":120},"p":{"x":10,"y":10,"w":300,"h":120}}"#)
 
+        // Waited for rather than asserted after a fixed pump: the reveal deadline is
+        // short, and a loaded runner can take longer than it to deliver the
+        // navigation, which would reveal at the old frame first.
+        TestUtils.waitUntil("the page is refitted to the new orientation") {
+            self.onMain { manager.placedFrameForTesting } == CGRect(x: 10, y: 10, width: 300, height: 120)
+        }
         XCTAssertEqual(onMain { self.page(of: manager)?.isHidden }, false, "the fitted content is not shown again")
-        XCTAssertEqual(onMain { manager.placedFrameForTesting }, CGRect(x: 10, y: 10, width: 300, height: 120))
+    }
+
+    /// Every action event URL is answered with `.cancel`, and WebKit reports that
+    /// as a failed navigation. Closing for it would tear down a page that was only
+    /// asking to be resized; a real failure still closes.
+    func testACancelledNavigationDoesNotCloseThePage() {
+        let countly = startInstance()
+        let manager = present(countly, url: "https://example.com/o/sdk/content",
+                              frame: CGRect(x: 16, y: 16, width: 370, height: 144))
+        waitForLoad(manager)
+
+        let page = onMain { self.page(of: manager) }
+        onMain { manager.webView(page!, didFailProvisionalNavigation: nil, withError: URLError(.cancelled)) }
+        XCTAssertNotNil(onMain { self.page(of: manager) }, "a cancelled navigation must not close the page")
+
+        onMain { manager.webView(page!, didFail: nil, withError: URLError(.cancelled)) }
+        XCTAssertNotNil(onMain { self.page(of: manager) }, "a cancelled committed navigation must not close the page either")
+
+        onMain { manager.webView(page!, didFailProvisionalNavigation: nil, withError: URLError(.cannotFindHost)) }
+        XCTAssertNil(onMain { self.page(of: manager) }, "a genuine load failure still dismisses the page")
     }
 
     /// A page that never answers the new surface is shown again anyway, after the

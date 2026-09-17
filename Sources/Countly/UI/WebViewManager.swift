@@ -2184,15 +2184,34 @@ extension WebViewManager: WKNavigationDelegate {
 
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        guard !Self.isCancellation(error) else {
+            core.logger.d(Self.module, "didFail", "the navigation was cancelled rather than failing, the page is left as it is")
+            return
+        }
         let failure = error as NSError
         core.logger.d(Self.module, "didFail", "the page failed to load after being committed and the web view is dismissed, error: [\(failure.localizedDescription)], domain: [\(failure.domain)], code: [\(failure.code)], reason: [navigation-failure]")
         close()
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        guard !Self.isCancellation(error) else {
+            core.logger.d(Self.module, "didFailProvisionalNavigation", "the navigation was cancelled rather than failing, the page is left as it is")
+            return
+        }
         let failure = error as NSError
         core.logger.d(Self.module, "didFailProvisionalNavigation", "the page failed to start loading and the web view is dismissed, error: [\(failure.localizedDescription)], domain: [\(failure.domain)], code: [\(failure.code)], reason: [navigation-failure]")
         close()
+    }
+
+    /// Whether a navigation failure is the SDK's own `.cancel` coming back.
+    ///
+    /// Every action event URL is answered with `decisionHandler(.cancel)`, and
+    /// WebKit reports that as a failed navigation carrying `NSURLErrorCancelled`.
+    /// Tearing the page down for it would close a content the page was only asking
+    /// to resize. The reference dismisses on every error and has the same bug.
+    private static func isCancellation(_ error: Error) -> Bool {
+        let failure = error as NSError
+        return failure.domain == NSURLErrorDomain && failure.code == NSURLErrorCancelled
     }
 }
 
