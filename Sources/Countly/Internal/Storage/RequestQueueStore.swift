@@ -101,15 +101,18 @@ final class RequestQueueStore {
     ///     produced under.
     ///   - trackingEnabled: When the server has switched tracking off, the
     ///     request is discarded instead of queued.
-    func enqueue(_ queryString: String, appVersion: String, trackingEnabled: Bool) {
+    /// - Returns: The request exactly as stored, app version included, or `nil`
+    ///   when it was refused.
+    @discardableResult
+    func enqueue(_ queryString: String, appVersion: String, trackingEnabled: Bool) -> String? {
         guard trackingEnabled else {
             logger?.d(Self.module, "enqueue", "request is not stored in the queue, reason: tracking is disabled by behavior settings, queryStringLength: [\(queryString.count)]")
-            return
+            return nil
         }
 
         guard !queryString.isEmpty else {
             logger?.d(Self.module, "enqueue", "request is not stored in the queue, reason: it reached the store with an empty query string")
-            return
+            return nil
         }
 
         let stamped = queryString + "&\(QS.appVersion)=\(appVersion)"
@@ -120,6 +123,7 @@ final class RequestQueueStore {
         trimToLimitLocked()
         requests.append(stamped)
         logger?.d(Self.module, "enqueue", "request is stored in the queue, queryStringLength: [\(stamped.count)], queuedRequestCount: [\(requests.count)], storedRequestsLimit: [\(storedRequestsLimit)]")
+        return stamped
     }
 
     /// Makes room for one more request, dropping the oldest when the queue is at

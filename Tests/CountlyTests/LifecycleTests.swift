@@ -183,8 +183,8 @@ final class LifecycleTests: CountlyBaseTestCase {
     /// naming screens itself, a manual call would produce a second, competing view
     /// for the same screen, so manual calls are refused until it is switched off.
     func testManualViewCallsAreRefusedWhileAutomaticTrackingIsOn() throws {
-        #if !(os(iOS) || os(tvOS))
-        throw XCTSkip("automatic view tracking is implemented on iOS and tvOS only, as in the reference SDK")
+        #if !(os(iOS) || os(tvOS) || os(visionOS))
+        throw XCTSkip("automatic view tracking needs UIKit, as in the reference SDK")
         #else
         let countly = startInstance {
             $0.eventSendThreshold = 1
@@ -209,8 +209,8 @@ final class LifecycleTests: CountlyBaseTestCase {
     /// Turning it on needs both the server's permission and the user's, so an
     /// application cannot switch it on against either.
     func testAutomaticViewTrackingCannotBeTurnedOnWithoutConsent() throws {
-        #if !(os(iOS) || os(tvOS))
-        throw XCTSkip("automatic view tracking is implemented on iOS and tvOS only, as in the reference SDK")
+        #if !(os(iOS) || os(tvOS) || os(visionOS))
+        throw XCTSkip("automatic view tracking needs UIKit, as in the reference SDK")
         #else
         let countly = startInstance {
             $0.requiresConsent = true

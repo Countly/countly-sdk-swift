@@ -13,9 +13,8 @@ import MachO
 /// Captures crashes and handled errors, with the context needed to symbolicate
 /// them later.
 ///
-/// A fatal crash is sent immediately and synchronously, because the process is
-/// about to die and a queued request would never leave. Everything else goes
-/// through the normal queue.
+/// A crash the SDK detects itself is written to disk while the process goes down
+/// and sent on the next launch. Everything else goes through the normal queue.
 final class CrashModule: ModuleBase {
 
     override class var moduleName: String { "Crash" }
@@ -197,6 +196,8 @@ final class CrashModule: ModuleBase {
     }
 
     /// Called by the process-wide handler when a crash is detected.
+    ///
+    /// Stores the report for the next launch to send.
     func handleAutoDetectedCrash(name: String, reason: String, stackTrace: [String]) {
         // Reached from the signal handler, so nothing here may log at error or
         // warning: those bump the health tracker, whose dispatch primitives are
@@ -227,7 +228,10 @@ final class CrashModule: ModuleBase {
                isAutoDetected: true)
     }
 
-    /// Builds the report, gives the filter callback a say, and sends it.
+    /// Builds the report, gives the filter callback a say, and queues it.
+    ///
+    /// An automatically detected crash is only stored, for the next launch to
+    /// send; everything else joins the queue and starts a drain.
     private func handle(name: String,
                         description: String,
                         stackTrace: [String],
@@ -300,9 +304,7 @@ final class CrashModule: ModuleBase {
             return
         }
 
-        // An automatically detected crash is sent synchronously because the process
-        // is about to die; everything else joins the queue.
-        logI("handle", "crash recorded, crashName: [\(name)], isFatal: [\(crashData.fatal)], isAutoDetected: [\(isAutoDetected)], delivery: [\(isAutoDetected ? "immediate" : "queued")], customSegmentationKeyCount: [\(crashData.crashSegmentation.count)], breadcrumbCount: [\(crashData.breadcrumbs.count)], stackTraceFrameCount: [\(stackTrace.count)]")
+        logI("handle", "crash recorded, crashName: [\(name)], isFatal: [\(crashData.fatal)], isAutoDetected: [\(isAutoDetected)], delivery: [\(isAutoDetected ? "next launch" : "queued")], customSegmentationKeyCount: [\(crashData.crashSegmentation.count)], breadcrumbCount: [\(crashData.breadcrumbs.count)], stackTraceFrameCount: [\(stackTrace.count)]")
         logV("handle", "crash detail, breadcrumbs: [\(crashData.breadcrumbs)], crashSegmentation: [\(crashData.crashSegmentation)], stackTrace: [\(crashData.stackTrace)]")
 
         // `CountlyJSON` reports a serialization failure at error level, and an
@@ -311,26 +313,36 @@ final class CrashModule: ModuleBase {
         // reports the failure itself at debug.
         let payload = CountlyJSON.string(from: report, logger: isAutoDetected ? nil : log)
         if payload == nil {
-            logD("handle", "the crash report could not be serialized to JSON and will reach the server empty, crashName: [\(name)], isAutoDetected: [\(isAutoDetected)]")
+            logD("handle", "the crash report could not be serialized to JSON and will not be sent, crashName: [\(name)], isAutoDetected: [\(isAutoDetected)]")
         }
 
-        core.network.sendCrashReport(payload?.urlEscaped ?? "", immediately: isAutoDetected)
-
-        // A crash handler that stays installed would re-enter on the way down.
-        if isAutoDetected {
-            stopCrashReporting()
+        guard isAutoDetected else {
+            core.network.sendCrashReport(payload?.urlEscaped)
+            return
         }
+
+        core.network.storeCrashReport(payload?.urlEscaped)
+
+        // The stored report carries the breadcrumbs, which the next launch would
+        // attach again, and a handler left installed would re-enter on the way down.
+        stopCrashReporting()
     }
 
     /// Turns the assembled crash data into the payload the server reads.
     ///
     /// - Parameter hadFilterCallback: whether the host application was given the
-    ///   report to change, which decides whether the segmentation has to be capped
-    ///   a second time.
+    ///   report to change, which decides whether the segmentation has to be
+    ///   sanitized again.
     private func wireReport(for crashData: CountlyCrashData,
                             stackTrace: [String],
                             hadFilterCallback: Bool) -> [String: Any] {
-        var report = crashData.crashMetrics
+        // The metrics are the SDK's own keys, so only their value types need
+        // checking, and only when a callback had the chance to change them. One
+        // value JSON cannot carry would otherwise make the whole report
+        // serialize to nothing.
+        var report = hadFilterCallback
+            ? core.limits.filterSupportedDataTypes(crashData.crashMetrics)
+            : crashData.crashMetrics
         report[Key.error] = crashData.stackTrace
         let symbolication = binaryImages(for: stackTrace)
         report[Key.binaryImages] = symbolication.images
@@ -351,13 +363,15 @@ final class CrashModule: ModuleBase {
         }
 
         if !crashData.crashSegmentation.isEmpty {
-            // Capped a second time only when there was a callback that could have
-            // changed the segmentation. `CountlyCrashData` is a class, so an
-            // enriching callback would otherwise ship unbounded keys and values;
-            // without one the dictionary is still exactly what was sanitized on the
-            // way in, and re-capping it is pure rework on every recorded error.
+            // Sanitized rather than merely capped when there was a callback that
+            // could have changed the segmentation. `CountlyCrashData` is a class,
+            // so an enriching callback would otherwise ship unbounded keys and
+            // values, and a value JSON cannot represent would make the whole
+            // report serialize to nothing and be lost. Without a callback the
+            // dictionary is still exactly what was sanitized on the way in, and
+            // redoing that is pure rework on every recorded error.
             report[Key.custom] = hadFilterCallback
-                ? core.limits.truncatedAndLimited(crashData.crashSegmentation, "Crash segmentation")
+                ? (core.limits.sanitized(crashData.crashSegmentation, "Crash segmentation") ?? [:])
                 : crashData.crashSegmentation
         }
 

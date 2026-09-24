@@ -27,6 +27,197 @@ final class CrashTests: CountlyBaseTestCase {
         TestUtils.requests(requestQueue(of: instance), carrying: "crash").count
     }
 
+    /// Crash requests in the instance's queue file, read back from disk by a store
+    /// of its own. What a process killed right now would find on the next launch,
+    /// which the in-memory queue does not show.
+    private func crashCountOnDisk(of instance: CountlyInstance) -> Int {
+        let fromDisk = RequestQueueStore(namespace: core(of: instance).namespace, logger: nil)
+        return TestUtils.requests(fromDisk.snapshot, carrying: "crash").count
+    }
+
+    /// Crash requests that reached the transport.
+    private var sentCrashCount: Int {
+        MockURLProtocol.requests.filter { $0.query.contains("crash=") }.count
+    }
+
+    // MARK: - Durability
+
+    /// A crash the SDK detects itself is written to disk before the handler
+    /// returns, and nothing is sent while the process goes down. The stored report
+    /// carries the breadcrumbs, and the breadcrumb file is emptied so the next
+    /// launch does not attach the same lines to an unrelated report.
+    func testADetectedCrashIsStoredWithItsBreadcrumbsAndNothingIsSent() throws {
+        try skipUnlessNetworkIsInterceptable()
+        MockURLProtocol.respondToEverything(json: #"{"result":"Success"}"#)
+        let countly = startInstance { $0.features = [.crashReporting] }
+        countly.crashes.addCrashBreadcrumb("opened cart")
+
+        reportAutoDetectedCrash(on: countly)
+        TestUtils.pump(0.5)
+
+        XCTAssertEqual(sentCrashCount, 0, "nothing may be sent while the process goes down")
+        XCTAssertEqual(crashCountOnDisk(of: countly), 1,
+                       "the report should be on disk by the time the handler returns")
+        let logs = lastCrash(of: countly)?["_logs"] as? String ?? ""
+        XCTAssertTrue(logs.contains("opened cart"), "the stored report should carry the breadcrumbs, logs were: [\(logs)]")
+        XCTAssertEqual(core(of: countly).crashLogStore.readAll() ?? "", "",
+                       "the breadcrumb file should be empty once the report holding them is stored")
+    }
+
+    /// The next launch sends what the crashed run stored, through the ordinary
+    /// queue, and the report leaves the queue once the server accepts it.
+    func testAStoredCrashIsSentOnTheNextLaunch() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let name = uniqueInstanceName()
+        let crashedConfig = baseConfig(instanceName: name)
+        crashedConfig.features = [.crashReporting]
+        let crashed = start(crashedConfig)
+
+        reportAutoDetectedCrash(on: crashed, name: "SIGSEGV", reason: "App terminated by SIGSEGV")
+        XCTAssertEqual(sentCrashCount, 0, "the crashed run may not send the report itself")
+        crashed.halt()
+
+        MockURLProtocol.respondToEverything(json: #"{"result":"Success"}"#)
+        let relaunched = start(baseConfig(instanceName: name))
+
+        TestUtils.waitUntil("the stored crash report is sent") { self.sentCrashCount == 1 }
+        let sent = MockURLProtocol.requests.first { $0.query.contains("crash=") }
+        let crash = sent.flatMap { TestUtils.parseQuery($0.query)["crash"] as? [String: Any] }
+        XCTAssertEqual(sent?.path, "/i")
+        XCTAssertEqual(crash?["_type"] as? String, "SIGSEGV")
+        XCTAssertEqual(crash?["_name"] as? String, "App terminated by SIGSEGV")
+        XCTAssertEqual(crash?["_nonfatal"] as? Bool, false)
+        TestUtils.waitUntil("the accepted crash report leaves the queue") { self.crashCount(of: relaunched) == 0 }
+    }
+
+    /// Tracking off is a kill switch, and the crash path honours it like every
+    /// other request: nothing is kept for a later launch.
+    func testNoCrashReportIsStoredWhileTrackingIsDisabled() {
+        let countly = startInstance {
+            $0.sdkBehaviorSettings = ServerConfigBuilder().tracking(false).json()
+        }
+
+        reportAutoDetectedCrash(on: countly)
+
+        XCTAssertEqual(crashCountOnDisk(of: countly), 0, "no crash report may be kept while tracking is switched off")
+    }
+
+    /// With several instances, every one of them stores the crash, and none sends
+    /// it while the process goes down.
+    func testEveryInstanceStoresTheCrashAndNoneSendsIt() throws {
+        try skipUnlessNetworkIsInterceptable()
+        MockURLProtocol.respondToEverything(json: #"{"result":"Success"}"#)
+        let first = startInstance { $0.features = [.crashReporting]; $0.appKey = "first-app" }
+        let second = startInstance { $0.features = [.crashReporting]; $0.appKey = "second-app" }
+
+        CrashHandlerInstaller.shared.dispatch(name: "SIGSEGV", reason: "boom", stackTrace: ["0 MyApp 0x1 boom"])
+        TestUtils.pump(0.5)
+
+        XCTAssertEqual(crashCountOnDisk(of: first), 1)
+        XCTAssertEqual(crashCountOnDisk(of: second), 1)
+        XCTAssertEqual(sentCrashCount, 0, "no instance may send the crash while the process goes down")
+    }
+
+    /// The filter callback receives a mutable object, so whatever it puts back has
+    /// to survive serialization. A value JSON cannot represent would otherwise
+    /// make the whole report serialize to nothing and be lost silently.
+    func testAValueTheFilterCallbackAddsIsSanitizedRatherThanLosingTheReport() {
+        let countly = startInstance {
+            $0.crashes.crashFilterCallback = { data in
+                data.crashSegmentation["seenAt"] = Date(timeIntervalSince1970: 1_700_000_000)
+                data.crashSegmentation["binary"] = Data([0x01])
+                data.crashMetrics["lastSync"] = Date(timeIntervalSince1970: 1_700_000_000)
+                data.crashMetrics["ratio"] = Double.nan
+                return false
+            }
+        }
+
+        countly.crashes.recordError("Boom", isFatal: false, stackTrace: ["0 MyApp 0x1 boom"])
+
+        guard let crash = lastCrash(of: countly) else {
+            XCTFail("the report should still have been queued, not lost to a serialization failure")
+            return
+        }
+        let custom = crash["_custom"] as? [String: Any] ?? [:]
+        XCTAssertEqual((custom["seenAt"] as? NSNumber)?.int64Value, 1_700_000_000_000)
+        XCTAssertNil(custom["binary"])
+        XCTAssertEqual((crash["lastSync"] as? NSNumber)?.int64Value, 1_700_000_000_000)
+        XCTAssertNil(crash["ratio"], "a number JSON cannot carry should be dropped, not take the report with it")
+    }
+
+    /// A number JSON cannot represent in the segmentation is dropped on its own.
+    /// Kept, it makes the whole report unserializable and every later crash with
+    /// it is lost.
+    func testANonFiniteCrashSegmentationValueDoesNotLoseTheReport() {
+        let countly = startInstance()
+        countly.crashes.setCrashSegmentation(["load": Double.infinity, "screen": "cart"])
+
+        countly.crashes.recordError("Boom", isFatal: false, stackTrace: ["0 MyApp 0x1 boom"])
+
+        let custom = lastCrash(of: countly)?["_custom"] as? [String: Any]
+        XCTAssertEqual(custom?["screen"] as? String, "cart", "the report should still arrive")
+        XCTAssertNil(custom?["load"])
+    }
+
+    // MARK: - Signal dispositions
+
+    #if os(iOS) || os(tvOS) || os(visionOS) || os(macOS)
+    /// A host that ignores a signal has decided the process survives it, SIGPIPE
+    /// on a closed socket being the usual case. Replacing that with a handler
+    /// reports a crash that never happened and then kills the process on the next
+    /// one, so the SDK leaves such a signal alone, and gives every other signal
+    /// back to its previous disposition when it stops.
+    func testASignalTheHostIgnoresIsLeftAlone() throws {
+        var original = sigaction()
+        sigaction(SIGPIPE, nil, &original)
+        defer { sigaction(SIGPIPE, &original, nil) }
+        signal(SIGPIPE, SIG_IGN)
+
+        let countly = startInstance { $0.features = [.crashReporting] }
+
+        var whileStarted = sigaction()
+        sigaction(SIGPIPE, nil, &whileStarted)
+        XCTAssertTrue(CrashHandlerInstaller.isIgnored(whileStarted), "an ignored signal should stay ignored while the SDK runs")
+
+        countly.halt()
+
+        var afterHalt = sigaction()
+        sigaction(SIGPIPE, nil, &afterHalt)
+        XCTAssertTrue(CrashHandlerInstaller.isIgnored(afterHalt), "an ignored signal should still be ignored once the SDK stops")
+    }
+
+    /// Every catchable signal the kernel treats as a crash is reported, SIGSYS
+    /// and SIGEMT included, and each goes back to what it was once the SDK stops.
+    func testEveryCrashSignalIsHandledAndGivenBackOnStop() {
+        let signals = [SIGABRT, SIGILL, SIGSEGV, SIGFPE, SIGBUS, SIGPIPE, SIGTRAP, SIGSYS, SIGEMT]
+        let before = signals.map(Self.handlerAddress)
+        let ignoredBefore = signals.map { CrashHandlerInstaller.isIgnored(Self.action(of: $0)) }
+
+        let countly = startInstance { $0.features = [.crashReporting] }
+        let whileStarted = signals.map(Self.handlerAddress)
+        countly.halt()
+        let afterHalt = signals.map(Self.handlerAddress)
+
+        // A signal the test runner ignores is left alone by design, so only the
+        // others have to change hands.
+        for (index, signalCode) in signals.enumerated() where !ignoredBefore[index] {
+            XCTAssertNotEqual(whileStarted[index], before[index], "signal \(signalCode) should be handled while the SDK runs")
+        }
+        XCTAssertEqual(afterHalt, before, "every signal should be given back its previous disposition")
+    }
+
+    private static func action(of signalCode: Int32) -> sigaction {
+        var action = sigaction()
+        sigaction(signalCode, nil, &action)
+        return action
+    }
+
+    /// The installed handler as an address, 0 for the default disposition.
+    private static func handlerAddress(_ signalCode: Int32) -> Int {
+        action(of: signalCode).__sigaction_u.__sa_handler.map { unsafeBitCast($0, to: Int.self) } ?? 0
+    }
+    #endif
+
     // MARK: - The payload
 
     func testAHandledErrorCarriesItsNameStackTraceAndTheNonFatalFlag() {

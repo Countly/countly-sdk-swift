@@ -162,13 +162,58 @@ final class ValidationTests: CountlyBaseTestCase {
     func testAListDropsOnlyItsUnsupportedElements() {
         let enforcer = LimitsEnforcer(limits: CountlySDKLimitsConfig(), logger: nil)
 
-        let filtered = enforcer.filterSupportedDataTypes(["list": ["a", 1, Data(), Date(), "b"]])
+        let filtered = enforcer.filterSupportedDataTypes(["list": ["a", 1, Data(), "b"]])
         guard let list = filtered["list"] as? [Any] else {
             XCTFail("the list should have survived: \(filtered)")
             return
         }
 
         XCTAssertEqual(list.map { "\($0)" }, ["a", "1", "b"])
+    }
+
+    /// The server reads a date as epoch milliseconds, so a date is converted
+    /// rather than dropped.
+    func testADateBecomesEpochMilliseconds() {
+        let enforcer = LimitsEnforcer(limits: CountlySDKLimitsConfig(), logger: nil)
+        let moment = Date(timeIntervalSince1970: 1_700_000_000.123)
+
+        let filtered = enforcer.filterSupportedDataTypes(["when": moment])
+
+        XCTAssertEqual(filtered["when"] as? Int64, 1_700_000_000_123)
+    }
+
+    /// Lists carry dates too, and a converted element must stay in its place
+    /// rather than being appended after the survivors.
+    func testADateInsideAListIsConvertedInPlace() {
+        let enforcer = LimitsEnforcer(limits: CountlySDKLimitsConfig(), logger: nil)
+        let moment = Date(timeIntervalSince1970: 1)
+
+        let filtered = enforcer.filterSupportedDataTypes(["list": ["a", moment, Data(), "b"]])
+        guard let list = filtered["list"] as? [Any] else {
+            XCTFail("the list should have survived: \(filtered)")
+            return
+        }
+
+        XCTAssertEqual(list.map { "\($0)" }, ["a", "1000", "b"])
+    }
+
+    /// The extremes are ordinary dates as far as the conversion is concerned, so
+    /// neither may trap or be dropped.
+    func testTheDistantDatesStillConvert() {
+        XCTAssertNotNil(LimitsEnforcer.epochMilliseconds(.distantPast))
+        XCTAssertNotNil(LimitsEnforcer.epochMilliseconds(.distantFuture))
+        XCTAssertEqual(LimitsEnforcer.epochMilliseconds(Date(timeIntervalSince1970: 0)), 0)
+        XCTAssertEqual(LimitsEnforcer.epochMilliseconds(Date(timeIntervalSince1970: -1.5)), -1500)
+    }
+
+    /// A date built from a non-finite interval has no epoch value, and converting
+    /// one would trap rather than drop it.
+    func testADateWithNoRepresentableEpochIsDroppedRatherThanTrapping() {
+        let enforcer = LimitsEnforcer(limits: CountlySDKLimitsConfig(), logger: nil)
+        let unrepresentable = Date(timeIntervalSince1970: .infinity)
+
+        XCTAssertNil(LimitsEnforcer.epochMilliseconds(unrepresentable))
+        XCTAssertTrue(enforcer.filterSupportedDataTypes(["when": unrepresentable]).isEmpty)
     }
 
     // MARK: - JSON that cannot be represented

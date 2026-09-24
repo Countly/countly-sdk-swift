@@ -354,4 +354,104 @@ final class ViewsTests: CountlyBaseTestCase {
                        "the view name is capped by the key limit")
         XCTAssertEqual(segmentation["a-long"] as? String, "a-lo")
     }
+
+    // MARK: - IDs held across a background and foreground cycle
+
+    /// Names of the view events for one screen, oldest first.
+    private func events(named name: String, of instance: CountlyInstance) -> [[String: Any]] {
+        viewEvents(of: instance).filter { ($0["segmentation"] as? [String: Any])?[SegKey.name] as? String == name }
+    }
+
+    /// Foregrounding reopens a view under a fresh ID, but the host still holds the
+    /// one it was given. Stopping with it has to close the reopened view, or the
+    /// screen stays open and is reopened on every later foreground.
+    func testAViewIDStillStopsTheViewAfterABackgroundAndForeground() {
+        let countly = viewInstance()
+        let views = core(of: countly).modules.views
+
+        guard let heldID = countly.views.startView("Article") else {
+            XCTFail("the view should have started")
+            return
+        }
+        views.applicationDidEnterBackground()
+        views.applicationWillEnterForeground()
+
+        countly.views.stopView(id: heldID)
+        views.applicationDidEnterBackground()
+        views.applicationWillEnterForeground()
+
+        XCTAssertEqual(events(named: "Article", of: countly).count, 4,
+                       "start, close on background, reopen on foreground, stop, and nothing reopened after it")
+    }
+
+    /// The held ID keeps working over any number of cycles, not only the first.
+    func testAViewIDFollowsTheViewThroughSeveralCycles() {
+        let countly = viewInstance()
+        let views = core(of: countly).modules.views
+
+        guard let heldID = countly.views.startView("Article") else {
+            XCTFail("the view should have started")
+            return
+        }
+        for _ in 0..<3 {
+            views.applicationDidEnterBackground()
+            views.applicationWillEnterForeground()
+        }
+        countly.views.addSegmentation(toViewWithID: heldID, segmentation: ["read": "yes"])
+        countly.views.stopView(id: heldID)
+
+        let last = events(named: "Article", of: countly).last
+        XCTAssertEqual((last?["segmentation"] as? [String: Any])?["read"] as? String, "yes",
+                       "segmentation added with the held ID should reach the reopened view's end event")
+    }
+
+    // MARK: - Consent withdrawal
+
+    /// Withdrawing view consent closes every open view, manual ones included, so
+    /// none of them later reports a duration that covers time the user opted out.
+    func testWithdrawingViewConsentClosesManualViews() {
+        let countly = viewInstance {
+            $0.requiresConsent = true
+            $0.consents = [.viewTracking]
+        }
+        let views = core(of: countly).modules.views
+
+        countly.views.startView("Home")
+        countly.consent.cancelConsent(for: .viewTracking)
+        countly.consent.giveConsent(for: .viewTracking)
+        views.applicationDidEnterBackground()
+        views.applicationWillEnterForeground()
+
+        XCTAssertEqual(events(named: "Home", of: countly).count, 2,
+                       "the view is started, closed by the withdrawal, and never reopened")
+    }
+
+    // MARK: - Screens that report themselves
+
+    /// The SwiftUI modifier's segmentation reaches the end event as well, which is
+    /// the one carrying the duration.
+    func testAReportedViewCarriesItsSegmentationOntoTheEndEvent() {
+        let countly = viewInstance()
+
+        let id = countly.views.startReportedView("Paywall", segmentation: ["plan": "pro"])
+        XCTAssertNotNil(id)
+        countly.views.stopReportedView(id: id ?? "", segmentation: ["plan": "pro"])
+
+        let paywall = events(named: "Paywall", of: countly)
+        XCTAssertEqual(paywall.count, 2)
+        XCTAssertEqual((paywall.last?["segmentation"] as? [String: Any])?["plan"] as? String, "pro")
+        XCTAssertNotNil(paywall.last?["dur"], "the end event is the one with the duration")
+    }
+
+    /// A reported view another path already closed is not stopped a second time.
+    func testStoppingAReportedViewThatIsAlreadyClosedDoesNothing() {
+        let countly = viewInstance()
+
+        let id = countly.views.startReportedView("Paywall", segmentation: nil) ?? ""
+        countly.views.stopAllViews()
+        countly.views.stopReportedView(id: id, segmentation: nil)
+
+        XCTAssertEqual(events(named: "Paywall", of: countly).count, 2, "one start and one end, not a second end")
+    }
+
 }

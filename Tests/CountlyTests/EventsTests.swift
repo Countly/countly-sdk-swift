@@ -215,7 +215,8 @@ final class EventsTests: CountlyBaseTestCase {
 
     /// The server stores numbers, strings, booleans and lists of those. Anything
     /// else is dropped key by key rather than failing the whole event, so one bad
-    /// value cannot cost the rest of the segmentation.
+    /// value cannot cost the rest of the segmentation. A date is the exception:
+    /// the server reads one as epoch milliseconds, so it is converted.
     func testUnsupportedSegmentationValuesAreDroppedWithoutLosingTheEvent() {
         let countly = startInstance { $0.eventSendThreshold = 1 }
 
@@ -224,13 +225,35 @@ final class EventsTests: CountlyBaseTestCase {
             "text": "value",
             "list": ["a", 1],
             "binary": Data([0x01]),
-            "date": Date(),
+            "date": Date(timeIntervalSince1970: 1_700_000_000),
         ])
 
         guard let request = TestUtils.request(requestQueue(of: countly), at: 0) else { return }
         let segmentation = (TestUtils.events(in: request)[0]["segmentation"] as? [String: Any]) ?? [:]
 
-        XCTAssertEqual(Set(segmentation.keys), ["number", "text", "list"])
+        XCTAssertEqual(Set(segmentation.keys), ["number", "text", "list", "date"])
+        XCTAssertEqual((segmentation["date"] as? NSNumber)?.int64Value, 1_700_000_000_000,
+                       "the date should have reached the wire as epoch milliseconds")
+    }
+
+    /// A number JSON cannot represent is dropped on its own. Kept, it makes the
+    /// whole batch unserializable, and every event recorded around it is lost.
+    func testANonFiniteSegmentationValueDoesNotCostTheOtherEvents() {
+        let countly = startInstance { $0.eventSendThreshold = 3 }
+
+        countly.events.recordEvent("a")
+        countly.events.recordEvent("b", segmentation: ["ratio": Double.nan, "kept": "yes"])
+        countly.events.recordEvent("c", segmentation: ["load": Double.infinity])
+
+        let events = requestQueue(of: countly)
+            .map(TestUtils.parseQuery)
+            .compactMap { $0["events"] as? [[String: Any]] }
+            .flatMap { $0 }
+        XCTAssertEqual(events.compactMap { $0["key"] as? String }.filter { ["a", "b", "c"].contains($0) }, ["a", "b", "c"],
+                       "every event should survive a bad value in one of them")
+        let b = events.first { $0["key"] as? String == "b" }?["segmentation"] as? [String: Any]
+        XCTAssertEqual(b?["kept"] as? String, "yes")
+        XCTAssertNil(b?["ratio"])
     }
 
     // MARK: - Consent

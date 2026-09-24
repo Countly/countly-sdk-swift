@@ -89,7 +89,10 @@ final class ConnectionManager: NSObject {
 
     /// Queues a request without starting a drain, for callers that will follow up
     /// with several more.
-    func enqueue(_ queryString: String) {
+    ///
+    /// - Returns: The request exactly as stored, or `nil` when the store refused it.
+    @discardableResult
+    func enqueue(_ queryString: String) -> String? {
         core.requestQueueStore.enqueue(queryString,
                                        appVersion: DeviceMetrics.appVersion,
                                        trackingEnabled: core.serverConfig.trackingEnabled)
@@ -205,6 +208,13 @@ final class ConnectionManager: NSObject {
         // it now would attribute the data to the placeholder ID.
         if head.contains("&\(QS.deviceID)=\(TemporaryDeviceID.value)") {
             abortProcessing("device ID of the request at the head of the queue is the temporary device ID")
+            return
+        }
+
+        // Re-read after taking the head: a crash stored in between must not start a
+        // send the dying process cannot finish. The store's lock, taken by both, orders it.
+        if core.isCrashing {
+            abortProcessing("application started crashing while the queue was being read")
             return
         }
 
@@ -529,90 +539,42 @@ final class ConnectionManager: NSObject {
 
     // MARK: - Crash reports
 
-    /// Sends a crash report, optionally bypassing the queue.
-    ///
-    /// An immediate send blocks the calling thread until the server answers,
-    /// because the process is about to die and an async send would not survive it.
-    /// If it fails the report is queued so the next launch sends it.
-    ///
-    /// Reachable from the signal handler, so no log line here goes above info:
-    /// error and warning logging touches dispatch primitives that are not
-    /// async-signal-safe.
-    func sendCrashReport(_ report: String?, immediately: Bool) {
-        guard core.serverConfig.networkingEnabled else {
-            core.logger.d(Self.module, "sendCrashReport", "crash report is dropped, reason: SDK networking is disabled from server config, crashReportLength: [\(report?.count ?? 0)]")
-            return
-        }
-
+    /// Queues a crash report the application recorded itself and starts a drain.
+    func sendCrashReport(_ report: String?) {
         guard let report else {
             core.logger.d(Self.module, "sendCrashReport", "crash report is nil, converting it to JSON may have failed due to custom objects in the crash segmentation")
             return
         }
+        core.logger.d(Self.module, "sendCrashReport", "crash report is added to the request queue, crashReportLength: [\(report.count)]")
+        enqueueAndProceed(builder.queryEssentials() + "&\(QS.crash)=\(report)")
+    }
 
-        let queryString = "\(builder.queryEssentials())&\(QS.crash)=\(report)"
-
-        guard immediately else {
-            core.logger.d(Self.module, "sendCrashReport", "crash report is added to the request queue, crashReportLength: [\(report.count)]")
-            enqueueAndProceed(queryString)
+    /// Writes a detected crash to disk, to be sent on the next launch.
+    ///
+    /// Nothing is sent while the process goes down. A send from the crash handler
+    /// needs locks, allocation and a wait on the network, none of it safe there;
+    /// it holds a dying app open until the server answers, and a process that
+    /// dies after the server accepted the report sends it again on the next launch.
+    ///
+    /// Reachable from the signal handler, so no log line here goes above info:
+    /// error and warning logging touches dispatch primitives that are not
+    /// async-signal-safe.
+    func storeCrashReport(_ report: String?) {
+        guard let report else {
+            core.logger.d(Self.module, "storeCrashReport", "crash report is nil, converting it to JSON may have failed due to custom objects in the crash segmentation")
             return
         }
 
-        // Stops anything else from starting a drain that would race the crash
-        // report. Only the crash leaves at crash time: recorded events and the
-        // running session stay on disk and are reported on the next launch.
+        // Set before the report is queued, so a drain reading the queue afterwards
+        // sees it and starts no send the dying process could not finish.
         core.isCrashing = true
 
-        if core.modules.deviceID.isTemporary {
-            core.logger.d(Self.module, "sendCrashReport", "crash report is stored to be sent later, reason: device ID is the temporary device ID, crashReportLength: [\(report.count)]")
-            enqueue(queryString)
-            core.requestQueueStore.saveSync()
+        guard enqueue(builder.queryEssentials() + "&\(QS.crash)=\(report)") != nil else {
+            core.logger.d(Self.module, "storeCrashReport", "crash report is not stored, reason: the request queue refused it, crashReportLength: [\(report.count)]")
             return
         }
-
         core.requestQueueStore.saveSync()
-
-        let stamped = "\(queryString)&\(QS.appVersion)=\(DeviceMetrics.appVersion)"
-        guard let endpointURL = URL(string: core.config.normalizedHost + Endpoint.input) else {
-            // Queued instead of dropped: the host may be fixed on a later launch,
-            // and trapping here would crash the app while it is already crashing.
-            core.logger.d(Self.module, "sendCrashReport", "the server URL could not be built, the crash report is queued instead")
-            enqueue(queryString)
-            core.requestQueueStore.saveSync()
-            return
-        }
-
-        var request = URLRequest(url: endpointURL)
-        request.httpMethod = "POST"
-        request.httpBody = Data(builder.appendChecksum(stamped).utf8)
-
-        core.logger.i(Self.module, "sendCrashReport", "sending crash report immediately, endpoint: [\(Endpoint.input)], method: [POST], bodySize: [\(request.httpBody?.count ?? 0)]")
-
-        let semaphore = DispatchSemaphore(value: 0)
-        let completion: (Data?, URLResponse?, Error?) -> Void = { [weak self, core] data, response, error in
-            defer { semaphore.signal() }
-            guard let self else { return }
-            _ = core
-
-            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-            if error != nil || !self.isRequestSuccessful(response: response, data: data, endpoint: Endpoint.input) {
-                self.core.logger.d(Self.module, "sendCrashReport", "immediate crash report request failed and it is queued to be sent later, endpoint: [\(request.url?.path ?? "")], statusCode: [\(statusCode)], errorDescription: [\(error?.localizedDescription ?? "none")]")
-                self.enqueue(queryString)
-                self.core.requestQueueStore.saveSync()
-            } else {
-                self.core.logger.d(Self.module, "sendCrashReport", "immediate crash report request completed successfully, endpoint: [\(request.url?.path ?? "")], responseSize: [\(data?.count ?? 0)]")
-            }
-        }
-
-        guard let task = queuedTask(with: request, completionHandler: completion) else {
-            core.logger.d(Self.module, "sendCrashReport", "the connection manager is halted, the crash report is queued instead")
-            enqueue(queryString)
-            core.requestQueueStore.saveSync()
-            return
-        }
-        task.resume()
-
-        logRequest(request)
-        semaphore.wait()
+        core.logger.d(Self.module, "storeCrashReport", "crash report is stored and will be sent on the next launch, crashReportLength: [\(report.count)]")
     }
 
     // MARK: - Request construction
