@@ -69,7 +69,7 @@
   * "addCrashBreadcrumb(log)" / "clearCrashBreadcrumbs()"
   * "setCrashSegmentation(segmentation)"
   * Automatic signal and uncaught exception handlers, chaining to any handler already installed, plus a crash filter callback and a regular expression filter via "CountlyConfig.crashes" and "crashFilter". A signal the application ignores, such as SIGPIPE, is left alone, and every other one is passed on after it is reported, so the process ends exactly as it would without the SDK.
-  * A detected crash is stored before delivery is attempted, for every instance before any of them sends, so a process that dies mid send, or a paused network, still reports it on a later launch
+  * A detected crash is stored for every instance while the process goes down and sent on the next launch. Nothing is sent from inside the crash handler.
 
 * Added the remote config API on "countly.remoteConfig":
   * "getValue(key)" / "getAllValues()"
@@ -116,7 +116,8 @@
 
 * Added automatic view tracking on iOS, tvOS and visionOS:
   * "CountlyConfig.enableAutomaticViewTracking", with an exclusion list ("automaticViewTrackingExclusionList") matching the resolved view name, the class name or a superclass, and a "CountlyAutoViewTrackingName" protocol for naming a screen explicitly
-  * A screen known only by a compiler-generated Swift class name, a SwiftUI hosting controller for example, is not reported; give it a title or adopt "CountlyAutoViewTrackingName"
+  * A SwiftUI hosting controller is reported under the name of the view it hosts, so `UIHostingController<CheckoutView>` reports as "CheckoutView". A hosted view that also reports itself with "countlyView" is reported twice unless its name is on the exclusion list.
+  * A host of an erased "AnyView", which SwiftUI uses for its own sheets and navigation destinations, and any other screen known only by a compiler-generated Swift class name, is not reported; give it a title or adopt "CountlyAutoViewTrackingName"
   * "CountlyConfig.disableSwizzling", which stops the "viewDidAppear" and "viewDidDisappear" exchange. That exchange is the only thing automatic view tracking watches, so this leaves it off, even when SDK behavior settings would switch it on; report screens yourself instead. It applies to its own instance only and does not cover push handling, which "disableAutomaticPushHandling" turns off.
   * A SwiftUI "countlyView(_:segmentation:instance:)" modifier, because one hosting controller is a single appearance and a SwiftUI screen has to name itself. Works with automatic view tracking on or off.
 

@@ -13,9 +13,8 @@ import MachO
 /// Captures crashes and handled errors, with the context needed to symbolicate
 /// them later.
 ///
-/// A fatal crash is sent immediately and synchronously, because the process is
-/// about to die and a queued request would never leave. Everything else goes
-/// through the normal queue.
+/// A crash the SDK detects itself is written to disk while the process goes down
+/// and sent on the next launch. Everything else goes through the normal queue.
 final class CrashModule: ModuleBase {
 
     override class var moduleName: String { "Crash" }
@@ -198,9 +197,8 @@ final class CrashModule: ModuleBase {
 
     /// Called by the process-wide handler when a crash is detected.
     ///
-    /// Stores the report and returns what its send needs, leaving the send to
-    /// ``deliver(_:)`` so that every instance stores before any of them sends.
-    func handleAutoDetectedCrash(name: String, reason: String, stackTrace: [String]) -> ImmediateCrashDelivery? {
+    /// Stores the report for the next launch to send.
+    func handleAutoDetectedCrash(name: String, reason: String, stackTrace: [String]) {
         // Reached from the signal handler, so nothing here may log at error or
         // warning: those bump the health tracker, whose dispatch primitives are
         // not async signal safe and can deadlock the process mid crash.
@@ -208,48 +206,42 @@ final class CrashModule: ModuleBase {
 
         guard core.serverConfig.crashReportingEnabled else {
             logD("handleAutoDetectedCrash", "the detected crash is not reported, crash reporting is disabled by server config")
-            return nil
+            return
         }
 
         guard core.serverConfig.automaticCrashReportingEnabled else {
             logD("handleAutoDetectedCrash", "the detected crash is not reported, automatic crash reporting is disabled by server config")
-            return nil
+            return
         }
 
         guard core.modules.consent.hasConsent(for: .crashReporting) else {
             logD("handleAutoDetectedCrash", "the detected crash is not reported, no crashes consent is given")
-            return nil
+            return
         }
 
-        return handle(name: name,
-                      description: reason,
-                      stackTrace: stackTrace,
-                      userInfo: [:],
-                      segmentationOverride: nil,
-                      isFatal: true,
-                      isAutoDetected: true)
+        handle(name: name,
+               description: reason,
+               stackTrace: stackTrace,
+               userInfo: [:],
+               segmentationOverride: nil,
+               isFatal: true,
+               isAutoDetected: true)
     }
 
-    /// Sends a report ``handleAutoDetectedCrash(name:reason:stackTrace:)`` stored.
-    func deliver(_ delivery: ImmediateCrashDelivery) {
-        core.network.deliverImmediateCrashReport(delivery)
-    }
-
-    /// Builds the report, gives the filter callback a say, and sends it.
+    /// Builds the report, gives the filter callback a say, and queues it.
     ///
-    /// - Returns: For an automatically detected crash, the stored report still to
-    ///   be sent; `nil` otherwise, and whenever there is nothing to send.
-    @discardableResult
+    /// An automatically detected crash is only stored, for the next launch to
+    /// send; everything else joins the queue and starts a drain.
     private func handle(name: String,
                         description: String,
                         stackTrace: [String],
                         userInfo: [String: Any],
                         segmentationOverride: [String: Any]?,
                         isFatal: Bool,
-                        isAutoDetected: Bool) -> ImmediateCrashDelivery? {
+                        isAutoDetected: Bool) {
         guard core.serverConfig.crashReportingEnabled else {
             logD("handle", "crash report is dropped before it is built, crash reporting is disabled by server config, isFatal: [\(isFatal)], isAutoDetected: [\(isAutoDetected)]")
-            return nil
+            return
         }
 
         // Limited before anything reads it, so the regular expression filter, the
@@ -299,7 +291,7 @@ final class CrashModule: ModuleBase {
         guard !matchesFilter, !filteredByCallback else {
             logD("handle", "crash report is filtered out and will not be processed, crashName: [\(name)], isFatal: [\(isFatal)], matchesRegexFilter: [\(matchesFilter)], matchesFilterCallback: [\(filteredByCallback)]")
             if isAutoDetected { stopCrashReporting() }
-            return nil
+            return
         }
 
         let report = wireReport(for: crashData,
@@ -309,12 +301,10 @@ final class CrashModule: ModuleBase {
         if let shouldSend = core.config.shouldSendCrashReportCallback, !shouldSend(report) {
             logD("handle", "crash report is dropped by the shouldSendCrashReport callback, crashName: [\(name)], isFatal: [\(isFatal)], reportFieldCount: [\(report.count)]")
             if isAutoDetected { stopCrashReporting() }
-            return nil
+            return
         }
 
-        // An automatically detected crash is sent synchronously because the process
-        // is about to die; everything else joins the queue.
-        logI("handle", "crash recorded, crashName: [\(name)], isFatal: [\(crashData.fatal)], isAutoDetected: [\(isAutoDetected)], delivery: [\(isAutoDetected ? "immediate" : "queued")], customSegmentationKeyCount: [\(crashData.crashSegmentation.count)], breadcrumbCount: [\(crashData.breadcrumbs.count)], stackTraceFrameCount: [\(stackTrace.count)]")
+        logI("handle", "crash recorded, crashName: [\(name)], isFatal: [\(crashData.fatal)], isAutoDetected: [\(isAutoDetected)], delivery: [\(isAutoDetected ? "next launch" : "queued")], customSegmentationKeyCount: [\(crashData.crashSegmentation.count)], breadcrumbCount: [\(crashData.breadcrumbs.count)], stackTraceFrameCount: [\(stackTrace.count)]")
         logV("handle", "crash detail, breadcrumbs: [\(crashData.breadcrumbs)], crashSegmentation: [\(crashData.crashSegmentation)], stackTrace: [\(crashData.stackTrace)]")
 
         // `CountlyJSON` reports a serialization failure at error level, and an
@@ -327,18 +317,15 @@ final class CrashModule: ModuleBase {
         }
 
         guard isAutoDetected else {
-            core.network.sendCrashReport(payload?.urlEscaped, immediately: false)
-            return nil
+            core.network.sendCrashReport(payload?.urlEscaped)
+            return
         }
 
-        let delivery = core.network.persistImmediateCrashReport(payload?.urlEscaped)
+        core.network.storeCrashReport(payload?.urlEscaped)
 
-        // Before the send rather than after it. The stored report already carries
-        // the breadcrumbs, so a process killed mid-send would otherwise leave them
-        // in the file for the next launch to attach to an unrelated report. And a
-        // crash handler that stays installed would re-enter on the way down.
+        // The stored report carries the breadcrumbs, which the next launch would
+        // attach again, and a handler left installed would re-enter on the way down.
         stopCrashReporting()
-        return delivery
     }
 
     /// Turns the assembled crash data into the payload the server reads.

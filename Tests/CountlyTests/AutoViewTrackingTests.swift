@@ -10,6 +10,7 @@
 
 import XCTest
 import UIKit
+import SwiftUI
 @testable import Countly
 
 /// Naming screens without the application having to.
@@ -40,6 +41,15 @@ final class AutoViewTrackingTests: CountlyBaseTestCase {
     /// Generic, so the runtime only knows it by a mangled name, the same way it
     /// knows a SwiftUI hosting controller.
     private final class GenericViewController<Content>: UIViewController {}
+
+    /// SwiftUI screens, which a hosting controller is named after.
+    private struct CheckoutScreen: View {
+        var body: some View { Text("Checkout") }
+    }
+
+    private struct ReceiptScreen: View {
+        var body: some View { Text("Receipt") }
+    }
 
     /// Every `[CLY]_view` event the instance produced, oldest first.
     private func viewEvents(of instance: CountlyInstance) -> [[String: Any]] {
@@ -386,20 +396,48 @@ final class AutoViewTrackingTests: CountlyBaseTestCase {
 
     // MARK: - Screens with only a mangled class name
 
-    /// A screen known only by a compiler-mangled class name is not reported under
-    /// it, but the screen the user left is still closed, so its duration stops
-    /// where the user actually left it.
-    func testAScreenWithOnlyAMangledClassNameIsNotReportedButClosesThePreviousOne() {
+    /// A SwiftUI hosting controller is known to the runtime only by a mangled
+    /// name, so it is reported under the view it hosts, with modifiers taken off,
+    /// and the screen the user left is closed as for any other screen.
+    func testASwiftUIHostingControllerIsNamedByTheViewItHosts() {
+        let countly = trackingInstance()
+        let views = core(of: countly).modules.views
+
+        views.handleAutoTrackedViewController(TitledViewController(named: "Cart"))
+        views.handleAutoTrackedViewController(UIHostingController(rootView: CheckoutScreen()))
+        views.handleAutoTrackedViewController(UIHostingController(rootView: ReceiptScreen().padding()))
+
+        XCTAssertEqual(names(of: countly),
+                       ["Cart", "Cart", "CheckoutScreen", "CheckoutScreen", "ReceiptScreen"],
+                       "each screen should start under the hosted view's name and close the one before it")
+    }
+
+    /// A screen with nothing readable left, a generic class of the application's
+    /// own or a SwiftUI host of an erased `AnyView` such as SwiftUI's own sheets
+    /// use, is not reported, but the screen the user left is still closed, so its
+    /// duration stops where the user actually left it.
+    func testAScreenWithNoReadableNameIsNotReportedButClosesThePreviousOne() {
         let countly = trackingInstance()
         let views = core(of: countly).modules.views
 
         views.handleAutoTrackedViewController(TitledViewController(named: "Cart"))
         views.handleAutoTrackedViewController(GenericViewController<Int>())
+        views.handleAutoTrackedViewController(TitledViewController(named: "Basket"))
+        views.handleAutoTrackedViewController(UIHostingController(rootView: AnyView(CheckoutScreen())))
 
-        XCTAssertFalse(names(of: countly).contains { $0.hasPrefix("_Tt") },
-                       "no mangled class name should reach the dashboard, found: [\(names(of: countly))]")
-        XCTAssertEqual(names(of: countly).filter { $0 == "Cart" }.count, 2,
-                       "the screen the user left should be closed, a start and an end")
+        XCTAssertEqual(names(of: countly), ["Cart", "Cart", "Basket", "Basket"],
+                       "only the titled screens should be reported, each started and then closed")
+    }
+
+    /// The hosted view's name is the screen's name, so the exclusion list can
+    /// leave out a SwiftUI screen that already reports itself with `countlyView`.
+    func testAHostedSwiftUIViewCanBeExcludedByItsName() {
+        let countly = trackingInstance { $0.automaticViewTrackingExclusionList = ["CheckoutScreen"] }
+
+        appear(UIHostingController(rootView: CheckoutScreen()))
+        appear(TitledViewController(named: "Ordinary"))
+
+        XCTAssertEqual(names(of: countly), ["Ordinary"])
     }
 
     /// The same screen with a title is reported under it, as any other.

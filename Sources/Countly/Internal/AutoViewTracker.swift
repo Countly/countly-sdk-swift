@@ -83,8 +83,9 @@ final class AutoViewTracker {
     ///
     /// Falls back down a chain rather than to a single source, because a view
     /// controller may express its name in any of these and an unnamed screen is
-    /// worse than a class name. A compiler-mangled class name is worse still, so
-    /// a screen left with only that is `nil`.
+    /// worse than a class name. A compiler-mangled class name is worse still: a
+    /// SwiftUI hosting controller is named by the view it hosts instead, and any
+    /// other screen left with only a mangled name is `nil`.
     static func title(for viewController: UIViewController?) -> String? {
         guard let viewController else { return nil }
 
@@ -112,7 +113,77 @@ final class AutoViewTracker {
         // `_TtGC7SwiftUI19UIHostingControllerV5MyApp11ContentView_`, which no one
         // reading the dashboard can recognise.
         let className = NSStringFromClass(type(of: viewController))
-        return className.hasPrefix("_Tt") ? nil : className
+        guard className.hasPrefix("_Tt") else { return className }
+        return hostedViewName(of: viewController)
+    }
+
+    /// The type name of the view a SwiftUI hosting controller hosts.
+    ///
+    /// Read off the readable type name of its `UIHostingController` ancestor, so
+    /// SwiftUI's own subclasses are covered too, with `ModifiedContent` wrappers
+    /// taken off: `UIHostingController<ModifiedContent<ContentView, …>>` is
+    /// `ContentView`.
+    ///
+    /// - Returns: `nil` for a view controller that hosts no SwiftUI view, and for
+    ///   a root erased to `AnyView`, which is what SwiftUI's own sheet and
+    ///   navigation hosts hold and which names no screen.
+    private static func hostedViewName(of viewController: UIViewController) -> String? {
+        var ancestor: AnyClass? = type(of: viewController)
+        while let current = ancestor {
+            if let hosting = genericComponents(of: String(describing: current)),
+               hosting.base == "UIHostingController" {
+                return rootViewName(hosting.arguments.first)
+            }
+            ancestor = class_getSuperclass(current)
+        }
+        return nil
+    }
+
+    /// A hosted root view's type name with its `ModifiedContent` wrappers taken
+    /// off, or `nil` when nothing that names a screen is left.
+    private static func rootViewName(_ typeName: String?) -> String? {
+        guard var name = typeName else { return nil }
+
+        while let modified = genericComponents(of: name),
+              modified.base == "ModifiedContent",
+              let content = modified.arguments.first {
+            name = content
+        }
+
+        guard !name.isEmpty, name != "AnyView" else { return nil }
+        return name
+    }
+
+    /// Splits a generic type name such as `Base<A, B<C, D>>` into its base name
+    /// and its top-level arguments, or returns `nil` for a name that is not
+    /// generic.
+    private static func genericComponents(of typeName: String) -> (base: String, arguments: [String])? {
+        guard typeName.hasSuffix(">"), let open = typeName.firstIndex(of: "<") else { return nil }
+
+        let base = String(typeName[..<open])
+        let inner = typeName[typeName.index(after: open)..<typeName.index(before: typeName.endIndex)]
+
+        var arguments: [String] = []
+        var current = ""
+        var depth = 0
+        for character in inner {
+            switch character {
+            case "<", "(":
+                depth += 1
+                current.append(character)
+            case ">", ")":
+                depth -= 1
+                current.append(character)
+            case "," where depth == 0:
+                arguments.append(current.trimmingCharacters(in: .whitespaces))
+                current = ""
+            default:
+                current.append(character)
+            }
+        }
+        arguments.append(current.trimmingCharacters(in: .whitespaces))
+
+        return (base, arguments)
     }
 
     /// The view controller currently on screen.

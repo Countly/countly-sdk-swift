@@ -659,7 +659,7 @@ final class ViewsModule: ModuleBase {
             // The screen itself goes unreported, having no usable name, but the
             // one the user just left is still closed, or it would go on timing a
             // screen that is no longer shown.
-            logD("handleAutoTrackedViewController", "appeared view controller has only a compiler generated class name, no view is started for it and the current auto stopped view is closed, class: [\(className)]")
+            logD("handleAutoTrackedViewController", "appeared view controller has no readable name, only a compiler generated class name or a SwiftUI host of an erased view, no view is started for it and the current auto stopped view is closed, class: [\(className)]")
             stopAutoStoppedView()
             return
         }

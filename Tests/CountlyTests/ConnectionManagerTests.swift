@@ -111,54 +111,37 @@ final class ConnectionManagerTests: CountlyBaseTestCase {
 
     // MARK: - Crash reports
 
-    /// A crash the SDK detected itself may be the last thing the process does, so
-    /// its report is sent on the spot rather than queued, and the call blocks until
-    /// the server has answered.
-    func testAnAutoDetectedCrashIsSentImmediatelyRatherThanQueued() {
-        MockURLProtocol.respondToEverything(json: Self.accepted)
-        let countly = startInstance { $0.features = [.crashReporting] }
-
-        reportAutoDetectedCrash(on: countly)
-
-        // Already delivered by the time the call returns, which is the point of the
-        // immediate path.
-        let sent = MockURLProtocol.requests.filter { $0.query.contains("crash=") }
-        XCTAssertEqual(sent.count, 1)
-        XCTAssertEqual(sent.first?.method, "POST")
-        XCTAssertEqual(sent.first?.path, "/i")
-        XCTAssertTrue(requestQueue(of: countly).filter { $0.contains("crash=") }.isEmpty,
-                      "an accepted immediate report must not also sit in the queue")
-    }
-
-    /// If the immediate send fails, the report goes back into the queue rather than
-    /// being lost: the crash still happened.
-    func testAnAutoDetectedCrashThatCannotBeSentIsQueuedInstead() {
-        // No handler, so the send fails at the transport level.
-        let countly = startInstance { $0.features = [.crashReporting] }
-
-        reportAutoDetectedCrash(on: countly)
-
-        XCTAssertEqual(requestQueue(of: countly).filter { $0.contains("crash=") }.count, 1)
-    }
-
-    /// In temporary mode nothing may be attributed, so even a crash the SDK caught
-    /// itself waits for a real device ID instead of going out under the placeholder.
-    func testAnAutoDetectedCrashIsHeldBackInTemporaryDeviceIDMode() {
+    /// A crash the SDK detected itself stops the queue for the rest of the dying
+    /// process: its report, and anything recorded after it, wait on disk for the
+    /// next launch instead of starting a send the process cannot finish.
+    func testAnAutoDetectedCrashStopsTheQueueUntilTheNextLaunch() {
         MockURLProtocol.respondToEverything(json: Self.accepted)
         let countly = startInstance {
-            $0.temporaryDeviceIDMode = true
-            $0.deviceID = nil
             $0.features = [.crashReporting]
+            $0.eventSendThreshold = 1
         }
+        TestUtils.waitUntil("the start-up queue drains") { self.requestQueue(of: countly).isEmpty }
 
         reportAutoDetectedCrash(on: countly)
+        let sentBeforeTheCrash = MockURLProtocol.requests.count
+        countly.events.recordEvent("after the crash")
+        TestUtils.pump(0.5)
 
-        XCTAssertTrue(MockURLProtocol.requests.filter { $0.query.contains("crash=") }.isEmpty)
-        XCTAssertEqual(requestQueue(of: countly).filter { $0.contains("crash=") }.count, 1)
+        XCTAssertEqual(MockURLProtocol.requests.count, sentBeforeTheCrash,
+                       "no request may start once the crash is stored")
+        let queued = requestQueue(of: countly)
+        XCTAssertEqual(TestUtils.requests(queued, carrying: "crash").count, 1,
+                       "the crash report should wait in the queue")
+        let eventKeys = TestUtils.requests(queued, carrying: "events")
+            .compactMap { $0["events"] as? [[String: Any]] }
+            .flatMap { $0 }
+            .compactMap { $0["key"] as? String }
+        XCTAssertTrue(eventKeys.contains("after the crash"),
+                      "an event recorded after the crash should wait in the queue too, found: [\(eventKeys)]")
     }
 
-    /// An error the application reported itself is not urgent, however it is
-    /// flagged: only a crash the SDK caught skips the queue.
+    /// An error the application reported itself is drained right away, however it
+    /// is flagged: only a crash the SDK caught waits for the next launch.
     func testAManuallyRecordedErrorAlwaysGoesThroughTheQueue() {
         MockURLProtocol.respondToEverything(json: Self.accepted)
         let countly = startInstance()
@@ -166,15 +149,14 @@ final class ConnectionManagerTests: CountlyBaseTestCase {
         countly.crashes.recordError("handled", isFatal: false, stackTrace: [])
         countly.crashes.recordError("reported as fatal", isFatal: true, stackTrace: [])
 
-        // Both go through the queue, so both are drained rather than sent on the
-        // spot. Counted at the transport because a drained queue is empty.
+        // Counted at the transport because a drained queue is empty.
         TestUtils.waitUntil("both reports drain") {
             MockURLProtocol.requests.filter { $0.query.contains("crash=") }.count == 2
         }
         XCTAssertTrue(MockURLProtocol.requests
             .filter { $0.query.contains("crash=") }
             .allSatisfy { $0.method == "GET" },
-            "a queued report is an ordinary request, not the immediate POST")
+            "a queued report is an ordinary request")
     }
 
     // MARK: - Picture upload

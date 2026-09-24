@@ -173,28 +173,6 @@ final class RequestQueueStore {
         logger?.d(Self.module, "removeHead", "request at the head of the queue is removed, remainingRequestCount: [\(requests.count)]")
     }
 
-    /// Removes the first queued request containing this marker.
-    ///
-    /// Matched on a fragment rather than on the whole request, because the
-    /// immediate crash report is delivered while it sits in the queue and the
-    /// bulk rewrites (device ID, app key) can edit the copy in place meanwhile.
-    /// An exact-string removal would then find nothing and the report the server
-    /// already accepted would be sent again on the next launch.
-    ///
-    /// Unlike ``removeHead(_:)`` this does not care where the request sits: the
-    /// crash report is appended to the tail.
-    func removeFirst(containing marker: String) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        guard let index = requests.firstIndex(where: { $0.contains(marker) }) else {
-            logger?.d(Self.module, "removeFirst", "no queued request carries the marker and nothing is removed, markerLength: [\(marker.count)], queuedRequestCount: [\(requests.count)]")
-            return
-        }
-        requests.remove(at: index)
-        logger?.d(Self.module, "removeFirst", "a request is removed from the queue, removedAtIndex: [\(index)], remainingRequestCount: [\(requests.count)]")
-    }
-
     /// Drops every queued request.
     func flush() {
         lock.lock()

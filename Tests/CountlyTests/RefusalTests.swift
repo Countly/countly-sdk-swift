@@ -205,9 +205,9 @@ final class RefusalTests: CountlyBaseTestCase {
 
     // MARK: - A host that cannot be turned into a URL
 
-    /// A host that cannot form a URL leaves the crash report in the queue rather
-    /// than dropping it: the host may be fixed on a later launch, and trapping
-    /// while the application is already crashing is the worst possible moment.
+    /// A host that cannot form a URL still leaves the crash report in the queue:
+    /// the host may be fixed on a later launch, and trapping while the application
+    /// is already crashing is the worst possible moment.
     func testACrashIsQueuedWhenTheServerURLCannotBeBuilt() {
         let countly = startInstance {
             $0.features = [.crashReporting]

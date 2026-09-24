@@ -62,7 +62,8 @@ final class SDKCore {
     var hasFinishedInit = false
 
     /// Whether the application is currently crashing, which suspends queue
-    /// processing so the crash report is the last thing that goes out.
+    /// processing: nothing is sent while the process goes down, and the stored
+    /// crash report goes out on the next launch.
     var isCrashing = false
 
     /// Whether the application is terminating, which stops new requests from

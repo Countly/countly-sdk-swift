@@ -141,14 +141,11 @@ class CountlyBaseTestCase: XCTestCase {
     }
 
     /// Reports a crash to one instance the way the signal handler does: the
-    /// report is stored first and then sent, blocking until the server answers.
+    /// report is stored for the next launch and nothing is sent.
     func reportAutoDetectedCrash(on instance: CountlyInstance,
                                  name: String = "SIGSEGV",
                                  reason: String = "boom",
                                  stackTrace: [String] = ["0 MyApp 0x1 boom"]) {
-        let crashes = core(of: instance).modules.crashes
-        if let delivery = crashes.handleAutoDetectedCrash(name: name, reason: reason, stackTrace: stackTrace) {
-            crashes.deliver(delivery)
-        }
+        core(of: instance).modules.crashes.handleAutoDetectedCrash(name: name, reason: reason, stackTrace: stackTrace)
     }
 }

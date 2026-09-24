@@ -165,20 +165,11 @@ final class CrashHandlerInstaller {
         }
     }
 
-    /// Reports one crash to every registered module, in two passes.
-    ///
-    /// Every instance stores its report before any of them sends. Each send
-    /// blocks until its server answers, and a process killed during the first
-    /// one would otherwise take every later instance's report with it, never
-    /// written.
+    /// Reports one crash to every registered module, each storing its report for
+    /// the next launch to send.
     func dispatch(name: String, reason: String, stackTrace: [String]) {
-        let pending = activeModules().compactMap { module in
+        for module in activeModules() {
             module.handleAutoDetectedCrash(name: name, reason: reason, stackTrace: stackTrace)
-                .map { (module, $0) }
-        }
-
-        for (module, delivery) in pending {
-            module.deliver(delivery)
         }
     }
 }
