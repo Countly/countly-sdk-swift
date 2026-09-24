@@ -226,6 +226,17 @@ public final class ViewsAPI: CountlyAPIBase {
         core()?.modules.views.resumeView(id: viewID)
     }
 
+    /// Starts the view a SwiftUI screen reports for itself, for
+    /// ``CountlyViewModifier``.
+    func startReportedView(_ viewName: String, segmentation: [String: Any]?) -> String? {
+        core()?.modules.views.startReportedView(viewName, segmentation: segmentation)
+    }
+
+    /// Stops a view ``startReportedView(_:segmentation:)`` started.
+    func stopReportedView(id viewID: String, segmentation: [String: Any]?) {
+        core()?.modules.views.stopReportedView(id: viewID, segmentation: segmentation)
+    }
+
     /// Stops every open view.
     public func stopAllViews(segmentation: [String: Any]? = nil) {
         core()?.modules.views.stopAllViews(segmentation: segmentation)

@@ -8,7 +8,7 @@
 
 import Foundation
 
-#if os(iOS) || os(tvOS)
+#if os(iOS) || os(tvOS) || os(visionOS)
 import UIKit
 import ObjectiveC
 
@@ -83,7 +83,8 @@ final class AutoViewTracker {
     ///
     /// Falls back down a chain rather than to a single source, because a view
     /// controller may express its name in any of these and an unnamed screen is
-    /// worse than a class name.
+    /// worse than a class name. A compiler-mangled class name is worse still, so
+    /// a screen left with only that is `nil`.
     static func title(for viewController: UIViewController?) -> String? {
         guard let viewController else { return nil }
 
@@ -106,7 +107,12 @@ final class AutoViewTracker {
             return navigationTitle
         }
 
-        return NSStringFromClass(type(of: viewController))
+        // A generic or private Swift class, a SwiftUI hosting controller among
+        // them, only has its mangled runtime name here, such as
+        // `_TtGC7SwiftUI19UIHostingControllerV5MyApp11ContentView_`, which no one
+        // reading the dashboard can recognise.
+        let className = NSStringFromClass(type(of: viewController))
+        return className.hasPrefix("_Tt") ? nil : className
     }
 
     /// The view controller currently on screen.
@@ -210,7 +216,7 @@ extension UIViewController {
     }
 
     private var isCountlyPageSheetModal: Bool {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         return modalPresentationStyle == .pageSheet && isBeingPresented
         #else
         return false

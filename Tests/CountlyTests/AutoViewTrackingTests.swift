@@ -6,7 +6,7 @@
 //  Please visit www.count.ly for more information.
 //
 
-#if os(iOS) || os(tvOS)
+#if os(iOS) || os(tvOS) || os(visionOS)
 
 import XCTest
 import UIKit
@@ -36,6 +36,10 @@ final class AutoViewTrackingTests: CountlyBaseTestCase {
     }
 
     private final class ExcludedByClassViewController: UIViewController {}
+
+    /// Generic, so the runtime only knows it by a mangled name, the same way it
+    /// knows a SwiftUI hosting controller.
+    private final class GenericViewController<Content>: UIViewController {}
 
     /// Every `[CLY]_view` event the instance produced, oldest first.
     private func viewEvents(of instance: CountlyInstance) -> [[String: Any]] {
@@ -323,6 +327,100 @@ final class AutoViewTrackingTests: CountlyBaseTestCase {
         XCTAssertFalse(names(of: tracking).contains("Shared"), "excluded here")
         XCTAssertTrue(names(of: other).contains("Shared"), "not excluded there")
     }
+
+    // MARK: - Opting out of the method exchange
+
+    /// Runs the main queue until everything `start(with:)` deferred to it has
+    /// run. The main queue is serial and first in first out, so a block enqueued
+    /// after start returns cannot run before the SDK's own. Asserting without
+    /// this passes whatever the flag does, because nothing has happened yet.
+    private func drainMainQueue() {
+        let drained = expectation(description: "main queue drained")
+        DispatchQueue.main.async { drained.fulfill() }
+        wait(for: [drained], timeout: 5)
+    }
+
+    /// The exchange is the only source of appearances, so refusing it refuses the
+    /// feature. Leaving the module active instead would be worse than off: the
+    /// active flag makes it reject the host's own view calls too.
+    func testDisablingSwizzlingLeavesAutomaticViewTrackingOff() {
+        let countly = startInstance {
+            $0.enableAutomaticViewTracking = true
+            $0.disableSwizzling = true
+        }
+        drainMainQueue()
+
+        XCTAssertFalse(core(of: countly).modules.views.isAutoViewTrackingActive,
+                       "automatic view tracking cannot run without the method exchange")
+    }
+
+    /// The contract the flag exists for: with the exchange refused, the host
+    /// reports its own screens and the SDK accepts them. The public API is what
+    /// a host and the SwiftUI modifier both use, so that is what is driven here.
+    func testDisablingSwizzlingLetsTheHostReportScreensItself() {
+        let countly = startInstance {
+            $0.eventSendThreshold = 1
+            $0.enableAutomaticViewTracking = true
+            $0.disableSwizzling = true
+        }
+        drainMainQueue()
+
+        countly.views.startView("Settings")
+        countly.views.stopView(name: "Settings")
+
+        XCTAssertTrue(names(of: countly).contains("Settings"),
+                      "a screen the host reported should reach the server, found: [\(names(of: countly))]")
+    }
+
+    /// A SwiftUI screen reports itself even while automatic tracking runs. The
+    /// method exchange never sees a SwiftUI screen, so this is not the second view
+    /// for one screen that the manual call gate exists to prevent.
+    func testAReportedViewIsAcceptedWhileAutomaticTrackingIsOn() {
+        let countly = trackingInstance()
+
+        let id = countly.views.startReportedView("Settings", segmentation: nil)
+
+        XCTAssertNotNil(id, "the reported view should not be refused as a manual call")
+        XCTAssertTrue(names(of: countly).contains("Settings"))
+    }
+
+    // MARK: - Screens with only a mangled class name
+
+    /// A screen known only by a compiler-mangled class name is not reported under
+    /// it, but the screen the user left is still closed, so its duration stops
+    /// where the user actually left it.
+    func testAScreenWithOnlyAMangledClassNameIsNotReportedButClosesThePreviousOne() {
+        let countly = trackingInstance()
+        let views = core(of: countly).modules.views
+
+        views.handleAutoTrackedViewController(TitledViewController(named: "Cart"))
+        views.handleAutoTrackedViewController(GenericViewController<Int>())
+
+        XCTAssertFalse(names(of: countly).contains { $0.hasPrefix("_Tt") },
+                       "no mangled class name should reach the dashboard, found: [\(names(of: countly))]")
+        XCTAssertEqual(names(of: countly).filter { $0 == "Cart" }.count, 2,
+                       "the screen the user left should be closed, a start and an end")
+    }
+
+    /// The same screen with a title is reported under it, as any other.
+    func testAScreenWithAMangledClassNameIsReportedWhenItHasATitle() {
+        let countly = trackingInstance()
+        let screen = GenericViewController<Int>()
+        screen.title = "Checkout"
+
+        core(of: countly).modules.views.handleAutoTrackedViewController(screen)
+
+        XCTAssertTrue(names(of: countly).contains("Checkout"))
+    }
+
+    /// Swizzling is allowed by default, so enabling automatic view tracking
+    /// alone starts it.
+    func testLeavingSwizzlingEnabledStartsAutomaticViewTracking() {
+        let countly = trackingInstance()
+
+        XCTAssertTrue(core(of: countly).modules.views.isAutoViewTrackingActive)
+    }
+
 }
 
 #endif

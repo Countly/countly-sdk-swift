@@ -101,15 +101,18 @@ final class RequestQueueStore {
     ///     produced under.
     ///   - trackingEnabled: When the server has switched tracking off, the
     ///     request is discarded instead of queued.
-    func enqueue(_ queryString: String, appVersion: String, trackingEnabled: Bool) {
+    /// - Returns: The request exactly as stored, app version included, or `nil`
+    ///   when it was refused.
+    @discardableResult
+    func enqueue(_ queryString: String, appVersion: String, trackingEnabled: Bool) -> String? {
         guard trackingEnabled else {
             logger?.d(Self.module, "enqueue", "request is not stored in the queue, reason: tracking is disabled by behavior settings, queryStringLength: [\(queryString.count)]")
-            return
+            return nil
         }
 
         guard !queryString.isEmpty else {
             logger?.d(Self.module, "enqueue", "request is not stored in the queue, reason: it reached the store with an empty query string")
-            return
+            return nil
         }
 
         let stamped = queryString + "&\(QS.appVersion)=\(appVersion)"
@@ -120,6 +123,7 @@ final class RequestQueueStore {
         trimToLimitLocked()
         requests.append(stamped)
         logger?.d(Self.module, "enqueue", "request is stored in the queue, queryStringLength: [\(stamped.count)], queuedRequestCount: [\(requests.count)], storedRequestsLimit: [\(storedRequestsLimit)]")
+        return stamped
     }
 
     /// Makes room for one more request, dropping the oldest when the queue is at
@@ -167,6 +171,28 @@ final class RequestQueueStore {
         }
         requests.removeFirst()
         logger?.d(Self.module, "removeHead", "request at the head of the queue is removed, remainingRequestCount: [\(requests.count)]")
+    }
+
+    /// Removes the first queued request containing this marker.
+    ///
+    /// Matched on a fragment rather than on the whole request, because the
+    /// immediate crash report is delivered while it sits in the queue and the
+    /// bulk rewrites (device ID, app key) can edit the copy in place meanwhile.
+    /// An exact-string removal would then find nothing and the report the server
+    /// already accepted would be sent again on the next launch.
+    ///
+    /// Unlike ``removeHead(_:)`` this does not care where the request sits: the
+    /// crash report is appended to the tail.
+    func removeFirst(containing marker: String) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let index = requests.firstIndex(where: { $0.contains(marker) }) else {
+            logger?.d(Self.module, "removeFirst", "no queued request carries the marker and nothing is removed, markerLength: [\(marker.count)], queuedRequestCount: [\(requests.count)]")
+            return
+        }
+        requests.remove(at: index)
+        logger?.d(Self.module, "removeFirst", "a request is removed from the queue, removedAtIndex: [\(index)], remainingRequestCount: [\(requests.count)]")
     }
 
     /// Drops every queued request.

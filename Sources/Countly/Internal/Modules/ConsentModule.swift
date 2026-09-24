@@ -250,8 +250,8 @@ final class ConsentModule: ModuleBase {
                 logD("consentDidChange", "consent granted, feature: [\(feature.wireName)], automatic view tracking will be started")
                 modules?.views.startAutoViewTracking()
             } else {
-                logD("consentDidChange", "consent cancelled, feature: [\(feature.wireName)], automatic view tracking will be stopped")
-                modules?.views.stopAutoViewTracking()
+                logD("consentDidChange", "consent cancelled, feature: [\(feature.wireName)], automatic view tracking and every open view will be stopped")
+                modules?.views.stopAllViewsForConsentWithdrawal()
             }
 
         case .attribution:

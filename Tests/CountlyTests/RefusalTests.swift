@@ -216,8 +216,7 @@ final class RefusalTests: CountlyBaseTestCase {
             $0.host = "https://exa mple.com"
         }
 
-        core(of: countly).modules.crashes.handleAutoDetectedCrash(
-            name: "SIGSEGV", reason: "boom", stackTrace: ["0 MyApp 0x1 boom"])
+        reportAutoDetectedCrash(on: countly)
 
         XCTAssertEqual(requestQueue(of: countly).filter { $0.contains("crash=") }.count, 1)
     }
@@ -256,7 +255,7 @@ final class RefusalTests: CountlyBaseTestCase {
     /// changed: reporting it on every foreground would flood the dashboard with a
     /// value that did not move.
     func testTheOrientationIsOnlyReportedWhenItChanges() throws {
-        #if !(os(iOS) || os(tvOS))
+        #if !os(iOS)
         throw XCTSkip("orientation is only reported where the interface has one")
         #else
         let countly = startInstance { $0.eventSendThreshold = 1 }
@@ -280,7 +279,7 @@ final class RefusalTests: CountlyBaseTestCase {
     /// The orientation describes the person using the device, so it answers to user
     /// details consent rather than to view tracking.
     func testTheOrientationNeedsUserDetailsConsent() throws {
-        #if !(os(iOS) || os(tvOS))
+        #if !os(iOS)
         throw XCTSkip("orientation is only reported where the interface has one")
         #else
         let countly = startInstance {
@@ -300,7 +299,7 @@ final class RefusalTests: CountlyBaseTestCase {
     /// Orientation tracking is on by default but can be switched off, for an
     /// application that does not want the extra events.
     func testOrientationTrackingCanBeSwitchedOff() throws {
-        #if !(os(iOS) || os(tvOS))
+        #if !os(iOS)
         throw XCTSkip("orientation is only reported where the interface has one")
         #else
         let countly = startInstance {

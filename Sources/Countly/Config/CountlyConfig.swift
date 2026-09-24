@@ -80,6 +80,25 @@ public final class CountlyConfig {
     /// Reports a view every time a view controller appears.
     public var enableAutomaticViewTracking: Bool = false
 
+    /// Stops the SDK from exchanging `UIViewController.viewDidAppear` and
+    /// `viewDidDisappear` implementations.
+    ///
+    /// That exchange is the only thing automatic view tracking watches, so this
+    /// also turns automatic view tracking off, whatever
+    /// ``enableAutomaticViewTracking`` says. Report screens with ``ViewsAPI`` or
+    /// the SwiftUI `countlyView(_:segmentation:instance:)` modifier instead.
+    ///
+    /// It also holds against SDK behavior settings, which can otherwise switch
+    /// automatic view tracking on from the server.
+    ///
+    /// Two things it does not cover:
+    /// - Other instances. The exchange is process-wide and never uninstalled, so
+    ///   an instance that allows it installs it for the process; this flag only
+    ///   decides whether *this* instance asks for it and listens to it.
+    /// - Push handling, which adds the registration callbacks to the application
+    ///   delegate at runtime. Turn that off with ``disableAutomaticPushHandling``.
+    public var disableSwizzling: Bool = false
+
     /// View names that automatic view tracking skips.
     public var automaticViewTrackingExclusionList: [String] = []
 

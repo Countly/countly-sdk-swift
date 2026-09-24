@@ -8,7 +8,7 @@
 
 import Foundation
 
-#if os(iOS) || os(tvOS)
+#if os(iOS) || os(tvOS) || os(visionOS)
 import UIKit
 #endif
 
@@ -23,6 +23,14 @@ final class ViewsModule: ModuleBase {
 
     /// Open views, keyed by view ID.
     private var viewDataDictionary: [String: CountlyViewData] = [:]
+
+    /// IDs handed out for views that a background and foreground cycle has since
+    /// reopened, mapped to the ID the view is open under now.
+    ///
+    /// A restart opens the view again under a fresh ID, which is what the wire
+    /// reports. The host still holds the ID it was given, so every call taking a
+    /// view ID resolves it through here first.
+    private var restartedViewIDs: [String: String] = [:]
 
     /// Segmentation merged into every view event.
     private var globalViewSegmentation: [String: Any] = [:]
@@ -47,7 +55,7 @@ final class ViewsModule: ModuleBase {
     private var lastInterfaceOrientation: String?
 
     /// Names and class names that automatic view tracking never reports.
-    #if os(iOS) || os(tvOS)
+    #if os(iOS) || os(tvOS) || os(visionOS)
     private var automaticViewTrackingExclusionList: [String] = AutoViewTracker.defaultExclusionList
     #else
     private var automaticViewTrackingExclusionList: [String] = []
@@ -56,7 +64,7 @@ final class ViewsModule: ModuleBase {
     /// Exclusion entries matched by name, and the subset that resolves to a real
     /// class. Rebuilt only when the list changes.
     private lazy var excludedNames: Set<String> = Set(automaticViewTrackingExclusionList)
-    #if os(iOS) || os(tvOS)
+    #if os(iOS) || os(tvOS) || os(visionOS)
     private lazy var excludedClasses: [AnyClass] = automaticViewTrackingExclusionList.compactMap { NSClassFromString($0) }
     #endif
 
@@ -98,7 +106,7 @@ final class ViewsModule: ModuleBase {
     /// classes are resolved when the list changes rather than on every screen.
     private func rebuildExclusionLookups() {
         excludedNames = Set(automaticViewTrackingExclusionList)
-        #if os(iOS) || os(tvOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         excludedClasses = automaticViewTrackingExclusionList.compactMap { NSClassFromString($0) }
         // An entry that resolves to no class only ever matches by name, so a
         // mistyped class name shows up here as a gap between the two counts.
@@ -160,12 +168,13 @@ final class ViewsModule: ModuleBase {
 
         guard manualCallsAllowed("stop view by ID", "stopViewWithID") else { return }
 
-        stopViewInternal(viewID: viewID, customSegmentation: segmentation, autoPaused: false)
+        stopViewInternal(viewID: currentID(for: viewID), customSegmentation: segmentation, autoPaused: false)
     }
 
     /// Stops the clock on a view without closing it.
-    func pauseView(id viewID: String) {
-        logI("pauseView", "pause view requested, viewID: [\(viewID)]")
+    func pauseView(id heldID: String) {
+        logI("pauseView", "pause view requested, viewID: [\(heldID)]")
+        let viewID = currentID(for: heldID)
 
         guard manualCallsAllowed("pause view", "pauseView") else { return }
 
@@ -182,8 +191,9 @@ final class ViewsModule: ModuleBase {
     }
 
     /// Restarts the clock on a paused view.
-    func resumeView(id viewID: String) {
-        logI("resumeView", "resume view requested, viewID: [\(viewID)]")
+    func resumeView(id heldID: String) {
+        logI("resumeView", "resume view requested, viewID: [\(heldID)]")
+        let viewID = currentID(for: heldID)
 
         guard manualCallsAllowed("resume view", "resumeView") else { return }
 
@@ -198,6 +208,39 @@ final class ViewsModule: ModuleBase {
         logD("resumeView", "view resumed and its duration clock restarted, viewID: [\(viewID)], name: [\(viewData.viewName)]")
     }
 
+    /// Starts the view a SwiftUI screen reports for itself.
+    ///
+    /// Not gated like a manual call: the gate keeps a host from opening a second
+    /// view for a screen automatic tracking already reports, and a SwiftUI screen
+    /// is one the method exchange never sees. An ordinary view rather than an
+    /// auto-stopped one, because the screen closes it itself when it disappears.
+    func startReportedView(_ viewName: String, segmentation: [String: Any]?) -> String? {
+        logI("startReportedView", "a SwiftUI screen reports itself, name: [\(viewName)], segmentationKeyCount: [\(segmentation?.count ?? 0)]")
+        return startViewInternal(viewName, customSegmentation: segmentation, isAutoStoppedView: false)
+    }
+
+    /// Stops a view a SwiftUI screen reported for itself.
+    ///
+    /// Quiet when the view is already closed. A consent withdrawal or a switch of
+    /// automatic tracking closes every open view, and the screen learning of it
+    /// only when it disappears is not an error.
+    func stopReportedView(id heldID: String, segmentation: [String: Any]?) {
+        let viewID = currentID(for: heldID)
+        guard viewDataDictionary[viewID] != nil else {
+            logD("stopReportedView", "the reported view is already closed and nothing is stopped, viewID: [\(viewID)]")
+            return
+        }
+        stopViewInternal(viewID: viewID, customSegmentation: segmentation, autoPaused: false)
+    }
+
+    /// Closes every open view, not only the automatic ones, because view consent
+    /// is being withdrawn. Runs while that consent still holds, so the views can
+    /// still report how long they were open.
+    func stopAllViewsForConsentWithdrawal() {
+        stopAutoViewTracking()
+        stopAllViewsInternal(segmentation: nil)
+    }
+
     /// Stops every open view.
     func stopAllViews(segmentation: [String: Any]? = nil) {
         logI("stopAllViews", "stop all views requested, segmentationKeyCount: [\(segmentation?.count ?? 0)]")
@@ -208,8 +251,9 @@ final class ViewsModule: ModuleBase {
     }
 
     /// Adds segmentation to an open view, reported when it stops.
-    func addSegmentation(toViewWithID viewID: String, segmentation: [String: Any]) {
-        logI("addSegmentationToViewWithID", "add segmentation to view by ID requested, viewID: [\(viewID)], segmentationKeyCount: [\(segmentation.count)]")
+    func addSegmentation(toViewWithID heldID: String, segmentation: [String: Any]) {
+        logI("addSegmentationToViewWithID", "add segmentation to view by ID requested, viewID: [\(heldID)], segmentationKeyCount: [\(segmentation.count)]")
+        let viewID = currentID(for: heldID)
 
         guard !viewID.isEmpty else {
             logE("addSegmentationToViewWithID", "view ID is null or empty, adding segmentation by view ID will be ignored")
@@ -364,7 +408,19 @@ final class ViewsModule: ModuleBase {
 
         if !autoPaused {
             viewDataDictionary.removeValue(forKey: viewID)
+            forgetRestartAliases(of: viewID)
         }
+    }
+
+    /// The ID a view the host holds an ID for is open under now.
+    private func currentID(for heldID: String) -> String {
+        restartedViewIDs[heldID] ?? heldID
+    }
+
+    /// Drops the aliases that lead to a view which is gone for good.
+    private func forgetRestartAliases(of viewID: String) {
+        guard !restartedViewIDs.isEmpty else { return }
+        restartedViewIDs = restartedViewIDs.filter { $0.value != viewID }
     }
 
     private func validateViewOperation(viewID: String, operation: String) -> Bool {
@@ -463,8 +519,16 @@ final class ViewsModule: ModuleBase {
             if let newID, let newData = viewDataDictionary[newID] {
                 logD("startStoppedViews", "view started automatically after restart, name: [\(viewData.viewName)], newViewID: [\(newID)], previousViewID: [\(viewData.viewID)], carriedSegmentationKeyCount: [\(viewData.segmentation.count)]")
                 newData.segmentation = viewData.segmentation
+
+                // Every ID the host may still hold for this view moves on with
+                // it, so aliases never chain and a lookup is always one step.
+                for (heldID, current) in restartedViewIDs where current == viewData.viewID {
+                    restartedViewIDs[heldID] = newID
+                }
+                restartedViewIDs[viewData.viewID] = newID
             } else {
                 logD("startStoppedViews", "a view marked for restart could not be started again, name: [\(viewData.viewName)], previousViewID: [\(viewData.viewID)]")
+                forgetRestartAliases(of: viewData.viewID)
             }
 
             viewDataDictionary.removeValue(forKey: viewData.viewID)
@@ -498,7 +562,7 @@ final class ViewsModule: ModuleBase {
 
     /// Starts reporting a view for every view controller that appears.
     func startAutoViewTracking() {
-        #if os(iOS) || os(tvOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         guard core.serverConfig.automaticViewTrackingEnabled else {
             logD("startAutoViewTracking", "automatic view tracking is not enabled by behavior settings, it will not be started")
             return
@@ -506,6 +570,15 @@ final class ViewsModule: ModuleBase {
 
         guard core.modules.consent.hasConsent(for: .viewTracking) else {
             logV("startAutoViewTracking", "no consent for views, automatic view tracking will not be started")
+            return
+        }
+
+        // The method exchange is the only source of appearances, so refusing it
+        // refuses the feature. Activating anyway would be worse than doing
+        // nothing: the active flag makes the module reject the host's own view
+        // calls, and the host would be left unable to report anything at all.
+        guard !core.config.disableSwizzling else {
+            logI("startAutoViewTracking", "automatic view tracking will not be started, reason: swizzling is disabled by configuration, report screens with the views API or the SwiftUI countlyView modifier instead")
             return
         }
 
@@ -528,7 +601,7 @@ final class ViewsModule: ModuleBase {
 
     /// Stops reporting view controller appearances.
     func stopAutoViewTracking() {
-        #if os(iOS) || os(tvOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         logD("stopAutoViewTracking", "automatic view tracking will be disabled, runningViewCount: [\(viewDataDictionary.count)]")
         setAutoViewTrackingActive(false)
         AutoViewTracker.shared.deregister(self)
@@ -559,7 +632,7 @@ final class ViewsModule: ModuleBase {
         isAutoViewTrackingActive = active
     }
 
-    #if os(iOS) || os(tvOS)
+    #if os(iOS) || os(tvOS) || os(visionOS)
     /// Called by the process-wide tracker for every appeared view controller.
     func handleAutoTrackedViewController(_ viewController: UIViewController) {
         guard isAutoViewTrackingActive else {
@@ -580,7 +653,14 @@ final class ViewsModule: ModuleBase {
         }
 
         guard let title = AutoViewTracker.title(for: viewController) else {
-            logD("handleAutoTrackedViewController", "appeared view controller has no resolvable title, no view will be started for it, class: [\(NSStringFromClass(type(of: viewController)))]")
+            let className = NSStringFromClass(type(of: viewController))
+            guard !isExcludedFromAutoTracking(viewController, title: className, from: "handleAutoTrackedViewController") else { return }
+
+            // The screen itself goes unreported, having no usable name, but the
+            // one the user just left is still closed, or it would go on timing a
+            // screen that is no longer shown.
+            logD("handleAutoTrackedViewController", "appeared view controller has only a compiler generated class name, no view is started for it and the current auto stopped view is closed, class: [\(className)]")
+            stopAutoStoppedView()
             return
         }
 
@@ -700,7 +780,7 @@ final class ViewsModule: ModuleBase {
         // nothing changed.
         recordOrientation()
 
-        #if os(iOS) || os(tvOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         if !isAutoViewTrackingActive, isManualViewRestartActive {
             logD("applicationWillEnterForeground", "app entered foreground with manual view restart active, stopped views will be started automatically")
             startStoppedViews()
@@ -718,7 +798,7 @@ final class ViewsModule: ModuleBase {
     }
 
     func applicationDidEnterBackground() {
-        #if os(iOS) || os(tvOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         if isAutoViewTrackingActive {
             logD("applicationDidEnterBackground", "app entered background while automatic view tracking is active, current view will be stopped automatically")
             stopCurrentView()
@@ -750,12 +830,13 @@ final class ViewsModule: ModuleBase {
         // record a `[CLY]_view` end event for every open view, queued for an
         // instance that is going away, and written to a store that `clearStorage`
         // is about to wipe. The reference resets its state silently.
-        #if os(iOS) || os(tvOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         AutoViewTracker.shared.deregister(self)
         isAutoViewTrackingActive = false
         #endif
 
         viewDataDictionary.removeAll()
+        restartedViewIDs.removeAll()
         globalViewSegmentation.removeAll()
         currentViewID = nil
         previousViewID = nil

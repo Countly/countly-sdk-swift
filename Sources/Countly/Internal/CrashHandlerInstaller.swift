@@ -32,11 +32,23 @@ final class CrashHandlerInstaller {
     /// application's or another SDK's handler still runs.
     private var previousUncaughtExceptionHandler: (@convention(c) (NSException) -> Void)?
 
+    /// The disposition each handled signal had before the SDK installed its own,
+    /// keyed by signal. A signal missing here was left alone.
+    ///
+    /// Written only while installing, before any handler can run, so the signal
+    /// handler reads it without a lock.
+    private var previousSignalActions: [Int32: sigaction] = [:]
+
     private init() {}
 
     /// Signals that mean the process is going down in a way worth reporting.
+    ///
+    /// Every catchable signal whose default action is to dump core, which is how
+    /// the kernel classes a crash, plus SIGPIPE, whose default action terminates.
+    /// SIGQUIT dumps core too but is a request to quit rather than a fault, and
+    /// SIGKILL cannot be caught at all.
     private static let handledSignals: [Int32] = [
-        SIGABRT, SIGILL, SIGSEGV, SIGFPE, SIGBUS, SIGPIPE, SIGTRAP,
+        SIGABRT, SIGILL, SIGSEGV, SIGFPE, SIGBUS, SIGPIPE, SIGTRAP, SIGSYS, SIGEMT,
     ]
 
     // MARK: - Registration
@@ -81,8 +93,39 @@ final class CrashHandlerInstaller {
         NSSetUncaughtExceptionHandler(countlyUncaughtExceptionHandler)
 
         #if os(iOS) || os(tvOS) || os(visionOS) || os(macOS)
+        previousSignalActions.removeAll()
         for signalCode in Self.handledSignals {
+            var previous = sigaction()
+            sigaction(signalCode, nil, &previous)
+
+            // A host that ignores a signal has decided the process survives it,
+            // SIGPIPE on a closed socket being the usual case. A handler here
+            // would report a crash that never happens, and the default action
+            // restored afterwards would kill the process on the next one.
+            guard !Self.isIgnored(previous) else { continue }
+
+            previousSignalActions[signalCode] = previous
             signal(signalCode, countlySignalHandler)
+        }
+        #endif
+    }
+
+    /// Whether a disposition ignores its signal.
+    static func isIgnored(_ action: sigaction) -> Bool {
+        guard let handler = action.__sigaction_u.__sa_handler else { return false }
+        return unsafeBitCast(handler, to: Int.self) == unsafeBitCast(SIG_IGN, to: Int.self)
+    }
+
+    /// Puts back the disposition every handled signal had before the SDK's.
+    ///
+    /// A host's or another SDK's handler gets its signal again, and one that was
+    /// left at the default goes back to the default. Safe to repeat, and called
+    /// from the signal handler, where only `sigaction` is used.
+    fileprivate func restorePreviousSignalActions() {
+        #if os(iOS) || os(tvOS) || os(visionOS) || os(macOS)
+        for signalCode in Self.handledSignals {
+            guard var previous = previousSignalActions[signalCode] else { continue }
+            sigaction(signalCode, &previous, nil)
         }
         #endif
     }
@@ -92,12 +135,7 @@ final class CrashHandlerInstaller {
         // path (the handler stops reporting once it has recorded), and the handler
         // still has to chain to it afterwards.
         NSSetUncaughtExceptionHandler(previousUncaughtExceptionHandler)
-
-        #if os(iOS) || os(tvOS) || os(visionOS) || os(macOS)
-        for signalCode in Self.handledSignals {
-            signal(signalCode, SIG_DFL)
-        }
-        #endif
+        restorePreviousSignalActions()
     }
 
     /// Chains to whatever handler was installed before the SDK's.
@@ -121,14 +159,26 @@ final class CrashHandlerInstaller {
         case SIGBUS: return "SIGBUS"
         case SIGPIPE: return "SIGPIPE"
         case SIGTRAP: return "SIGTRAP"
+        case SIGSYS: return "SIGSYS"
+        case SIGEMT: return "SIGEMT"
         default: return "SIG\(signalCode)"
         }
     }
 
-    /// Reports one crash to every registered module.
-    fileprivate func dispatch(name: String, reason: String, stackTrace: [String]) {
-        for module in activeModules() {
+    /// Reports one crash to every registered module, in two passes.
+    ///
+    /// Every instance stores its report before any of them sends. Each send
+    /// blocks until its server answers, and a process killed during the first
+    /// one would otherwise take every later instance's report with it, never
+    /// written.
+    func dispatch(name: String, reason: String, stackTrace: [String]) {
+        let pending = activeModules().compactMap { module in
             module.handleAutoDetectedCrash(name: name, reason: reason, stackTrace: stackTrace)
+                .map { (module, $0) }
+        }
+
+        for (module, delivery) in pending {
+            module.deliver(delivery)
         }
     }
 }
@@ -169,4 +219,11 @@ private let countlySignalHandler: @convention(c) (Int32) -> Void = { signalCode 
         name: "Fatal Signal",
         reason: "App terminated by \(CrashHandlerInstaller.name(for: signalCode))",
         stackTrace: frames)
+
+    // The signal goes back to whatever handled it before and then takes its
+    // course. Returning alone would let a signal the process survives, SIGPIPE,
+    // carry on as if nothing happened, with the SDK convinced it crashed; the
+    // signal is blocked while this runs, so the raise lands once it returns.
+    CrashHandlerInstaller.shared.restorePreviousSignalActions()
+    raise(signalCode)
 }

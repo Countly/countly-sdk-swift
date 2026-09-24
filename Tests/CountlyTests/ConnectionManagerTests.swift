@@ -118,8 +118,7 @@ final class ConnectionManagerTests: CountlyBaseTestCase {
         MockURLProtocol.respondToEverything(json: Self.accepted)
         let countly = startInstance { $0.features = [.crashReporting] }
 
-        core(of: countly).modules.crashes.handleAutoDetectedCrash(
-            name: "SIGSEGV", reason: "boom", stackTrace: ["0 MyApp 0x1 boom"])
+        reportAutoDetectedCrash(on: countly)
 
         // Already delivered by the time the call returns, which is the point of the
         // immediate path.
@@ -137,8 +136,7 @@ final class ConnectionManagerTests: CountlyBaseTestCase {
         // No handler, so the send fails at the transport level.
         let countly = startInstance { $0.features = [.crashReporting] }
 
-        core(of: countly).modules.crashes.handleAutoDetectedCrash(
-            name: "SIGSEGV", reason: "boom", stackTrace: ["0 MyApp 0x1 boom"])
+        reportAutoDetectedCrash(on: countly)
 
         XCTAssertEqual(requestQueue(of: countly).filter { $0.contains("crash=") }.count, 1)
     }
@@ -153,8 +151,7 @@ final class ConnectionManagerTests: CountlyBaseTestCase {
             $0.features = [.crashReporting]
         }
 
-        core(of: countly).modules.crashes.handleAutoDetectedCrash(
-            name: "SIGSEGV", reason: "boom", stackTrace: ["0 MyApp 0x1 boom"])
+        reportAutoDetectedCrash(on: countly)
 
         XCTAssertTrue(MockURLProtocol.requests.filter { $0.query.contains("crash=") }.isEmpty)
         XCTAssertEqual(requestQueue(of: countly).filter { $0.contains("crash=") }.count, 1)

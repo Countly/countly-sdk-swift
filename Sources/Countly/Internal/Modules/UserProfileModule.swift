@@ -168,13 +168,13 @@ final class UserProfileModule: ModuleBase {
                 continue
             }
 
-            guard isValidDataType(value) else {
+            guard let storable = storableValue(value) else {
                 logD("setProperties", "provided value type is not supported, key: [\(key)], type: [\(type(of: value))], omitting entry")
                 skippedCount += 1
                 continue
             }
 
-            customProperties[core.limits.truncatedKey(key, "setProperties")] = value
+            customProperties[core.limits.truncatedKey(key, "setProperties")] = storable
             appliedCount += 1
         }
         lock.unlock()
@@ -203,12 +203,12 @@ final class UserProfileModule: ModuleBase {
             return
         }
 
-        guard isValidDataType(value) else {
+        guard let storable = storableValue(value) else {
             logW("setCustomProperty", "custom property value type is not supported, key: [\(key)], type: [\(type(of: value))], omitting call")
             return
         }
 
-        let stored = truncatedValue(value, forKey: key, "setCustomProperty")
+        let stored = truncatedValue(storable, forKey: key, "setCustomProperty")
 
         lock.lock()
         customProperties[core.limits.truncatedKey(key, "setCustomProperty")] = stored
@@ -268,7 +268,7 @@ final class UserProfileModule: ModuleBase {
         logI("modify", "user property modifier will be applied, modifier: [\(modifier.rawValue)], key: [\(key)]")
         logV("modify", "modifier operand value detail, modifier: [\(modifier.rawValue)], key: [\(key)], value: [\(value)]")
 
-        guard isValidDataType(value) else {
+        guard let storable = storableValue(value) else {
             logW("modify", "modifier value type is not supported, modifier: [\(modifier.rawValue)], key: [\(key)], type: [\(type(of: value))], omitting call")
             return
         }
@@ -278,8 +278,8 @@ final class UserProfileModule: ModuleBase {
             return
         }
 
-        var stored = value
-        if let stringValue = value as? String {
+        var stored = storable
+        if let stringValue = storable as? String {
             stored = core.limits.truncatedValue(stringValue, "modify")
         }
 
@@ -547,28 +547,18 @@ final class UserProfileModule: ModuleBase {
         core.modules.events.sendEvents()
     }
 
-    /// Whether the server can store this value: numbers, strings, and lists of
-    /// those.
-    private func isValidDataType(_ value: Any) -> Bool {
-        if let number = value as? NSNumber { return Self.isFinite(number) }
-        if value is String { return true }
-        if let list = value as? [Any] { return list.allSatisfy(isValidDataType) }
-        return false
-    }
-
-    /// Whether a number can be represented in JSON.
+    /// The value as the server stores it, or `nil` when it cannot be stored.
     ///
-    /// `NaN` and the infinities cannot, and one of them anywhere in the profile
-    /// makes `JSONSerialization` reject the whole object. The payload would then
-    /// serialize to an empty string, the SDK would send `user_details=` with
-    /// nothing in it, and the staged properties would be cleared as if they had
-    /// been delivered. Rejecting the one bad value at the door costs the caller
-    /// that value and nothing else.
-    private static func isFinite(_ number: NSNumber) -> Bool {
-        // Only the floating point representations can be non-finite; asking an
-        // integer for its double value is a conversion, not a check.
-        guard CFNumberIsFloatType(number) else { return true }
-        return number.doubleValue.isFinite
+    /// Scalars follow the same rule as segmentation, so a date becomes epoch
+    /// milliseconds and a non-finite number is refused here too. The one rule of
+    /// the profile's own is that a list is refused whole when any element is,
+    /// since half a list is not what the caller asked to store.
+    private func storableValue(_ value: Any) -> Any? {
+        if let list = value as? [Any] {
+            let converted = list.compactMap(storableValue)
+            return converted.count == list.count ? converted : nil
+        }
+        return core.limits.supportedValue(value)
     }
 
     // MARK: - Lifecycle

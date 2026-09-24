@@ -202,14 +202,27 @@ final class UserProfileTests: CountlyBaseTestCase {
         let countly = startInstance()
 
         countly.userProfile.setCustomProperty("binary", value: Data([0x00]))
-        countly.userProfile.setCustomProperty("moment", value: Date())
         countly.userProfile.setCustomProperty("fine", value: "yes")
         countly.userProfile.save()
 
         let custom = lastCustom(of: countly)
         XCTAssertNil(custom["binary"])
-        XCTAssertNil(custom["moment"])
         XCTAssertEqual(custom["fine"] as? String, "yes")
+    }
+
+    /// The server reads a date as epoch milliseconds, and a user property has to
+    /// agree with event and view segmentation about that rather than dropping it.
+    func testADateUserPropertyBecomesEpochMilliseconds() {
+        let countly = startInstance()
+        let moment = Date(timeIntervalSince1970: 1_700_000_000)
+
+        countly.userProfile.setCustomProperty("signup", value: moment)
+        countly.userProfile.setProperties(["seen": moment])
+        countly.userProfile.save()
+
+        let custom = lastCustom(of: countly)
+        XCTAssertEqual((custom["signup"] as? NSNumber)?.int64Value, 1_700_000_000_000)
+        XCTAssertEqual((custom["seen"] as? NSNumber)?.int64Value, 1_700_000_000_000)
     }
 
     /// `NaN` and the infinities cannot be represented in JSON, and one of them

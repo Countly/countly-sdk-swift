@@ -197,7 +197,10 @@ final class CrashModule: ModuleBase {
     }
 
     /// Called by the process-wide handler when a crash is detected.
-    func handleAutoDetectedCrash(name: String, reason: String, stackTrace: [String]) {
+    ///
+    /// Stores the report and returns what its send needs, leaving the send to
+    /// ``deliver(_:)`` so that every instance stores before any of them sends.
+    func handleAutoDetectedCrash(name: String, reason: String, stackTrace: [String]) -> ImmediateCrashDelivery? {
         // Reached from the signal handler, so nothing here may log at error or
         // warning: those bump the health tracker, whose dispatch primitives are
         // not async signal safe and can deadlock the process mid crash.
@@ -205,39 +208,48 @@ final class CrashModule: ModuleBase {
 
         guard core.serverConfig.crashReportingEnabled else {
             logD("handleAutoDetectedCrash", "the detected crash is not reported, crash reporting is disabled by server config")
-            return
+            return nil
         }
 
         guard core.serverConfig.automaticCrashReportingEnabled else {
             logD("handleAutoDetectedCrash", "the detected crash is not reported, automatic crash reporting is disabled by server config")
-            return
+            return nil
         }
 
         guard core.modules.consent.hasConsent(for: .crashReporting) else {
             logD("handleAutoDetectedCrash", "the detected crash is not reported, no crashes consent is given")
-            return
+            return nil
         }
 
-        handle(name: name,
-               description: reason,
-               stackTrace: stackTrace,
-               userInfo: [:],
-               segmentationOverride: nil,
-               isFatal: true,
-               isAutoDetected: true)
+        return handle(name: name,
+                      description: reason,
+                      stackTrace: stackTrace,
+                      userInfo: [:],
+                      segmentationOverride: nil,
+                      isFatal: true,
+                      isAutoDetected: true)
+    }
+
+    /// Sends a report ``handleAutoDetectedCrash(name:reason:stackTrace:)`` stored.
+    func deliver(_ delivery: ImmediateCrashDelivery) {
+        core.network.deliverImmediateCrashReport(delivery)
     }
 
     /// Builds the report, gives the filter callback a say, and sends it.
+    ///
+    /// - Returns: For an automatically detected crash, the stored report still to
+    ///   be sent; `nil` otherwise, and whenever there is nothing to send.
+    @discardableResult
     private func handle(name: String,
                         description: String,
                         stackTrace: [String],
                         userInfo: [String: Any],
                         segmentationOverride: [String: Any]?,
                         isFatal: Bool,
-                        isAutoDetected: Bool) {
+                        isAutoDetected: Bool) -> ImmediateCrashDelivery? {
         guard core.serverConfig.crashReportingEnabled else {
             logD("handle", "crash report is dropped before it is built, crash reporting is disabled by server config, isFatal: [\(isFatal)], isAutoDetected: [\(isAutoDetected)]")
-            return
+            return nil
         }
 
         // Limited before anything reads it, so the regular expression filter, the
@@ -287,7 +299,7 @@ final class CrashModule: ModuleBase {
         guard !matchesFilter, !filteredByCallback else {
             logD("handle", "crash report is filtered out and will not be processed, crashName: [\(name)], isFatal: [\(isFatal)], matchesRegexFilter: [\(matchesFilter)], matchesFilterCallback: [\(filteredByCallback)]")
             if isAutoDetected { stopCrashReporting() }
-            return
+            return nil
         }
 
         let report = wireReport(for: crashData,
@@ -297,7 +309,7 @@ final class CrashModule: ModuleBase {
         if let shouldSend = core.config.shouldSendCrashReportCallback, !shouldSend(report) {
             logD("handle", "crash report is dropped by the shouldSendCrashReport callback, crashName: [\(name)], isFatal: [\(isFatal)], reportFieldCount: [\(report.count)]")
             if isAutoDetected { stopCrashReporting() }
-            return
+            return nil
         }
 
         // An automatically detected crash is sent synchronously because the process
@@ -311,26 +323,39 @@ final class CrashModule: ModuleBase {
         // reports the failure itself at debug.
         let payload = CountlyJSON.string(from: report, logger: isAutoDetected ? nil : log)
         if payload == nil {
-            logD("handle", "the crash report could not be serialized to JSON and will reach the server empty, crashName: [\(name)], isAutoDetected: [\(isAutoDetected)]")
+            logD("handle", "the crash report could not be serialized to JSON and will not be sent, crashName: [\(name)], isAutoDetected: [\(isAutoDetected)]")
         }
 
-        core.network.sendCrashReport(payload?.urlEscaped ?? "", immediately: isAutoDetected)
-
-        // A crash handler that stays installed would re-enter on the way down.
-        if isAutoDetected {
-            stopCrashReporting()
+        guard isAutoDetected else {
+            core.network.sendCrashReport(payload?.urlEscaped, immediately: false)
+            return nil
         }
+
+        let delivery = core.network.persistImmediateCrashReport(payload?.urlEscaped)
+
+        // Before the send rather than after it. The stored report already carries
+        // the breadcrumbs, so a process killed mid-send would otherwise leave them
+        // in the file for the next launch to attach to an unrelated report. And a
+        // crash handler that stays installed would re-enter on the way down.
+        stopCrashReporting()
+        return delivery
     }
 
     /// Turns the assembled crash data into the payload the server reads.
     ///
     /// - Parameter hadFilterCallback: whether the host application was given the
-    ///   report to change, which decides whether the segmentation has to be capped
-    ///   a second time.
+    ///   report to change, which decides whether the segmentation has to be
+    ///   sanitized again.
     private func wireReport(for crashData: CountlyCrashData,
                             stackTrace: [String],
                             hadFilterCallback: Bool) -> [String: Any] {
-        var report = crashData.crashMetrics
+        // The metrics are the SDK's own keys, so only their value types need
+        // checking, and only when a callback had the chance to change them. One
+        // value JSON cannot carry would otherwise make the whole report
+        // serialize to nothing.
+        var report = hadFilterCallback
+            ? core.limits.filterSupportedDataTypes(crashData.crashMetrics)
+            : crashData.crashMetrics
         report[Key.error] = crashData.stackTrace
         let symbolication = binaryImages(for: stackTrace)
         report[Key.binaryImages] = symbolication.images
@@ -351,13 +376,15 @@ final class CrashModule: ModuleBase {
         }
 
         if !crashData.crashSegmentation.isEmpty {
-            // Capped a second time only when there was a callback that could have
-            // changed the segmentation. `CountlyCrashData` is a class, so an
-            // enriching callback would otherwise ship unbounded keys and values;
-            // without one the dictionary is still exactly what was sanitized on the
-            // way in, and re-capping it is pure rework on every recorded error.
+            // Sanitized rather than merely capped when there was a callback that
+            // could have changed the segmentation. `CountlyCrashData` is a class,
+            // so an enriching callback would otherwise ship unbounded keys and
+            // values, and a value JSON cannot represent would make the whole
+            // report serialize to nothing and be lost. Without a callback the
+            // dictionary is still exactly what was sanitized on the way in, and
+            // redoing that is pure rework on every recorded error.
             report[Key.custom] = hadFilterCallback
-                ? core.limits.truncatedAndLimited(crashData.crashSegmentation, "Crash segmentation")
+                ? (core.limits.sanitized(crashData.crashSegmentation, "Crash segmentation") ?? [:])
                 : crashData.crashSegmentation
         }
 

@@ -412,13 +412,25 @@ struct LimitsEnforcer {
     /// Keeps only the value types the server accepts: numbers, strings, booleans,
     /// and arrays of those. Anything else is dropped with a log line rather than
     /// failing the whole call.
+    ///
+    /// Dates are converted rather than dropped, because the server reads a date
+    /// as epoch milliseconds and dropping one loses data the caller clearly meant
+    /// to send.
+    ///
+    /// Reachable from the crash signal handler, so the drop is reported at debug.
+    /// Warning level would re-enter the health tracker, whose dispatch primitives
+    /// are not async-signal-safe.
     func filterSupportedDataTypes(_ dictionary: [String: Any]) -> [String: Any] {
         var result: [String: Any] = [:]
         for (key, value) in dictionary {
-            if value is NSNumber || value is String {
-                result[key] = value
+            if let converted = supportedValue(value) {
+                result[key] = converted
             } else if let array = value as? [Any] {
                 result[key] = filterSupportedDataTypes(array)
+            } else if value is Date {
+                logger?.d(Self.module, "filterSupportedDataTypes", "dropping dictionary entry with a date that has no representable epoch value, key: [\(key)]")
+            } else if value is NSNumber {
+                logger?.d(Self.module, "filterSupportedDataTypes", "dropping dictionary entry with a number JSON cannot represent, key: [\(key)]")
             } else {
                 logger?.d(Self.module, "filterSupportedDataTypes", "dropping dictionary entry with an unsupported value type, key: [\(key)], receivedType: [\(type(of: value))]")
             }
@@ -428,10 +440,46 @@ struct LimitsEnforcer {
 
     /// Array counterpart of `filterSupportedDataTypes`.
     func filterSupportedDataTypes(_ array: [Any]) -> [Any] {
-        array.filter { element in
-            if element is NSNumber || element is String { return true }
-            logger?.d(Self.module, "filterSupportedDataTypes", "dropping array element with an unsupported type, only numbers and strings are allowed, receivedType: [\(type(of: element))]")
-            return false
+        array.compactMap { element in
+            if let converted = supportedValue(element) { return converted }
+            logger?.d(Self.module, "filterSupportedDataTypes", "dropping array element with an unsupported type, only numbers, strings and dates are allowed, receivedType: [\(type(of: element))]")
+            return nil
         }
+    }
+
+    /// One scalar as the server stores it, or `nil` when it cannot be stored.
+    ///
+    /// The single place that decides what a segmentation scalar may be, so the
+    /// dictionary walk and the array walk cannot drift apart on it.
+    func supportedValue(_ value: Any) -> Any? {
+        if let number = value as? NSNumber { return Self.isFinite(number) ? number : nil }
+        if value is String { return value }
+        if let date = value as? Date { return Self.epochMilliseconds(date) }
+        return nil
+    }
+
+    /// Whether a number can be represented in JSON.
+    ///
+    /// `NaN` and the infinities cannot, and one of them anywhere in an object
+    /// makes `JSONSerialization` reject the whole thing: a single bad segmentation
+    /// value would cost every event in its batch, or a whole crash report.
+    /// Refusing the one value at the door costs the caller that value alone.
+    static func isFinite(_ number: NSNumber) -> Bool {
+        // Only the floating point representations can be non-finite; asking an
+        // integer for its double value is a conversion, not a check.
+        guard CFNumberIsFloatType(number) else { return true }
+        return number.doubleValue.isFinite
+    }
+
+    /// A date as the epoch milliseconds the server reads, or `nil` when it does
+    /// not fit one.
+    ///
+    /// `Date.distantPast` and `Date.distantFuture` both fit; a date built from a
+    /// non-finite interval does not, and converting one would trap.
+    static func epochMilliseconds(_ date: Date) -> Int64? {
+        // `Int64(exactly:)` rather than a pair of comparisons: `Double(Int64.max)`
+        // rounds up to 2^63, so `<= Double(Int64.max)` admits a value one ulp
+        // past the range and the conversion traps on it.
+        return Int64(exactly: (date.timeIntervalSince1970 * 1000).rounded())
     }
 }
