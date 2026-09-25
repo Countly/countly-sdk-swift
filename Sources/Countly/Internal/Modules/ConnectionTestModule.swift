@@ -85,7 +85,7 @@ final class ConnectionTestModule: ModuleBase, @unchecked Sendable {
     ]
 
     /// Raw outcome of one probe request, before grading.
-    struct ProbeOutcome {
+    struct ProbeOutcome: Sendable {
         /// HTTP status, or 0 when none could be read.
         let status: Int
         let latencyMs: Int64
@@ -179,17 +179,17 @@ final class ConnectionTestModule: ModuleBase, @unchecked Sendable {
         // The core is captured strongly for the life of the battery: the module
         // holds it `unowned`, and `halt()` can release it while probes are still
         // running. The halted flag then drops the report.
-        DispatchQueue.global(qos: .utility).async { [weak self, core] in
+        Task(priority: .utility) { [weak self, core] in
             guard let self else { return }
-            self.runBatteryAndReport(serverConfigLatencyMs: serverConfigLatencyMs, serverURL: core.config.normalizedHost)
+            await self.runBatteryAndReport(serverConfigLatencyMs: serverConfigLatencyMs, serverURL: core.config.normalizedHost)
             self.releaseBattery()
         }
     }
 
     /// Runs every row in order and queues the report, unless the instance was
     /// halted meanwhile.
-    func runBatteryAndReport(serverConfigLatencyMs: Int64, serverURL: String) {
-        let results = runBattery(serverConfigLatencyMs: serverConfigLatencyMs, serverURL: serverURL)
+    func runBatteryAndReport(serverConfigLatencyMs: Int64, serverURL: String) async {
+        let results = await runBattery(serverConfigLatencyMs: serverConfigLatencyMs, serverURL: serverURL)
 
         guard !isHalted else {
             logD("runBatteryAndReport", "the module was halted during the battery, the report is dropped")
@@ -203,7 +203,7 @@ final class ConnectionTestModule: ModuleBase, @unchecked Sendable {
 
     /// Probes every row sequentially against `serverURL`. Rows not reached before
     /// the battery cap report `not run`.
-    func runBattery(serverConfigLatencyMs: Int64, serverURL: String) -> [ResultRow] {
+    func runBattery(serverConfigLatencyMs: Int64, serverURL: String) async -> [ResultRow] {
         let requestCount = Self.rows.reduce(0) { $0 + $1.paths.count }
         let cap = Double(requestCount) * perRequestTimeout + batteryCapExtra
         let batteryStart = Date()
@@ -224,7 +224,7 @@ final class ConnectionTestModule: ModuleBase, @unchecked Sendable {
                 continue
             }
 
-            results.append(probeRow(row, serverURL: serverURL))
+            results.append(await probeRow(row, serverURL: serverURL))
         }
 
         transport.batteryFinished()
@@ -233,14 +233,14 @@ final class ConnectionTestModule: ModuleBase, @unchecked Sendable {
 
     /// Probes every path of one row and combines them: `ok` only if all passed,
     /// the first failing status and reason, summed latency.
-    func probeRow(_ row: ProbeRow, serverURL: String) -> ResultRow {
+    func probeRow(_ row: ProbeRow, serverURL: String) async -> ResultRow {
         var result = ResultRow(feature: row.feature, ok: true, pathCount: row.paths.count)
 
         for (index, path) in row.paths.enumerated() {
             if isHalted { break }
 
             let url = Self.probeURL(path: path, serverURL: serverURL)
-            let outcome = transport.probe(url, timeout: perRequestTimeout)
+            let outcome = await transport.probe(url, timeout: perRequestTimeout)
             result.latencyMs += outcome.latencyMs
 
             let failure = Self.grade(status: outcome.status, failure: outcome.failure, requiresSuccessStatus: row.requiresSuccessStatus)
@@ -352,8 +352,8 @@ final class ConnectionTestModule: ModuleBase, @unchecked Sendable {
 
 /// Issues one probe. A protocol so tests can swap the network out.
 protocol ProbeTransport: AnyObject {
-    /// One bare GET, waited for synchronously.
-    func probe(_ url: URL, timeout: TimeInterval) -> ConnectionTestModule.ProbeOutcome
+    /// One bare GET, answered once it completes or its deadline passes.
+    func probe(_ url: URL, timeout: TimeInterval) async -> ConnectionTestModule.ProbeOutcome
     /// Called once the battery is over, so a transport can release what it built.
     func batteryFinished()
 }
@@ -378,41 +378,51 @@ final class URLSessionProbeTransport: NSObject, ProbeTransport, @unchecked Senda
         super.init()
     }
 
-    func probe(_ url: URL, timeout: TimeInterval) -> ConnectionTestModule.ProbeOutcome {
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        request.timeoutInterval = timeout
+    func probe(_ url: URL, timeout: TimeInterval) async -> ConnectionTestModule.ProbeOutcome {
+        var bareRequest = URLRequest(url: url)
+        bareRequest.httpMethod = "GET"
+        bareRequest.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        bareRequest.timeoutInterval = timeout
+        let request = bareRequest
 
-        let done = DispatchSemaphore(value: 0)
-        let record = ProbeRecord()
+        // `data(for:)` is safe on this session: nothing invalidates it until the
+        // battery that is running this probe has finished.
+        let session = probeSession(timeout: timeout)
         let start = Date()
 
-        let task = probeSession(timeout: timeout).dataTask(with: request) { _, response, error in
-            if let error {
-                record.set(status: 0, failure: (error as NSError).code == NSURLErrorTimedOut ? ConnectionTestModule.Reason.timeout : ConnectionTestModule.Reason.transport)
-            } else if let http = response as? HTTPURLResponse {
-                record.set(status: http.statusCode, failure: nil)
-            } else {
-                record.set(status: 0, failure: ConnectionTestModule.Reason.transport)
+        // The request's own deadline should fire first; the watchdog only guards
+        // against an answer that never comes. Whichever finishes first decides,
+        // and the other is cancelled.
+        let answer = await withTaskGroup(of: (status: Int, failure: String?)?.self) { group in
+            group.addTask { await Self.answer(to: request, on: session) }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64((timeout + 5) * 1_000_000_000))
+                return nil
             }
-            done.signal()
-        }
-        task.resume()
-
-        // The request's own deadline should fire first; this only guards against a
-        // completion that never comes. Cancelling makes the completion run, so it
-        // is waited for and its write cannot race the verdict.
-        if done.wait(timeout: .now() + timeout + 5) == .timedOut {
-            task.cancel()
-            done.wait()
-            record.set(status: 0, failure: ConnectionTestModule.Reason.timeout)
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
         }
 
-        let result = record.current
-        return ConnectionTestModule.ProbeOutcome(status: result.status,
-                                                 latencyMs: Int64(-start.timeIntervalSinceNow * 1000),
-                                                 failure: result.failure)
+        let latencyMs = Int64(-start.timeIntervalSinceNow * 1000)
+        guard let answer else {
+            return ConnectionTestModule.ProbeOutcome(status: 0, latencyMs: latencyMs, failure: ConnectionTestModule.Reason.timeout)
+        }
+        return ConnectionTestModule.ProbeOutcome(status: answer.status, latencyMs: latencyMs, failure: answer.failure)
+    }
+
+    /// The status the server answered with, or why there is none.
+    private static func answer(to request: URLRequest, on session: URLSession) async -> (status: Int, failure: String?) {
+        do {
+            let (_, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                return (0, ConnectionTestModule.Reason.transport)
+            }
+            return (http.statusCode, nil)
+        } catch {
+            let timedOut = (error as NSError).code == NSURLErrorTimedOut
+            return (0, timedOut ? ConnectionTestModule.Reason.timeout : ConnectionTestModule.Reason.transport)
+        }
     }
 
     func batteryFinished() {
@@ -477,31 +487,5 @@ extension URLSessionProbeTransport: URLSessionTaskDelegate {
             return
         }
         core.network.urlSession(session, didReceive: challenge, completionHandler: completionHandler)
-    }
-}
-
-/// What one probe's completion reported.
-///
-/// Written on the session's queue and read on the thread waiting for the probe,
-/// both under the lock.
-private final class ProbeRecord: @unchecked Sendable {
-
-    private let lock = NSLock()
-    private var status = 0
-    private var failure: String?
-
-    /// Replaces what was recorded.
-    func set(status: Int, failure: String?) {
-        lock.lock()
-        self.status = status
-        self.failure = failure
-        lock.unlock()
-    }
-
-    /// What is recorded now.
-    var current: (status: Int, failure: String?) {
-        lock.lock()
-        defer { lock.unlock() }
-        return (status, failure)
     }
 }

@@ -116,7 +116,7 @@ public enum CountlyNotificationService {
 
         // The content handler must run exactly once, and the content must not be
         // written while it is being delivered. Everything below reaches the system
-        // through this gate: a download callback, the deadline, or synchronously.
+        // through this gate: the assembly task or the deadline, whichever is first.
         let gate = DeliveryGate(content: content, contentHandler: contentHandler)
 
         // Whatever has been assembled by the deadline is what gets delivered.
@@ -131,15 +131,14 @@ public enum CountlyNotificationService {
         }
 
         let attachmentURL = countlyPayload[CountlyPushKey.attachment] as? String
-        if buttonTitles.isEmpty {
-            finish(gate: gate, attachmentURL: attachmentURL, notificationID: notificationID)
-            return
-        }
-
-        registerCategory(buttonTitles: buttonTitles, notificationID: notificationID) { categoryIdentifier in
-            gate.mutate { $0.categoryIdentifier = categoryIdentifier }
-            log("didReceive, the notification now carries its action buttons, category: [\(categoryIdentifier)]")
-            finish(gate: gate, attachmentURL: attachmentURL, notificationID: notificationID)
+        Task {
+            if !buttonTitles.isEmpty {
+                let categoryIdentifier = await registerCategory(buttonTitles: buttonTitles, notificationID: notificationID)
+                gate.mutate { $0.categoryIdentifier = categoryIdentifier }
+                log("didReceive, the notification now carries its action buttons, category: [\(categoryIdentifier)]")
+            }
+            await attach(from: attachmentURL, notificationID: notificationID, to: gate)
+            gate.deliver()
         }
     }
 
@@ -151,68 +150,59 @@ public enum CountlyNotificationService {
     /// this SDK registered for an earlier notification. Replacing the whole set
     /// outright, which is the obvious implementation, silently unregisters every
     /// category the host application set up for its own notifications.
-    private static func registerCategory(buttonTitles: [String],
-                                         notificationID: String,
-                                         completion: @escaping @Sendable (String) -> Void) {
+    ///
+    /// - Returns: The identifier of the registered category.
+    private static func registerCategory(buttonTitles: [String], notificationID: String) async -> String {
         let categoryIdentifier = CountlyPushKey.categoryIdentifierPrefix + notificationID
+        let center = UNUserNotificationCenter.current()
+        let category = makeCategory(identifier: categoryIdentifier, buttonTitles: buttonTitles)
 
-        UNUserNotificationCenter.current().getNotificationCategories { existing in
-            let center = UNUserNotificationCenter.current()
-            let category = makeCategory(identifier: categoryIdentifier, buttonTitles: buttonTitles)
+        // Everything already registered is kept, the host application's and this
+        // SDK's alike. Clearing the SDK's own on each notification, which is the
+        // obvious way to stop the set growing, unregisters the category an earlier
+        // notification is still sitting in Notification Center pointing at, and
+        // that notification then expands with no buttons at all.
+        //
+        // `Set.insert` keeps whatever is already there, and two categories with the
+        // same identifier but different actions are not equal, so a plain insert
+        // would leave the set holding both. Which of them `setNotificationCategories`
+        // keeps is undefined, and the identifier check below would report success
+        // either way, so the notification can expand showing the previous
+        // notification's buttons. The identifier is the key here, so anything
+        // already under it is removed first.
+        var categories = await center.notificationCategories().filter { $0.identifier != categoryIdentifier }
+        categories.insert(category)
 
-            // Everything already registered is kept, the host application's and this
-            // SDK's alike. Clearing the SDK's own on each notification, which is the
-            // obvious way to stop the set growing, unregisters the category an
-            // earlier notification is still sitting in Notification Center pointing
-            // at, and that notification then expands with no buttons at all.
-            //
-            // `Set.insert` keeps whatever is already there, and two categories with
-            // the same identifier but different actions are not equal, so a plain
-            // insert would leave the set holding both. Which of them
-            // `setNotificationCategories` keeps is undefined, and the identifier
-            // check below would report success either way, so the notification can
-            // expand showing the previous notification's buttons. The identifier is
-            // the key here, so anything already under it is removed first.
-            var categories = existing.filter { $0.identifier != categoryIdentifier }
-            categories.insert(category)
-
-            // Bounded so a chatty application does not accumulate categories without
-            // limit. Which of the older ones goes is arbitrary, because the set is
-            // unordered and carries no timestamp; the newest is always kept.
-            let ours = categories.filter { $0.identifier.hasPrefix(CountlyPushKey.categoryIdentifierPrefix) }
-            if ours.count > Self.maxRetainedCategories {
-                for stale in ours.filter({ $0.identifier != categoryIdentifier }).prefix(ours.count - Self.maxRetainedCategories) {
-                    categories.remove(stale)
-                }
-            }
-
-            center.setNotificationCategories(categories)
-            log("registerCategory, registered \(buttonTitles.count) action buttons under category [\(categoryIdentifier)]")
-
-            // Read back before continuing. Two notifications arriving together run
-            // in two extension processes, and this read-modify-write is not atomic
-            // across them, so the loser of the race would deliver a notification
-            // pointing at a category that is no longer registered.
-            center.getNotificationCategories { confirmed in
-                guard !confirmed.contains(where: { $0.identifier == categoryIdentifier }) else {
-                    completion(categoryIdentifier)
-                    return
-                }
-
-                log("registerCategory, the category was overwritten by a concurrent registration, writing it again")
-                var retry = confirmed.filter { $0.identifier != categoryIdentifier }
-                retry.insert(makeCategory(identifier: categoryIdentifier, buttonTitles: buttonTitles))
-                UNUserNotificationCenter.current().setNotificationCategories(retry)
-                completion(categoryIdentifier)
+        // Bounded so a chatty application does not accumulate categories without
+        // limit. Which of the older ones goes is arbitrary, because the set is
+        // unordered and carries no timestamp; the newest is always kept.
+        let ours = categories.filter { $0.identifier.hasPrefix(CountlyPushKey.categoryIdentifierPrefix) }
+        if ours.count > Self.maxRetainedCategories {
+            for stale in ours.filter({ $0.identifier != categoryIdentifier }).prefix(ours.count - Self.maxRetainedCategories) {
+                categories.remove(stale)
             }
         }
+
+        center.setNotificationCategories(categories)
+        log("registerCategory, registered \(buttonTitles.count) action buttons under category [\(categoryIdentifier)]")
+
+        // Read back before continuing. Two notifications arriving together run in
+        // two extension processes, and this read-modify-write is not atomic across
+        // them, so the loser of the race would deliver a notification pointing at a
+        // category that is no longer registered.
+        let confirmed = await center.notificationCategories()
+        guard !confirmed.contains(where: { $0.identifier == categoryIdentifier }) else {
+            return categoryIdentifier
+        }
+
+        log("registerCategory, the category was overwritten by a concurrent registration, writing it again")
+        var retry = confirmed.filter { $0.identifier != categoryIdentifier }
+        retry.insert(category)
+        center.setNotificationCategories(retry)
+        return categoryIdentifier
     }
 
     /// The category carrying one notification's action buttons, in payload order.
-    ///
-    /// Built from the titles wherever it is needed rather than handed between the
-    /// callbacks, because a category is not safe to share across the queues they
-    /// run on.
     private static func makeCategory(identifier: String, buttonTitles: [String]) -> UNNotificationCategory {
         let actions = buttonTitles.enumerated().map { index, title in
             UNNotificationAction(identifier: "\(CountlyPushKey.actionIdentifierPrefix)\(index + 1)",
@@ -227,22 +217,22 @@ public enum CountlyNotificationService {
 
     // MARK: - Attachment
 
-    private static func finish(gate: DeliveryGate,
-                               attachmentURL: String?,
-                               notificationID: String) {
+    /// Downloads the payload's media, when it names one, and attaches it.
+    ///
+    /// Leaves the content as it was on any failure: a notification without its
+    /// image still carries its text and its buttons.
+    private static func attach(from attachmentURL: String?, notificationID: String, to gate: DeliveryGate) async {
         guard let attachmentURL, !attachmentURL.isEmpty else {
-            log("finish, no attachment specified in the Countly payload")
-            gate.deliver()
+            log("attach, no attachment specified in the Countly payload")
             return
         }
 
         guard let url = resolveAttachmentURL(attachmentURL) else {
-            log("finish, the attachment URL in the Countly payload is not a URL, url: [\(attachmentURL)]")
-            gate.deliver()
+            log("attach, the attachment URL in the Countly payload is not a URL, url: [\(attachmentURL)]")
             return
         }
 
-        log("finish, downloading the attachment specified in the Countly payload, url: [\(url.absoluteString)]")
+        log("attach, downloading the attachment specified in the Countly payload, url: [\(url.absoluteString)]")
 
         // A dedicated ephemeral session rather than a shared one: this runs in the
         // extension's own short lived process, and a cached or cookie carrying
@@ -250,42 +240,37 @@ public enum CountlyNotificationService {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForResource = attachmentTimeout
         let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
 
-        let task = session.downloadTask(with: url) { location, response, error in
-            defer {
-                session.finishTasksAndInvalidate()
-                gate.deliver()
-            }
-
-            if let error {
-                let nsError = error as NSError
-                log("finish, attachment download failed, url: [\(url.absoluteString)], domain: [\(nsError.domain)], code: [\(nsError.code)], error: [\(error.localizedDescription)]")
-                return
-            }
-
-            guard let location else {
-                log("finish, attachment download produced no file")
-                return
-            }
-
-            let suggested = response?.suggestedFilename ?? url.lastPathComponent
-            let fileName = "\(notificationID)-\(suggested)"
-            let destination = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(fileName)
-
-            do {
-                // The system deletes the downloaded file as soon as this callback
-                // returns, and a leftover from a previous notification with the
-                // same name would make the move fail.
-                try? FileManager.default.removeItem(at: destination)
-                try FileManager.default.moveItem(at: location, to: destination)
-                let attachment = try UNNotificationAttachment(identifier: fileName, url: destination, options: nil)
-                gate.mutate { $0.attachments = [attachment] }
-                log("finish, attachment added to the notification")
-            } catch {
-                log("finish, attachment could not be attached: \(error.localizedDescription)")
-            }
+        let location: URL
+        let response: URLResponse
+        do {
+            (location, response) = try await session.download(from: url)
+        } catch {
+            let nsError = error as NSError
+            log("attach, attachment download failed, url: [\(url.absoluteString)], domain: [\(nsError.domain)], code: [\(nsError.code)], error: [\(error.localizedDescription)]")
+            return
         }
-        task.resume()
+
+        // Unlike the completion handler form, the async download leaves the file
+        // where it landed, so it is removed once it has been moved or given up on.
+        defer { try? FileManager.default.removeItem(at: location) }
+
+        let suggested = response.suggestedFilename ?? url.lastPathComponent
+        let fileName = "\(notificationID)-\(suggested)"
+        let destination = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(fileName)
+
+        do {
+            // A leftover from a previous notification with the same name would make
+            // the move fail.
+            try? FileManager.default.removeItem(at: destination)
+            try FileManager.default.moveItem(at: location, to: destination)
+            let attachment = try UNNotificationAttachment(identifier: fileName, url: destination, options: nil)
+            gate.mutate { $0.attachments = [attachment] }
+            log("attach, attachment added to the notification")
+        } catch {
+            log("attach, attachment could not be attached: \(error.localizedDescription)")
+        }
     }
 
     /// The URL to download the attachment from, or nil when the payload's string

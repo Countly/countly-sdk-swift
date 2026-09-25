@@ -149,12 +149,17 @@ final class ConnectionTestTests: CountlyBaseTestCase {
             return _urls
         }
 
-        func probe(_ url: URL, timeout: TimeInterval) -> ConnectionTestModule.ProbeOutcome {
+        func probe(_ url: URL, timeout: TimeInterval) async -> ConnectionTestModule.ProbeOutcome {
+            record(url)
+            if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+            return ConnectionTestModule.ProbeOutcome(status: status, latencyMs: Int64(delay * 1000), failure: nil)
+        }
+
+        /// Keeps the probed URL for the assertions.
+        private func record(_ url: URL) {
             lock.lock()
             _urls.append(url)
             lock.unlock()
-            if delay > 0 { Thread.sleep(forTimeInterval: delay) }
-            return ConnectionTestModule.ProbeOutcome(status: status, latencyMs: Int64(delay * 1000), failure: nil)
         }
 
         func batteryFinished() {}
@@ -493,12 +498,12 @@ final class ConnectionTestTests: CountlyBaseTestCase {
         XCTAssertNil(singleRow["n"], "a single path row carries no path count")
     }
 
-    func testARunWithoutAServerConfigLatencyOmitsTheScRow() {
+    func testARunWithoutAServerConfigLatencyOmitsTheScRow() async {
         let module = module(of: startInstance())
         let transport = CannedTransport(status: 400)
         module.transport = transport
 
-        let rows = module.runBattery(serverConfigLatencyMs: -1, serverURL: "https://x.com/prefix")
+        let rows = await module.runBattery(serverConfigLatencyMs: -1, serverURL: "https://x.com/prefix")
 
         XCTAssertEqual(rows.map(\.feature), expectedFeatures.filter { $0 != "sc" }, "omitted rather than invented")
         XCTAssertEqual(transport.urls.count, expectedProbePaths.count)
