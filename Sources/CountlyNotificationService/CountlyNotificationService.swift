@@ -130,20 +130,16 @@ public enum CountlyNotificationService {
             }
         }
 
-        let buttons = countlyPayload[CountlyPushKey.buttons] as? [[String: Any]] ?? []
-        if buttons.isEmpty {
-            finish(gate: gate,
-                   attachmentURL: countlyPayload[CountlyPushKey.attachment] as? String,
-                   notificationID: notificationID)
+        let attachmentURL = countlyPayload[CountlyPushKey.attachment] as? String
+        if buttonTitles.isEmpty {
+            finish(gate: gate, attachmentURL: attachmentURL, notificationID: notificationID)
             return
         }
 
-        registerCategory(for: buttons, notificationID: notificationID) { categoryIdentifier in
+        registerCategory(buttonTitles: buttonTitles, notificationID: notificationID) { categoryIdentifier in
             gate.mutate { $0.categoryIdentifier = categoryIdentifier }
             log("didReceive, the notification now carries its action buttons, category: [\(categoryIdentifier)]")
-            finish(gate: gate,
-                   attachmentURL: countlyPayload[CountlyPushKey.attachment] as? String,
-                   notificationID: notificationID)
+            finish(gate: gate, attachmentURL: attachmentURL, notificationID: notificationID)
         }
     }
 
@@ -155,23 +151,15 @@ public enum CountlyNotificationService {
     /// this SDK registered for an earlier notification. Replacing the whole set
     /// outright, which is the obvious implementation, silently unregisters every
     /// category the host application set up for its own notifications.
-    private static func registerCategory(for buttons: [[String: Any]],
+    private static func registerCategory(buttonTitles: [String],
                                          notificationID: String,
-                                         completion: @escaping (String) -> Void) {
-        let actions = buttons.enumerated().map { index, button in
-            UNNotificationAction(identifier: "\(CountlyPushKey.actionIdentifierPrefix)\(index + 1)",
-                                 title: button[CountlyPushKey.actionButtonTitle] as? String ?? "",
-                                 options: [.foreground])
-        }
-
+                                         completion: @escaping @Sendable (String) -> Void) {
         let categoryIdentifier = CountlyPushKey.categoryIdentifierPrefix + notificationID
-        let category = UNNotificationCategory(identifier: categoryIdentifier,
-                                              actions: actions,
-                                              intentIdentifiers: [],
-                                              options: [])
 
-        let center = UNUserNotificationCenter.current()
-        center.getNotificationCategories { existing in
+        UNUserNotificationCenter.current().getNotificationCategories { existing in
+            let center = UNUserNotificationCenter.current()
+            let category = makeCategory(identifier: categoryIdentifier, buttonTitles: buttonTitles)
+
             // Everything already registered is kept, the host application's and this
             // SDK's alike. Clearing the SDK's own on each notification, which is the
             // obvious way to stop the set growing, unregisters the category an
@@ -199,7 +187,7 @@ public enum CountlyNotificationService {
             }
 
             center.setNotificationCategories(categories)
-            log("registerCategory, registered \(actions.count) action buttons under category [\(categoryIdentifier)]")
+            log("registerCategory, registered \(buttonTitles.count) action buttons under category [\(categoryIdentifier)]")
 
             // Read back before continuing. Two notifications arriving together run
             // in two extension processes, and this read-modify-write is not atomic
@@ -213,11 +201,28 @@ public enum CountlyNotificationService {
 
                 log("registerCategory, the category was overwritten by a concurrent registration, writing it again")
                 var retry = confirmed.filter { $0.identifier != categoryIdentifier }
-                retry.insert(category)
-                center.setNotificationCategories(retry)
+                retry.insert(makeCategory(identifier: categoryIdentifier, buttonTitles: buttonTitles))
+                UNUserNotificationCenter.current().setNotificationCategories(retry)
                 completion(categoryIdentifier)
             }
         }
+    }
+
+    /// The category carrying one notification's action buttons, in payload order.
+    ///
+    /// Built from the titles wherever it is needed rather than handed between the
+    /// callbacks, because a category is not safe to share across the queues they
+    /// run on.
+    private static func makeCategory(identifier: String, buttonTitles: [String]) -> UNNotificationCategory {
+        let actions = buttonTitles.enumerated().map { index, title in
+            UNNotificationAction(identifier: "\(CountlyPushKey.actionIdentifierPrefix)\(index + 1)",
+                                 title: title,
+                                 options: [.foreground])
+        }
+        return UNNotificationCategory(identifier: identifier,
+                                      actions: actions,
+                                      intentIdentifiers: [],
+                                      options: [])
     }
 
     // MARK: - Attachment
@@ -315,8 +320,9 @@ public enum CountlyNotificationService {
     /// queue. Serializing only the *delivery* is not enough, because the deadline
     /// can hand the content to the system while a download callback is still
     /// assigning `content.attachments` to the same object. Every read, every write
-    /// and the delivery itself therefore go through one lock.
-    private final class DeliveryGate {
+    /// and the delivery itself therefore go through one lock, which is what makes
+    /// the unchecked `Sendable` true.
+    private final class DeliveryGate: @unchecked Sendable {
 
         private let lock = NSLock()
         private let content: UNMutableNotificationContent

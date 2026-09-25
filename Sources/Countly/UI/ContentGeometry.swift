@@ -20,6 +20,7 @@ import UIKit
 /// they have to agree: a page told it has the whole 874pt window and then placed in
 /// the 812pt between the Dynamic Island and the home indicator is a page that
 /// scrolls, with its buttons cut in half at the bottom edge.
+@MainActor
 enum ContentGeometry {
 
 #if os(macOS)
@@ -45,7 +46,7 @@ enum ContentGeometry {
 
     /// A top inset at least this large is a hardware cutout rather than an ordinary
     /// status bar, which is 20pt.
-    private static let notchInsetThreshold: CGFloat = 44
+    nonisolated private static let notchInsetThreshold: CGFloat = 44
 
     private static var window: UIWindow? { ScreenReader.keyWindow }
 
@@ -90,7 +91,7 @@ enum ContentGeometry {
     /// legible fits behind one: immersive means "under the status bar", not "under
     /// the Dynamic Island". The bottom inset only goes in safe area mode, which is
     /// what asks for the home indicator to be left clear.
-    static func contentSize(in bounds: CGSize,
+    nonisolated static func contentSize(in bounds: CGSize,
                             insets: UIEdgeInsets,
                             displayOption: WebViewDisplayOption) -> CGSize {
         var size = bounds
@@ -114,7 +115,7 @@ enum ContentGeometry {
     /// Applied to the placement the server sent, never to the frame already on
     /// screen: the shifts are additive, so re-applying them walks the page off the
     /// display one rotation at a time.
-    static func placementOffset(insets: UIEdgeInsets,
+    nonisolated static func placementOffset(insets: UIEdgeInsets,
                                 displayOption: WebViewDisplayOption,
                                 isLandscapeLeft: Bool) -> CGPoint {
         var offset = CGPoint.zero
@@ -134,7 +135,7 @@ enum ContentGeometry {
     }
 
     /// Whether the top inset is a hardware cutout rather than a status bar.
-    private static func hasTopNotch(_ insets: UIEdgeInsets) -> Bool {
+    nonisolated private static func hasTopNotch(_ insets: UIEdgeInsets) -> Bool {
         insets.top >= notchInsetThreshold
     }
 

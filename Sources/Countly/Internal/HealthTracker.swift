@@ -19,7 +19,9 @@ import Foundation
 /// Nothing on this class may log at error or warning level. Those two levels call
 /// straight back into `logError` / `logWarning`, which would repopulate the very
 /// counters a clear is discarding, and re-enter the serial queue that owns them.
-final class HealthTracker {
+///
+/// Unchecked `Sendable`: every counter is owned by the serial queue.
+final class HealthTracker: @unchecked Sendable {
 
     private static let module = "HealthTracker"
 

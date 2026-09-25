@@ -28,6 +28,9 @@ import WebKit
 /// so the test suite can assert against the real object rather than a projection
 /// that would drift from it; that is only safe while the class itself is out of
 /// reach. Making this `public` would take the web view's whole API along with it.
+///
+/// Main actor isolated, like the web view and the windows it drives.
+@MainActor
 final class WebViewManager: NSObject {
 
     private static let module = "WebView"
@@ -53,7 +56,7 @@ final class WebViewManager: NSObject {
     ]
 
     /// Parameters whose values may themselves contain an unescaped `&`.
-    private static let reservedKeys = ["action", "event", "resize_me", "close", "link"]
+    nonisolated private static let reservedKeys = ["action", "event", "resize_me", "close", "link"]
 
     private unowned let core: SDKCore
 
@@ -298,13 +301,16 @@ final class WebViewManager: NSObject {
     ///
     /// Process wide rather than per instance, as Android's flag is: the screen is
     /// shared whatever instance is drawing on it.
-    static let gate = PresentationGate()
+    nonisolated static let gate = PresentationGate()
 
-    final class PresentationGate {
+    /// Unchecked `Sendable`: the holder is guarded by the lock, and a release can
+    /// come from a manager's deinit on any thread.
+    final class PresentationGate: @unchecked Sendable {
         private let lock = NSLock()
         private weak var holder: WebViewManager?
 
         /// Claims the gate for `manager`, or reports who holds it.
+        @MainActor
         func claim(_ manager: WebViewManager) -> Bool {
             lock.lock(); defer { lock.unlock() }
             if let holder, holder !== manager, !holder.isClosed { return false }
@@ -548,14 +554,10 @@ final class WebViewManager: NSObject {
     /// the host can change while content is up, and the notifications are cheap.
     /// The work itself is skipped unless the surface actually moved.
     private func observeSurfaceChanges() {
-        let recompute: (Notification) -> Void = { [weak self] _ in
-            self?.surfaceDidChange()
-        }
-
         for name in [NSWindow.didResizeNotification, NSWindow.didMoveNotification] {
             surfaceObservers.append(
-                NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { note in
-                    recompute(note)
+                NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.surfaceDidChange() }
                 })
         }
     }
@@ -626,45 +628,38 @@ final class WebViewManager: NSObject {
 
         core.logger.d(Self.module, "close", "web view is being closed")
 
-        let finish = { [weak self] in
-            guard let self else { return }
-            // Invalidated here rather than above: a `Timer` has to be invalidated on
-            // the thread that scheduled it, and `close()` accepts calls from any.
-            self.cancelStallTimer()
-            self.cancelContentShownDeadline()
-            self.pendingReload?.cancel()
-            self.pendingReload = nil
-            self.pendingRotationReveal?.cancel()
-            self.pendingRotationReveal = nil
-            self.webView?.stopLoading()
-            self.webView?.navigationDelegate = nil
-            let controller = self.webView?.configuration.userContentController
-            controller?.removeScriptMessageHandler(forName: ScriptMessage.resourceLoadError)
-            controller?.removeScriptMessageHandler(forName: ScriptMessage.resourceVerifyResult)
-            controller?.removeScriptMessageHandler(forName: ScriptMessage.widgetCommand)
-            controller?.removeScriptMessageHandler(forName: ScriptMessage.cardSize)
-            controller?.removeAllUserScripts()
-            self.webView?.removeFromSuperview()
-            self.webView = nil
-            #if os(macOS)
-            // Before hiding it: a parent holds its children on screen, so an
-            // attached panel would return with the window it was left on.
-            self.window?.unbind()
-            #endif
-            self.window?.isHidden = true
-            self.window?.rootViewController = nil
-            self.window = nil
-            self.backgroundView = nil
+        cancelStallTimer()
+        cancelContentShownDeadline()
+        pendingReload?.cancel()
+        pendingReload = nil
+        pendingRotationReveal?.cancel()
+        pendingRotationReveal = nil
+        webView?.stopLoading()
+        webView?.navigationDelegate = nil
+        let controller = webView?.configuration.userContentController
+        controller?.removeScriptMessageHandler(forName: ScriptMessage.resourceLoadError)
+        controller?.removeScriptMessageHandler(forName: ScriptMessage.resourceVerifyResult)
+        controller?.removeScriptMessageHandler(forName: ScriptMessage.widgetCommand)
+        controller?.removeScriptMessageHandler(forName: ScriptMessage.cardSize)
+        controller?.removeAllUserScripts()
+        webView?.removeFromSuperview()
+        webView = nil
+        #if os(macOS)
+        // Before hiding it: a parent holds its children on screen, so an
+        // attached panel would return with the window it was left on.
+        window?.unbind()
+        #endif
+        window?.isHidden = true
+        window?.rootViewController = nil
+        window = nil
+        backgroundView = nil
 
-            // Released before the caller is told, so a caller may present again
-            // from inside its own dismiss callback.
-            Self.gate.release(self)
-            let dismiss = self.dismissBlock
-            self.dismissBlock = nil
-            dismiss?()
-        }
-
-        onMainThread(finish)
+        // Released before the caller is told, so a caller may present again from
+        // inside its own dismiss callback.
+        Self.gate.release(self)
+        let dismiss = dismissBlock
+        dismissBlock = nil
+        dismiss?()
     }
 
     /// How long a widget is held back waiting for the page to state its size.
@@ -704,10 +699,12 @@ final class WebViewManager: NSObject {
         guard !hasAppeared, pendingFirstFit == nil else { return }
 
         let deadline = DispatchWorkItem { [weak self] in
-            guard let self, !self.hasAppeared else { return }
-            self.pendingFirstFit = nil
-            self.core.logger.d(Self.module, "awaitFirstFitThenAppear", "the page did not ask for a size within the deadline, so it is shown at the size its type allows")
-            self.reportAppearance()
+            MainActor.assumeIsolated {
+                guard let self, !self.hasAppeared else { return }
+                self.pendingFirstFit = nil
+                self.core.logger.d(Self.module, "awaitFirstFitThenAppear", "the page did not ask for a size within the deadline, so it is shown at the size its type allows")
+                self.reportAppearance()
+            }
         }
         pendingFirstFit = deadline
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.firstFitDeadline, execute: deadline)
@@ -759,7 +756,9 @@ final class WebViewManager: NSObject {
         let configured = TimeInterval(core.config.content.contentReloadOnStallTimeout) / 1000.0
         let timeout = configured > 0 ? configured : Self.defaultStallTimeout
         stallTimer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
-            self?.attemptRecovery(reason: "the content did not report itself shown in time")
+            MainActor.assumeIsolated {
+                self?.attemptRecovery(reason: "the content did not report itself shown in time")
+            }
         }
     }
 
@@ -777,9 +776,11 @@ final class WebViewManager: NSObject {
         guard !isFeedbackWidget else { return }
         contentShownDeadlineTimer?.invalidate()
         contentShownDeadlineTimer = Timer.scheduledTimer(withTimeInterval: Self.contentShownDeadline, repeats: false) { [weak self] _ in
-            guard let self, !self.isClosed else { return }
-            self.core.logger.w(Self.module, "contentShownDeadline", "the content never reported that it is shown, the web view is dismissed, deadlineSeconds: [\(Self.contentShownDeadline.logSeconds)], wasRevealed: [\(self.hasAppeared)]")
-            self.close()
+            MainActor.assumeIsolated {
+                guard let self, !self.isClosed else { return }
+                self.core.logger.w(Self.module, "contentShownDeadline", "the content never reported that it is shown, the web view is dismissed, deadlineSeconds: [\(Self.contentShownDeadline.logSeconds)], wasRevealed: [\(self.hasAppeared)]")
+                self.close()
+            }
         }
     }
 
@@ -964,7 +965,9 @@ final class WebViewManager: NSObject {
 
         pendingRotationReveal?.cancel()
         let deadline = DispatchWorkItem { [weak self] in
-            self?.revealAfterRotation(reason: "the page did not ask for a size within the deadline")
+            MainActor.assumeIsolated {
+                self?.revealAfterRotation(reason: "the page did not ask for a size within the deadline")
+            }
         }
         pendingRotationReveal = deadline
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.firstFitDeadline, execute: deadline)
@@ -990,7 +993,7 @@ final class WebViewManager: NSObject {
     /// Whether two surfaces are of different orientation. Always false on macOS: a
     /// window has no orientation to rotate into, a resize is handled by
     /// `surfaceDidChange`, and the server's geometry is never re-applied there.
-    private static func orientationDiffers(_ from: CGSize, _ to: CGSize) -> Bool {
+    nonisolated private static func orientationDiffers(_ from: CGSize, _ to: CGSize) -> Bool {
         #if os(macOS)
         return false
         #else
@@ -1002,7 +1005,7 @@ final class WebViewManager: NSObject {
     /// taken from the entry for that surface's orientation. Nil when the server
     /// said nothing for it: the other orientation's frame is not a substitute, since
     /// its coordinates were measured against a surface of the other shape.
-    static func serverFrame(from placement: [String: Any], for container: CGSize) -> CGRect? {
+    nonisolated static func serverFrame(from placement: [String: Any], for container: CGSize) -> CGRect? {
         let key = container.width > container.height ? "l" : "p"
         guard let geometry = placement[key] as? [String: Any], !geometry.isEmpty else { return nil }
         return CGRect(contentGeometry: geometry, container: container)
@@ -1295,7 +1298,7 @@ final class WebViewManager: NSObject {
     ///
     /// The documented limitation is that a value literally containing
     /// `&<reserved key>=<valid value>` can still be mis-split.
-    static func parseActionQuery(_ urlString: String) -> [String: Any] {
+    nonisolated static func parseActionQuery(_ urlString: String) -> [String: Any] {
         var result: [String: Any] = [:]
 
         let decoded = urlString.removingPercentEncoding ?? urlString
@@ -1357,7 +1360,7 @@ final class WebViewManager: NSObject {
     }
 
     /// Rightmost occurrence of `needle` in `haystack` starting before `limit`.
-    private static func lastIndex(of needle: [Character], in haystack: [Character], before limit: Int) -> Int? {
+    nonisolated private static func lastIndex(of needle: [Character], in haystack: [Character], before limit: Int) -> Int? {
         guard needle.count <= limit else { return nil }
         var index = limit - needle.count
         while index >= 0 {
@@ -1369,7 +1372,7 @@ final class WebViewManager: NSObject {
 
     /// Whether a value is plausible for its key, which is what tells a real
     /// parameter from text that happens to look like one.
-    private static func isReservedValue(_ value: String, validFor key: String) -> Bool {
+    nonisolated private static func isReservedValue(_ value: String, validFor key: String) -> Bool {
         switch key {
         case "event":
             return CountlyJSON.object(from: Data(value.utf8), logger: nil) is [Any]
@@ -1390,7 +1393,7 @@ final class WebViewManager: NSObject {
     ///
     /// Accepts the same spellings the other SDKs' pages send, not just `1`: a page
     /// sending `close=true` would otherwise leave content on screen forever.
-    private static func isTruthy(_ value: String) -> Bool {
+    nonisolated private static func isTruthy(_ value: String) -> Bool {
         switch value.lowercased() {
         case "1", "true", "yes": return true
         default: return false
@@ -1399,7 +1402,7 @@ final class WebViewManager: NSObject {
 
     /// Whether the value starts with a URI scheme, which covers both `https` links
     /// and custom-scheme deep links.
-    static func hasURIScheme(_ value: String) -> Bool {
+    nonisolated static func hasURIScheme(_ value: String) -> Bool {
         guard let colon = value.firstIndex(of: ":"), colon != value.startIndex else { return false }
 
         for (offset, character) in value[value.startIndex..<colon].enumerated() {
@@ -1635,11 +1638,6 @@ final class WebViewManager: NSObject {
     /// otherwise flash the page away, re-fire its on-load event, or dismiss content
     /// the user is part way through.
     private func attemptRecovery(reason: String) {
-        guard Thread.isMainThread else {
-            DispatchQueue.main.async { [weak self] in self?.attemptRecovery(reason: reason) }
-            return
-        }
-
         guard !isClosed else { return }
 
         if hasAppeared {
@@ -1677,14 +1675,17 @@ final class WebViewManager: NSObject {
         core.logger.d(Self.module, "attemptRecovery", "scheduling a reload, attempt: [\(resourceRetryCount)], maxAttempts: [\(Self.maxResourceRetries)], delay: [\(delay.logSeconds)], reason: [\(reason)]")
 
         let reload = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.pendingReload = nil
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.pendingReload = nil
 
-            guard !self.isClosed, !self.hasAppeared else { return }
-            self.webView?.reload()
-            // Re-armed, so a reload that stalls in turn still has a deadline. Without
-            // this the recovery attempt itself would leave the overlay with none.
-            self.armStallTimerIfNeeded()
+                guard !self.isClosed, !self.hasAppeared else { return }
+                self.webView?.reload()
+                // Re-armed, so a reload that stalls in turn still has a deadline.
+                // Without this the recovery attempt itself would leave the overlay
+                // with none.
+                self.armStallTimerIfNeeded()
+            }
         }
         pendingReload = reload
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: reload)
@@ -1726,7 +1727,7 @@ extension WebViewManager: WKNavigationDelegate {
 
     func webView(_ webView: WKWebView,
                  decidePolicyFor navigationAction: WKNavigationAction,
-                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+                 decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void) {
         guard let url = navigationAction.request.url?.absoluteString else {
             core.logger.d(Self.module, "decidePolicyFor", "the navigation action carries no URL, allowing it")
             decisionHandler(.allow)
@@ -1791,7 +1792,7 @@ extension WebViewManager: WKNavigationDelegate {
     /// Rebuilt by hand rather than through `URLComponents`, which reports no query
     /// for the opaque schemes this is used with and would drop the rest of the URL
     /// on the way back out.
-    static func withoutCloseParameter(_ urlString: String) -> String {
+    nonisolated static func withoutCloseParameter(_ urlString: String) -> String {
         guard let mark = urlString.firstIndex(where: { $0 == "?" || $0 == "&" }) else { return urlString }
 
         let head = String(urlString[urlString.startIndex..<mark])
@@ -1811,7 +1812,7 @@ extension WebViewManager: WKNavigationDelegate {
     /// Reads the raw string rather than `URLComponents`, which does not expose a
     /// query for the opaque schemes this is used with: `mailto:a@b.com?close=1` has
     /// no host and no path, and `URLComponents.queryItems` comes back nil for it.
-    static func closeRequested(in urlString: String) -> Bool {
+    nonisolated static func closeRequested(in urlString: String) -> Bool {
         guard let mark = urlString.firstIndex(where: { $0 == "?" || $0 == "&" }) else { return false }
 
         for pair in urlString[urlString.index(after: mark)...].split(separator: "&") {
@@ -1824,7 +1825,7 @@ extension WebViewManager: WKNavigationDelegate {
 
     func webView(_ webView: WKWebView,
                  decidePolicyFor navigationResponse: WKNavigationResponse,
-                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+                 decisionHandler: @escaping @MainActor (WKNavigationResponsePolicy) -> Void) {
         let response = navigationResponse.response
         let http = response as? HTTPURLResponse
         let statusCode = http?.statusCode ?? 0
@@ -1863,7 +1864,7 @@ extension WebViewManager: WKNavigationDelegate {
 
     func webView(_ webView: WKWebView,
                  didReceive challenge: URLAuthenticationChallenge,
-                 completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+                 completionHandler: @escaping @MainActor (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
         core.logger.d(Self.module, "didReceiveChallenge", "an authentication challenge was received and the default handling is performed, host: [\(challenge.protectionSpace.host)], authenticationMethod: [\(challenge.protectionSpace.authenticationMethod)]")
         completionHandler(.performDefaultHandling, nil)
     }
@@ -2209,7 +2210,7 @@ extension WebViewManager: WKNavigationDelegate {
     /// WebKit reports that as a failed navigation carrying `NSURLErrorCancelled`.
     /// Tearing the page down for it would close a content the page was only asking
     /// to resize. The reference dismisses on every error and has the same bug.
-    private static func isCancellation(_ error: Error) -> Bool {
+    nonisolated private static func isCancellation(_ error: Error) -> Bool {
         let failure = error as NSError
         return failure.domain == NSURLErrorDomain && failure.code == NSURLErrorCancelled
     }
@@ -2262,6 +2263,7 @@ final class WebViewController: UIViewController {
 /// `WKUserContentController` holds its message handlers strongly, and the manager
 /// owns the web view that owns the controller, so registering the manager itself
 /// would make a cycle that nothing ever breaks.
+@MainActor
 private final class ScriptMessageProxy: NSObject, WKScriptMessageHandler {
 
     private weak var target: WebViewManager?

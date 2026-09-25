@@ -23,6 +23,7 @@ import WebKit
 /// These drive a real `WKWebView` on the simulator. `about:blank` loads with no
 /// network, and navigations are driven from JavaScript, which is exactly how a real
 /// content page reaches the SDK.
+@MainActor
 final class WebViewPresentationTests: CountlyBaseTestCase {
 
     private var manager: WebViewManager?
@@ -41,13 +42,16 @@ final class WebViewPresentationTests: CountlyBaseTestCase {
     /// mid-test. The two cases that are about the deadline set their own.
     override func setUp() {
         super.setUp()
-        WebViewManager.contentShownDeadline = 600
+        // XCTest calls both on the main thread.
+        MainActor.assumeIsolated { WebViewManager.contentShownDeadline = 600 }
     }
 
     override func tearDown() {
-        if let manager { onMain { manager.close() } }
-        manager = nil
-        WebViewManager.contentShownDeadline = 60
+        MainActor.assumeIsolated {
+            if let manager { onMain { manager.close() } }
+            manager = nil
+            WebViewManager.contentShownDeadline = 60
+        }
         super.tearDown()
     }
 
@@ -1307,6 +1311,7 @@ private final class DummyTransitionCoordinator: NSObject, UIViewControllerTransi
 /// to resize, and seeing its rounded corners. A page that paints a full-surface
 /// backdrop takes both away, and neither loss is anything the SDK is entitled to
 /// cause: the content is a guest on someone else's window.
+@MainActor
 final class OverlayEdgeTests: XCTestCase {
 
     private func makeBackground(margin: CGFloat) -> PassThroughBackgroundView {

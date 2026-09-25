@@ -14,7 +14,10 @@ import Foundation
 /// requests, so a later request must not overtake an earlier one. The head of the
 /// queue is only removed once the server has accepted it, which is what makes the
 /// SDK survive a crash or a dead network without losing data.
-final class ConnectionManager: NSObject {
+///
+/// Unchecked `Sendable`: the drain state, the callbacks and the sessions are each
+/// guarded by a lock or by the callback queue.
+final class ConnectionManager: NSObject, @unchecked Sendable {
 
     private static let module = "ConnectionManager"
 
@@ -807,7 +810,7 @@ final class ConnectionManager: NSObject {
             core.logger.d(Self.module, "queuedTask", "the request is not sent, the connection manager is halted, endpoint: [\(request.url?.path ?? "")]")
             return nil
         }
-        return queuedSessionLocked().dataTask(with: request, completionHandler: completionHandler)
+        return queuedSessionLocked().dataTask(with: request, completionHandler: Self.sessionCompletion(completionHandler))
     }
 
     /// The counterpart of ``queuedTask(with:completionHandler:)`` on the instant
@@ -820,7 +823,17 @@ final class ConnectionManager: NSObject {
             core.logger.d(Self.module, "instantTask", "the request is not sent, the connection manager is halted, endpoint: [\(request.url?.path ?? "")]")
             return nil
         }
-        return instantSessionLocked().dataTask(with: request, completionHandler: completionHandler)
+        return instantSessionLocked().dataTask(with: request, completionHandler: Self.sessionCompletion(completionHandler))
+    }
+
+    /// A completion handler `URLSession` accepts, calling through to `handler`.
+    ///
+    /// The handlers are the modules' own closures, and each module guards what its
+    /// handler touches, so they are handed to the session's queue unchecked.
+    private static func sessionCompletion(_ handler: @escaping (Data?, URLResponse?, Error?) -> Void)
+        -> @Sendable (Data?, URLResponse?, Error?) -> Void {
+        let handler = UncheckedSendable(handler)
+        return { data, response, error in handler.value(data, response, error) }
     }
 
     // MARK: - Sessions

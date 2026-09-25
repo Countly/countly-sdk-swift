@@ -19,7 +19,10 @@ import ObjectiveC
 /// tracker is a shared object with a registry rather than a per-instance one.
 /// Everything downstream of the callback is per instance: each subscriber applies
 /// its own exclusion list, consent and behavior settings.
-final class AutoViewTracker {
+///
+/// Unchecked `Sendable`: the registry and the swizzle flag are guarded by their
+/// locks, and appearances arrive on the main thread.
+final class AutoViewTracker: @unchecked Sendable {
 
     static let shared = AutoViewTracker()
 
@@ -54,6 +57,7 @@ final class AutoViewTracker {
     /// The swizzle outlives the last subscriber, so this runs for every screen in
     /// the host application even when the SDK is halted. The empty case is the
     /// common one and costs nothing.
+    @MainActor
     func viewControllerDidAppear(_ viewController: UIViewController) {
         guard !subscribers.isEmpty else { return }
 
@@ -86,6 +90,7 @@ final class AutoViewTracker {
     /// worse than a class name. A compiler-mangled class name is worse still: a
     /// SwiftUI hosting controller is named by the view it hosts instead, and any
     /// other screen left with only a mangled name is `nil`.
+    @MainActor
     static func title(for viewController: UIViewController?) -> String? {
         guard let viewController else { return nil }
 
@@ -187,6 +192,7 @@ final class AutoViewTracker {
     }
 
     /// The view controller currently on screen.
+    @MainActor
     static func topViewController() -> UIViewController? {
         var top = ScreenReader.keyWindow?.rootViewController
 
@@ -249,6 +255,10 @@ final class AutoViewTracker {
 }
 
 /// Lets a view controller name itself for automatic view tracking.
+///
+/// Main actor isolated, like the view controllers that adopt it, so a Swift 6
+/// view controller conforms without marking the name `nonisolated`.
+@MainActor
 public protocol CountlyAutoViewTrackingName: AnyObject {
     /// The name to report instead of the title or class name.
     var countlyAutoViewTrackingName: String? { get }
@@ -320,6 +330,7 @@ private final class WeakViewControllerBox {
 }
 
 private enum AssociatedKeys {
-    static var presentingViewController: UInt8 = 0
+    /// Only its address is used, as the associated object key.
+    nonisolated(unsafe) static var presentingViewController: UInt8 = 0
 }
 #endif

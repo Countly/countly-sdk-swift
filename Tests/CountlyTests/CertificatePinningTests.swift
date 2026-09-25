@@ -44,7 +44,7 @@ final class CertificatePinningTests: CountlyBaseTestCase {
     ///
     /// `URLProtectionSpace` only populates `serverTrust` for a real server-trust
     /// challenge, which a test cannot provoke, so it is overridden.
-    private final class TrustingProtectionSpace: URLProtectionSpace {
+    private final class TrustingProtectionSpace: URLProtectionSpace, @unchecked Sendable {
         let trust: SecTrust?
 
         init(trust: SecTrust?) {

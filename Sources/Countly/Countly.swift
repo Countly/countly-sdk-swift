@@ -30,7 +30,7 @@ public enum Countly {
     public static let defaultInstanceName = StorageNamespace.defaultInstanceName
 
     private static let lock = NSLock()
-    private static var instances: [String: CountlyInstance] = [:]
+    nonisolated(unsafe) private static var instances: [String: CountlyInstance] = [:]
 
     // MARK: - Access
 

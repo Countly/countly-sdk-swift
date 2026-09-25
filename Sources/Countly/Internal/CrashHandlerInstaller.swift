@@ -20,7 +20,10 @@ import Darwin
 /// might be held, no allocation that might block, no logging that would re-enter
 /// the health tracker's dispatch queues. What happens there is kept to capturing
 /// a backtrace and calling straight through.
-final class CrashHandlerInstaller {
+///
+/// Unchecked `Sendable`: the registry and the install state are guarded by their
+/// locks, and the saved signal dispositions are written before any handler runs.
+final class CrashHandlerInstaller: @unchecked Sendable {
 
     static let shared = CrashHandlerInstaller()
 

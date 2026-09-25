@@ -21,6 +21,7 @@ import SwiftUI
 /// long they were on it.
 ///
 /// These push real view controllers through the same callback the swizzle uses.
+@MainActor
 final class AutoViewTrackingTests: CountlyBaseTestCase {
 
     /// A view controller with a title, which is what the SDK names a screen by.

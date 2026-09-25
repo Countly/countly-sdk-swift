@@ -14,7 +14,7 @@ import Foundation
 /// updates while the application is in the foreground, and `end_session` with the
 /// remaining duration. The server stitches them together, so sending them out of
 /// order or twice produces a wrong session length.
-final class SessionsModule: ModuleBase {
+final class SessionsModule: ModuleBase, @unchecked Sendable {
 
     override class var moduleName: String { "Sessions" }
 
@@ -47,7 +47,7 @@ final class SessionsModule: ModuleBase {
     /// property of the launch. A per-instance flag is reset by `start(with:)`, so
     /// halting and re-initialising inside one process would swallow a real resume
     /// and leave the SDK with no open session until the next one.
-    private static var hasSkippedFirstResume = false
+    nonisolated(unsafe) private static var hasSkippedFirstResume = false
     #endif
 
     // MARK: - Timer

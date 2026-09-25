@@ -14,7 +14,7 @@ import CoreLocation
 /// The SDK never asks the device where it is. Everything here is supplied by the
 /// host application, which is what keeps location an explicit product decision
 /// rather than a side effect of integrating analytics.
-final class LocationModule: ModuleBase {
+final class LocationModule: ModuleBase, @unchecked Sendable {
 
     override class var moduleName: String { "Location" }
 

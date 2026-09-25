@@ -39,7 +39,10 @@ enum PushDeviceToken {
 /// `UNUserNotificationCenter` delegate. All three land here and are fanned out to
 /// every instance that switched push on, so several instances can report the same
 /// notification to their own servers.
-final class PushRuntime: NSObject {
+///
+/// Unchecked `Sendable`: the token and the delegate bookkeeping are guarded by the
+/// lock, and the application delegate is only touched on the main thread.
+final class PushRuntime: NSObject, @unchecked Sendable {
 
     static let shared = PushRuntime()
 
@@ -120,8 +123,12 @@ final class PushRuntime: NSObject {
     /// application records nothing and opens nothing.
     func replayLaunchNotification(_ launchInfo: [AnyHashable: Any]) {
         #if canImport(UserNotifications)
-        guard let response = launchInfo[NSApplication.launchUserNotificationUserInfoKey] as? UNNotificationResponse else { return }
-        handle(response: response)
+        // The host's launch dictionary, which nothing else touches once passed in.
+        let launchInfo = UncheckedSendable(launchInfo)
+        onMainThread { [weak self] in
+            guard let response = launchInfo.value[NSApplication.launchUserNotificationUserInfoKey] as? UNNotificationResponse else { return }
+            self?.handle(response: response)
+        }
         #endif
     }
     #endif
@@ -131,7 +138,8 @@ final class PushRuntime: NSObject {
         subscribers.current().contains { $0.hasPushConsent }
     }
 
-    /// Asks the system to register for remote notifications. Main thread only.
+    /// Asks the system to register for remote notifications.
+    @MainActor
     private func requestRemoteNotificationRegistration() {
         #if os(iOS) || os(visionOS)
         UIApplication.shared.registerForRemoteNotifications()
@@ -174,8 +182,7 @@ final class PushRuntime: NSObject {
     /// added when the host has none, so nothing the host does is lost. Done once
     /// per process however many instances ask for it, and never undone: there is no
     /// "before" implementation to restore, only the host's, which still runs.
-    ///
-    /// Main thread only.
+    @MainActor
     private func graftApplicationDelegate() {
         #if os(iOS) || os(visionOS)
         let delegate: AnyObject? = UIApplication.shared.delegate
@@ -376,7 +383,7 @@ extension PushRuntime: UNUserNotificationCenterDelegate {
     /// business and goes straight to whichever delegate was there before.
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 willPresent notification: UNNotification,
-                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+                                withCompletionHandler completionHandler: @escaping @Sendable (UNNotificationPresentationOptions) -> Void) {
         let isCountlyNotification = countlyPayload(in: notification.request.content.userInfo) != nil
         logInfo("willPresent", "a notification arrived while the application is in the foreground, isCountlyNotification: [\(isCountlyNotification)], chainedDelegatePresent: [\(chainedDelegate != nil)]")
         log("willPresent", "foreground notification detail, \(describe(notification.request))")
@@ -429,7 +436,7 @@ extension PushRuntime: UNUserNotificationCenterDelegate {
     private func forward(to delegate: UNUserNotificationCenterDelegate?,
                          center: UNUserNotificationCenter,
                          willPresent notification: UNNotification,
-                         completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+                         completionHandler: @escaping @Sendable (UNNotificationPresentationOptions) -> Void) {
         guard let delegate,
               delegate.responds(to: #selector(UNUserNotificationCenterDelegate.userNotificationCenter(_:willPresent:withCompletionHandler:))) else {
             completionHandler([])
@@ -441,7 +448,7 @@ extension PushRuntime: UNUserNotificationCenterDelegate {
     /// The user tapped the notification body or one of its action buttons.
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 didReceive response: UNNotificationResponse,
-                                withCompletionHandler completionHandler: @escaping () -> Void) {
+                                withCompletionHandler completionHandler: @escaping @Sendable () -> Void) {
         logInfo("didReceive", "the user acted on a notification, actionIdentifier: [\(response.actionIdentifier)], isCountlyNotification: [\(countlyPayload(in: response.notification.request.content.userInfo) != nil)]")
         log("didReceive", "acted notification detail, \(describe(response.notification.request))")
         log("didReceive", "acted notification payload detail, userInfo: [\(response.notification.request.content.userInfo)]", verbose: true)

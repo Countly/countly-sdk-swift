@@ -20,7 +20,10 @@ import Foundation
 /// Reachable from the crash signal handler, so every log line here stays at debug
 /// or lower. Error and warning logging re-enters the health tracker, which uses
 /// dispatch primitives that are not async-signal-safe.
-final class RequestQueueStore {
+///
+/// Unchecked `Sendable`: the queue is guarded by the lock, and every write goes
+/// through the write queue.
+final class RequestQueueStore: @unchecked Sendable {
 
     private static let module = "RequestQueue"
 
@@ -317,7 +320,7 @@ final class RequestQueueStore {
     /// Held against suspension for the length of the write. This is the write that
     /// records a request as sent, so a process suspended between the response and
     /// this landing rolls the queue back and sends the request again.
-    func save(completion: (() -> Void)? = nil) {
+    func save(completion: (@Sendable () -> Void)? = nil) {
         BackgroundTaskGuard.shared.begin()
         writeQueue.async { [weak self] in
             self?.saveSync()

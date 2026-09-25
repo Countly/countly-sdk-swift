@@ -20,7 +20,7 @@ import UIKit
 /// has anything to show this user. At most one content is displayed at a time,
 /// enforced by a presentation slot, because two overlapping web views over the
 /// application would be unusable.
-final class ContentModule: ModuleBase {
+final class ContentModule: ModuleBase, @unchecked Sendable {
 
     override class var moduleName: String { "Content" }
 
@@ -266,15 +266,13 @@ final class ContentModule: ModuleBase {
     /// runnable, which runs on a URLSession completion thread, and
     /// `enterContentZone` from wherever the host application calls it.
     private func invalidateTimers() {
-        let invalidate = { [weak self] in
+        onMainThread { [weak self] in
             guard let self else { return }
             self.zoneTimer?.invalidate()
             self.zoneTimer = nil
             self.reentryTimer?.invalidate()
             self.reentryTimer = nil
         }
-
-        onMainThread(invalidate)
     }
 
     /// Whether the zone visit that scheduled some work is still the current one.
@@ -321,7 +319,7 @@ final class ContentModule: ModuleBase {
     private func closeShownContent() {
         #if os(iOS) || os(visionOS) || os(macOS)
         if Thread.isMainThread {
-            tearDownShownContent()
+            MainActor.assumeIsolated { tearDownShownContent() }
             return
         }
 
@@ -338,6 +336,7 @@ final class ContentModule: ModuleBase {
     }
 
     #if os(iOS) || os(visionOS) || os(macOS)
+    @MainActor
     private func tearDownShownContent() {
         if let manager = webViewManager {
             logI("tearDownShownContent", "closing the currently shown content")
@@ -359,6 +358,15 @@ final class ContentModule: ModuleBase {
     }
 
     private func fetchContents(contentID: String?, failure: (() -> Void)?) {
+        // The request reports the window's size, which only the main thread can read.
+        guard Thread.isMainThread else {
+            let failure = UncheckedSendable(failure)
+            DispatchQueue.main.async { [weak self] in
+                self?.fetchContents(contentID: contentID, failure: failure.value)
+            }
+            return
+        }
+
         guard core.modules.consent.hasConsent(for: .content) else {
             logV("fetchContents", "no consent given for content, skipping the content fetch")
             return
@@ -390,7 +398,7 @@ final class ContentModule: ModuleBase {
 
         logD("fetchContents", "fetching the content details, isPreview: [\(contentID != nil)]")
 
-        let request = fetchRequest(contentID: contentID)
+        let request = MainActor.assumeIsolated { fetchRequest(contentID: contentID) }
 
         core.network.instantTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
@@ -429,6 +437,7 @@ final class ContentModule: ModuleBase {
         }?.resume()
     }
 
+    @MainActor
     private func fetchRequest(contentID: String?) -> URLRequest {
         var queryString = core.network.builder.queryEssentials()
         queryString += "&\(QS.method)=\(Self.fetchMethod)"
@@ -463,6 +472,7 @@ final class ContentModule: ModuleBase {
     ///
     /// Both orientations are reported so the server can prepare a layout for each,
     /// whichever the device is in now.
+    @MainActor
     private func resolutionJSON() -> String {
         #if os(iOS) || os(visionOS) || os(macOS)
         let size = windowSize()
@@ -493,6 +503,7 @@ final class ContentModule: ModuleBase {
     ///
     /// The same rule places what comes back, so the page is laid out at the size it
     /// is actually going to be given. See `ContentGeometry`.
+    @MainActor
     private func windowSize() -> CGSize {
         let displayOption = core.config.content.webViewDisplayOption
         let size = ContentGeometry.windowSize(displayOption: displayOption,
@@ -549,8 +560,11 @@ final class ContentModule: ModuleBase {
             return
         }
 
+        // Parsed from the response and touched by nothing else once handed over.
+        let placement = UncheckedSendable(placement)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            let placement = placement.value
 
             // The zone can be exited while this is in flight, which releases the
             // claim. Content the application has already exited must not appear.

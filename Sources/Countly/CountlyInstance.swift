@@ -139,6 +139,10 @@ public final class CountlyInstance {
 
         config.sdkInternalLimits.clampToMinimums()
 
+        // Metrics read off the main thread fall back on the last interface reading
+        // taken on it, so one is taken now.
+        DeviceMetrics.refreshInterfaceReading()
+
         let builtCore = SDKCore(instanceName: name, config: config)
         builtCore.hasStarted = true
         self.core = builtCore

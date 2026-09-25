@@ -17,7 +17,7 @@ import AppKit
 
 /// Reports how long things take: network calls, application launch, and whatever
 /// the host application chooses to time itself.
-final class APMModule: ModuleBase {
+final class APMModule: ModuleBase, @unchecked Sendable {
 
     override class var moduleName: String { "APM" }
 
@@ -141,7 +141,7 @@ final class APMModule: ModuleBase {
         logD("observeActivation", "activation observers installed for the foreground and background traces, observerCount: [\(activationObservers.count)]")
     }
 
-    private func observe(_ name: Notification.Name, handler: @escaping () -> Void) {
+    private func observe(_ name: Notification.Name, handler: @escaping @Sendable () -> Void) {
         let token = NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { _ in
             handler()
         }

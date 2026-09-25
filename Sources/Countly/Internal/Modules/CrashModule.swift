@@ -15,7 +15,7 @@ import MachO
 ///
 /// A crash the SDK detects itself is written to disk while the process goes down
 /// and sent on the next launch. Everything else goes through the normal queue.
-final class CrashModule: ModuleBase {
+final class CrashModule: ModuleBase, @unchecked Sendable {
 
     override class var moduleName: String { "Crash" }
 

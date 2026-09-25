@@ -58,7 +58,7 @@ enum UserPropertyModifier: String {
 /// a row costs one request. Anything pending is flushed before a session or an
 /// event goes out, because the server attributes those to whatever profile it
 /// currently holds.
-final class UserProfileModule: ModuleBase {
+final class UserProfileModule: ModuleBase, @unchecked Sendable {
 
     override class var moduleName: String { "UserProfile" }
 

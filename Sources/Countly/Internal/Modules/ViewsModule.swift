@@ -17,7 +17,7 @@ import UIKit
 /// A view is a reserved event with a start marker, a duration and a name. Several
 /// views can be open at once, which is what makes tabbed and split layouts
 /// reportable, so the module keeps a set rather than a single current view.
-final class ViewsModule: ModuleBase {
+final class ViewsModule: ModuleBase, @unchecked Sendable {
 
     override class var moduleName: String { "Views" }
 
@@ -586,9 +586,31 @@ final class ViewsModule: ModuleBase {
         AutoViewTracker.shared.register(self)
         logD("startAutoViewTracking", "automatic view tracking is enabled and registered for view controller appearances, exclusionEntryCount: [\(automaticViewTrackingExclusionList.count)]")
 
+        onMainThread { [weak self] in
+            self?.startViewAlreadyOnScreen()
+        }
+        #endif
+    }
+
+    #if os(iOS) || os(tvOS) || os(visionOS)
+    /// Starts a view for the screen that is up when automatic tracking starts,
+    /// which no appearance will report because it already happened.
+    ///
+    /// Tracking started off the main thread gets here a turn later, by which time
+    /// it may have been stopped again or an appearance may have started this very
+    /// screen, so both are checked.
+    @MainActor
+    private func startViewAlreadyOnScreen() {
+        guard isAutoViewTrackingActive else { return }
+
         let topViewController = AutoViewTracker.topViewController()
         guard let topViewController, let title = AutoViewTracker.title(for: topViewController) else {
             logD("startAutoViewTracking", "no view controller with a resolvable title is on screen, no view will be started until the next appearance")
+            return
+        }
+
+        guard currentView?.viewName != core.limits.truncatedKey(title, "View name") else {
+            logD("startAutoViewTracking", "the view already on screen was started by its appearance, it will not be started again, name: [\(title)]")
             return
         }
 
@@ -596,8 +618,8 @@ final class ViewsModule: ModuleBase {
 
         logD("startAutoViewTracking", "the view already on screen will be started automatically, name: [\(title)]")
         _ = startViewInternal(title, customSegmentation: nil, isAutoStoppedView: true)
-        #endif
     }
+    #endif
 
     /// Stops reporting view controller appearances.
     func stopAutoViewTracking() {
@@ -634,6 +656,7 @@ final class ViewsModule: ModuleBase {
 
     #if os(iOS) || os(tvOS) || os(visionOS)
     /// Called by the process-wide tracker for every appeared view controller.
+    @MainActor
     func handleAutoTrackedViewController(_ viewController: UIViewController) {
         guard isAutoViewTrackingActive else {
             logD("handleAutoTrackedViewController", "automatic view tracking is not active, appeared view controller will be ignored")
@@ -761,13 +784,10 @@ final class ViewsModule: ModuleBase {
     #if os(iOS)
     /// The interface orientation, read from the window's scene where one exists.
     ///
-    /// Read from the interface rather than the device, because a device lying flat
-    /// reports face up while the interface is still portrait or landscape.
+    /// Off the main thread this is the orientation the interface last had there,
+    /// which is what a session begun from a background thread reports.
     private func currentOrientationMode() -> String? {
-        guard let orientation = ScreenReader.keyWindow?.windowScene?.interfaceOrientation else { return nil }
-        if orientation.isPortrait { return "portrait" }
-        if orientation.isLandscape { return "landscape" }
-        return nil
+        DeviceMetrics.interfaceReading.interfaceOrientationMode
     }
     #endif
 

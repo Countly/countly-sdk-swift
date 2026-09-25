@@ -1,4 +1,4 @@
-// swift-tools-version:5.9
+// swift-tools-version:6.0
 
 import PackageDescription
 
@@ -53,7 +53,10 @@ let package = Package(
         .testTarget(
             name: "CountlyTests",
             dependencies: ["Countly"],
-            path: "Tests/CountlyTests"
+            path: "Tests/CountlyTests",
+            swiftSettings: [.swiftLanguageMode(.v5)]
         ),
-    ]
+    ],
+
+    swiftLanguageModes: [.v6]
 )

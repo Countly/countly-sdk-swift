@@ -13,7 +13,7 @@ import Foundation
 /// The widget itself is a web page the server renders. The SDK's job is to know
 /// which widgets exist, put the right one on screen, and turn what the user
 /// answered into a reserved event.
-final class FeedbackModule: ModuleBase {
+final class FeedbackModule: ModuleBase, @unchecked Sendable {
 
     override class var moduleName: String { "Feedback" }
 
@@ -87,7 +87,7 @@ final class FeedbackModule: ModuleBase {
                   let payload = CountlyJSON.object(from: data, logger: self.log) as? [String: Any] else {
                 let nsError = error as NSError?
                 self.logD("getAvailableFeedbackWidgets", "feedback widget list fetch failed, statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], error: [\(nsError?.localizedDescription ?? "")], domain: [\(nsError?.domain ?? "")], code: [\(nsError?.code ?? 0)]")
-                DispatchQueue.main.async {
+                deliverOnMainQueue {
                     completion(nil, error ?? CountlyError.feedbacksGeneralAPIError.asNSError)
                 }
                 return
@@ -96,7 +96,7 @@ final class FeedbackModule: ModuleBase {
             guard let rawWidgets = payload["result"] as? [[String: Any]] else {
                 self.logE("getAvailableFeedbackWidgets", "feedback widget list response has no result field, ignoring the response")
                 self.logD("getAvailableFeedbackWidgets", "widget list response shape detail, responseSize: [\(data?.count ?? 0)], responseFields: [\(payload.keys.sorted().joined(separator: ", "))]")
-                DispatchQueue.main.async { completion(nil, CountlyError.feedbacksGeneralAPIError.asNSError) }
+                deliverOnMainQueue { completion(nil, CountlyError.feedbacksGeneralAPIError.asNSError) }
                 return
             }
 
@@ -111,7 +111,7 @@ final class FeedbackModule: ModuleBase {
                 self.logD("getAvailableFeedbackWidgets", "some widget entries could not be read and were dropped from the list, receivedWidgetCount: [\(rawWidgets.count)], usableWidgetCount: [\(widgets.count)]")
             }
 
-            DispatchQueue.main.async { completion(widgets, nil) }
+            deliverOnMainQueue { completion(widgets, nil) }
         }?.resume()
     }
 
@@ -185,8 +185,13 @@ final class FeedbackModule: ModuleBase {
         }
 
         #if os(iOS) || os(visionOS) || os(macOS)
+        // The host's widget and callback, handed to the main thread with the call.
+        let handedWidget = UncheckedSendable(widget)
+        let handedCallback = UncheckedSendable(callback)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            let widget = handedWidget.value
+            let callback = handedCallback.value
 
             // Built on the main thread: the URL carries the resolved theme, and
             // resolving it reads interface state that is only safe to touch there.
@@ -236,19 +241,17 @@ final class FeedbackModule: ModuleBase {
     /// to and no way for the user to be sure it belongs to anything.
     override func halt(clearStorage: Bool) {
         #if os(iOS) || os(visionOS) || os(macOS)
-        let managers = presentedWidgetManagers
+        let managers = presentedWidgetManagers.compactMap { $0 as? WebViewManager }
         presentedWidgetManagers.removeAll()
 
         guard !managers.isEmpty else { return }
         logD("halt", "taking the presented feedback widgets off screen, widgetCount: [\(managers.count)]")
 
-        let close = {
+        onMainThread {
             for manager in managers {
-                (manager as? WebViewManager)?.close()
+                manager.close()
             }
         }
-
-        onMainThread(close)
         #endif
     }
 
@@ -257,6 +260,7 @@ final class FeedbackModule: ModuleBase {
     /// - Parameter surface: the size the widget will be shown in. It goes into
     ///   `custom` because the widget templates lay themselves out from it, not from
     ///   anything they can measure on their own.
+    @MainActor
     private func widgetURL(for widget: CountlyFeedbackWidget, surface: CGSize) -> URL? {
         var urlString = "\(core.config.normalizedHost)\(Endpoint.feedback)/\(widget.type.wireName)"
 
@@ -378,14 +382,14 @@ final class FeedbackModule: ModuleBase {
                   let widgetData = CountlyJSON.object(from: data, logger: self.log) as? [String: Any] else {
                 let nsError = error as NSError?
                 self.logD("fetchWidgetData", "widget data request failed, widgetID: [\(widget.id)], statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], error: [\(nsError?.localizedDescription ?? "")], domain: [\(nsError?.domain ?? "")], code: [\(nsError?.code ?? 0)]")
-                DispatchQueue.main.async {
+                deliverOnMainQueue {
                     completion(nil, error ?? CountlyError.feedbackWidgetNotAvailable.asNSError)
                 }
                 return
             }
 
             self.logD("fetchWidgetData", "widget data fetched, widgetID: [\(widget.id)], fieldCount: [\(widgetData.count)], fields: [\(widgetData.keys.sorted().joined(separator: ", "))]")
-            DispatchQueue.main.async { completion(widgetData, nil) }
+            deliverOnMainQueue { completion(widgetData, nil) }
         }?.resume()
     }
 

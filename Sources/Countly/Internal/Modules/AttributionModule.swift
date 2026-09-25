@@ -13,7 +13,7 @@ import Foundation
 /// Direct attribution carries a Countly campaign the user clicked. Indirect
 /// attribution carries advertising identifiers the host application obtained
 /// itself, which the SDK never collects on its own.
-final class AttributionModule: ModuleBase {
+final class AttributionModule: ModuleBase, @unchecked Sendable {
 
     override class var moduleName: String { "Attribution" }
 

@@ -64,11 +64,6 @@ jobs:
       matrix:
         env:
           [
-            { os_version: 14, platform: "macOS",    sdk: "macosx14.5",    xcode: "15.4" },
-            { os_version: 14, platform: "iOS",      sdk: "iphoneos17.5",  xcode: "15.4" },
-            { os_version: 14, platform: "tvOS",     sdk: "appletvos17.5", xcode: "15.4" },
-            { os_version: 14, platform: "watchOS",  sdk: "watchos10.5",   xcode: "15.4" },
-            { os_version: 14, platform: "visionOS", sdk: "xros1.2",       xcode: "15.4" },
             { os_version: 15, platform: "macOS",    sdk: "macosx15.5",    xcode: "16.4" },
             { os_version: 15, platform: "iOS",      sdk: "iphoneos18.5",  xcode: "16.4" },
             { os_version: 15, platform: "tvOS",     sdk: "appletvos18.5", xcode: "16.4" },

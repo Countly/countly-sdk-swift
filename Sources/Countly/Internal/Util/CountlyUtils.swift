@@ -106,11 +106,39 @@ extension Data {
 /// thread state they own, and deferring that to the next run loop turn when
 /// already on the main thread would let the caller return while its timers are
 /// still armed and its window is still on screen.
-func onMainThread(_ work: @escaping () -> Void) {
+func onMainThread(_ work: @escaping @MainActor () -> Void) {
     if Thread.isMainThread {
-        work()
+        MainActor.assumeIsolated(work)
     } else {
-        DispatchQueue.main.async(execute: work)
+        DispatchQueue.main.async { work() }
+    }
+}
+
+/// Calls a host application callback on the main queue, on a later turn.
+///
+/// Where the public API promises a callback once its request is answered. The
+/// callback and what it is called with belong to the host, so they cross threads
+/// unchecked: nothing in the SDK touches them again once they are handed over.
+func deliverOnMainQueue(_ work: @escaping () -> Void) {
+    let work = UncheckedSendable(work)
+    DispatchQueue.main.async { work.value() }
+}
+
+/// A value carried to another thread that the compiler cannot prove safe to carry.
+///
+/// Only for values the SDK's own threading already makes safe: a host callback
+/// called where the API promises, or a value nothing touches again once it has
+/// been handed over.
+///
+/// One value per box. Swift 6.3 miscompiles a box of a tuple that holds a
+/// closure: reading it inside another closure over-releases the tuple's other
+/// elements, which then crash when their last owner lets go.
+struct UncheckedSendable<Value>: @unchecked Sendable {
+    let value: Value
+
+    /// Wraps `value` for the hop.
+    init(_ value: Value) {
+        self.value = value
     }
 }
 

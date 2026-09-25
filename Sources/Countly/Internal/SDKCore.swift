@@ -17,7 +17,10 @@ import Foundation
 ///
 /// Modules hold the core `unowned`, the core holds the modules strongly, and the
 /// `CountlyInstance` holds the core. Nothing in that graph retains a cycle.
-final class SDKCore {
+///
+/// Unchecked `Sendable`: every thread the SDK runs on reaches the core. Its
+/// collaborators guard themselves, and its flags are plain values read whole.
+final class SDKCore: @unchecked Sendable {
 
     /// Registry key of this instance.
     let instanceName: String
@@ -168,7 +171,7 @@ extension SDKCore: LogGatheringTransport {
 ///
 /// A class rather than a struct so the core can hold it after the modules were
 /// built against the core.
-final class ModuleRegistry {
+final class ModuleRegistry: Sendable {
 
     let consent: ConsentModule
     let deviceID: DeviceIDModule
@@ -229,7 +232,12 @@ final class ModuleRegistry {
 ///
 /// A class rather than a protocol so modules inherit the `core` plumbing and the
 /// default lifecycle hooks instead of restating them.
-class ModuleBase {
+///
+/// Unchecked `Sendable`: a module is reached from the host's calls on any thread,
+/// from lifecycle notifications on the main thread and from URLSession
+/// completions, and what keeps its state consistent is its own lock or the main
+/// thread, neither of which the compiler can see.
+class ModuleBase: @unchecked Sendable {
 
     unowned let core: SDKCore
 

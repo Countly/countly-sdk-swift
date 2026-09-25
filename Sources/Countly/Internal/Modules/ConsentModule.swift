@@ -14,7 +14,7 @@ import Foundation
 /// is what makes an integration that does not care about consent work unchanged.
 /// When it is on nothing is collected until the host application says so, and
 /// every change is reported to the server as a full snapshot of the state.
-final class ConsentModule: ModuleBase {
+final class ConsentModule: ModuleBase, @unchecked Sendable {
 
     override class var moduleName: String { "Consent" }
 

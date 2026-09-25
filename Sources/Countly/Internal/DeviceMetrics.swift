@@ -51,7 +51,7 @@ enum DeviceMetrics {
         #if targetEnvironment(macCatalyst)
         return "desktop"
         #elseif os(iOS)
-        return UIDevice.current.userInterfaceIdiom == .pad ? "tablet" : "mobile"
+        return interfaceReading.deviceType
         #elseif os(watchOS)
         return "wearable"
         #elseif os(tvOS)
@@ -100,7 +100,7 @@ enum DeviceMetrics {
 
     static var osVersion: String? {
         #if os(iOS) || os(tvOS) || os(visionOS)
-        return UIDevice.current.systemVersion
+        return interfaceReading.osVersion
         #elseif os(watchOS)
         return WKInterfaceDevice.current().systemVersion
         #elseif os(macOS)
@@ -142,19 +142,11 @@ enum DeviceMetrics {
     /// Read from the key window rather than the screen where possible, because on
     /// iPad multitasking the window is what the application actually occupies.
     static var resolution: String? {
-        #if os(iOS) || os(tvOS) || os(visionOS)
-        guard let window = ScreenReader.keyWindow else { return nil }
-        let bounds = window.bounds
-        let scale = window.traitCollection.displayScale
-        return String(format: "%gx%g", bounds.size.width * scale, bounds.size.height * scale)
+        #if os(iOS) || os(tvOS) || os(visionOS) || os(macOS)
+        return interfaceReading.resolution
         #elseif os(watchOS)
         let bounds = WKInterfaceDevice.current().screenBounds
         let scale = WKInterfaceDevice.current().screenScale
-        return String(format: "%gx%g", bounds.size.width * scale, bounds.size.height * scale)
-        #elseif os(macOS)
-        guard let screen = NSScreen.main else { return nil }
-        let bounds = screen.frame
-        let scale = screen.backingScaleFactor
         return String(format: "%gx%g", bounds.size.width * scale, bounds.size.height * scale)
         #else
         return nil
@@ -163,13 +155,10 @@ enum DeviceMetrics {
 
     /// Screen scale, `@2x` style.
     static var density: String? {
-        #if os(iOS) || os(tvOS) || os(visionOS)
-        return "@\(Int(ScreenReader.screenScale))x"
+        #if os(iOS) || os(tvOS) || os(visionOS) || os(macOS)
+        return interfaceReading.density
         #elseif os(watchOS)
         return "@\(Int(WKInterfaceDevice.current().screenScale))x"
-        #elseif os(macOS)
-        guard let screen = NSScreen.main else { return nil }
-        return "@\(Int(screen.backingScaleFactor))x"
         #else
         return nil
         #endif
@@ -183,6 +172,7 @@ enum DeviceMetrics {
     /// On macOS the overlay is a panel of its own rather than a window belonging to
     /// the application, so the application's effective appearance is what a widget
     /// is shown against.
+    @MainActor
     static var themeMode: String? {
         #if os(iOS) || os(tvOS)
         let traits = ScreenReader.keyWindow?.traitCollection ?? UIScreen.main.traitCollection
@@ -208,6 +198,7 @@ enum DeviceMetrics {
 
     /// Appends the current theme to a URL that will be loaded in a web view, so
     /// the widget renders against the same theme as the application.
+    @MainActor
     static func urlStringByAppendingThemeMode(_ url: String) -> String {
         urlString(url, byAppendingThemeMode: themeMode)
     }
@@ -320,7 +311,7 @@ enum DeviceMetrics {
             }
         }
         guard result == KERN_SUCCESS else { return 0 }
-        return UInt64(vm_page_size) * UInt64(stats.free_count)
+        return UInt64(getpagesize()) * UInt64(stats.free_count)
     }
 
     static var totalRAM: UInt64 { ProcessInfo.processInfo.physicalMemory }
@@ -340,8 +331,7 @@ enum DeviceMetrics {
     /// Battery percentage, or `-1` when it cannot be read.
     static var batteryLevel: Int {
         #if os(iOS) || os(visionOS)
-        guard UIDevice.current.batteryState != .unknown else { return -1 }
-        return abs(Int(UIDevice.current.batteryLevel * 100))
+        return interfaceReading.batteryLevel
         #elseif os(watchOS)
         return abs(Int(WKInterfaceDevice.current().batteryLevel * 100))
         #elseif os(macOS)
@@ -360,10 +350,7 @@ enum DeviceMetrics {
 
     static var orientation: String? {
         #if os(iOS)
-        let names = ["Unknown", "Portrait", "PortraitUpsideDown", "LandscapeLeft", "LandscapeRight", "FaceUp", "FaceDown"]
-        let raw = UIDevice.current.orientation.rawValue
-        guard raw >= 0, raw < names.count else { return nil }
-        return names[Int(raw)]
+        return interfaceReading.orientation
         #elseif os(watchOS)
         let names = ["CrownLeft", "CrownRight"]
         let raw = WKInterfaceDevice.current().crownOrientation.rawValue
@@ -388,13 +375,15 @@ enum DeviceMetrics {
         guard sysctlbyname(key, nil, &size, nil, 0) == 0, size > 0 else { return nil }
         var buffer = [CChar](repeating: 0, count: size)
         guard sysctlbyname(key, &buffer, &size, nil, 0) == 0 else { return nil }
-        return String(cString: buffer)
+        let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        return String(decoding: bytes, as: UTF8.self)
     }
 }
 
 #if os(iOS) || os(tvOS) || os(visionOS)
 /// Window and screen lookups, isolated so the platform conditionals stay in one
 /// place.
+@MainActor
 enum ScreenReader {
 
     /// The window the application is presenting in, preferring the active scene.
@@ -438,6 +427,7 @@ enum ScreenReader {
 /// A macOS application has no single "key window" the SDK should present over, and
 /// content is shown in a panel of its own, so what matters here is the screen the
 /// user is actually looking at rather than any window of the host's.
+@MainActor
 enum ScreenReader {
 
     /// The window the person is actually working in, which is the one whose screen
@@ -615,3 +605,102 @@ enum ScreenReader {
 }
 #endif
 
+// MARK: - Interface reading
+
+/// The interface facts the metrics report, read together on the main thread.
+struct InterfaceReading: Sendable {
+    var deviceType: String?
+    var osVersion: String?
+    var resolution: String?
+    var density: String?
+    var batteryLevel = -1
+    var orientation: String?
+
+    /// `portrait` or `landscape`, as the orientation event reports the interface.
+    var interfaceOrientationMode: String?
+}
+
+extension DeviceMetrics {
+
+    private static let interfaceLock = NSLock()
+    nonisolated(unsafe) private static var lastInterfaceReading = InterfaceReading()
+
+    /// The interface as it is now on the main thread, and as it last was there on
+    /// every other thread.
+    ///
+    /// The platform answers these only on the main thread, and metrics are read
+    /// wherever the SDK happens to be: a session the host begins from a background
+    /// thread, a remote config download, a crash handler. Each reading taken on the
+    /// main thread is kept for the others. A crash handler on another thread must
+    /// not call into the interface at all, since it can wait forever on a lock the
+    /// crash left held.
+    static var interfaceReading: InterfaceReading {
+        guard Thread.isMainThread else {
+            interfaceLock.lock()
+            defer { interfaceLock.unlock() }
+            return lastInterfaceReading
+        }
+
+        let reading = MainActor.assumeIsolated { readInterface() }
+        interfaceLock.lock()
+        lastInterfaceReading = reading
+        interfaceLock.unlock()
+        return reading
+    }
+
+    /// Takes a reading on the main thread, so a reader elsewhere has one to use.
+    static func refreshInterfaceReading() {
+        onMainThread { _ = interfaceReading }
+    }
+
+    /// Reads every interface fact the metrics report.
+    @MainActor
+    private static func readInterface() -> InterfaceReading {
+        var reading = InterfaceReading()
+
+        #if os(iOS) || os(tvOS) || os(visionOS)
+        let device = UIDevice.current
+        reading.osVersion = device.systemVersion
+
+        if let window = ScreenReader.keyWindow {
+            let bounds = window.bounds
+            let scale = window.traitCollection.displayScale
+            reading.resolution = String(format: "%gx%g", bounds.size.width * scale, bounds.size.height * scale)
+        }
+        reading.density = "@\(Int(ScreenReader.screenScale))x"
+
+        #if os(iOS) || os(visionOS)
+        if device.batteryState != .unknown {
+            reading.batteryLevel = abs(Int(device.batteryLevel * 100))
+        }
+        #endif
+
+        #if os(iOS)
+        reading.deviceType = device.userInterfaceIdiom == .pad ? "tablet" : "mobile"
+
+        let names = ["Unknown", "Portrait", "PortraitUpsideDown", "LandscapeLeft", "LandscapeRight", "FaceUp", "FaceDown"]
+        let raw = device.orientation.rawValue
+        if raw >= 0, raw < names.count {
+            reading.orientation = names[raw]
+        }
+
+        // The interface rather than the device, because a device lying flat reports
+        // face up while the interface is still portrait or landscape.
+        if let interface = ScreenReader.keyWindow?.windowScene?.interfaceOrientation {
+            if interface.isPortrait { reading.interfaceOrientationMode = "portrait" }
+            if interface.isLandscape { reading.interfaceOrientationMode = "landscape" }
+        }
+        #endif
+
+        #elseif os(macOS)
+        if let screen = NSScreen.main {
+            let bounds = screen.frame
+            let scale = screen.backingScaleFactor
+            reading.resolution = String(format: "%gx%g", bounds.size.width * scale, bounds.size.height * scale)
+            reading.density = "@\(Int(scale))x"
+        }
+        #endif
+
+        return reading
+    }
+}

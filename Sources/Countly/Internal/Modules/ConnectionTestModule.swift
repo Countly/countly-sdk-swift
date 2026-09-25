@@ -16,14 +16,14 @@ import Foundation
 /// answer on most rows is the application level `400 Missing parameter`, which
 /// proves the request crossed the proxy and reached Countly code. Nothing about
 /// the test is persisted.
-final class ConnectionTestModule: ModuleBase {
+final class ConnectionTestModule: ModuleBase, @unchecked Sendable {
 
     override class var moduleName: String { "ConnectionTest" }
 
     /// Deadline for one probe. A `var` so the suite can hold it open: a probe that
     /// stalls on a loaded machine would otherwise be graded as a timeout rather
     /// than on the status the server gave it.
-    static var defaultPerRequestTimeout: TimeInterval = 10
+    nonisolated(unsafe) static var defaultPerRequestTimeout: TimeInterval = 10
     static let defaultBatteryCapExtra: TimeInterval = 30
     static let maxRows = 32
     static let maxReportBytes = 8 * 1024
@@ -361,7 +361,10 @@ protocol ProbeTransport: AnyObject {
 /// The default transport: a session built from the SDK's own configuration, so
 /// probes ride the same custom headers and, through the delegate, the same
 /// certificate pinning. Caching is off and redirects are not followed.
-final class URLSessionProbeTransport: NSObject, ProbeTransport {
+///
+/// Unchecked `Sendable`: the session is guarded by its lock, and the core is only
+/// read once the transport is built.
+final class URLSessionProbeTransport: NSObject, ProbeTransport, @unchecked Sendable {
 
     /// Held weakly: the core owns the module that owns this transport, and a
     /// URLSession retains its delegate until it is invalidated.
@@ -382,21 +385,17 @@ final class URLSessionProbeTransport: NSObject, ProbeTransport {
         request.timeoutInterval = timeout
 
         let done = DispatchSemaphore(value: 0)
-        let resultLock = NSLock()
-        var status = 0
-        var failure: String?
+        let record = ProbeRecord()
         let start = Date()
 
         let task = probeSession(timeout: timeout).dataTask(with: request) { _, response, error in
-            resultLock.lock()
             if let error {
-                failure = (error as NSError).code == NSURLErrorTimedOut ? ConnectionTestModule.Reason.timeout : ConnectionTestModule.Reason.transport
+                record.set(status: 0, failure: (error as NSError).code == NSURLErrorTimedOut ? ConnectionTestModule.Reason.timeout : ConnectionTestModule.Reason.transport)
             } else if let http = response as? HTTPURLResponse {
-                status = http.statusCode
+                record.set(status: http.statusCode, failure: nil)
             } else {
-                failure = ConnectionTestModule.Reason.transport
+                record.set(status: 0, failure: ConnectionTestModule.Reason.transport)
             }
-            resultLock.unlock()
             done.signal()
         }
         task.resume()
@@ -407,17 +406,13 @@ final class URLSessionProbeTransport: NSObject, ProbeTransport {
         if done.wait(timeout: .now() + timeout + 5) == .timedOut {
             task.cancel()
             done.wait()
-            resultLock.lock()
-            status = 0
-            failure = ConnectionTestModule.Reason.timeout
-            resultLock.unlock()
+            record.set(status: 0, failure: ConnectionTestModule.Reason.timeout)
         }
 
-        resultLock.lock()
-        defer { resultLock.unlock() }
-        return ConnectionTestModule.ProbeOutcome(status: status,
+        let result = record.current
+        return ConnectionTestModule.ProbeOutcome(status: result.status,
                                                  latencyMs: Int64(-start.timeIntervalSinceNow * 1000),
-                                                 failure: failure)
+                                                 failure: result.failure)
     }
 
     func batteryFinished() {
@@ -482,5 +477,31 @@ extension URLSessionProbeTransport: URLSessionTaskDelegate {
             return
         }
         core.network.urlSession(session, didReceive: challenge, completionHandler: completionHandler)
+    }
+}
+
+/// What one probe's completion reported.
+///
+/// Written on the session's queue and read on the thread waiting for the probe,
+/// both under the lock.
+private final class ProbeRecord: @unchecked Sendable {
+
+    private let lock = NSLock()
+    private var status = 0
+    private var failure: String?
+
+    /// Replaces what was recorded.
+    func set(status: Int, failure: String?) {
+        lock.lock()
+        self.status = status
+        self.failure = failure
+        lock.unlock()
+    }
+
+    /// What is recorded now.
+    var current: (status: Int, failure: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (status, failure)
     }
 }

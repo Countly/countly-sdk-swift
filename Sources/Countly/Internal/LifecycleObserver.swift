@@ -26,9 +26,9 @@ import WatchKit
 enum AppState {
 
     private static let lock = NSLock()
-    private static var cachedIsForeground: Bool = true
-    private static var cachedIsActive: Bool = true
-    private static var isObserving = false
+    nonisolated(unsafe) private static var cachedIsForeground: Bool = true
+    nonisolated(unsafe) private static var cachedIsActive: Bool = true
+    nonisolated(unsafe) private static var isObserving = false
 
     /// Whether the application is anywhere other than the background.
     ///
@@ -102,33 +102,33 @@ enum AppState {
     /// or mis-seeded, and the notifications correct a background launch a moment
     /// later.
     private static func seedFromPlatform() {
-        guard Thread.isMainThread else {
-            DispatchQueue.main.async { seedFromPlatform() }
-            return
-        }
+        onMainThread {
+            let (isForeground, isActive) = platformState()
 
+            // Under the same lock the readers take: the crash path reads this from
+            // another thread.
+            lock.lock()
+            cachedIsForeground = isForeground
+            cachedIsActive = isActive
+            lock.unlock()
+        }
+    }
+
+    /// Whether the platform reports the application in the foreground, and active.
+    @MainActor
+    private static func platformState() -> (isForeground: Bool, isActive: Bool) {
         #if os(iOS) || os(tvOS) || os(visionOS)
         let state = UIApplication.shared.applicationState
-        let isForeground = state != .background
-        let isActive = state == .active
+        return (state != .background, state == .active)
         #elseif os(macOS)
-        let isForeground = NSApplication.shared.isActive
-        let isActive = isForeground
+        let isActive = NSApplication.shared.isActive
+        return (isActive, isActive)
         #elseif os(watchOS)
         let state = WKExtension.shared().applicationState
-        let isForeground = state != .background
-        let isActive = state == .active
+        return (state != .background, state == .active)
         #else
-        let isForeground = true
-        let isActive = true
+        return (true, true)
         #endif
-
-        // Under the same lock the readers take: the crash path reads this from
-        // another thread.
-        lock.lock()
-        cachedIsForeground = isForeground
-        cachedIsActive = isActive
-        lock.unlock()
     }
 
     /// Observes one notification.
@@ -151,7 +151,10 @@ enum AppState {
 /// Each instance owns its own observer rather than sharing a process-wide one
 /// that fans out, so halting an instance detaches exactly its own observation and
 /// there is no shared registry to keep in sync.
-final class LifecycleObserver {
+///
+/// Unchecked `Sendable`: the callbacks run on the main thread, termination aside,
+/// and registering and deregistering happen under the instance's lifecycle lock.
+final class LifecycleObserver: @unchecked Sendable {
 
     private static let module = "Lifecycle"
 
@@ -274,7 +277,7 @@ final class LifecycleObserver {
         handler?()
     }
 
-    private func add(_ name: Notification.Name, event: String, _ handler: @escaping () -> Void) {
+    private func add(_ name: Notification.Name, event: String, _ handler: @escaping @Sendable () -> Void) {
         let token = NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
             self?.core.logger.d(Self.module, "add", "lifecycle notification received, it is handled on the main queue, event: [\(event)], isForeground: [\(AppState.isForeground)], isActive: [\(AppState.isActive)]")
             handler()
@@ -287,7 +290,7 @@ final class LifecycleObserver {
     ///
     /// Termination is the one path where this matters: an enqueued block may never
     /// get a run loop turn before the process exits, which loses the final flush.
-    private func addSynchronously(_ name: Notification.Name, event: String, _ handler: @escaping () -> Void) {
+    private func addSynchronously(_ name: Notification.Name, event: String, _ handler: @escaping @Sendable () -> Void) {
         let token = NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
             self?.core.logger.d(Self.module, "addSynchronously", "lifecycle notification received, it is handled on the posting thread, event: [\(event)], isForeground: [\(AppState.isForeground)], isActive: [\(AppState.isActive)]")
             handler()

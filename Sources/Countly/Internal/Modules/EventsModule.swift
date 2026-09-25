@@ -15,7 +15,7 @@ import Foundation
 /// the server relies on. They are also flushed whenever something else has to go
 /// out first, so an event recorded before a session end is never reported after
 /// it.
-final class EventsModule: ModuleBase {
+final class EventsModule: ModuleBase, @unchecked Sendable {
 
     override class var moduleName: String { "Events" }
 

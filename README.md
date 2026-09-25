@@ -105,7 +105,7 @@ class NotificationService: UNNotificationServiceExtension {
 
 ## Requirements
 
-iOS 15, tvOS 15, watchOS 9, macOS 12, visionOS 1. Swift 5.9. These are the oldest deployment targets Xcode 27 builds for.
+iOS 15, tvOS 15, watchOS 9, macOS 12, visionOS 1, the oldest deployment targets Xcode 27 builds for. Xcode 16 or later: the SDK is built in the Swift 6 language mode, and an application in either the Swift 5 or the Swift 6 language mode can use it.
 
 ## Security
 

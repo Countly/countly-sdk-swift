@@ -126,7 +126,10 @@ protocol LogGatheringTransport: AnyObject {
 /// Wire shape of a batch: `{"i":gatherID,"d":dropped,"l":[{"t":ms,"l":"e","m":message}]}`.
 /// Nothing here is persisted: the arm is held in memory and re-learned from the
 /// next `sc` response, exactly like the connection test.
-final class LogGatherer {
+///
+/// Unchecked `Sendable`: the held lines are guarded by the lock, and delivery runs
+/// on its own serial queue.
+final class LogGatherer: @unchecked Sendable {
 
     private static let module = "LogGathering"
 

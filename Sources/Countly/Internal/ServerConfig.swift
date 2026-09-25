@@ -21,7 +21,10 @@ import Foundation
 ///
 /// When the server says nothing the resolved value equals the developer config,
 /// so adopting behavior settings never changes an existing integration.
-final class ServerConfig {
+///
+/// Unchecked `Sendable`. The fetch completion applies new settings while other
+/// threads read the current ones, and nothing orders the two.
+final class ServerConfig: @unchecked Sendable {
 
     private static let module = "ServerConfig"
 
@@ -409,9 +412,11 @@ final class ServerConfig {
     }
 
     private func installRefreshTimer(config: CountlyConfig) {
+        // The instance's own config, which every thread of the SDK already shares.
+        let config = UncheckedSendable(config)
         let timer = Timer(timeInterval: TimeInterval(currentUpdateIntervalHours) * 60 * 60,
                           repeats: true) { [weak self] _ in
-            self?.fetch(config: config)
+            self?.fetch(config: config.value)
         }
         RunLoop.main.add(timer, forMode: .common)
         refreshTimer = timer

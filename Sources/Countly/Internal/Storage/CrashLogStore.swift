@@ -18,7 +18,9 @@ import Foundation
 /// point: a breadcrumb recorded before a `deleteAll` must not be written after it
 /// and reappear in the next launch's report, which is what a store that mixed an
 /// asynchronous append with a synchronous delete would do.
-final class CrashLogStore {
+///
+/// Unchecked `Sendable` for the same reason: the queue is the only way in.
+final class CrashLogStore: @unchecked Sendable {
 
     private static let module = "CrashLogStore"
     private static let fileName = "CountlyCustomCrash"

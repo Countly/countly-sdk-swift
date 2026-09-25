@@ -15,7 +15,7 @@ import Foundation
 /// answered. After a user change the cache is kept but marked as belonging to the
 /// previous user, so the application can decide whether a stale value is
 /// acceptable.
-final class RemoteConfigModule: ModuleBase {
+final class RemoteConfigModule: ModuleBase, @unchecked Sendable {
 
     override class var moduleName: String { "RemoteConfig" }
 
@@ -375,7 +375,7 @@ final class RemoteConfigModule: ModuleBase {
             // a hop that captured that local would keep this module alive past the
             // core it holds `unowned`. The caller's completion still runs either
             // way, which is what it is waiting for.
-            DispatchQueue.main.async { [weak self] in
+            deliverOnMainQueue { [weak self] in
                 if let resolvedError {
                     let nsError = resolvedError as NSError
                     self?.logD("fetch", "remote config request failed, statusCode: [\(statusCode)], error: [\(nsError.localizedDescription)], domain: [\(nsError.domain)], code: [\(nsError.code)]")
@@ -580,7 +580,7 @@ final class RemoteConfigModule: ModuleBase {
                   let variants = CountlyJSON.object(from: data, logger: self.log) as? [String: Any] else {
                 let nsError = error as NSError?
                 self.logD("testingDownloadVariantInformation", "variants request failed, statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], error: [\(nsError?.localizedDescription ?? "")], domain: [\(nsError?.domain ?? "")], code: [\(nsError?.code ?? 0)]")
-                DispatchQueue.main.async { completion(.error, error ?? CountlyError.remoteConfigGeneralAPIError.asNSError) }
+                deliverOnMainQueue { completion(.error, error ?? CountlyError.remoteConfigGeneralAPIError.asNSError) }
                 return
             }
 
@@ -590,7 +590,7 @@ final class RemoteConfigModule: ModuleBase {
             self.localCachedVariants = flattened
             self.stateLock.unlock()
             self.logD("testingDownloadVariantInformation", "variants request successfully completed, the locally cached variants are replaced, variantKeyCount: [\(flattened.count)], variantKeys: [\(Self.describe(flattened.keys))]")
-            DispatchQueue.main.async { completion(.success, nil) }
+            deliverOnMainQueue { completion(.success, nil) }
         }?.resume()
     }
 
@@ -615,7 +615,7 @@ final class RemoteConfigModule: ModuleBase {
             guard error == nil, statusCode == 200 else {
                 let nsError = error as NSError?
                 self.logD("testingDownloadExperimentInformation", "experiment request failed, statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], error: [\(nsError?.localizedDescription ?? "")], domain: [\(nsError?.domain ?? "")], code: [\(nsError?.code ?? 0)]")
-                DispatchQueue.main.async { completion(.error, error ?? CountlyError.remoteConfigGeneralAPIError.asNSError) }
+                deliverOnMainQueue { completion(.error, error ?? CountlyError.remoteConfigGeneralAPIError.asNSError) }
                 return
             }
 
@@ -663,7 +663,7 @@ final class RemoteConfigModule: ModuleBase {
             self.stateLock.unlock()
 
             self.logD("testingDownloadExperimentInformation", "experiment request successfully completed, the locally cached experiments are replaced, responseShape: [\(responseShape)], experimentCount: [\(experiments.count)], experimentIDs: [\(Self.describe(experiments.keys))]")
-            DispatchQueue.main.async { completion(.success, nil) }
+            deliverOnMainQueue { completion(.success, nil) }
         }?.resume()
     }
 
@@ -702,7 +702,7 @@ final class RemoteConfigModule: ModuleBase {
             guard error == nil, statusCode == 200 else {
                 let nsError = error as NSError?
                 self.logD("testingEnrollIntoVariant", "variant enrollment request failed, key: [\(key)], variantName: [\(variantName)], statusCode: [\(statusCode)], error: [\(nsError?.localizedDescription ?? "")], domain: [\(nsError?.domain ?? "")], code: [\(nsError?.code ?? 0)]")
-                DispatchQueue.main.async { completion(.error, error ?? CountlyError.remoteConfigGeneralAPIError.asNSError) }
+                deliverOnMainQueue { completion(.error, error ?? CountlyError.remoteConfigGeneralAPIError.asNSError) }
                 return
             }
 
@@ -713,7 +713,7 @@ final class RemoteConfigModule: ModuleBase {
             self.logD("testingEnrollIntoVariant", "variant enrollment successfully completed, the cached values will be cleared and downloaded again, key: [\(key)], variantName: [\(variantName)]")
             self.clearCachedRemoteConfig()
             self.downloadRemoteConfigAutomatically()
-            DispatchQueue.main.async { completion(.success, nil) }
+            deliverOnMainQueue { completion(.success, nil) }
         }?.resume()
     }
 

@@ -17,7 +17,7 @@ import UserNotifications
 /// The device token belongs to the process, not to a Countly instance, so it is
 /// received once and handed to whichever instances want it. Reporting it is per
 /// instance, because each has its own app key and server.
-final class PushModule: ModuleBase {
+final class PushModule: ModuleBase, @unchecked Sendable {
 
     override class var moduleName: String { "Push" }
 
@@ -144,6 +144,8 @@ final class PushModule: ModuleBase {
 
         logD("askForNotificationPermission", "asking the system for notification authorization, resolvedOptions: [\(resolved.rawValue)], defaultsUsed: [\(options == 0)]")
 
+        // The host's callback, answered on the thread the system answers on.
+        let completion = UncheckedSendable(completion)
         UNUserNotificationCenter.current().requestAuthorization(options: resolved) { [weak self] granted, error in
             guard let self else { return }
 
@@ -153,7 +155,7 @@ final class PushModule: ModuleBase {
                 self.logI("askForNotificationPermission", "notification permission result received, granted: [\(granted)]")
             }
 
-            completion?(granted, error)
+            completion.value?(granted, error)
             self.sendToken()
         }
         #else

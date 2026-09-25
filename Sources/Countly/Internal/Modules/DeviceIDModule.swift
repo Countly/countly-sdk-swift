@@ -14,7 +14,7 @@ import Foundation
 /// same identity across launches. Changing it is the only operation in the SDK
 /// that can split or join a user's history, which is why it has two explicit
 /// forms: with a server side merge, and without.
-final class DeviceIDModule: ModuleBase {
+final class DeviceIDModule: ModuleBase, @unchecked Sendable {
 
     override class var moduleName: String { "DeviceID" }
 

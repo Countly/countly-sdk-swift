@@ -26,7 +26,9 @@ import UIKit
 /// to the application, so several Countly instances asking at once must not each
 /// take one out and have the first to finish end it for the others. The count is
 /// what keeps it alive until the last of them is done.
-final class BackgroundTaskGuard {
+///
+/// Unchecked `Sendable`: the count and the task identifier are guarded by the lock.
+final class BackgroundTaskGuard: @unchecked Sendable {
 
     static let shared = BackgroundTaskGuard()
 
@@ -108,6 +110,7 @@ final class BackgroundTaskGuard {
 
     #if os(iOS) || os(tvOS) || os(visionOS)
     /// Gives the task back without waiting for the work, because the system asked.
+    @MainActor
     private func expire() {
         lock.lock()
         let identifier = self.identifier
