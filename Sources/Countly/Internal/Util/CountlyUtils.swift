@@ -29,12 +29,7 @@ extension String {
 
     /// Lowercase hex SHA-256 of the UTF-8 bytes, used for request checksums.
     var sha256Hex: String {
-        let data = Data(utf8)
-        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
-        data.withUnsafeBytes { buffer in
-            _ = CC_SHA256(buffer.baseAddress, CC_LONG(buffer.count), &digest)
-        }
-        return Data(digest).hexString
+        Data(utf8).sha256Hex
     }
 
     /// How old a queued request is, from the timestamp it carries.
@@ -81,6 +76,15 @@ extension String {
 }
 
 extension Data {
+
+    /// Lowercase hex SHA-256 of the bytes.
+    var sha256Hex: String {
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        withUnsafeBytes { buffer in
+            _ = CC_SHA256(buffer.baseAddress, CC_LONG(buffer.count), &digest)
+        }
+        return Data(digest).hexString
+    }
 
     /// Lowercase hex, used for digests and for the APNs device token.
     ///
@@ -314,20 +318,35 @@ enum CountlyJSON {
 
 // MARK: - Archiving
 
+/// Keyed archives in the shape the Objective-C SDK reads and writes.
+///
+/// `ArchivedRCData` goes under that SDK's class name, mapped on each archive
+/// rather than claimed for the whole process, since a process can hold that
+/// SDK's own class as well. Kept in one place so the two stores that archive
+/// cannot drift on it.
 enum CountlyArchive {
+
+    /// Archives `root` as `NSKeyedArchiver.archivedData(withRootObject:)` does.
+    static func encodeRoot(_ root: Any) -> Data {
+        let archiver = NSKeyedArchiver(requiringSecureCoding: false)
+        archiver.setClassName(ArchivedRCData.archivedClassName, for: ArchivedRCData.self)
+        archiver.encode(root, forKey: NSKeyedArchiveRootObjectKey)
+        archiver.finishEncoding()
+        return archiver.encodedData
+    }
 
     /// Reads back the root object of a keyed archive the SDK wrote.
     ///
     /// Secure coding is switched off deliberately: the archives hold plain
     /// property list values written by this SDK into its own storage, and the
-    /// decoder cannot be given a class list for `Any`. Kept in one place so the
-    /// two stores that read archives cannot drift on it.
+    /// decoder cannot be given a class list for `Any`.
     ///
     /// Throws whatever `NSKeyedUnarchiver` throws, so each caller reports a
     /// corrupt store in its own terms.
     static func decodeRoot(from data: Data) throws -> Any? {
         let unarchiver = try NSKeyedUnarchiver(forReadingFrom: data)
         unarchiver.requiresSecureCoding = false
+        unarchiver.setClass(ArchivedRCData.self, forClassName: ArchivedRCData.archivedClassName)
         let root = unarchiver.decodeObject(forKey: NSKeyedArchiveRootObjectKey)
         unarchiver.finishDecoding()
         return root

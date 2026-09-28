@@ -191,6 +191,10 @@ enum DefaultLimits {
 /// same keys with a namespace suffix appended, see `StorageNamespace`.
 enum PersistencyKey {
     static let queuedRequests = "kCountlyQueuedRequestsPersistencyKey"
+    /// The token of the queue state a `Countly.dat` this SDK wrote mirrors. The
+    /// Objective-C SDK writes only `queuedRequests` back, so a file without it was
+    /// written by that SDK.
+    static let queueMirrorToken = "kCountlyQueueMirrorToken"
     static let healthCheckState = "kCountlyHealthCheckStatePersistencyKey"
     static let storedDeviceID = "kCountlyStoredDeviceIDKey"
     static let storedNSUUID = "kCountlyStoredNSUUIDKey"

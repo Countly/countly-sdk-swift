@@ -3,7 +3,7 @@
 * Initial release of the Countly Swift SDK.
 
 * Added multi-instance entrypoints on "Countly":
-  * "Countly.shared", the default instance, which reads and writes the storage a previous "countly-sdk-ios" integration left behind
+  * "Countly.shared", the default instance, which reads and writes the storage a previous "countly-sdk-ios" integration left behind, and keeps its request queue and its remote config cache readable by "countly-sdk-ios", so an application can go back to it without losing either
   * "Countly.instance(named:)", which creates the instance if needed. Getting a handle never starts it; the caller always calls "start(with:)".
   * "Countly.getInstance(named:)" / "Countly.listInstances()" / "Countly.haltAllInstances(clearStorage:)"
   * "Countly.removeInstance(named:)", which stops a named instance and drops it from the registry, keeping its stored data
@@ -98,6 +98,8 @@
 
 * Added the attribution API on "countly.attribution":
   * "recordDirectAttribution(campaignType:campaignData:)" / "recordIndirectAttribution(attribution)"
+
+* The request queue is stored one file per request, written as each request is queued and deleted as it is sent. A queue rewrite, such as a temporary device ID becoming the real one, lands all at once.
 
 * Added the request queue API on "countly.requestQueue":
   * "count" / "attemptToSendStoredRequests()" / "flushQueues()"

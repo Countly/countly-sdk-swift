@@ -252,8 +252,7 @@ public enum CountlyNotificationService {
             return
         }
 
-        // Unlike the completion handler form, the async download leaves the file
-        // where it landed, so it is removed once it has been moved or given up on.
+        // The async download leaves its file behind, unlike the completion handler form.
         defer { try? FileManager.default.removeItem(at: location) }
 
         let suggested = response.suggestedFilename ?? url.lastPathComponent
@@ -261,8 +260,7 @@ public enum CountlyNotificationService {
         let destination = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(fileName)
 
         do {
-            // A leftover from a previous notification with the same name would make
-            // the move fail.
+            // A leftover with the same name from an earlier notification would fail the move.
             try? FileManager.default.removeItem(at: destination)
             try FileManager.default.moveItem(at: location, to: destination)
             let attachment = try UNNotificationAttachment(identifier: fileName, url: destination, options: nil)

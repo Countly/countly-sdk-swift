@@ -30,22 +30,28 @@ public final class CountlyRCData {
     }
 }
 
-/// Decodes the cache entries an earlier Objective-C Countly SDK left behind.
+/// One cached remote config value as it is archived: exactly as the Objective-C
+/// Countly SDK archives its `CountlyRCData`, under the same class name and keys.
 ///
-/// That SDK archived `CountlyRCData` objects into user defaults where this one
-/// archives plain dictionaries. An archive naming a class the running process does
-/// not have decodes to nothing at all, so without a stand-in registered under the
-/// same Objective-C name an application migrating from it silently loses every
-/// cached remote config value and reads `nil` for every key until the next
-/// download.
-///
-/// Read only. The values are rewritten in this SDK's own shape as soon as they are
-/// loaded, so the conversion happens once.
-@objc(CountlyRCData)
-final class LegacyArchivedRCData: NSObject, NSCoding {
+/// Both SDKs read and write the same user defaults key, so the shape is shared.
+/// An application moving from that SDK keeps its cached values, and one going
+/// back to it finds them again. An archive naming a class the running process
+/// does not have decodes to nothing, and the Objective-C SDK takes any entry that
+/// is not its own class for one, which ends in an unrecognized selector crash.
+/// `CountlyArchive` applies the class name.
+final class ArchivedRCData: NSObject, NSCoding {
+
+    /// The class name archives carry, the Objective-C SDK's own.
+    static let archivedClassName = "CountlyRCData"
 
     let value: Any?
     let isCurrentUsersData: Bool
+
+    init(value: Any?, isCurrentUsersData: Bool) {
+        self.value = value
+        self.isCurrentUsersData = isCurrentUsersData
+        super.init()
+    }
 
     init?(coder: NSCoder) {
         // The key names are the selector names the reference encoded under.

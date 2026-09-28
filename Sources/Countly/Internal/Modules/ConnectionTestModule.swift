@@ -385,14 +385,11 @@ final class URLSessionProbeTransport: NSObject, ProbeTransport, @unchecked Senda
         bareRequest.timeoutInterval = timeout
         let request = bareRequest
 
-        // `data(for:)` is safe on this session: nothing invalidates it until the
-        // battery that is running this probe has finished.
+        // `data(for:)` is safe here: this session is only invalidated after the battery.
         let session = probeSession(timeout: timeout)
         let start = Date()
 
-        // The request's own deadline should fire first; the watchdog only guards
-        // against an answer that never comes. Whichever finishes first decides,
-        // and the other is cancelled.
+        // A watchdog for an answer that never comes; the first to finish wins.
         let answer = await withTaskGroup(of: (status: Int, failure: String?)?.self) { group in
             group.addTask { await Self.answer(to: request, on: session) }
             group.addTask {

@@ -1681,9 +1681,7 @@ final class WebViewManager: NSObject {
 
                 guard !self.isClosed, !self.hasAppeared else { return }
                 self.webView?.reload()
-                // Re-armed, so a reload that stalls in turn still has a deadline.
-                // Without this the recovery attempt itself would leave the overlay
-                // with none.
+                // Re-armed, so a reload that stalls in turn still has a deadline rather than none.
                 self.armStallTimerIfNeeded()
             }
         }

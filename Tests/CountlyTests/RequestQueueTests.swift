@@ -18,25 +18,28 @@ import XCTest
 /// rather than about any one feature.
 final class RequestQueueTests: CountlyBaseTestCase {
 
-    /// Namespaces the stores built here own, deleted afterwards so no queue file
-    /// is left in the application container between runs.
+    /// Namespaces the stores built here own. Their queue files go with the stores
+    /// in the base class's `tearDown`, their user defaults here.
     private var namespaces: [StorageNamespace] = []
 
     override func tearDown() {
         for namespace in namespaces {
-            RequestQueueStore(namespace: namespace, logger: nil).deleteFile()
             KeyValueStore(namespace: namespace, logger: nil).clearAll()
         }
         namespaces.removeAll()
         super.tearDown()
     }
 
-    /// A store on a namespace of its own, so no two tests can see each other's
-    /// queue file.
-    private func makeStore(_ suffix: String = #function) -> RequestQueueStore {
+    /// A namespace of its own, so no two tests can see each other's queue files.
+    private func makeNamespace(_ suffix: String = #function) -> StorageNamespace {
         let namespace = StorageNamespace(instanceName: "rq-\(suffix)-\(UUID().uuidString.prefix(8))")
         namespaces.append(namespace)
-        return RequestQueueStore(namespace: namespace, logger: nil)
+        return namespace
+    }
+
+    /// A store on a namespace of its own.
+    private func makeStore(_ suffix: String = #function) -> RequestQueueStore {
+        openStore(makeNamespace(suffix))
     }
 
     private func enqueue(_ store: RequestQueueStore, _ queryString: String) {
@@ -239,15 +242,14 @@ final class RequestQueueTests: CountlyBaseTestCase {
     /// The queue exists to survive process death, so a store built on the same
     /// namespace has to find what the previous one left behind.
     func testTheQueueSurvivesBeingReadBackFromDisk() {
-        let namespace = StorageNamespace(instanceName: "rq-persist-\(UUID().uuidString.prefix(8))")
-        namespaces.append(namespace)
+        let namespace = makeNamespace()
 
-        let first = RequestQueueStore(namespace: namespace, logger: nil)
-        first.enqueue("app_key=k&n=0", appVersion: "1.0", trackingEnabled: true)
-        first.enqueue("app_key=k&n=1", appVersion: "1.0", trackingEnabled: true)
+        let first = openStore(namespace)
+        enqueue(first, "app_key=k&n=0")
+        enqueue(first, "app_key=k&n=1")
         first.saveSync()
 
-        let second = RequestQueueStore(namespace: namespace, logger: nil)
+        let second = openStore(namespace)
         XCTAssertEqual(second.count, 2)
         XCTAssertEqual(second.snapshot.map { TestUtils.parseQuery($0)["n"] as? String }, ["0", "1"])
     }
@@ -260,6 +262,162 @@ final class RequestQueueTests: CountlyBaseTestCase {
 
         XCTAssertEqual(store.count, 0)
         XCTAssertNil(store.head)
+    }
+
+    // MARK: - One file per request
+
+    /// The generation directories of a namespace, lowest first. More than one
+    /// after a rewrite means the rewrite did not clean up after itself.
+    private func generationDirectories(_ namespace: StorageNamespace) -> [URL] {
+        let root = requestDirectory(namespace)
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []
+        return names.compactMap { Int($0) }.sorted().map { root.appendingPathComponent("\($0)") }
+    }
+
+    /// Sets the POSIX permissions of a file or directory.
+    private func setPermissions(_ permissions: Int, _ url: URL) throws {
+        try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: url.path)
+    }
+
+    /// Every request is a file of its own, written as it is queued and deleted as
+    /// it is sent, so the next launch finds exactly the queue in its order. A named
+    /// instance keeps no `Countly.dat`: no other SDK reads its data.
+    func testEveryRequestIsAFileAndTheQueueComesBackInOrder() {
+        let namespace = makeNamespace()
+        let first = openStore(namespace)
+        for index in 0..<5 {
+            enqueue(first, "app_key=k&n=\(index)")
+        }
+        first.removeHead(first.head ?? "")
+        first.saveSync()
+
+        XCTAssertEqual(requestFiles(namespace).count, 4)
+        let second = openStore(namespace)
+        XCTAssertEqual(second.snapshot.map { TestUtils.parseQuery($0)["n"] as? String }, ["1", "2", "3", "4"])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: legacyQueueFileURL(namespace).path), "a named instance wrote a Countly.dat")
+
+        enqueue(second, "app_key=k&n=5")
+        second.saveSync()
+        XCTAssertEqual(openStore(namespace).snapshot.last.map { TestUtils.parseQuery($0)["n"] as? String },
+                       "5", "a request queued after a restart went ahead of older ones")
+    }
+
+    /// A rewrite of every request lands as one switch: after it only the new
+    /// generation is on disk, and a restart reads every request rewritten.
+    func testARewriteOfTheWholeQueueLandsAllAtOnce() {
+        let namespace = makeNamespace()
+        let store = openStore(namespace)
+        for index in 0..<3 {
+            enqueue(store, "app_key=k&device_id=\(TemporaryDeviceID.value)&t=9&n=\(index)")
+        }
+        store.saveSync()
+
+        store.replaceTemporaryDeviceIDs(with: "real-id", typeValue: 1)
+        store.saveSync()
+
+        XCTAssertEqual(generationDirectories(namespace).count, 1)
+        let reloaded = openStore(namespace).snapshot.map(TestUtils.parseQuery)
+        XCTAssertEqual(reloaded.count, 3)
+        XCTAssertTrue(reloaded.allSatisfy { $0["device_id"] as? String == "real-id" && $0["t"] as? String == "1" })
+    }
+
+    /// A file that reads but is broken costs that one request, never the queue. A
+    /// file that cannot be read at all, a protected one on a locked device for
+    /// instance, costs nothing: it stays where it is and a later launch reads it.
+    func testABrokenRequestFileCostsOnlyThatRequestAndAnUnreadableOneIsKept() throws {
+        let namespace = makeNamespace()
+        let store = openStore(namespace)
+        for index in 0..<3 {
+            enqueue(store, "app_key=k&n=\(index)")
+        }
+        store.saveSync()
+
+        let files = requestFiles(namespace)
+        try Data([0xFF, 0xFE, 0xFD]).write(to: files[1])
+        try setPermissions(0o000, files[2])
+        defer { try? setPermissions(0o644, files[2]) }
+
+        let locked = openStore(namespace)
+        XCTAssertEqual(locked.snapshot.map { TestUtils.parseQuery($0)["n"] as? String }, ["0"])
+        enqueue(locked, "app_key=k&n=3")
+        locked.saveSync()
+        XCTAssertEqual(requestFiles(namespace).count, 3, "the broken file stays, or the unreadable one is gone")
+
+        try setPermissions(0o644, files[2])
+        XCTAssertEqual(openStore(namespace).snapshot.map { TestUtils.parseQuery($0)["n"] as? String }, ["0", "2", "3"])
+    }
+
+    /// A write that fails is made again by the next sync, a single request and a
+    /// rewrite of the whole queue alike, so a disk that refused writes for a while
+    /// loses nothing once it takes them again.
+    func testAWriteThatFailsIsMadeAgainByTheNextSync() throws {
+        let namespace = makeNamespace()
+        let store = openStore(namespace)
+        enqueue(store, "app_key=k&device_id=\(TemporaryDeviceID.value)&t=9&n=0")
+        store.saveSync()
+
+        let root = requestDirectory(namespace)
+        let generation = try XCTUnwrap(generationDirectories(namespace).last)
+        try setPermissions(0o555, generation)
+        try setPermissions(0o555, root)
+        defer {
+            try? setPermissions(0o755, root)
+            try? setPermissions(0o755, generation)
+        }
+
+        enqueue(store, "app_key=k&device_id=\(TemporaryDeviceID.value)&t=9&n=1")
+        store.replaceTemporaryDeviceIDs(with: "real-id", typeValue: 1)
+        store.saveSync()
+        XCTAssertEqual(requestFiles(namespace).count, 1, "the directories were meant to refuse the writes")
+
+        try setPermissions(0o755, root)
+        try setPermissions(0o755, generation)
+        store.saveSync()
+
+        let reloaded = openStore(namespace).snapshot.map(TestUtils.parseQuery)
+        XCTAssertEqual(reloaded.map { $0["n"] as? String }, ["0", "1"])
+        XCTAssertTrue(reloaded.allSatisfy { $0["device_id"] as? String == "real-id" }, "the rewrite never reached disk")
+        XCTAssertEqual(generationDirectories(namespace).count, 1)
+    }
+
+    /// A state file that cannot be read, cut short by a power loss or written by a
+    /// later SDK, is no reason to touch a request file: the newest generation is
+    /// read instead, and new requests join it.
+    func testAStateFileThatCannotBeReadLosesNoRequest() throws {
+        let namespace = makeNamespace()
+        let store = openStore(namespace)
+        for index in 0..<3 {
+            enqueue(store, "app_key=k&n=\(index)")
+        }
+        store.saveSync()
+
+        try Data().write(to: requestDirectory(namespace).appendingPathComponent("state.json"))
+
+        let reloaded = openStore(namespace)
+        XCTAssertEqual(reloaded.snapshot.map { TestUtils.parseQuery($0)["n"] as? String }, ["0", "1", "2"])
+        enqueue(reloaded, "app_key=k&n=3")
+        reloaded.saveSync()
+        XCTAssertEqual(requestFiles(namespace).count, 4, "a request file was removed on the word of a state file that could not be read")
+    }
+
+    /// A flush is how pending data is discarded on request, so it is all or
+    /// nothing on disk as well, and clearing the storage leaves nothing behind.
+    func testAFlushAndAClearLeaveNothingBehind() {
+        let namespace = makeNamespace()
+        let store = openStore(namespace, mirrorsLegacyFile: true)
+        for index in 0..<3 {
+            enqueue(store, "app_key=k&n=\(index)")
+        }
+        store.flush()
+        store.saveSync()
+
+        XCTAssertEqual(requestFiles(namespace).count, 0)
+        XCTAssertEqual(generationDirectories(namespace).count, 1)
+        XCTAssertEqual(openStore(namespace, mirrorsLegacyFile: true).count, 0)
+
+        store.deleteFile()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: requestDirectory(namespace).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: legacyQueueFileURL(namespace).path))
     }
 
     // MARK: - Through the SDK

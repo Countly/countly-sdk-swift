@@ -28,6 +28,10 @@ class CountlyBaseTestCase: XCTestCase {
     /// Started instances, halted in reverse order at the end of the test.
     private var started: [CountlyInstance] = []
 
+    /// Request queue stores the test opened itself. Each deletes its files in
+    /// `tearDown`, so a sync it still has queued cannot write a file back later.
+    private var openedStores: [RequestQueueStore] = []
+
     override func setUp() {
         super.setUp()
         MockURLProtocol.reset()
@@ -38,6 +42,10 @@ class CountlyBaseTestCase: XCTestCase {
             instance.halt(clearStorage: true)
         }
         started.removeAll()
+        for store in openedStores {
+            store.deleteFile()
+        }
+        openedStores.removeAll()
         MockURLProtocol.reset()
         super.tearDown()
     }
@@ -138,6 +146,35 @@ class CountlyBaseTestCase: XCTestCase {
     /// Every request this instance has queued but not yet had accepted.
     func requestQueue(of instance: CountlyInstance) -> [String] {
         core(of: instance).requestQueueStore.snapshot
+    }
+
+    // MARK: - Request queue files
+
+    /// Opens a request queue store on `namespace`, deleted with its files at the
+    /// end of the test.
+    func openStore(_ namespace: StorageNamespace, mirrorsLegacyFile: Bool? = nil) -> RequestQueueStore {
+        let store = RequestQueueStore(namespace: namespace, logger: nil, mirrorsLegacyFile: mirrorsLegacyFile)
+        openedStores.append(store)
+        return store
+    }
+
+    /// The directory a namespace's request files live under.
+    func requestDirectory(_ namespace: StorageNamespace) -> URL {
+        StorageLocation.directoryURL(logger: nil)
+            .appendingPathComponent(namespace.directoryName("CountlyRequests"))
+    }
+
+    /// Every request file of a namespace, across generations, oldest first.
+    func requestFiles(_ namespace: StorageNamespace) -> [URL] {
+        let root = requestDirectory(namespace)
+        let names = (FileManager.default.enumerator(atPath: root.path)?.allObjects as? [String]) ?? []
+        return names.filter { $0.hasSuffix(".req") }.sorted().map { root.appendingPathComponent($0) }
+    }
+
+    /// A namespace's `Countly.dat`, where the Objective-C SDK keeps its queue.
+    func legacyQueueFileURL(_ namespace: StorageNamespace) -> URL {
+        StorageLocation.directoryURL(logger: nil)
+            .appendingPathComponent(namespace.fileName("Countly", extension: "dat"))
     }
 
     /// Reports a crash to one instance the way the signal handler does: the

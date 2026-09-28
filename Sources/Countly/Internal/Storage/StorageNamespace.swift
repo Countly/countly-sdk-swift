@@ -56,6 +56,11 @@ struct StorageNamespace: Equatable {
         isDefault ? base : "\(base)_\(suffix)"
     }
 
+    /// Namespaces a directory name, the same way as a key.
+    func directoryName(_ base: String) -> String {
+        key(base)
+    }
+
     /// Namespaces a file name, keeping its extension in place.
     func fileName(_ base: String, extension fileExtension: String) -> String {
         isDefault ? "\(base).\(fileExtension)" : "\(base)_\(suffix).\(fileExtension)"

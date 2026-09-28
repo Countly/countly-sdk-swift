@@ -35,7 +35,7 @@ final class RemoteConfigModule: ModuleBase, @unchecked Sendable {
         static let autoOptIn = "oi"
     }
 
-    /// Storage shape of one cached value.
+    /// Keys of a value cached as a dictionary, a shape that is read and rewritten.
     private enum CacheKey {
         static let value = "v"
         static let isCurrentUsersData = "c"
@@ -96,28 +96,27 @@ final class RemoteConfigModule: ModuleBase, @unchecked Sendable {
     private func loadCache() {
         let stored = core.keyValueStore.remoteConfig
         var restored: [String: CountlyRCData] = [:]
-        var foundLegacyEntries = false
+        var foundOtherShapes = false
 
         for (key, raw) in stored {
-            if let entry = raw as? [String: Any] {
-                restored[key] = CountlyRCData(value: unwrapNull(entry[CacheKey.value]),
-                                              isCurrentUsersData: (entry[CacheKey.isCurrentUsersData] as? Bool) ?? true)
-            } else if let legacy = raw as? LegacyArchivedRCData {
-                // Written by an earlier Objective-C Countly SDK in the same
-                // application, before it was replaced by this one.
-                foundLegacyEntries = true
-                restored[key] = CountlyRCData(value: unwrapNull(legacy.value),
-                                              isCurrentUsersData: legacy.isCurrentUsersData)
+            guard let archived = raw as? ArchivedRCData else {
+                // The Objective-C SDK takes any entry for its own class, so the cache is rewritten below.
+                foundOtherShapes = true
+                if let entry = raw as? [String: Any] {
+                    restored[key] = CountlyRCData(value: unwrapNull(entry[CacheKey.value]),
+                                                  isCurrentUsersData: (entry[CacheKey.isCurrentUsersData] as? Bool) ?? true)
+                }
+                continue
             }
+            restored[key] = CountlyRCData(value: unwrapNull(archived.value),
+                                          isCurrentUsersData: archived.isCurrentUsersData)
         }
 
         cachedRemoteConfig = restored
         let staleKeyCount = cachedRemoteConfig.values.filter { !$0.isCurrentUsersData }.count
-        logD("loadCache", "remote config cache is loaded from persistency, cachedKeyCount: [\(cachedRemoteConfig.count)], staleKeyCount: [\(staleKeyCount)], migratedFromPreviousSDK: [\(foundLegacyEntries)], cachedKeys: [\(Self.describe(cachedRemoteConfig.keys))]")
+        logD("loadCache", "remote config cache is loaded from persistency, cachedKeyCount: [\(cachedRemoteConfig.count)], staleKeyCount: [\(staleKeyCount)], rewrittenInTheSharedShape: [\(foundOtherShapes)], cachedKeys: [\(Self.describe(cachedRemoteConfig.keys))]")
 
-        // Rewritten in this SDK's shape so the legacy decode runs once rather than
-        // on every launch for the rest of the application's life.
-        if foundLegacyEntries {
+        if foundOtherShapes {
             persistCache()
         }
     }
@@ -135,13 +134,12 @@ final class RemoteConfigModule: ModuleBase, @unchecked Sendable {
         value is NSNull ? nil : value
     }
 
+    /// Writes the cache in the shape both SDKs read, a nil value as `NSNull` the
+    /// way the Objective-C SDK stores a JSON null.
     private func persistCache() {
         var stored: [String: Any] = [:]
         for (key, data) in cachedRemoteConfig {
-            stored[key] = [
-                CacheKey.value: data.value ?? NSNull(),
-                CacheKey.isCurrentUsersData: data.isCurrentUsersData,
-            ]
+            stored[key] = ArchivedRCData(value: data.value ?? NSNull(), isCurrentUsersData: data.isCurrentUsersData)
         }
         core.keyValueStore.remoteConfig = stored
     }

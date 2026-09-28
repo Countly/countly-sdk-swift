@@ -81,7 +81,7 @@ let analytics = Countly.instance(named: "analytics")
 analytics.start(with: analyticsConfig)
 ```
 
-`Countly.instance(named:)` creates the handle but never starts it, so holding a reference cannot begin collecting data by accident. `Countly.shared` is the default instance, and it reads and writes the same storage a previous `countly-sdk-ios` integration used, so an application moving to this SDK keeps its device ID and its queued requests.
+`Countly.instance(named:)` creates the handle but never starts it, so holding a reference cannot begin collecting data by accident. `Countly.shared` is the default instance, and it reads and writes the same storage a previous `countly-sdk-ios` integration used, so an application moving to this SDK keeps its device ID and its queued requests. The queue and the cached remote config stay readable by `countly-sdk-ios` too, so an application that goes back to it keeps them as well.
 
 ## Push notifications
 

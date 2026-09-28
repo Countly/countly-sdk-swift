@@ -137,14 +137,9 @@ final class KeyValueStore {
     }
 
     private func archive(_ value: [String: Any], _ key: String) {
-        do {
-            let data = try NSKeyedArchiver.archivedData(withRootObject: value, requiringSecureCoding: false)
-            defaults.set(data, forKey: namespace.key(key))
-            logger?.d(Self.module, "archive", "value is archived into the key value store, key: [\(key)], entryCount: [\(value.count)], dataSize: [\(data.count)]")
-        } catch {
-            let failure = error as NSError
-            logger?.e(Self.module, "archive", "value could not be archived and is not stored, key: [\(key)], entryCount: [\(value.count)], errorDomain: [\(failure.domain)], errorCode: [\(failure.code)], error: [\(failure.localizedDescription)]")
-        }
+        let data = CountlyArchive.encodeRoot(value)
+        defaults.set(data, forKey: namespace.key(key))
+        logger?.d(Self.module, "archive", "value is archived into the key value store, key: [\(key)], entryCount: [\(value.count)], dataSize: [\(data.count)]")
     }
 
     private func unarchiveDictionary(_ key: String) -> [String: Any] {

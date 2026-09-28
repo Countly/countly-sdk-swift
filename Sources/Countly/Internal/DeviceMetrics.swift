@@ -684,8 +684,7 @@ extension DeviceMetrics {
             reading.orientation = names[raw]
         }
 
-        // The interface rather than the device, because a device lying flat reports
-        // face up while the interface is still portrait or landscape.
+        // The interface's orientation, since a device lying flat reports face up.
         if let interface = ScreenReader.keyWindow?.windowScene?.interfaceOrientation {
             if interface.isPortrait { reading.interfaceOrientationMode = "portrait" }
             if interface.isLandscape { reading.interfaceOrientationMode = "landscape" }
