@@ -17,11 +17,12 @@ import Foundation
 ///
 /// Obtained from `Countly.shared` or `Countly.instance(named:)`, never
 /// constructed directly.
-public final class CountlyInstance {
+public final class CountlyInstance: NSObject {
 
     private static let module = "Countly"
 
     /// Registry key of this instance.
+    @objc
     public let name: String
 
     /// Built by `start(with:)` and released by `halt()`.
@@ -35,48 +36,63 @@ public final class CountlyInstance {
     // MARK: - Feature facades
 
     /// Custom events.
+    @objc
     public private(set) lazy var events = EventsAPI(instance: self)
 
     /// Sessions.
+    @objc
     public private(set) lazy var sessions = SessionsAPI(instance: self)
 
     /// View tracking.
+    @objc
     public private(set) lazy var views = ViewsAPI(instance: self)
 
     /// The user profile.
+    @objc
     public private(set) lazy var userProfile = UserProfileAPI(instance: self)
 
     /// Consent.
+    @objc
     public private(set) lazy var consent = ConsentAPI(instance: self)
 
     /// The device ID.
+    @objc
     public private(set) lazy var deviceID = DeviceIDAPI(instance: self)
 
     /// Location.
+    @objc
     public private(set) lazy var location = LocationAPI(instance: self)
 
     /// Crash reporting.
+    @objc
     public private(set) lazy var crashes = CrashesAPI(instance: self)
 
     /// Remote config and A/B testing.
+    @objc
     public private(set) lazy var remoteConfig = RemoteConfigAPI(instance: self)
 
     /// Attribution.
+    @objc
     public private(set) lazy var attribution = AttributionAPI(instance: self)
 
     /// Performance monitoring.
+    @objc
     public private(set) lazy var performance = APMAPI(instance: self)
 
     /// Feedback widgets.
+    @objc
     public private(set) lazy var feedback = FeedbackAPI(instance: self)
 
     /// Content zone.
+    @objc
     public private(set) lazy var content = ContentAPI(instance: self)
 
     /// Push notifications.
+    @objc
     public private(set) lazy var push = PushAPI(instance: self)
 
     /// The request queue.
+    @objc
     public private(set) lazy var requestQueue = RequestQueueAPI(instance: self)
 
     // MARK: - Init
@@ -86,6 +102,7 @@ public final class CountlyInstance {
     }
 
     /// Whether this instance has been started and not halted.
+    @objc
     public var isStarted: Bool {
         lifecycleLock.lock()
         defer { lifecycleLock.unlock() }
@@ -114,6 +131,7 @@ public final class CountlyInstance {
     /// A second call is ignored rather than restarting: an already running
     /// instance has a session open and a queue in flight, and tearing that down
     /// silently would lose data.
+    @objc(startWithConfig:)
     public func start(with config: CountlyConfig) {
         lifecycleLock.lock()
         defer { lifecycleLock.unlock() }
@@ -379,6 +397,7 @@ public final class CountlyInstance {
     ///
     /// Requests already queued keep going to their original destination only if
     /// they have already been sent; anything still queued goes to the new host.
+    @objc
     public func setNewHost(_ host: String) {
         guard let core = requireCore() else { return }
         guard !host.isEmpty else {
@@ -394,6 +413,7 @@ public final class CountlyInstance {
     /// Queued requests keep the app key they were recorded under, so data already
     /// collected still lands where it belongs. Use the request queue API to rewrite
     /// or drop them.
+    @objc
     public func setNewAppKey(_ appKey: String) {
         guard let core = requireCore() else { return }
         guard !appKey.isEmpty else {
@@ -409,6 +429,7 @@ public final class CountlyInstance {
     }
 
     /// Replaces the session configuration used for every request.
+    @objc
     public func setNewURLSessionConfiguration(_ configuration: URLSessionConfiguration) {
         guard let core = requireCore() else { return }
         core.logger.i(Self.module, "setNewURLSessionConfiguration", "a custom URL session configuration is being applied and the cached sessions will be rebuilt, customHeaderCount: [\(configuration.httpAdditionalHeaders?.count ?? 0)]")
@@ -417,6 +438,7 @@ public final class CountlyInstance {
     }
 
     /// Adds headers to every request the SDK makes.
+    @objc
     public func addCustomNetworkRequestHeaders(_ headers: [String: String]?) {
         guard let core = requireCore() else { return }
         core.logger.i(Self.module, "addCustomNetworkRequestHeaders", "custom network request headers are being set through the public API, providedHeaderCount: [\(headers?.count ?? 0)]")
@@ -424,6 +446,7 @@ public final class CountlyInstance {
     }
 
     /// Reports the device metrics again, optionally overriding some of them.
+    @objc
     public func recordMetrics(_ metricsOverride: [String: String]? = nil) {
         guard let core = requireCore() else { return }
 
@@ -449,6 +472,7 @@ public final class CountlyInstance {
     ///
     /// Keys the SDK owns are stripped, because a request that overrides the device
     /// ID or the timestamp would be attributed to the wrong user or moment.
+    @objc
     public func addDirectRequest(_ parameters: [String: String]?) {
         guard let core = requireCore() else { return }
         guard let parameters, !parameters.isEmpty else {
@@ -479,6 +503,7 @@ public final class CountlyInstance {
     }
 
     /// Suspends tracking: flushes what is pending and closes the session.
+    @objc
     public func suspend() {
         guard let core = requireCore() else { return }
         core.logger.i(Self.module, "suspend", "the public suspend call is received, pending data will be flushed and the session closed")
@@ -486,6 +511,7 @@ public final class CountlyInstance {
     }
 
     /// Resumes tracking after a suspend.
+    @objc
     public func resume() {
         guard let core = requireCore() else { return }
         core.logger.i(Self.module, "resume", "the public resume call is received, session handling will be restarted")
@@ -496,6 +522,7 @@ public final class CountlyInstance {
     ///
     /// - Parameter clearStorage: When `true`, the persisted device ID, queue and
     ///   cached state are erased too. The next start looks like a first install.
+    @objc
     public func halt(clearStorage: Bool = false) {
         lifecycleLock.lock()
         defer { lifecycleLock.unlock() }

@@ -9,7 +9,8 @@
 import Foundation
 
 /// Application performance monitoring settings.
-public final class CountlyAPMConfig {
+@objcMembers
+public final class CountlyAPMConfig: NSObject {
 
     /// Reports how long the application spends in the foreground and in the
     /// background as APM traces.
@@ -28,5 +29,5 @@ public final class CountlyAPMConfig {
     /// real launch moment better than the SDK does. Zero means no override.
     public var appStartTimestampOverride: Int64 = 0
 
-    public init() {}
+    public override init() {}
 }

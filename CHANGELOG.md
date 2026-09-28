@@ -105,6 +105,8 @@
   * "addQueueFlushRunnable(runnable)" / "clearQueueFlushRunnables()"
   * "queuedRequests()" / "store(queryString)", which read the queue and append a request verbatim
 
+* Added request queue persistence in an SQLite database, "CountlyRequests.sqlite", one per instance, that writes every change as a single transaction. The default instance also keeps "Countly.dat" current and archives cached remote config values the way "countly-sdk-ios" does, so an app can go back to that SDK without losing a queued request or a cached value, and the queue that SDK leaves behind is taken over again on the way back.
+
 * Added the push API on "countly.push":
   * "askForNotificationPermission(options:completion:)"
   * "recordPushNotificationToken()" / "clearPushNotificationToken()"
@@ -152,3 +154,5 @@
 * On watchOS the session follows the extension's active state on its own, so the host no longer calls "suspend()" and "resume()" from its extension delegate.
 
 * Added support for iOS 15, tvOS 15, watchOS 9, macOS 12 and visionOS 1, the deployment floor of Xcode 27, from a single Swift package.
+
+* Added Objective-C support: the public API is available to an Objective-C application under the same names, with "startWithConfig:" and "didReceiveNotificationRequest:withContentHandler:" as in "countly-sdk-ios". Values Swift keeps as optional enums or arrays of enums, such as "pushTestMode" and "consents", are "NSNumber" there. The SwiftUI "countlyView" modifier stays Swift only.

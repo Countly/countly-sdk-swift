@@ -15,10 +15,11 @@ import Foundation
 public typealias CrashFilterCallback = (_ crash: CountlyCrashData) -> Bool
 
 /// Crash reporting settings.
-public final class CountlyCrashesConfig {
+@objcMembers
+public final class CountlyCrashesConfig: NSObject {
 
     /// Inspects, edits or drops each crash report before it is queued.
     public var crashFilterCallback: CrashFilterCallback?
 
-    public init() {}
+    public override init() {}
 }

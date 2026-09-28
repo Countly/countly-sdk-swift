@@ -13,7 +13,8 @@ import Foundation
 /// The callback may mutate any field. The SDK records which fields were changed
 /// and reports that as a bitfield so the server can tell a filtered report from
 /// an untouched one.
-public final class CountlyCrashData {
+@objcMembers
+public final class CountlyCrashData: NSObject {
 
     public var stackTrace: String
     public var name: String
@@ -51,6 +52,7 @@ public final class CountlyCrashData {
         self.fatal = fatal
         self.tracksChanges = trackChanges
         self.checksums = []
+        super.init()
         if trackChanges {
             self.checksums = currentChecksums()
         }

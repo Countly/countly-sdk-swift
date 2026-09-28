@@ -138,7 +138,7 @@ final class KeyValueStore {
 
     private func archive(_ value: [String: Any], _ key: String) {
         do {
-            let data = try NSKeyedArchiver.archivedData(withRootObject: value, requiringSecureCoding: false)
+            let data = try CountlyArchive.encodeRoot(value)
             defaults.set(data, forKey: namespace.key(key))
             logger?.d(Self.module, "archive", "value is archived into the key value store, key: [\(key)], entryCount: [\(value.count)], dataSize: [\(data.count)]")
         } catch {

@@ -11,6 +11,7 @@ import Foundation
 // MARK: - Crashes
 
 /// Reports crashes, handled errors, and the breadcrumbs leading to them.
+@objcMembers
 public final class CrashesAPI: CountlyAPIBase {
 
     /// Records an exception.
@@ -29,6 +30,7 @@ public final class CrashesAPI: CountlyAPIBase {
     }
 
     /// Records a Swift error.
+    @objc(recordNSError:isFatal:stackTrace:segmentation:)
     public func recordError(_ error: Error,
                             isFatal: Bool = false,
                             stackTrace: [String]? = nil,
@@ -63,6 +65,7 @@ public final class CrashesAPI: CountlyAPIBase {
 // MARK: - Remote config
 
 /// Reads server-controlled values and drives A/B tests.
+@objcMembers
 public final class RemoteConfigAPI: CountlyAPIBase {
 
     /// The cached value for a key.
@@ -175,6 +178,7 @@ public final class RemoteConfigAPI: CountlyAPIBase {
 // MARK: - Attribution
 
 /// Reports where an install or a session came from.
+@objcMembers
 public final class AttributionAPI: CountlyAPIBase {
 
     /// Reports a Countly campaign the user came from.
@@ -197,6 +201,7 @@ public final class AttributionAPI: CountlyAPIBase {
 
 /// Times network calls, application launch, and whatever the host application
 /// chooses.
+@objcMembers
 public final class APMAPI: CountlyAPIBase {
 
     /// Reports one network call.
@@ -245,6 +250,7 @@ public final class APMAPI: CountlyAPIBase {
 // MARK: - Feedback
 
 /// Presents surveys, NPS and rating widgets.
+@objcMembers
 public final class FeedbackAPI: CountlyAPIBase {
 
     /// Fetches the widgets the server offers for this application.
@@ -309,6 +315,7 @@ public final class FeedbackAPI: CountlyAPIBase {
 // MARK: - Content
 
 /// Controls the in-app content zone.
+@objcMembers
 public final class ContentAPI: CountlyAPIBase {
 
     /// Starts polling the server for content to show.
@@ -335,6 +342,7 @@ public final class ContentAPI: CountlyAPIBase {
 // MARK: - Push
 
 /// Registers for push notifications and records what the user did with them.
+@objcMembers
 public final class PushAPI: CountlyAPIBase {
 
     /// Asks the user for notification permission and reports the token afterwards.

@@ -21,7 +21,8 @@ import UserNotifications
 /// Getting an instance never starts it. Starting is always an explicit
 /// `start(with:)` by the caller, so an accidental reference cannot begin
 /// collecting data.
-public enum Countly {
+@objcMembers
+public final class Countly: NSObject {
 
     /// Registry key of the default instance.
     ///
@@ -31,6 +32,8 @@ public enum Countly {
 
     private static let lock = NSLock()
     private static var instances: [String: CountlyInstance] = [:]
+
+    private override init() {}
 
     // MARK: - Access
 
@@ -48,6 +51,7 @@ public enum Countly {
     /// A natural choice of name is the app key, which gives one isolated instance
     /// per dashboard application. Passing `nil` or an empty name returns the
     /// default instance.
+    @objc(instanceNamed:)
     public static func instance(named name: String?) -> CountlyInstance {
         var key = defaultInstanceName
         if let name, !name.isEmpty {
@@ -68,6 +72,7 @@ public enum Countly {
     ///
     /// Unlike `instance(named:)` this never creates one, which is what a caller
     /// checking whether an instance was set up should use.
+    @objc(getInstanceNamed:)
     public static func getInstance(named name: String) -> CountlyInstance? {
         lock.lock()
         defer { lock.unlock() }
@@ -107,6 +112,7 @@ public enum Countly {
     /// what the instance recorded but has not sent yet, so a caller who wants it
     /// gone calls `halt(clearStorage: true)` on the instance first. The default
     /// instance cannot be removed; `halt()` resets it.
+    @objc(removeInstanceNamed:)
     public static func removeInstance(named name: String?) {
         guard let name, !name.isEmpty, name != defaultInstanceName else {
             Logger.print("[Warning] [Countly] removeInstance, the default instance can not be removed, use halt() to reset it, the call is ignored")

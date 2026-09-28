@@ -15,7 +15,7 @@ import Foundation
 /// The SDK prints nothing unless `CountlyConfig.enableDebug` is set or a
 /// `CountlyLoggerDelegate` is attached. A line is emitted only when its level is
 /// less than or equal to the configured `internalLogLevel`.
-public enum CountlyLogLevel: Int, CaseIterable, Sendable {
+@objc public enum CountlyLogLevel: Int, CaseIterable, Sendable {
     case none = 0
     case error = 1
     case warning = 2
@@ -41,7 +41,7 @@ public enum CountlyLogLevel: Int, CaseIterable, Sendable {
 /// Lines arrive already prefixed with `[Countly] [<Level>] `. The delegate is
 /// called on whichever thread produced the log, so implementations must be
 /// thread safe and must not block.
-public protocol CountlyLoggerDelegate: AnyObject {
+@objc public protocol CountlyLoggerDelegate: AnyObject {
     func internalLog(_ log: String, level: CountlyLogLevel)
 }
 
@@ -50,7 +50,7 @@ public protocol CountlyLoggerDelegate: AnyObject {
 /// A feature that can be individually consented to.
 ///
 /// Raw values are the wire names the server expects in the `consent=` payload.
-public enum ConsentFeature: Int, CaseIterable, Sendable {
+@objc public enum ConsentFeature: Int, CaseIterable, Sendable {
     case sessions
     case events
     case userDetails
@@ -110,7 +110,7 @@ public enum ConsentFeature: Int, CaseIterable, Sendable {
 /// Objective-C SDK spelled `1` as "IDFV" and used a separate `2` for the
 /// platforms it called "NSUUID", but both branches produced a `UUID()` and
 /// `identifierForVendor` was never read, so the distinction described nothing.
-public enum DeviceIDType: Int, Sendable {
+@objc public enum DeviceIDType: Int, Sendable {
     /// Supplied by the host application.
     case developerSupplied = 0
     /// A UUID this SDK generated and stored.
@@ -125,7 +125,7 @@ public enum DeviceIDType: Int, Sendable {
 // MARK: - Features enabled at init
 
 /// Optional features that have to be switched on explicitly at init time.
-public enum CountlyFeature: Int, CaseIterable, Sendable {
+@objc public enum CountlyFeature: Int, CaseIterable, Sendable {
     case pushNotifications
     case crashReporting
 }
@@ -133,7 +133,7 @@ public enum CountlyFeature: Int, CaseIterable, Sendable {
 // MARK: - Push
 
 /// Which APNs environment the token should be reported against.
-public enum PushTestMode: Int, Sendable {
+@objc public enum PushTestMode: Int, Sendable {
     /// Development / debug builds signed with a development certificate.
     case development
     /// TestFlight or ad hoc builds signed with a distribution certificate.
@@ -155,7 +155,11 @@ public enum PushTestMode: Int, Sendable {
 // MARK: - Metrics
 
 /// Keys of the device metrics dictionary sent with `begin_session` and metric overrides.
-public enum MetricKey {
+///
+/// A class, so Objective-C sees the keys too.
+@objc(CountlyMetricKey)
+@objcMembers
+public final class MetricKey: NSObject {
     public static let device = "_device"
     public static let deviceType = "_device_type"
     public static let os = "_os"
@@ -167,18 +171,26 @@ public enum MetricKey {
     public static let locale = "_locale"
     public static let hasWatch = "_has_watch"
     public static let installedWatchApp = "_installed_watch_app"
+
+    private override init() {}
 }
 
 /// Keys accepted by `recordIndirectAttribution`.
-public enum AttributionKey {
+///
+/// A class, so Objective-C sees the keys too.
+@objc(CountlyAttributionKey)
+@objcMembers
+public final class AttributionKey: NSObject {
     public static let idfa = "idfa"
     public static let adid = "adid"
+
+    private override init() {}
 }
 
 // MARK: - Request results
 
 /// Outcome of a networked SDK call that reports back to the host application.
-public enum RequestResult: Int, Sendable {
+@objc public enum RequestResult: Int, Sendable {
     /// The request never reached the server.
     case networkIssue
     /// The server answered and the answer was usable.

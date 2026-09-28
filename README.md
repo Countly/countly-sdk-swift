@@ -7,7 +7,7 @@
 
 This repository contains the Countly Swift SDK, which can be integrated into iOS, iPadOS, tvOS, watchOS, macOS and visionOS applications written in Swift. The Countly Swift SDK is intended to be used with [Countly Lite](https://countly.com/lite), [Countly Flex](https://countly.com/flex), [Countly Enterprise](https://countly.com/enterprise).
 
-Its interface is Swift only. For an application written in Objective-C, use the [Countly iOS SDK](https://github.com/Countly/countly-sdk-ios).
+An application written in Objective-C uses the same SDK: see [From Objective-C](#from-objective-c).
 
 ## What is Countly?
 
@@ -72,6 +72,23 @@ With `config.requiresConsent = true` nothing is collected until consent is given
 Countly.shared.consent.giveConsent(for: [.sessions, .events, .viewTracking])
 ```
 
+## From Objective-C
+
+The interface is available to Objective-C under the same names, apart from the SwiftUI `countlyView` modifier:
+
+```objc
+@import Countly;
+
+CountlyConfig *config = [[CountlyConfig alloc] initWithAppKey:@"YOUR_APP_KEY" host:@"https://your.server.ly"];
+config.consents = @[@(ConsentFeatureSessions), @(ConsentFeatureEvents)];
+[Countly.shared startWithConfig:config];
+
+[Countly.shared.events recordEvent:@"purchase" segmentation:@{@"item": @"hat"}];
+[Countly.shared.views startView:@"Checkout" segmentation:nil];
+```
+
+Swift default arguments do not exist there, so pass `nil` for an argument you would leave out in Swift. A value Swift keeps as an optional enum, or as an array of enums, such as `config.pushTestMode` or `config.consents`, is an `NSNumber` holding the enum value. A notification service extension calls `[CountlyNotificationService didReceiveNotificationRequest:request withContentHandler:contentHandler]`.
+
 ## Multiple instances
 
 Several instances can run side by side. Each one owns its storage, device ID, request queue, timers, log level and lifecycle observation, so one application can report to two app keys, two servers, or two tenants at once without them seeing each other's data.
@@ -81,7 +98,7 @@ let analytics = Countly.instance(named: "analytics")
 analytics.start(with: analyticsConfig)
 ```
 
-`Countly.instance(named:)` creates the handle but never starts it, so holding a reference cannot begin collecting data by accident. `Countly.shared` is the default instance, and it reads and writes the same storage a previous `countly-sdk-ios` integration used, so an application moving to this SDK keeps its device ID and its queued requests.
+`Countly.instance(named:)` creates the handle but never starts it, so holding a reference cannot begin collecting data by accident. `Countly.shared` is the default instance, and it reads and writes the same storage a previous `countly-sdk-ios` integration used, so an application moving to this SDK keeps its device ID and its queued requests. The request queue and the cached remote config stay readable by `countly-sdk-ios` as well, so an application that goes back to it keeps them too.
 
 ## Push notifications
 

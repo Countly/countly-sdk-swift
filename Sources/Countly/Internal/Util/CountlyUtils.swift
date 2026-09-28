@@ -286,20 +286,41 @@ enum CountlyJSON {
 
 // MARK: - Archiving
 
+/// Keyed archives in the shape the Objective-C SDK reads and writes.
+///
+/// `ArchivedRCData` goes under that SDK's class name. Reading maps the name on each
+/// archive rather than for the whole process, since a process can hold that SDK's
+/// own class as well. Kept in one place so the stores that archive cannot drift
+/// on it.
 enum CountlyArchive {
+
+    /// Archives `root` as `NSKeyedArchiver.archivedData(withRootObject:)` does.
+    ///
+    /// Throws what that archiver throws, a value that cannot be archived included,
+    /// so a caller gets an error rather than an exception it cannot catch.
+    static func encodeRoot(_ root: Any) throws -> Data {
+        _ = archivesRCDataUnderItsObjectiveCName
+        return try NSKeyedArchiver.archivedData(withRootObject: root, requiringSecureCoding: false)
+    }
+
+    /// Names `ArchivedRCData` after the Objective-C SDK's class in every archive this
+    /// process writes, once. The process-wide table maps this SDK's own class only.
+    private static let archivesRCDataUnderItsObjectiveCName: Void = {
+        NSKeyedArchiver.setClassName(ArchivedRCData.archivedClassName, for: ArchivedRCData.self)
+    }()
 
     /// Reads back the root object of a keyed archive the SDK wrote.
     ///
     /// Secure coding is switched off deliberately: the archives hold plain
     /// property list values written by this SDK into its own storage, and the
-    /// decoder cannot be given a class list for `Any`. Kept in one place so the
-    /// two stores that read archives cannot drift on it.
+    /// decoder cannot be given a class list for `Any`.
     ///
     /// Throws whatever `NSKeyedUnarchiver` throws, so each caller reports a
     /// corrupt store in its own terms.
     static func decodeRoot(from data: Data) throws -> Any? {
         let unarchiver = try NSKeyedUnarchiver(forReadingFrom: data)
         unarchiver.requiresSecureCoding = false
+        unarchiver.setClass(ArchivedRCData.self, forClassName: ArchivedRCData.archivedClassName)
         let root = unarchiver.decodeObject(forKey: NSKeyedArchiveRootObjectKey)
         unarchiver.finishDecoding()
         return root

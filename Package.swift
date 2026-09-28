@@ -43,6 +43,7 @@ let package = Package(
                 .linkedFramework("CoreLocation"),
                 .linkedFramework("WebKit", .when(platforms: [.iOS, .visionOS, .macOS])),
                 .linkedFramework("CoreTelephony", .when(platforms: [.iOS])),
+                .linkedLibrary("sqlite3"),
             ]),
 
         .target(
@@ -54,6 +55,12 @@ let package = Package(
             name: "CountlyTests",
             dependencies: ["Countly"],
             path: "Tests/CountlyTests"
+        ),
+
+        .testTarget(
+            name: "CountlyObjCTests",
+            dependencies: ["Countly"],
+            path: "Tests/CountlyObjCTests"
         ),
     ]
 )

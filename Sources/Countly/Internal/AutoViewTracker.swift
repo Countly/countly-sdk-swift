@@ -249,7 +249,7 @@ final class AutoViewTracker {
 }
 
 /// Lets a view controller name itself for automatic view tracking.
-public protocol CountlyAutoViewTrackingName: AnyObject {
+@objc public protocol CountlyAutoViewTrackingName: AnyObject {
     /// The name to report instead of the title or class name.
     var countlyAutoViewTrackingName: String? { get }
 }

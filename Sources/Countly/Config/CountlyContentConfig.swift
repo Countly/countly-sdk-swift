@@ -9,7 +9,7 @@
 import Foundation
 
 /// How a content presentation ended.
-public enum ContentStatus: Int, Sendable {
+@objc public enum ContentStatus: Int, Sendable {
     /// The user reached the end of the content flow.
     case completed
     /// The content was dismissed before completing.
@@ -17,7 +17,7 @@ public enum ContentStatus: Int, Sendable {
 }
 
 /// How the content and feedback web views are laid out.
-public enum WebViewDisplayOption: Int, Sendable {
+@objc public enum WebViewDisplayOption: Int, Sendable {
     /// Full screen, ignoring safe area insets.
     case immersive
     /// Inset to the safe area.
@@ -37,7 +37,8 @@ public typealias ContentURLHandler = (_ url: URL) -> Bool
 /// Content zone settings.
 ///
 /// Content is an experimental feature and these options may change.
-public final class CountlyContentConfig {
+@objcMembers
+public final class CountlyContentConfig: NSObject {
 
     /// Notified when a content presentation completes or is closed.
     public var globalContentCallback: ContentCallback?
@@ -72,6 +73,14 @@ public final class CountlyContentConfig {
     /// configuration. Set it when the application gives its window a shape of its
     /// own, since nothing the SDK can read will describe that.
     public var overlayCornerRadius: CGFloat?
+
+    /// `overlayCornerRadius` for Objective-C, in points, or `nil`.
+    @available(swift, obsoleted: 1)
+    @objc(overlayCornerRadius)
+    public var objcOverlayCornerRadius: NSNumber? {
+        get { overlayCornerRadius.map { NSNumber(value: Double($0)) } }
+        set { overlayCornerRadius = newValue.map { CGFloat($0.doubleValue) } }
+    }
 
     /// Layout of the content and feedback web views. Default `.immersive`, except
     /// `.safeArea` on macOS.
@@ -127,5 +136,5 @@ public final class CountlyContentConfig {
     /// platform except macOS.
     public var showWidgetsWithinApp: Bool = false
 
-    public init() {}
+    public override init() {}
 }

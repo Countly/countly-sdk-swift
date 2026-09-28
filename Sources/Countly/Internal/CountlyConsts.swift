@@ -117,8 +117,9 @@ enum ReservedEventKey {
 /// Public so a host that handles notifications itself reads the same payload the
 /// SDK does. The notification service extension target has its own copy, because
 /// it is a separate process that does not link the main SDK; neither side gets to
-/// change one alone.
-public enum CountlyPushKey {
+/// change one alone. A class, so Objective-C sees the keys too.
+@objcMembers
+public final class CountlyPushKey: NSObject {
     /// The Countly payload, nested under this key in `userInfo`.
     public static let countlyPayload = "c"
     /// Server side ID of the notification.
@@ -145,6 +146,8 @@ public enum CountlyPushKey {
     /// Prefix of the notification category the extension registers, followed by
     /// the notification ID, so two notifications never share a button set.
     public static let categoryIdentifierPrefix = "CountlyCategoryIdentifier"
+
+    private override init() {}
 }
 
 /// Segmentation keys the SDK owns. A host application setting one of these has
@@ -198,6 +201,10 @@ enum PersistencyKey {
     static let isCustomDeviceID = "kCountlyIsCustomDeviceIDKey"
     static let remoteConfig = "kCountlyRemoteConfigKey"
     static let serverConfig = "kCountlyServerConfigPersistencyKey"
+
+    /// Carried next to the queue in the `Countly.dat` mirror, and never written by
+    /// the Objective-C SDK, which saves back only the queue key.
+    static let queueMirrorToken = "kCountlyQueueMirrorToken"
 }
 
 /// The sentinel device ID that means "hold everything until a real ID arrives".

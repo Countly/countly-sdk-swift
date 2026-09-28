@@ -72,6 +72,11 @@ enum TestUtils {
 
     // MARK: - Parsing
 
+    /// The `n` parameter of each request, which is how the queue tests name them.
+    static func names(_ requests: [String]) -> [String?] {
+        requests.map { parseQuery($0)["n"] as? String }
+    }
+
     /// Splits a queued query string into its parameters, percent-decoding both
     /// sides and parsing any value that is a JSON object or array.
     ///
