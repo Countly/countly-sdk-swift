@@ -495,9 +495,8 @@ final class RequestQueueTests: CountlyBaseTestCase {
     }
 
     /// A corrupt database costs the queue it held, never the ability to queue: it is
-    /// set aside, a new one is started, and a named instance, which has no mirror to
-    /// rebuild from, starts empty.
-    func testACorruptDatabaseIsSetAsideAndANamedInstanceStartsEmpty() throws {
+    /// set aside, and a new one is started empty.
+    func testACorruptDatabaseIsSetAsideAndANewOneStartsEmpty() throws {
         let namespace = makeNamespace()
         var first: RequestQueueStore? = RequestQueueStore(namespace: namespace, logger: nil)
         first.map { enqueue($0, "app_key=k&n=0") }
@@ -552,7 +551,7 @@ final class RequestQueueTests: CountlyBaseTestCase {
     /// nothing on disk as well, and clearing the storage leaves nothing behind.
     func testAFlushAndAClearLeaveNothingBehind() {
         let namespace = makeNamespace()
-        let store = openStore(namespace, mirrorsLegacyFile: true)
+        let store = openStore(namespace)
         for index in 0..<3 {
             enqueue(store, "app_key=k&n=\(index)")
         }
@@ -560,7 +559,7 @@ final class RequestQueueTests: CountlyBaseTestCase {
         store.saveSync()
 
         XCTAssertEqual(databaseRows(namespace).count, 0)
-        XCTAssertEqual(openStore(namespace, mirrorsLegacyFile: true).count, 0)
+        XCTAssertEqual(openStore(namespace).count, 0)
 
         store.deleteFile()
         for file in RequestQueueDatabase.sqliteFiles(of: databaseURL(namespace)) + [legacyQueueFileURL(namespace), pendingFileURL(namespace)] {

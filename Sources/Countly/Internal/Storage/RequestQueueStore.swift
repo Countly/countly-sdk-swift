@@ -13,10 +13,8 @@ import Foundation
 ///
 /// Data must never be lost, so every change reaches disk right after it is made:
 /// the write queue hands the whole queue to `RequestQueueDatabase`, which commits
-/// what changed as one SQLite transaction. See there for the files, and for the
-/// `Countly.dat` mirror that keeps the default instance's queue readable by
-/// countly-sdk-ios: an application can move to this SDK and back again without
-/// losing a queued request.
+/// what changed as one SQLite transaction. See there for the files, and for how the
+/// queue of countly-sdk-ios comes in.
 ///
 /// Reachable from the crash signal handler, so every log line here stays at debug
 /// or lower. Error and warning logging re-enters the health tracker, which uses
@@ -67,7 +65,7 @@ final class RequestQueueStore: @unchecked Sendable {
     private var isDeleted = false
 
     /// What the crash handler records about the database in a pending file: the
-    /// mirror token the queue was last committed under, and the highest sequence
+    /// lineage token the queue was last committed under, and the highest sequence
     /// known to be on disk. Kept here because the crash handler must not touch the
     /// database object, whose state the operation it interrupted may be changing.
     private var durableLineage: String?
@@ -113,16 +111,9 @@ final class RequestQueueStore: @unchecked Sendable {
     private let database: RequestQueueDatabase
 
     /// Reads the queue from disk. Called once per instance at init.
-    ///
-    /// - Parameter mirrorsLegacyFile: Whether `Countly.dat` is kept current for the
-    ///   Objective-C SDK. Defaults to the default instance, whose data is the only
-    ///   data that SDK reads.
-    init(namespace: StorageNamespace, logger: Logger?, mirrorsLegacyFile: Bool? = nil) {
+    init(namespace: StorageNamespace, logger: Logger?) {
         self.logger = logger
-        database = RequestQueueDatabase(namespace: namespace,
-                                        mirrorsLegacyFile: mirrorsLegacyFile ?? namespace.isDefault,
-                                        writeQueue: writeQueue,
-                                        logger: logger)
+        database = RequestQueueDatabase(namespace: namespace, logger: logger)
         writeQueue.setSpecific(key: writeQueueKey, value: true)
 
         if let loaded = database.attach(skippingPendingFile: nil) {
@@ -531,9 +522,8 @@ final class RequestQueueStore: @unchecked Sendable {
         }
     }
 
-    /// Writes every change so far to disk on the calling thread, the mirror
-    /// included. Used when the process is about to end, where an asynchronous
-    /// write would not survive.
+    /// Writes every change so far to disk on the calling thread. Used when the
+    /// process is about to end, where an asynchronous write would not survive.
     func saveSync() {
         guard DispatchQueue.getSpecific(key: writeQueueKey) == nil else {
             // Only the crash handler lands here, and waiting on this queue from itself would hang.
@@ -543,10 +533,7 @@ final class RequestQueueStore: @unchecked Sendable {
 
         // Routed through the write queue so an in-flight write cannot overtake this
         // one, and so a flush is never undone by a sync that copied the queue before it.
-        writeQueue.sync { [self] in
-            syncNow()
-            database.writeMirrorNow()
-        }
+        writeQueue.sync { [self] in syncNow() }
     }
 
     /// Saves the queue into the pending file, for the crash handler on the write
@@ -579,8 +566,8 @@ final class RequestQueueStore: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Deletes every file of the queue, the mirror included. Used by
-    /// `halt(clearStorage: true)`.
+    /// Deletes every file of the queue, a `Countly.dat` not merged yet included.
+    /// Used by `halt(clearStorage: true)`.
     ///
     /// A change made before the caller asked for the data to be erased cannot
     /// re-create a file afterwards: every sync from then on is skipped.

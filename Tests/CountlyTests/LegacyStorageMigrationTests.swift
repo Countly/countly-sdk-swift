@@ -25,7 +25,7 @@ final class LegacyStorageMigrationTests: CountlyBaseTestCase {
     /// `[NSKeyedArchiver archivedDataWithRootObject:@{kCountlyQueuedRequestsPersistencyKey: queuedRequests}]`
     /// with three requests: a `begin_session`, an `events` request, and one held
     /// under `CLYTemporaryDeviceID`.
-    private static let legacyQueueFile = Data(base64Encoded: "YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QD05TS2V5ZWRBcmNoaXZlctEICVRyb290gAGpCwwVFhwdHh8mVSRudWxs0w0ODxASFFdOUy5rZXlzWk5TLm9iamVjdHNWJGNsYXNzoRGAAqETgAOACF8QJGtDb3VudGx5UXVldWVkUmVxdWVzdHNQZXJzaXN0ZW5jeUtledIODxcboxgZGoAEgAWABoAHXxCqYXBwX2tleT1sZWdhY3lLZXkmZGV2aWNlX2lkPUxFR0FDWS1ERVZJQ0UtMSZ0aW1lc3RhbXA9MTcwMDAwMDAwMDAwMCZob3VyPTEwJmRvdz0xJnR6PTE4MCZzZGtfdmVyc2lvbj0yNS40LjAmc2RrX25hbWU9b2JqYy1uYXRpdmUtaW9zJmJlZ2luX3Nlc3Npb249MSZtZXRyaWNzPSU3QiU3RCZhdj0xLjBfEMlhcHBfa2V5PWxlZ2FjeUtleSZkZXZpY2VfaWQ9TEVHQUNZLURFVklDRS0xJnRpbWVzdGFtcD0xNzAwMDAwMDAxMDAwJmhvdXI9MTAmZG93PTEmdHo9MTgwJnNka192ZXJzaW9uPTI1LjQuMCZzZGtfbmFtZT1vYmpjLW5hdGl2ZS1pb3MmZXZlbnRzPSU1QiU3QiUyMmtleSUyMiUzQSUyMmxlZ2FjeSUyMiUyQyUyMmNvdW50JTIyJTNBMSU3RCU1RCZhdj0xLjBfELVhcHBfa2V5PWxlZ2FjeUtleSZkZXZpY2VfaWQ9Q0xZVGVtcG9yYXJ5RGV2aWNlSUQmdD05JnRpbWVzdGFtcD0xNzAwMDAwMDAyMDAwJmhvdXI9MTAmZG93PTEmdHo9MTgwJnNka192ZXJzaW9uPTI1LjQuMCZzZGtfbmFtZT1vYmpjLW5hdGl2ZS1pb3MmZW5kX3Nlc3Npb249MSZzZXNzaW9uX2R1cmF0aW9uPTUmYXY9MS4w0iAhIiNaJGNsYXNzbmFtZVgkY2xhc3Nlc15OU011dGFibGVBcnJheaMiJCVXTlNBcnJheVhOU09iamVjdNIgIScoXE5TRGljdGlvbmFyeaInJQAIABEAGgAkACkAMgA3AEkATABRAFMAXQBjAGoAcgB9AIQAhgCIAIoAjACOALUAugC+AMAAwgDEAMYBcwI/AvcC/AMHAxADHwMjAysDNAM5A0YAAAAAAAACAQAAAAAAAAApAAAAAAAAAAAAAAAAAAADSQ==")!
+    static let legacyQueueFile = Data(base64Encoded: "YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QD05TS2V5ZWRBcmNoaXZlctEICVRyb290gAGpCwwVFhwdHh8mVSRudWxs0w0ODxASFFdOUy5rZXlzWk5TLm9iamVjdHNWJGNsYXNzoRGAAqETgAOACF8QJGtDb3VudGx5UXVldWVkUmVxdWVzdHNQZXJzaXN0ZW5jeUtledIODxcboxgZGoAEgAWABoAHXxCqYXBwX2tleT1sZWdhY3lLZXkmZGV2aWNlX2lkPUxFR0FDWS1ERVZJQ0UtMSZ0aW1lc3RhbXA9MTcwMDAwMDAwMDAwMCZob3VyPTEwJmRvdz0xJnR6PTE4MCZzZGtfdmVyc2lvbj0yNS40LjAmc2RrX25hbWU9b2JqYy1uYXRpdmUtaW9zJmJlZ2luX3Nlc3Npb249MSZtZXRyaWNzPSU3QiU3RCZhdj0xLjBfEMlhcHBfa2V5PWxlZ2FjeUtleSZkZXZpY2VfaWQ9TEVHQUNZLURFVklDRS0xJnRpbWVzdGFtcD0xNzAwMDAwMDAxMDAwJmhvdXI9MTAmZG93PTEmdHo9MTgwJnNka192ZXJzaW9uPTI1LjQuMCZzZGtfbmFtZT1vYmpjLW5hdGl2ZS1pb3MmZXZlbnRzPSU1QiU3QiUyMmtleSUyMiUzQSUyMmxlZ2FjeSUyMiUyQyUyMmNvdW50JTIyJTNBMSU3RCU1RCZhdj0xLjBfELVhcHBfa2V5PWxlZ2FjeUtleSZkZXZpY2VfaWQ9Q0xZVGVtcG9yYXJ5RGV2aWNlSUQmdD05JnRpbWVzdGFtcD0xNzAwMDAwMDAyMDAwJmhvdXI9MTAmZG93PTEmdHo9MTgwJnNka192ZXJzaW9uPTI1LjQuMCZzZGtfbmFtZT1vYmpjLW5hdGl2ZS1pb3MmZW5kX3Nlc3Npb249MSZzZXNzaW9uX2R1cmF0aW9uPTUmYXY9MS4w0iAhIiNaJGNsYXNzbmFtZVgkY2xhc3Nlc15OU011dGFibGVBcnJheaMiJCVXTlNBcnJheVhOU09iamVjdNIgIScoXE5TRGljdGlvbmFyeaInJQAIABEAGgAkACkAMgA3AEkATABRAFMAXQBjAGoAcgB9AIQAhgCIAIoAjACOALUAugC+AMAAwgDEAMYBcwI/AvcC/AMHAxADHwMjAysDNAM5A0YAAAAAAAACAQAAAAAAAAApAAAAAAAAAAAAAAAAAAADSQ==")!
 
     /// `[NSKeyedArchiver archivedDataWithRootObject:cachedRemoteConfig]` where the
     /// values are `CountlyRCData`: `theme` = "dark" (current), `seats` = [1, 2]
@@ -201,20 +201,7 @@ final class LegacyStorageMigrationTests: CountlyBaseTestCase {
         XCTAssertTrue(store.isCustomDeviceID)
     }
 
-    // MARK: - Going back to the Objective-C SDK
-
-    /// A store that keeps `Countly.dat` current, as the default instance does. The
-    /// tests run on named namespaces so they never touch the test host's own file.
-    private func mirroringStore(_ namespace: StorageNamespace) -> RequestQueueStore {
-        openStore(namespace, mirrorsLegacyFile: true)
-    }
-
-    /// The queue as `CountlyPersistency` reads it: the one key, nothing else.
-    private func queueAsTheObjectiveCSDKReadsIt(_ namespace: StorageNamespace) throws -> [String]? {
-        let data = try Data(contentsOf: legacyQueueFileURL(namespace))
-        let root = try CountlyArchive.decodeRoot(from: data) as? [String: Any]
-        return root?[PersistencyKey.queuedRequests] as? [String]
-    }
+    // MARK: - Countly.dat after the move
 
     /// Archives `root` into `Countly.dat`.
     private func writeCountlyDat(_ root: [String: Any], _ namespace: StorageNamespace) throws {
@@ -228,245 +215,129 @@ final class LegacyStorageMigrationTests: CountlyBaseTestCase {
         try writeCountlyDat([PersistencyKey.queuedRequests: requests], namespace)
     }
 
-    /// Replaces the queue `Countly.dat` holds and keeps every other key, the token
-    /// included unless one is given.
-    private func rewriteMirror(_ requests: [String], token: String? = nil, _ namespace: StorageNamespace) throws {
-        let data = try Data(contentsOf: legacyQueueFileURL(namespace))
-        var root = try XCTUnwrap(CountlyArchive.decodeRoot(from: data) as? [String: Any])
-        root[PersistencyKey.queuedRequests] = requests
-        if let token {
-            root[PersistencyKey.queueMirrorToken] = token
-        }
-        try writeCountlyDat(root, namespace)
+    /// Whether a namespace's `Countly.dat` is still there.
+    private func legacyFileExists(_ namespace: StorageNamespace) -> Bool {
+        FileManager.default.fileExists(atPath: legacyQueueFileURL(namespace).path)
     }
 
-    /// An application that goes back to the Objective-C SDK finds, in the file that
-    /// SDK reads, exactly the queue this one had: what was sent is gone, what was
-    /// recorded since is there, and the order is the queue's.
-    func testTheObjectiveCSDKFindsTheQueueAfterADowngrade() throws {
+    /// The Objective-C SDK's queue moves into the database, and its file goes once
+    /// the queue is committed, so this SDK writes no file of that SDK's again.
+    func testTheObjectiveCSDKsQueueMovesIntoTheDatabaseAndItsFileGoes() throws {
         let namespace = StorageNamespace(instanceName: uniqueInstanceName())
         try seedLegacyStorage(namespace, isCustomDeviceID: true)
 
-        let store = mirroringStore(namespace)
-        XCTAssertEqual(store.count, 3)
-        store.removeHead(try XCTUnwrap(store.head))
-        store.enqueue("app_key=k&n=recorded-by-swift", appVersion: "1.0", trackingEnabled: true)
+        let store = openStore(namespace)
         store.saveSync()
 
-        XCTAssertEqual(try queueAsTheObjectiveCSDKReadsIt(namespace), store.snapshot,
-                       "the Objective-C SDK would send a different queue than this one holds")
-        XCTAssertEqual(databaseRows(namespace), store.snapshot, "one row per request")
-        XCTAssertEqual(mirroringStore(namespace).snapshot, store.snapshot, "a restart reads the same queue from the database")
+        XCTAssertEqual(databaseRows(namespace).count, 3)
+        XCTAssertEqual(databaseRows(namespace), store.snapshot, "one row per request, in queue order")
+        XCTAssertFalse(legacyFileExists(namespace), "Countly.dat outlived the commit of its queue")
+
+        store.enqueue("app_key=k&n=recorded-by-swift", appVersion: "1.0", trackingEnabled: true)
+        store.saveSync()
+        XCTAssertFalse(legacyFileExists(namespace), "the queue was written to Countly.dat again")
+        XCTAssertEqual(openStore(namespace).snapshot, store.snapshot, "a restart reads the same queue from the database")
     }
 
-    /// After a downgrade the Objective-C SDK owns the queue, and it writes the file
-    /// back without this SDK's token. Coming back to this SDK takes that queue
-    /// over, rather than resending what the Objective-C SDK already sent.
-    func testAQueueTheObjectiveCSDKWroteAfterADowngradeIsTakenOverOnTheWayBack() throws {
+    /// An application that went back to the Objective-C SDK without the migration
+    /// file left this SDK's rows where they were, and that SDK queued requests of its
+    /// own. Coming back keeps both: the rows first, since they are older.
+    func testAQueueTheObjectiveCSDKWroteLaterGoesAfterTheRows() throws {
         let namespace = StorageNamespace(instanceName: uniqueInstanceName())
-        try seedLegacyStorage(namespace, isCustomDeviceID: true)
+        seededNamespaces.append(namespace)
 
-        let beforeDowngrade = mirroringStore(namespace)
-        XCTAssertEqual(beforeDowngrade.count, 3)
-        beforeDowngrade.saveSync()
+        let beforeGoingBack = openStore(namespace)
+        beforeGoingBack.enqueue("app_key=k&n=0", appVersion: "1.0", trackingEnabled: true)
+        beforeGoingBack.enqueue("app_key=k&n=1", appVersion: "1.0", trackingEnabled: true)
+        beforeGoingBack.saveSync()
 
         try writeAsTheObjectiveCSDK(["app_key=k&n=queued-by-objc"], namespace)
 
-        let afterUpgrade = mirroringStore(namespace)
-        XCTAssertEqual(afterUpgrade.snapshot, ["app_key=k&n=queued-by-objc"])
-        afterUpgrade.saveSync()
-        XCTAssertEqual(databaseRows(namespace), ["app_key=k&n=queued-by-objc"], "the rows of the earlier run are still there")
-        XCTAssertEqual(mirroringStore(namespace).snapshot, ["app_key=k&n=queued-by-objc"],
-                       "taken over once, then read back from the database")
+        let comingBack = openStore(namespace)
+        XCTAssertEqual(TestUtils.names(comingBack.snapshot), ["0", "1", "queued-by-objc"])
+        comingBack.saveSync()
+        XCTAssertEqual(TestUtils.names(databaseRows(namespace)), ["0", "1", "queued-by-objc"])
+        XCTAssertFalse(legacyFileExists(namespace))
     }
 
-    /// The Objective-C SDK writes the same bytes for every empty queue, so the
-    /// empty queue it leaves after a downgrade looks exactly like one this SDK took
-    /// over before. It is taken over all the same: the requests this SDK still has
-    /// on disk were sent by that SDK, and must not be sent twice.
-    func testAnEmptyQueueTheObjectiveCSDKLeftAfterADowngradeIsTakenOver() throws {
+    /// A `Countly.dat` whose removal failed is the very file the rows came from. Its
+    /// digest is in the database, so it adds nothing, and a request sent since does
+    /// not come back.
+    func testACountlyDatWhoseQueueIsInTheDatabaseAlreadyAddsNothing() throws {
+        let namespace = StorageNamespace(instanceName: uniqueInstanceName())
+        try seedLegacyStorage(namespace, isCustomDeviceID: true)
+
+        let store = openStore(namespace)
+        store.removeHead(try XCTUnwrap(store.head))
+        store.saveSync()
+        try Self.legacyQueueFile.write(to: legacyQueueFileURL(namespace))
+
+        let next = openStore(namespace)
+        XCTAssertEqual(next.snapshot, store.snapshot, "a request already sent came back from a file already merged")
+        XCTAssertFalse(legacyFileExists(namespace), "the file already merged was left for every launch to read")
+    }
+
+    /// A `Countly.dat` with no queue under the key was written by neither SDK: the
+    /// rows stay, and the file goes rather than be read at every launch.
+    func testACountlyDatWithoutAQueueAddsNothingAndGoes() throws {
+        let namespace = StorageNamespace(instanceName: uniqueInstanceName())
+        try seedLegacyStorage(namespace, isCustomDeviceID: true)
+
+        openStore(namespace).saveSync()
+        try writeCountlyDat(["something": "else"], namespace)
+
+        XCTAssertEqual(openStore(namespace).count, 3, "the rows changed for a file that holds no queue")
+        XCTAssertFalse(legacyFileExists(namespace))
+    }
+
+    /// A crash on the write queue leaves a pending file, and the Objective-C SDK,
+    /// run in between without the migration file, a queue of its own. The next launch
+    /// keeps all of it, in the order it was recorded.
+    func testAPendingFileAndALaterCountlyDatAreBothKept() throws {
         let namespace = StorageNamespace(instanceName: uniqueInstanceName())
         seededNamespaces.append(namespace)
-        try writeAsTheObjectiveCSDK([], namespace)
 
-        let beforeDowngrade = mirroringStore(namespace)
-        beforeDowngrade.enqueue("app_key=k&n=0", appVersion: "1.0", trackingEnabled: true)
-        beforeDowngrade.enqueue("app_key=k&n=1", appVersion: "1.0", trackingEnabled: true)
-        beforeDowngrade.saveSync()
-        XCTAssertEqual(try queueAsTheObjectiveCSDKReadsIt(namespace)?.count, 2)
-
-        try writeAsTheObjectiveCSDK([], namespace)
-
-        let afterUpgrade = mirroringStore(namespace)
-        XCTAssertEqual(afterUpgrade.count, 0, "requests the Objective-C SDK already sent came back")
-        afterUpgrade.saveSync()
-        XCTAssertEqual(databaseRows(namespace).count, 0)
-    }
-
-    /// A take over cut short after it wrote the mirror but before its transaction
-    /// committed leaves a mirror whose token no database has. That mirror holds the
-    /// queue the take over was writing, so the next load takes it over.
-    func testAMirrorWithATokenTheDatabaseDoesNotHoldIsTakenOver() throws {
-        let namespace = StorageNamespace(instanceName: uniqueInstanceName())
-        try seedLegacyStorage(namespace, isCustomDeviceID: true)
-
-        let store = mirroringStore(namespace)
-        store.saveSync()
-        try rewriteMirror(["app_key=k&n=written-by-a-take-over"], token: "a-token-never-committed", namespace)
-
-        XCTAssertEqual(mirroringStore(namespace).snapshot, ["app_key=k&n=written-by-a-take-over"])
-    }
-
-    /// The mirror follows the queue on its own, a moment after it changes, so an
-    /// application killed without ever saving still leaves the Objective-C SDK the
-    /// queue as it was.
-    func testTheMirrorFollowsTheQueueWithoutASave() throws {
-        let namespace = StorageNamespace(instanceName: uniqueInstanceName())
-        try seedLegacyStorage(namespace, isCustomDeviceID: true)
-
-        let store = mirroringStore(namespace)
-        store.saveSync()
-        let taken = try queueAsTheObjectiveCSDKReadsIt(namespace)
-        store.removeHead(try XCTUnwrap(store.head))
-        store.enqueue("app_key=k&n=unsaved", appVersion: "1.0", trackingEnabled: true)
-        XCTAssertEqual(try queueAsTheObjectiveCSDKReadsIt(namespace), taken, "the mirror is rewritten on every change rather than a moment after")
-
-        TestUtils.waitUntil("the mirror catches up without a save") {
-            (try? self.queueAsTheObjectiveCSDKReadsIt(namespace)) == store.snapshot
-        }
-    }
-
-    /// A mirror left behind the database, by a process killed before it caught up,
-    /// is brought up to date by the next launch, which can be the last one before a
-    /// downgrade.
-    func testAMirrorLeftBehindTheDatabaseIsBroughtUpToDate() throws {
-        let namespace = StorageNamespace(instanceName: uniqueInstanceName())
-        try seedLegacyStorage(namespace, isCustomDeviceID: true)
-
-        let store = mirroringStore(namespace)
-        let beforeTheSend = store.snapshot
-        store.removeHead(try XCTUnwrap(store.head))
-        store.saveSync()
-        try rewriteMirror(beforeTheSend, namespace)
-
-        let nextLaunch = mirroringStore(namespace)
-        XCTAssertEqual(nextLaunch.count, 2)
-        TestUtils.waitUntil("the stale mirror is rewritten without a save") {
-            (try? self.queueAsTheObjectiveCSDKReadsIt(namespace)) == nextLaunch.snapshot
-        }
-    }
-
-    /// A mirror that cannot be written, here because the directory refuses new
-    /// files, is written again by a later save once it can be, and the database
-    /// takes every change meanwhile.
-    func testAMirrorWriteThatFailsIsMadeAgain() throws {
-        let namespace = StorageNamespace(instanceName: uniqueInstanceName())
-        try seedLegacyStorage(namespace, isCustomDeviceID: true)
-
-        let store = mirroringStore(namespace)
-        store.saveSync()
-        let beforeTheSend = store.snapshot
-
-        let directory = StorageLocation.directoryURL(logger: nil)
-        try setPermissions(0o555, directory)
-        defer { try? setPermissions(0o755, directory) }
-
-        store.removeHead(try XCTUnwrap(store.head))
-        store.saveSync()
-        XCTAssertEqual(try queueAsTheObjectiveCSDKReadsIt(namespace), beforeTheSend, "the directory was meant to refuse the write")
-        XCTAssertEqual(databaseRows(namespace), store.snapshot)
-
-        try setPermissions(0o755, directory)
-        store.saveSync()
-        XCTAssertEqual(try queueAsTheObjectiveCSDKReadsIt(namespace), store.snapshot)
-    }
-
-    /// A corrupt database is set aside, and the default instance's queue comes back
-    /// from the mirror it kept for the Objective-C SDK.
-    func testACorruptDatabaseIsRebuiltFromTheMirror() throws {
-        let namespace = StorageNamespace(instanceName: uniqueInstanceName())
-        try seedLegacyStorage(namespace, isCustomDeviceID: true)
-
-        var first: RequestQueueStore? = RequestQueueStore(namespace: namespace, logger: nil, mirrorsLegacyFile: true)
-        first?.removeHead(try XCTUnwrap(first?.head))
-        first?.saveSync()
-        let mirrored = try XCTUnwrap(first?.snapshot)
-        first = nil
-
-        try corruptDatabase(namespace)
-
-        let rebuilt = mirroringStore(namespace)
-        XCTAssertEqual(rebuilt.snapshot, mirrored, "the queue was not rebuilt from the mirror")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: queueFiles(namespace).setAside.path))
-        rebuilt.saveSync()
-        XCTAssertEqual(databaseRows(namespace), mirrored)
-        XCTAssertEqual(try queueAsTheObjectiveCSDKReadsIt(namespace), mirrored)
-    }
-
-    /// A pending file the crash handler wrote before a downgrade is still folded in
-    /// after the Objective-C SDK's queue is taken over: its requests that never
-    /// reached the database go after that queue, and none that did comes back.
-    func testAPendingFileIsFoldedInAfterTheObjectiveCSDKsQueueIsTakenOver() throws {
-        let namespace = StorageNamespace(instanceName: uniqueInstanceName())
-        seededNamespaces.append(namespace)
-        try writeAsTheObjectiveCSDK(["app_key=k&n=0", "app_key=k&n=1"], namespace)
-
-        let store = mirroringStore(namespace)
+        let store = openStore(namespace)
+        store.enqueue("app_key=k&n=0", appVersion: "1.0", trackingEnabled: true)
+        store.enqueue("app_key=k&n=1", appVersion: "1.0", trackingEnabled: true)
         store.saveSync()
 
         // Everything after the crash runs on the write queue, so this store never
         // syncs again, as a process that died there would not.
-        var afterUpgrade: [String] = []
+        var nextLaunch: [String] = []
         let crashed = expectation(description: "the crash handler ran on the write queue")
         store.save {
             store.enqueue("app_key=k&n=crash", appVersion: "1.0", trackingEnabled: true)
             store.saveSync()
             do {
-                try self.writeAsTheObjectiveCSDK(["app_key=k&n=1", "app_key=k&n=queued-by-objc"], namespace)
+                try self.writeAsTheObjectiveCSDK(["app_key=k&n=queued-by-objc"], namespace)
             } catch {
                 XCTFail("the Objective-C SDK's queue could not be written: \(error)")
             }
-            afterUpgrade = RequestQueueStore(namespace: namespace, logger: nil, mirrorsLegacyFile: true).snapshot
+            nextLaunch = RequestQueueStore(namespace: namespace, logger: nil).snapshot
             crashed.fulfill()
         }
         wait(for: [crashed], timeout: TestUtils.asyncTimeout)
 
-        XCTAssertEqual(TestUtils.names(afterUpgrade), ["1", "queued-by-objc", "crash"])
+        XCTAssertEqual(TestUtils.names(nextLaunch), ["0", "1", "crash", "queued-by-objc"])
     }
 
-    /// A crash between a take over's write of `Countly.dat` and its commit leaves a
-    /// file whose queue the next launch takes over again, and a pending file that
-    /// repeats part of it. Only what is in neither is added: nothing is sent twice.
-    func testACrashBetweenATakeOversStampAndItsCommitSendsNothingTwice() throws {
+    /// A crash after a load merged `Countly.dat` but before a sync committed it leaves
+    /// the merged queue in the pending file and the file itself in place. The next
+    /// launch finds its requests in both, and adds them once.
+    func testACrashBeforeTheMergeIsCommittedSendsNothingTwice() throws {
         let namespace = StorageNamespace(instanceName: uniqueInstanceName())
         seededNamespaces.append(namespace)
-        let database = RequestQueueDatabase(namespace: namespace,
-                                            mirrorsLegacyFile: true,
-                                            writeQueue: DispatchQueue(label: "test.requestqueue"),
-                                            logger: nil)
-        XCTAssertNotNil(database.attach(skippingPendingFile: nil), "the database should open")
+        try writeAsTheObjectiveCSDK(["app_key=k&n=0", "app_key=k&n=1"], namespace)
 
-        let stamped = ["app_key=k&n=taken-over", "app_key=k&n=queued-before-the-commit"]
-        try writeCountlyDat([PersistencyKey.queuedRequests: stamped, PersistencyKey.queueMirrorToken: "the-token-being-committed"], namespace)
-        let crashed = stamped.enumerated().map { QueuedRequest(sequence: Int64($0.offset + 1), request: $0.element) }
-            + [QueuedRequest(sequence: 3, request: "app_key=k&n=crash")]
-        XCTAssertNotNil(database.writePendingFile(crashed, lineage: nil, durableMaxSequence: 1, replacing: []))
+        let database = RequestQueueDatabase(namespace: namespace, logger: nil)
+        let loaded = try XCTUnwrap(database.attach(skippingPendingFile: nil), "the database should open")
+        XCTAssertEqual(TestUtils.names(loaded.queue.map(\.request)), ["0", "1"])
 
-        XCTAssertEqual(TestUtils.names(mirroringStore(namespace).snapshot),
-                       ["taken-over", "queued-before-the-commit", "crash"])
-    }
+        let atTheCrash = loaded.queue + [QueuedRequest(sequence: loaded.nextSequence, request: "app_key=k&n=crash")]
+        XCTAssertNotNil(database.writePendingFile(atTheCrash, lineage: loaded.lineage, durableMaxSequence: loaded.durableMaxSequence, replacing: []))
 
-    /// A `Countly.dat` with no queue under the key was written by neither SDK, so it
-    /// never replaces the rows.
-    func testACountlyDatWithoutAQueueIsNotTakenOver() throws {
-        let namespace = StorageNamespace(instanceName: uniqueInstanceName())
-        try seedLegacyStorage(namespace, isCustomDeviceID: true)
-
-        let store = mirroringStore(namespace)
-        store.saveSync()
-        try writeCountlyDat(["something": "else"], namespace)
-
-        XCTAssertEqual(mirroringStore(namespace).count, 3, "the rows were replaced by a file that holds no queue")
+        XCTAssertEqual(TestUtils.names(openStore(namespace).snapshot), ["0", "1", "crash"])
     }
 
     /// A value that cannot be archived is an error the store logs, never an exception

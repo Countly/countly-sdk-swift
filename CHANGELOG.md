@@ -105,7 +105,9 @@
   * "addQueueFlushRunnable(runnable)" / "clearQueueFlushRunnables()"
   * "queuedRequests()" / "store(queryString)", which read the queue and append a request verbatim
 
-* Added request queue persistence in an SQLite database, "CountlyRequests.sqlite", one per instance, that writes every change as a single transaction. The default instance also keeps "Countly.dat" current and archives cached remote config values the way "countly-sdk-ios" does, so an app can go back to that SDK without losing a queued request or a cached value, and the queue that SDK leaves behind is taken over again on the way back.
+* Added request queue persistence in an SQLite database, "CountlyRequests.sqlite", one per instance, that writes every change as a single transaction. The queue "countly-sdk-ios" left in "Countly.dat" moves into it on the first launch. Cached remote config values are archived the way "countly-sdk-ios" does.
+
+* Added "Migration/CountlySwiftSDKMigration.m", the one file an app going back to "countly-sdk-ios" adds to its target. It runs by itself on the first launch, before that SDK starts, and moves the queued requests into "Countly.dat". There is nothing to call.
 
 * Added the push API on "countly.push":
   * "askForNotificationPermission(options:completion:)"

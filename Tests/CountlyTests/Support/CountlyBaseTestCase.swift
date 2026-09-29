@@ -153,8 +153,8 @@ class CountlyBaseTestCase: XCTestCase {
 
     /// Opens a request queue store on `namespace`, deleted with its files at the
     /// end of the test.
-    func openStore(_ namespace: StorageNamespace, mirrorsLegacyFile: Bool? = nil) -> RequestQueueStore {
-        let store = RequestQueueStore(namespace: namespace, logger: nil, mirrorsLegacyFile: mirrorsLegacyFile)
+    func openStore(_ namespace: StorageNamespace) -> RequestQueueStore {
+        let store = RequestQueueStore(namespace: namespace, logger: nil)
         openedStores.append(store)
         return store
     }

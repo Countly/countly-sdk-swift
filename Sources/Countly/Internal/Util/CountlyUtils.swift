@@ -29,12 +29,7 @@ extension String {
 
     /// Lowercase hex SHA-256 of the UTF-8 bytes, used for request checksums.
     var sha256Hex: String {
-        let data = Data(utf8)
-        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
-        data.withUnsafeBytes { buffer in
-            _ = CC_SHA256(buffer.baseAddress, CC_LONG(buffer.count), &digest)
-        }
-        return Data(digest).hexString
+        Data(utf8).sha256Hex
     }
 
     /// How old a queued request is, from the timestamp it carries.
@@ -95,6 +90,15 @@ extension Data {
             characters.append(alphabet[Int(byte & 0x0F)])
         }
         return String(decoding: characters, as: UTF8.self)
+    }
+
+    /// Lowercase hex SHA-256 of the bytes.
+    var sha256Hex: String {
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        withUnsafeBytes { buffer in
+            _ = CC_SHA256(buffer.baseAddress, CC_LONG(buffer.count), &digest)
+        }
+        return Data(digest).hexString
     }
 }
 

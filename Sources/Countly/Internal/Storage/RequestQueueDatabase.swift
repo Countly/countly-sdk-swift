@@ -27,8 +27,8 @@ struct LoadedQueue {
     /// The first sequence that neither a row nor a request in `queue` uses.
     let nextSequence: Int64
 
-    /// The mirror token of the database state `queue` was read from, `nil` while a
-    /// take over waits for its first commit.
+    /// The lineage token of the database `queue` was read from, `nil` for a database
+    /// that has not committed a queue yet.
     let lineage: String?
 
     /// The highest sequence the next load finds without the pending file.
@@ -47,31 +47,28 @@ struct LoadedQueue {
 ///
 /// - `requests(seq INTEGER PRIMARY KEY, body TEXT NOT NULL)`: one row per queued
 ///   request, in queue order.
-/// - `meta(key TEXT PRIMARY KEY, value TEXT)`: the mirror token, and the token of
-///   the last pending file folded in.
+/// - `meta(key TEXT PRIMARY KEY, value TEXT)`: the lineage token, the token of the
+///   last pending file folded in, and the digest of the last `Countly.dat` merged.
 ///
-/// The schema version is `PRAGMA user_version`.
+/// The schema version is `PRAGMA user_version`. The migration file for going back to
+/// countly-sdk-ios reads this schema too.
 ///
 /// Every sync writes what changed since the last commit, by sequence, as one
 /// transaction. Memory is the truth: a transaction that fails is simply made again
 /// by the next sync.
 ///
-/// **Going back to countly-sdk-ios.** For the instances that mirror it, `Countly.dat`
-/// holds the queue as well, archived exactly as `CountlyPersistency` archives it plus
-/// the database's mirror token, a moment after each commit and at every synchronous
-/// save. That SDK saves back only its queue, so a `Countly.dat` without the
-/// database's token is newer than the database, and its queue is taken over. A byte
-/// digest of the file cannot stand in for the token: that SDK archives every empty
-/// queue to the same bytes. A take over commits under a new token, which reaches
-/// `Countly.dat` before the transaction that stores it: one cut short leaves a file
-/// that no database names, and the next load takes it over again.
+/// **Coming from countly-sdk-ios.** `Countly.dat` is where earlier Countly SDKs keep
+/// their queue. One found at load was written after the rows: on the first launch
+/// after that SDK, or on one after going back to it without the migration file. Its
+/// requests go after the rows, and the file is removed once they are committed. Its
+/// digest is committed with them, so a file whose removal failed is not added twice.
 ///
 /// **What is never lost.** A database that cannot be opened, a protected file on a
 /// locked device for instance, is left alone for a later attach. One that is corrupt,
-/// or written under a later schema, is set aside as `.corrupt`, and a new one takes
-/// over whatever `Countly.dat` holds. The crash handler can interrupt this object in
-/// the middle of a transaction, so a crash on the write queue's own thread writes the
-/// queue to the pending file instead, which the next load folds in.
+/// or written under a later schema, is set aside as `.corrupt` and a new one started.
+/// The crash handler can interrupt this object in the middle of a transaction, so a
+/// crash on the write queue's own thread writes the queue to the pending file instead,
+/// which the next load folds in.
 ///
 /// Confined to the store's write queue, apart from the first attach, which runs
 /// before anything else can reach it, and `writePendingFile`, which touches nothing
@@ -107,15 +104,14 @@ final class RequestQueueDatabase: @unchecked Sendable {
     /// The version of the schema this SDK writes and reads.
     static let schemaVersion: Int64 = 1
 
-    /// The `meta` key of the token the rows are committed under.
-    static let mirrorTokenKey = "mirror_token"
+    /// The `meta` key of the token that tells one database's history from another's.
+    static let lineageKey = "lineage"
 
     /// The `meta` key of the token of the last pending file folded in.
     static let pendingTokenKey = "pending_token"
 
-    /// How long the mirror waits for further changes before it is written, so a
-    /// drain of many requests rewrites it a few times rather than once each.
-    private static let mirrorDelay: TimeInterval = 1
+    /// The `meta` key of the SHA-256 of the last `Countly.dat` merged.
+    static let legacyDigestKey = "legacy_digest"
 
     /// How many free pages an emptied queue leaves before they are given back, since
     /// giving them back costs a commit of its own.
@@ -123,8 +119,6 @@ final class RequestQueueDatabase: @unchecked Sendable {
 
     let files: Files
 
-    private let mirrorsLegacyFile: Bool
-    private let writeQueue: DispatchQueue
     private weak var logger: Logger?
 
     /// `nil` before the first attach, and after a database set aside could not be
@@ -138,28 +132,25 @@ final class RequestQueueDatabase: @unchecked Sendable {
     /// The rows as last committed, in sequence order.
     private var committed: [QueuedRequest] = []
 
-    /// The mirror token the rows are committed under. `nil` until a take over, or a
-    /// database set aside, is first committed: the next sync then replaces every row
-    /// under a new token.
+    /// The lineage token the rows are committed under. `nil` until a new database, or
+    /// one started in place of a corrupt one, first commits: the next sync then writes
+    /// every row under a new token.
     private var lineage: String?
 
-    /// Whether `Countly.dat` is behind the committed rows.
-    private var isMirrorDirty = false
-    private var isMirrorScheduled = false
+    /// The digest of a `Countly.dat` whose requests the queue holds, until a sync
+    /// commits it and the file can go.
+    private var mergedLegacyDigest: String?
 
-    /// - Parameter mirrorsLegacyFile: Whether `Countly.dat` is kept current for the
-    ///   Objective-C SDK. Only the default instance's data is where that SDK looks.
-    init(namespace: StorageNamespace, mirrorsLegacyFile: Bool, writeQueue: DispatchQueue, logger: Logger?) {
+    /// Builds the object. Nothing is read until `attach(skippingPendingFile:)`.
+    init(namespace: StorageNamespace, logger: Logger?) {
         files = Files(namespace: namespace, directory: StorageLocation.directoryURL(logger: logger))
-        self.mirrorsLegacyFile = mirrorsLegacyFile
-        self.writeQueue = writeQueue
         self.logger = logger
     }
 
     // MARK: - Loading
 
-    /// Opens the database and decides what the queue is: the rows, or the queue in
-    /// `Countly.dat` when that is the newer of the two, with a pending file folded in.
+    /// Opens the database and decides what the queue is: the rows, with a pending file
+    /// folded in and a `Countly.dat` merged after them.
     ///
     /// Nothing is written but the schema of a new database and the removal of files
     /// already folded in. The first sync commits whatever was decided, so a launch cut
@@ -181,22 +172,11 @@ final class RequestQueueDatabase: @unchecked Sendable {
         connection = contents.connection
         isAttached = true
         committed = contents.rows
+        lineage = contents.meta[Self.lineageKey]
 
-        let storedLineage = contents.meta[Self.mirrorTokenKey]
-        var queue: [QueuedRequest]
-        if let requests = requestsToTakeOver(legacy, storedLineage: storedLineage) {
-            queue = requests.enumerated().map { QueuedRequest(sequence: Int64($0.offset + 1), request: $0.element) }
-            lineage = nil
-            logger?.d(Self.module, "attach", "the queue is taken over from the legacy file, legacyRequestCount: [\(queue.count)], databaseHadAToken: [\(storedLineage != nil)], mirrorsLegacyFile: [\(mirrorsLegacyFile)]")
-        } else {
-            queue = contents.rows
-            lineage = storedLineage
-            tidyLegacyFile(legacy, rows: contents.rows)
-            logger?.d(Self.module, "attach", "the queue is loaded from the database, restoredRequestCount: [\(queue.count)], mirrorIsBehind: [\(isMirrorDirty)]")
-        }
-
-        let durableMaxSequence = queue.last?.sequence ?? 0
-        var nextSequence = max(durableMaxSequence, contents.rows.last?.sequence ?? 0) + 1
+        var queue = contents.rows
+        let durableMaxSequence = contents.rows.last?.sequence ?? 0
+        var nextSequence = durableMaxSequence + 1
         var foldedToken: String?
 
         switch readPendingFile() {
@@ -211,7 +191,7 @@ final class RequestQueueDatabase: @unchecked Sendable {
                 queue = pending.queue
             } else {
                 let unsaved = pending.queue.filter { $0.sequence > pending.durableMaxSequence }
-                for request in Self.requests(of: unsaved, notIn: queue) {
+                for request in Self.requests(of: unsaved.map(\.request), notIn: queue) {
                     queue.append(QueuedRequest(sequence: nextSequence, request: request))
                     nextSequence += 1
                 }
@@ -225,6 +205,24 @@ final class RequestQueueDatabase: @unchecked Sendable {
             break
         }
 
+        switch legacy {
+        case .found(let file) where file.digest == contents.meta[Self.legacyDigestKey]:
+            removeItem(files.legacy, "a legacy file whose requests are already in the database")
+        case .found(let file):
+            let added = Self.requests(of: file.requests, notIn: queue)
+            for request in added {
+                queue.append(QueuedRequest(sequence: nextSequence, request: request))
+                nextSequence += 1
+            }
+            mergedLegacyDigest = file.digest
+            logger?.d(Self.module, "attach", "the queue in the legacy file is added after the database's, legacyRequestCount: [\(file.requests.count)], addedRequestCount: [\(added.count)], queuedRequestCount: [\(queue.count)]")
+        case .absent:
+            removeItem(files.legacy, "a legacy file that holds no queue")
+        case .unreadable:
+            break
+        }
+
+        logger?.d(Self.module, "attach", "the queue is loaded, restoredRequestCount: [\(queue.count)], databaseRowCount: [\(contents.rows.count)]")
         return LoadedQueue(queue: queue,
                            nextSequence: nextSequence,
                            lineage: lineage,
@@ -232,54 +230,25 @@ final class RequestQueueDatabase: @unchecked Sendable {
                            pendingFileToken: foldedToken)
     }
 
-    /// The requests of `pending` that `queue` does not hold, oldest first.
+    /// The requests of `requests` that `queue` does not hold, in their order.
     ///
-    /// Counted by body rather than by sequence: a crash between a take over's write of
-    /// `Countly.dat` and its commit leaves a file whose requests the next take over
-    /// brings back under other sequences, and a request's body carries its
-    /// timestamp, so two different ones do not match.
-    private static func requests(of pending: [QueuedRequest], notIn queue: [QueuedRequest]) -> [String] {
+    /// Counted by body rather than by sequence, since the requests come from another
+    /// file with sequences of its own. A request's body carries its timestamp, so two
+    /// different ones do not match.
+    private static func requests(of requests: [String], notIn queue: [QueuedRequest]) -> [String] {
         var held: [String: Int] = [:]
         for entry in queue {
             held[entry.request, default: 0] += 1
         }
         var missing: [String] = []
-        for entry in pending {
-            if let count = held[entry.request], count > 0 {
-                held[entry.request] = count - 1
+        for request in requests {
+            if let count = held[request], count > 0 {
+                held[request] = count - 1
             } else {
-                missing.append(entry.request)
+                missing.append(request)
             }
         }
         return missing
-    }
-
-    /// The requests to take over from `Countly.dat`, or `nil` when the rows are the
-    /// newer queue.
-    ///
-    /// A database without a token has never committed a queue, so whatever
-    /// `Countly.dat` holds is taken over, the default instance's mirror of a database
-    /// set aside included. One with a token takes over only a file that does not carry
-    /// it: written by the Objective-C SDK, or by a take over cut short.
-    private func requestsToTakeOver(_ legacy: StoredFile<LegacyQueue>, storedLineage: String?) -> [String]? {
-        switch legacy {
-        case .found(let file):
-            return storedLineage == nil || file.token != storedLineage ? file.requests : nil
-        case .absent, .unreadable:
-            return storedLineage == nil ? [] : nil
-        }
-    }
-
-    /// Brings `Countly.dat` in line with rows that are the newer queue: the mirror is
-    /// written again if it holds anything else, and an instance that does not mirror
-    /// removes the file a take over left behind.
-    private func tidyLegacyFile(_ legacy: StoredFile<LegacyQueue>, rows: [QueuedRequest]) {
-        guard mirrorsLegacyFile else {
-            removeItem(files.legacy, "the legacy file of a queue taken over earlier")
-            return
-        }
-        if case .found(let file) = legacy, file.requests.elementsEqual(rows.map(\.request)) { return }
-        isMirrorDirty = true
     }
 
     /// What an open database holds.
@@ -373,7 +342,7 @@ final class RequestQueueDatabase: @unchecked Sendable {
     ///
     /// - Parameter pendingToken: The token of a pending file whose requests `queue`
     ///   holds. Committed with the rows, so the next load does not fold it in again.
-    /// - Returns: The mirror token the rows are committed under, or `nil` when nothing
+    /// - Returns: The lineage token the rows are committed under, or `nil` when nothing
     ///   could be committed, which the next sync makes up for.
     func sync(_ queue: [QueuedRequest], pendingToken: String?) -> String? {
         guard isAttached else { return nil }
@@ -383,23 +352,29 @@ final class RequestQueueDatabase: @unchecked Sendable {
             connection = reopened
         }
 
+        let legacyDigest = mergedLegacyDigest
         let result = lineage == nil
-            ? commitWholeQueue(queue, pendingToken, isRetry: false)
-            : commitChanges(queue, pendingToken)
-        if result != nil, pendingToken != nil {
+            ? commitWholeQueue(queue, pendingToken, legacyDigest, isRetry: false)
+            : commitChanges(queue, pendingToken, legacyDigest)
+        guard result != nil else { return nil }
+
+        if pendingToken != nil {
             removeItem(files.pending, "a pending file whose requests are committed")
         }
-        scheduleMirror()
+        if legacyDigest != nil {
+            mergedLegacyDigest = nil
+            removeItem(files.legacy, "a legacy file whose requests are committed")
+        }
         return result
     }
 
     /// Writes the difference between the committed rows and `queue`.
-    private func commitChanges(_ queue: [QueuedRequest], _ pendingToken: String?) -> String? {
+    private func commitChanges(_ queue: [QueuedRequest], _ pendingToken: String?, _ legacyDigest: String?) -> String? {
         guard let connection, let lineage else { return nil }
 
         let changes = Self.changes(from: committed, to: queue)
         let changesRows = !changes.removed.isEmpty || !changes.written.isEmpty
-        guard changesRows || pendingToken != nil else { return lineage }
+        guard changesRows || pendingToken != nil || legacyDigest != nil else { return lineage }
 
         do {
             try connection.transaction {
@@ -413,18 +388,13 @@ final class RequestQueueDatabase: @unchecked Sendable {
                 for entry in changes.written {
                     try Self.insert(entry, into: connection)
                 }
-                if let pendingToken {
-                    try Self.setMeta(Self.pendingTokenKey, pendingToken, in: connection)
-                }
+                try Self.setMeta(pendingToken: pendingToken, legacyDigest: legacyDigest, in: connection)
             }
         } catch {
-            return recover(from: error, queue, pendingToken, isRetry: false)
+            return recover(from: error, queue, pendingToken, legacyDigest, isRetry: false)
         }
 
         committed = queue
-        if changesRows, mirrorsLegacyFile {
-            isMirrorDirty = true
-        }
         if queue.isEmpty, !changes.removed.isEmpty {
             releaseFreePages(connection)
         }
@@ -432,46 +402,34 @@ final class RequestQueueDatabase: @unchecked Sendable {
         return lineage
     }
 
-    /// Replaces every row with `queue` under a new token, which `Countly.dat` gets
-    /// first.
-    private func commitWholeQueue(_ queue: [QueuedRequest], _ pendingToken: String?, isRetry: Bool) -> String? {
+    /// Replaces every row with `queue` under a new lineage token.
+    private func commitWholeQueue(_ queue: [QueuedRequest], _ pendingToken: String?, _ legacyDigest: String?, isRetry: Bool) -> String? {
         guard let connection else { return nil }
 
         let token = UUID().uuidString
-        guard stampLegacyFile(queue, token: token) else {
-            logger?.d(Self.module, "sync", "the queue is not committed under a new token, since the legacy file could not take the token, it is tried again on the next sync, requestCount: [\(queue.count)]")
-            return nil
-        }
-
         do {
             try connection.transaction {
                 try connection.run("DELETE FROM requests")
                 for entry in queue {
                     try Self.insert(entry, into: connection)
                 }
-                try Self.setMeta(Self.mirrorTokenKey, token, in: connection)
-                if let pendingToken {
-                    try Self.setMeta(Self.pendingTokenKey, pendingToken, in: connection)
-                }
+                try Self.setMeta(Self.lineageKey, token, in: connection)
+                try Self.setMeta(pendingToken: pendingToken, legacyDigest: legacyDigest, in: connection)
             }
         } catch {
-            return recover(from: error, queue, pendingToken, isRetry: isRetry)
+            return recover(from: error, queue, pendingToken, legacyDigest, isRetry: isRetry)
         }
 
         committed = queue
         lineage = token
-        isMirrorDirty = false
-        if !mirrorsLegacyFile {
-            removeItem(files.legacy, "the legacy file of the queue just taken over")
-        }
-        logger?.d(Self.module, "sync", "the whole queue is committed under a new token, requestCount: [\(queue.count)]")
+        logger?.d(Self.module, "sync", "the whole queue is committed under a new lineage, requestCount: [\(queue.count)]")
         return token
     }
 
     /// Handles a transaction that failed. A database that turns out corrupt is set
     /// aside and the whole queue written into a new one; anything else is left for
     /// the next sync.
-    private func recover(from error: Error, _ queue: [QueuedRequest], _ pendingToken: String?, isRetry: Bool) -> String? {
+    private func recover(from error: Error, _ queue: [QueuedRequest], _ pendingToken: String?, _ legacyDigest: String?, isRetry: Bool) -> String? {
         guard Self.isUnusable(error), !isRetry else {
             logger?.d(Self.module, "sync", "the transaction failed and is made again by the next sync, requestCount: [\(queue.count)], \(Self.describe(error))")
             return nil
@@ -481,7 +439,7 @@ final class RequestQueueDatabase: @unchecked Sendable {
         lineage = nil
         guard setAsideUnusableDatabase(), let reopened = openSettingAsideUnusable("sync", openConnection) else { return nil }
         connection = reopened
-        return commitWholeQueue(queue, pendingToken, isRetry: true)
+        return commitWholeQueue(queue, pendingToken, legacyDigest, isRetry: true)
     }
 
     /// Writes one row, replacing a row under the same sequence.
@@ -492,6 +450,16 @@ final class RequestQueueDatabase: @unchecked Sendable {
     /// Sets one `meta` value.
     private static func setMeta(_ key: String, _ value: String, in connection: SQLiteConnection) throws {
         try connection.run("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", .text(key), .text(value))
+    }
+
+    /// Records the pending file and the `Countly.dat` whose requests a commit holds.
+    private static func setMeta(pendingToken: String?, legacyDigest: String?, in connection: SQLiteConnection) throws {
+        if let pendingToken {
+            try setMeta(pendingTokenKey, pendingToken, in: connection)
+        }
+        if let legacyDigest {
+            try setMeta(legacyDigestKey, legacyDigest, in: connection)
+        }
     }
 
     /// The sequences to delete and the rows to write for `committed` to become
@@ -530,77 +498,21 @@ final class RequestQueueDatabase: @unchecked Sendable {
         }
     }
 
-    // MARK: - Mirror
+    // MARK: - Countly.dat
 
-    /// Makes sure no `Countly.dat` is taken over once a commit under `token` lands, by
-    /// writing `queue` and the token into it.
-    ///
-    /// An instance that mirrors the file gets it written whether or not it exists.
-    /// One that does not mirror only has one an earlier SDK or a take over cut short
-    /// left, and removes it once the commit lands. The file is never removed instead:
-    /// it can hold the very queue being taken over, and a commit that then failed
-    /// would leave that queue nowhere on disk.
-    ///
-    /// - Returns: Whether the commit can go ahead.
-    private func stampLegacyFile(_ queue: [QueuedRequest], token: String) -> Bool {
-        guard mirrorsLegacyFile || FileManager.default.fileExists(atPath: files.legacy.path) else { return true }
-        return writeLegacyFile(queue.map(\.request), token: token)
-    }
-
-    /// Writes the mirror now if the committed rows changed since it was last written.
-    func writeMirrorNow() {
-        guard mirrorsLegacyFile, isMirrorDirty, let lineage else { return }
-        if writeLegacyFile(committed.map(\.request), token: lineage) {
-            isMirrorDirty = false
-        }
-    }
-
-    /// Writes the mirror a moment from now, held against suspension until then.
-    private func scheduleMirror() {
-        guard mirrorsLegacyFile, isMirrorDirty, !isMirrorScheduled, lineage != nil else { return }
-        isMirrorScheduled = true
-        BackgroundTaskGuard.shared.begin()
-        writeQueue.asyncAfter(deadline: .now() + Self.mirrorDelay) { [weak self] in
-            self?.isMirrorScheduled = false
-            self?.writeMirrorNow()
-            BackgroundTaskGuard.shared.end()
-        }
-    }
-
-    /// Archives `requests` into `Countly.dat` the way `CountlyPersistency` does, with
-    /// the token added.
-    private func writeLegacyFile(_ requests: [String], token: String) -> Bool {
-        let payload: [String: Any] = [
-            PersistencyKey.queuedRequests: requests,
-            PersistencyKey.queueMirrorToken: token,
-        ]
-
-        do {
-            let data = try CountlyArchive.encodeRoot(payload)
-            try data.write(to: files.legacy, options: .atomic)
-            logger?.d(Self.module, "writeMirror", "the queue is written to the legacy file the Objective-C SDK reads, requestCount: [\(requests.count)], dataSize: [\(data.count)]")
-            return true
-        } catch {
-            logger?.d(Self.module, "writeMirror", "the legacy file could not be written, it is tried again on the next change, requestCount: [\(requests.count)], \(Self.describe(error))")
-            return false
-        }
-    }
-
-    /// The queue `Countly.dat` holds, and the token of the database it mirrors, `nil`
-    /// when the Objective-C SDK wrote it.
+    /// The queue `Countly.dat` holds, and the SHA-256 of the file.
     private struct LegacyQueue {
         let requests: [String]
-        let token: String?
+        let digest: String
     }
 
     /// Reads `Countly.dat`. A file with no queue under the key was written by neither
-    /// SDK, and is never taken over in place of rows.
+    /// SDK, and nothing is taken from it.
     private func readLegacyFile() -> StoredFile<LegacyQueue> {
         read(files.legacy) { data in
             guard let root = try CountlyArchive.decodeRoot(from: data) as? [String: Any],
                   let stored = root[PersistencyKey.queuedRequests] as? [Any] else { return nil }
-            return LegacyQueue(requests: stored.compactMap { $0 as? String },
-                               token: root[PersistencyKey.queueMirrorToken] as? String)
+            return LegacyQueue(requests: stored.compactMap { $0 as? String }, digest: data.sha256Hex)
         }
     }
 
@@ -611,8 +523,8 @@ final class RequestQueueDatabase: @unchecked Sendable {
     private struct PendingFile: Codable {
         let token: String
 
-        /// The mirror token the queue's rows were committed under, `nil` when a take
-        /// over had not been committed yet or the database could not be read.
+        /// The lineage token the queue's rows were committed under, `nil` when the
+        /// database had not committed a queue yet or could not be read.
         let lineage: String?
 
         /// The highest sequence that was on disk for sure. Requests after it were not
@@ -693,13 +605,13 @@ final class RequestQueueDatabase: @unchecked Sendable {
         return .absent
     }
 
-    /// Removes the database, the mirror, the pending file and a database set aside.
+    /// Removes the database, the pending file, `Countly.dat` and a database set aside.
     func deleteEverything() {
         connection?.close()
         connection = nil
         committed.removeAll()
         lineage = nil
-        isMirrorDirty = false
+        mergedLegacyDigest = nil
 
         for url in Self.sqliteFiles(of: files.database) + Self.sqliteFiles(of: files.setAside) + [files.pending, files.legacy] {
             removeItem(url, "a file of the request queue")

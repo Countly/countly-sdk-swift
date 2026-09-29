@@ -201,10 +201,6 @@ enum PersistencyKey {
     static let isCustomDeviceID = "kCountlyIsCustomDeviceIDKey"
     static let remoteConfig = "kCountlyRemoteConfigKey"
     static let serverConfig = "kCountlyServerConfigPersistencyKey"
-
-    /// Carried next to the queue in the `Countly.dat` mirror, and never written by
-    /// the Objective-C SDK, which saves back only the queue key.
-    static let queueMirrorToken = "kCountlyQueueMirrorToken"
 }
 
 /// The sentinel device ID that means "hold everything until a real ID arrives".
