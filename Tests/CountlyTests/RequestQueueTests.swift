@@ -524,22 +524,22 @@ final class RequestQueueTests: CountlyBaseTestCase {
         enqueue(store, "app_key=k&n=1")
         store.saveSync()
 
-        var rowsAtTheCrash: [String] = []
-        var nextLaunch: [String] = []
+        let rowsAtTheCrash = Recorded<[String]>([])
+        let nextLaunch = Recorded<[String]>([])
         let crashed = expectation(description: "the crash handler ran on the write queue")
         store.save {
             // What the crash handler does: remove what was sent, queue the report, save synchronously.
             store.removeHead(store.head ?? "")
             self.enqueue(store, "app_key=k&n=crash")
             store.saveSync()
-            rowsAtTheCrash = self.databaseRows(namespace)
-            nextLaunch = RequestQueueStore(namespace: namespace, logger: nil).snapshot
+            rowsAtTheCrash.value = self.databaseRows(namespace)
+            nextLaunch.value = RequestQueueStore(namespace: namespace, logger: nil).snapshot
             crashed.fulfill()
         }
         wait(for: [crashed], timeout: TestUtils.asyncTimeout)
 
-        XCTAssertEqual(TestUtils.names(rowsAtTheCrash), ["0", "1"], "the crash handler touched the database")
-        XCTAssertEqual(TestUtils.names(nextLaunch), ["1", "crash"], "the next launch did not fold in the pending file")
+        XCTAssertEqual(TestUtils.names(rowsAtTheCrash.value), ["0", "1"], "the crash handler touched the database")
+        XCTAssertEqual(TestUtils.names(nextLaunch.value), ["1", "crash"], "the next launch did not fold in the pending file")
 
         store.saveSync()
         XCTAssertEqual(TestUtils.names(databaseRows(namespace)), ["1", "crash"])

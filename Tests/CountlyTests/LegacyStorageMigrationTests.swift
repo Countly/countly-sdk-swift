@@ -304,7 +304,7 @@ final class LegacyStorageMigrationTests: CountlyBaseTestCase {
 
         // Everything after the crash runs on the write queue, so this store never
         // syncs again, as a process that died there would not.
-        var nextLaunch: [String] = []
+        let nextLaunch = Recorded<[String]>([])
         let crashed = expectation(description: "the crash handler ran on the write queue")
         store.save {
             store.enqueue("app_key=k&n=crash", appVersion: "1.0", trackingEnabled: true)
@@ -314,12 +314,12 @@ final class LegacyStorageMigrationTests: CountlyBaseTestCase {
             } catch {
                 XCTFail("the Objective-C SDK's queue could not be written: \(error)")
             }
-            nextLaunch = RequestQueueStore(namespace: namespace, logger: nil).snapshot
+            nextLaunch.value = RequestQueueStore(namespace: namespace, logger: nil).snapshot
             crashed.fulfill()
         }
         wait(for: [crashed], timeout: TestUtils.asyncTimeout)
 
-        XCTAssertEqual(TestUtils.names(nextLaunch), ["0", "1", "crash", "queued-by-objc"])
+        XCTAssertEqual(TestUtils.names(nextLaunch.value), ["0", "1", "crash", "queued-by-objc"])
     }
 
     /// A crash after a load merged `Countly.dat` but before a sync committed it leaves

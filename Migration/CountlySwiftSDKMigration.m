@@ -302,10 +302,12 @@ static const sqlite3_int64 kSchemaVersion = 1;
 }
 
 /// Removes every row, and records the pending file folded in, so a database that
-/// outlives this run moves nothing again.
+/// outlives this run moves nothing again. Forgets the digest of the "Countly.dat"
+/// the Swift SDK merged as well: the file written now can have the same bytes, and
+/// holds requests this database no longer does.
 + (void)emptyDatabase:(sqlite3 *)database recordingPendingToken:(NSString *)token
 {
-    if (sqlite3_exec(database, "BEGIN IMMEDIATE; DELETE FROM requests;", NULL, NULL, NULL) != SQLITE_OK)
+    if (sqlite3_exec(database, "BEGIN IMMEDIATE; DELETE FROM requests; DELETE FROM meta WHERE key = 'legacy_digest';", NULL, NULL, NULL) != SQLITE_OK)
     {
         sqlite3_exec(database, "ROLLBACK", NULL, NULL, NULL);
         return;

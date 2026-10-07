@@ -264,6 +264,27 @@ final class SwiftSDKMigrationTests: CountlyBaseTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: files.legacy.path))
     }
 
+    /// A database the migration emptied but could not remove names no `Countly.dat`:
+    /// the file it wrote can have the very bytes of the one this SDK merged, and is
+    /// not taken for that one on the next launch.
+    func testADatabaseLeftBehindDoesNotHideTheMovedQueue() throws {
+        try LegacyStorageMigrationTests.legacyQueueFile.write(to: legacyQueueFileURL(namespace))
+        withStore { _ in }
+        try moveFilesIntoDirectory()
+        // A hard link keeps the database the migration removes, as a removal that failed would.
+        let leftBehind = directory.appendingPathComponent("left-behind.sqlite")
+        try FileManager.default.linkItem(at: files.database, to: leftBehind)
+
+        XCTAssertTrue(migrate())
+        let moved = try legacyQueue()
+        XCTAssertEqual(moved.count, 3)
+
+        try FileManager.default.moveItem(at: leftBehind, to: files.database)
+        try LegacyStorageMigrationTests.legacyQueueFile.write(to: files.legacy)
+        XCTAssertTrue(migrate())
+        XCTAssertEqual(try legacyQueue(), moved, "the moved queue was taken for the file this SDK merged, and dropped")
+    }
+
     /// Coming back to this SDK after countly-sdk-ios sent part of the moved queue
     /// brings back only what it did not send.
     func testThisSDKReadsTheMovedQueueBack() throws {

@@ -319,3 +319,14 @@ enum TestUtils {
         }
     }
 }
+
+/// A value a `@Sendable` closure records for the test, which reads it only after
+/// waiting on an expectation that closure fulfills. Such a closure cannot write a
+/// captured `var`, which Swift 5.10 reports as an error.
+final class Recorded<Value>: @unchecked Sendable {
+    var value: Value
+
+    init(_ value: Value) {
+        self.value = value
+    }
+}
