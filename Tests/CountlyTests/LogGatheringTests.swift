@@ -37,6 +37,7 @@ final class LogGatheringTests: CountlyBaseTestCase {
         private let lock = NSLock()
         private var _tracking = true
         private var _consent = true
+        private var _granted = Set(ConsentFeature.allCases)
         private var _refuse = false
         private var _payloads: [String] = []
         private var _threads: [Thread] = []
@@ -49,6 +50,24 @@ final class LogGatheringTests: CountlyBaseTestCase {
         var hasAnyConsent: Bool {
             get { lock.lock(); defer { lock.unlock() }; return _consent }
             set { lock.lock(); _consent = newValue; lock.unlock() }
+        }
+
+        /// The features consented to. Setting it also settles `hasAnyConsent`, so
+        /// a test states the consent state once.
+        var granted: Set<ConsentFeature> {
+            get { lock.lock(); defer { lock.unlock() }; return _granted }
+            set {
+                lock.lock()
+                _granted = newValue
+                _consent = !newValue.isEmpty
+                lock.unlock()
+            }
+        }
+
+        func hasConsent(for feature: ConsentFeature) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return _granted.contains(feature)
         }
 
         /// When set, the queue refuses every batch, as it does when tracking flips
@@ -100,9 +119,13 @@ final class LogGatheringTests: CountlyBaseTestCase {
         return LogGatheringDirective.parse(raw, logger: nil)
     }
 
-    private func capture(_ gatherer: LogGatherer, _ count: Int, level: CountlyLogLevel = .debug, message: String? = nil) {
+    private func capture(_ gatherer: LogGatherer,
+                         _ count: Int,
+                         level: CountlyLogLevel = .debug,
+                         message: String? = nil,
+                         scope: LogGatheringScope = .sdk) {
         for index in 0..<count {
-            gatherer.capture("\(message ?? harnessPrefix) \(index)", level: level)
+            gatherer.capture("\(message ?? harnessPrefix) \(index)", level: level, scope: scope, headerLength: 0)
         }
     }
 
@@ -297,7 +320,7 @@ final class LogGatheringTests: CountlyBaseTestCase {
 
     func testALongMessageIsCutNotDropped() throws {
         let gatherer = makeGatherer()
-        gatherer.capture("xxx" + String(repeating: "x", count: maxMessageLength + 500), level: .debug)
+        gatherer.capture("xxx" + String(repeating: "x", count: maxMessageLength + 500), level: .debug, scope: .sdk, headerLength: 0)
 
         let stored = try XCTUnwrap(gatherer.heldLines.first?.message)
         XCTAssertEqual(stored.utf16.count, maxMessageLength)
@@ -307,7 +330,7 @@ final class LogGatheringTests: CountlyBaseTestCase {
     func testTheCutNeverSplitsASurrogatePair() throws {
         let gatherer = makeGatherer()
         // One code unit short of the limit, then an emoji that needs two.
-        gatherer.capture(String(repeating: "a", count: maxMessageLength - 1) + "😀", level: .debug)
+        gatherer.capture(String(repeating: "a", count: maxMessageLength - 1) + "😀", level: .debug, scope: .sdk, headerLength: 0)
 
         let stored = try XCTUnwrap(gatherer.heldLines.first?.message)
         XCTAssertLessThanOrEqual(stored.utf16.count, maxMessageLength)
@@ -321,8 +344,8 @@ final class LogGatheringTests: CountlyBaseTestCase {
         let gatherer = makeGatherer()
         gatherer.apply(directive(id: "gather_marker"), source: "test")
 
-        gatherer.capture("request started &sdk_logs={\"i\":\"x\"}", level: .debug)
-        gatherer.capture("plain line", level: .debug)
+        gatherer.capture("request started &sdk_logs={\"i\":\"x\"}", level: .debug, scope: .sdk, headerLength: 0)
+        gatherer.capture("plain line", level: .debug, scope: .sdk, headerLength: 0)
 
         XCTAssertEqual(messages(gatherer), ["plain line"])
     }
@@ -501,6 +524,171 @@ final class LogGatheringTests: CountlyBaseTestCase {
         gatherer.flushNow()
         XCTAssertEqual(transport.payloads.count, 1)
         XCTAssertEqual(gatherer.heldLineCount, 0)
+    }
+
+    // MARK: - Consent, per line
+
+    /// Collects what the developer facing sink was handed, so a test can compare
+    /// it against what the same call uploaded.
+    private final class LogSink: CountlyLoggerDelegate {
+        private let lock = NSLock()
+        private var _lines: [String] = []
+
+        var lines: [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return _lines
+        }
+
+        func internalLog(_ log: String, level: CountlyLogLevel) {
+            lock.lock()
+            _lines.append(log)
+            lock.unlock()
+        }
+    }
+
+    /// The messages of the lines of the first uploaded batch, in order.
+    private func uploadedMessages(_ transport: FakeTransport) -> [String] {
+        guard let batch = transport.batches.first else { return [] }
+        return lines(in: batch).compactMap { $0["m"] as? String }
+    }
+
+    /// Mirrored on purpose, as the numbers above are: the wording is what an
+    /// operator reads in the dashboard when a feature was not consented to.
+    private func redactionNotice(_ wireName: String) -> String {
+        "no consent for [\(wireName)], the rest of this line is redacted"
+    }
+
+    /// The scope table is the whole of the per feature rule, so a module that
+    /// writes user data and is missing from it is the bug this guards against. A
+    /// name nobody has classified is cross cutting, never the SDK's own working.
+    func testEveryLogModuleIsClassified() {
+        let byFeature: [String: ConsentFeature] = [
+            "Events": .events, "Views": .viewTracking, "UserProfile": .userDetails,
+            "Sessions": .sessions, "Location": .location, "Crash": .crashReporting,
+            "CrashLogStore": .crashReporting, "Push": .pushNotifications,
+            "PushRuntime": .pushNotifications, "Attribution": .attribution,
+            "APM": .performanceMonitoring, "Feedback": .feedback,
+            "RemoteConfig": .remoteConfig, "Content": .content, "DeviceMetrics": .metrics,
+        ]
+        for (module, feature) in byFeature {
+            XCTAssertEqual(LogGatheringScope.ofModule(module), .feature(feature), "module \(module)")
+        }
+
+        let ownWorking = ["Countly", "Consent", "DeviceID", "ConnectionTest", "ConnectionManager",
+                          "RequestBuilder", "RequestQueue", "KeyValueStore", "Storage", "ServerConfig",
+                          "HealthTracker", "Lifecycle", "WebView", "LogGathering", "Utils"]
+        for module in ownWorking {
+            XCTAssertEqual(LogGatheringScope.ofModule(module), .sdk, "module \(module)")
+        }
+
+        XCTAssertEqual(LogGatheringScope.ofModule("Limits"), .anyFeature, "the limit checks quote whatever they truncated")
+        XCTAssertEqual(LogGatheringScope.ofModule("Module"), .anyFeature, "the unoverridden module name is not a licence to upload")
+        XCTAssertEqual(LogGatheringScope.ofModule("SomethingAddedLater"), .anyFeature)
+    }
+
+    func testALineGoesOutWholeOnlyWithTheConsentOfTheFeatureItCarries() throws {
+        let transport = FakeTransport()
+        let gatherer = makeGatherer(transport)
+        transport.granted = [.sessions]
+        gatherer.apply(directive(id: "gather_feature"), source: "test")
+
+        let eventHeader = "[Events] recordEvent, "
+        let viewHeader = "[Views] startView, "
+        let sessionHeader = "[Sessions] beginSession, "
+        let queueHeader = "[RequestQueue] enqueue, "
+
+        gatherer.capture(eventHeader + "recording an event, key: [cart_opened], segmentationKeys: [price]",
+                         level: .debug, scope: .feature(.events), headerLength: eventHeader.count)
+        gatherer.capture(viewHeader + "starting a view, name: [Checkout]",
+                         level: .debug, scope: .feature(.viewTracking), headerLength: viewHeader.count)
+        gatherer.capture(sessionHeader + "a session is begun, durationSeconds: [0]",
+                         level: .debug, scope: .feature(.sessions), headerLength: sessionHeader.count)
+        gatherer.capture(queueHeader + "request is stored in the queue, queryStringLength: [410]",
+                         level: .debug, scope: .sdk, headerLength: queueHeader.count)
+
+        gatherer.flushNow()
+
+        let uploaded = uploadedMessages(transport)
+        XCTAssertEqual(uploaded, [
+            eventHeader + redactionNotice("events"),
+            viewHeader + redactionNotice("views"),
+            sessionHeader + "a session is begun, durationSeconds: [0]",
+            queueHeader + "request is stored in the queue, queryStringLength: [410]",
+        ])
+
+        let whole = uploaded.joined()
+        XCTAssertFalse(whole.contains("cart_opened"), "an event key reached the server without events consent")
+        XCTAssertFalse(whole.contains("Checkout"), "a view name reached the server without views consent")
+        XCTAssertFalse(whole.contains("price"), "segmentation reached the server without events consent")
+    }
+
+    func testACrossCuttingLineNeedsEveryConsent() throws {
+        let transport = FakeTransport()
+        let gatherer = makeGatherer(transport)
+        transport.granted = Set(ConsentFeature.allCases).subtracting([.metrics])
+        gatherer.apply(directive(id: "gather_cross"), source: "test")
+
+        let header = "[Limits] truncatedValue, "
+        let message = header + "truncated value detail, target: [Event segmentation], fullValue: [steve@example.com]"
+        gatherer.capture(message, level: .verbose, scope: .anyFeature, headerLength: header.count)
+        gatherer.flushNow()
+
+        // The helper cannot say whose value it truncated, so one missing consent
+        // is enough to redact it, and the notice names the one that is missing.
+        XCTAssertEqual(uploadedMessages(transport), [header + redactionNotice("metrics")])
+
+        transport.granted = Set(ConsentFeature.allCases)
+        gatherer.capture(message, level: .verbose, scope: .anyFeature, headerLength: header.count)
+        gatherer.flushNow()
+        XCTAssertEqual(uploadedMessages(transport).count, 1)
+        XCTAssertEqual(transport.batches.count, 2)
+        XCTAssertEqual(lines(in: transport.batches[1]).compactMap { $0["m"] as? String }, [message],
+                       "with every consent given the line goes out as it was logged")
+    }
+
+    func testARedactedLineIsRedactedOnTheWireOnlyAndCanStillGoOutWholeLater() throws {
+        let transport = FakeTransport()
+        let gatherer = makeGatherer(transport)
+        transport.granted = [.sessions]
+        transport.refuses = true
+        gatherer.apply(directive(id: "gather_restore"), source: "test")
+
+        let header = "[Events] recordEvent, "
+        let message = header + "recording an event, key: [cart_opened]"
+        gatherer.capture(message, level: .debug, scope: .feature(.events), headerLength: header.count)
+        gatherer.flushNow()
+
+        XCTAssertTrue(transport.payloads.isEmpty)
+        XCTAssertEqual(messages(gatherer), [message], "the buffer holds what was logged, redaction happens on the way out")
+
+        transport.refuses = false
+        transport.granted = [.sessions, .events]
+        gatherer.flushNow()
+        XCTAssertEqual(uploadedMessages(transport), [message])
+    }
+
+    func testTheLocalLogKeepsWhatTheUploadedCopyLoses() throws {
+        let transport = FakeTransport()
+        let gatherer = makeGatherer(transport)
+        transport.granted = [.sessions]
+        gatherer.apply(directive(id: "gather_local"), source: "test")
+
+        let sink = LogSink()
+        let logger = Logger(instanceName: nil)
+        logger.delegate = sink
+        logger.level = .verbose
+        logger.gatherer = gatherer
+
+        logger.d("Events", "recordEvent", "recording an event, key: [cart_opened], segmentationKeys: [price]")
+        gatherer.flushNow()
+
+        let local = try XCTUnwrap(sink.lines.first)
+        XCTAssertTrue(local.contains("key: [cart_opened]"), "the developer log has to keep showing what the method was called with")
+        XCTAssertTrue(local.contains("segmentationKeys: [price]"))
+
+        let uploaded = try XCTUnwrap(uploadedMessages(transport).first)
+        XCTAssertEqual(uploaded, "[Events] recordEvent, " + redactionNotice("events"))
     }
 
     // MARK: - Wired into the SDK

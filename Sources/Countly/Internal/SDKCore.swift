@@ -159,6 +159,10 @@ extension SDKCore: LogGatheringTransport {
         modules.consent.hasAnyConsent
     }
 
+    func hasConsent(for feature: ConsentFeature) -> Bool {
+        modules.consent.hasConsent(for: feature)
+    }
+
     func sendSdkLogs(_ payload: String) -> Bool {
         network.sendSdkLogs(payload)
     }

@@ -359,7 +359,9 @@ final class WebViewManager: NSObject {
 
         // Host and path only: the query string carries the app key and device ID.
         core.logger.i(Self.module, "present", "web view presentation requested, host: [\(url.host ?? "")], path: [\(url.path)], isFeedbackWidget: [\(isFeedbackWidget)], pinnedToPortrait: [\(isPinnedToPortrait)]")
-        core.logger.v(Self.module, "present", "web view presentation detail, url: [\(url.absoluteString)], appearCallbackProvided: [\(appear != nil)], dismissCallbackProvided: [\(dismiss != nil)]")
+        // The widget URL carries the request essentials, and the surface serves
+        // both content and feedback, so the line belongs to neither alone.
+        core.logger.v(Self.module, "present", scope: .anyFeature, "web view presentation detail, url: [\(url.absoluteString)], appearCallbackProvided: [\(appear != nil)], dismissCallbackProvided: [\(dismiss != nil)]")
 
         appearBlock = appear
         dismissBlock = dismiss

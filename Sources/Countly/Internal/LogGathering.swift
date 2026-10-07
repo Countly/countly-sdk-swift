@@ -109,13 +109,77 @@ struct LogGatheringDirective: Equatable {
     }
 }
 
+/// What the user data in a gathered log line belongs to, and so whose consent
+/// the line needs before it may leave the device.
+///
+/// Log gathering never gets a consent of its own: a consent for logging could
+/// override the choices the user actually made. A line goes out under the
+/// consent of whatever it quotes instead, and a line that quotes nothing of the
+/// user's goes out as it is.
+enum LogGatheringScope: Equatable {
+
+    /// The SDK's own working: state, storage, networking, timing. Always uploaded.
+    case sdk
+
+    /// Data of one feature. Uploaded as logged only with that feature's consent.
+    case feature(ConsentFeature)
+
+    /// A line from a cross cutting helper, which can quote any feature's data and
+    /// cannot say which. Uploaded as logged only when every feature is consented
+    /// to.
+    case anyFeature
+
+    /// The scope of the lines a log module writes.
+    ///
+    /// Attribution is by module because the module is the one thing the logger
+    /// already holds for every line, and in this SDK a module is a feature. A
+    /// name this table does not know is cross cutting rather than the SDK's own
+    /// working, so a module added later cannot start uploading user data by being
+    /// forgotten here.
+    static func ofModule(_ module: String) -> LogGatheringScope {
+        switch module {
+        case "Events": return .feature(.events)
+        case "Views": return .feature(.viewTracking)
+        case "UserProfile": return .feature(.userDetails)
+        case "Sessions": return .feature(.sessions)
+        case "Location": return .feature(.location)
+        // The crash log store writes the breadcrumbs it was handed.
+        case "Crash", "CrashLogStore": return .feature(.crashReporting)
+        case "Push", "PushRuntime": return .feature(.pushNotifications)
+        case "Attribution": return .feature(.attribution)
+        case "APM": return .feature(.performanceMonitoring)
+        case "Feedback": return .feature(.feedback)
+        case "RemoteConfig": return .feature(.remoteConfig)
+        case "Content": return .feature(.content)
+        case "DeviceMetrics": return .feature(.metrics)
+
+        // The limit checks quote whatever key or value they truncated, which
+        // belongs to whichever feature happened to call them.
+        case "Limits": return .anyFeature
+
+        // The request path reports lengths, endpoints and counts rather than
+        // bodies, and the few lines that do quote a whole request say so at the
+        // call site. Health check and server config traffic is the SDK's own.
+        case "Countly", "Consent", "DeviceID", "ConnectionTest", "ConnectionManager",
+             "RequestBuilder", "RequestQueue", "KeyValueStore", "Storage", "ServerConfig",
+             "HealthTracker", "Lifecycle", "WebView", "LogGathering", "Utils":
+            return .sdk
+
+        default: return .anyFeature
+        }
+    }
+}
+
 /// What the gatherer needs from the rest of the SDK to deliver a batch.
 protocol LogGatheringTransport: AnyObject {
     /// Whether behavior settings allow requests to be queued at all.
     var isTrackingEnabled: Bool { get }
-    /// Whether any consent is given. Gathered lines quote event keys, segmentation
-    /// and whole requests, so they are user data.
+    /// Whether any consent is given. Nothing is uploaded, not even a redacted
+    /// line, while this is false.
     var hasAnyConsent: Bool { get }
+    /// Whether one feature is consented to, which decides whether a line carrying
+    /// that feature's user data goes out as logged or redacted.
+    func hasConsent(for feature: ConsentFeature) -> Bool
     /// Queues one `sdk_logs` batch. Returns whether the queue took it.
     func sendSdkLogs(_ payload: String) -> Bool
 }
@@ -156,11 +220,53 @@ final class LogGatherer {
     /// would nest the previous one and an idle SDK would gather forever.
     static let transportMarker = QS.sdkLogs
 
+    /// What replaces the body of a line whose feature is not consented to.
+    ///
+    /// Worded as a consent state rather than as a loss, because that is what an
+    /// operator reading the batch has to act on.
+    static func redactionNotice(_ missing: ConsentFeature) -> String {
+        "no consent for [\(missing.wireName)], the rest of this line is redacted"
+    }
+
     /// One gathered line, already truncated.
     struct Line: Equatable {
         let timestamp: Int64
         let level: String
         let message: String
+
+        /// Whose consent this line needs before it may go out as logged.
+        let scope: LogGatheringScope
+
+        /// How many characters at the front of `message` are the
+        /// `[module] function, ` header. Redaction keeps them and drops the rest,
+        /// which is the only part that can quote the user's own data. Held as a
+        /// length rather than a copy of the header, so the buffer still holds
+        /// every character of a line exactly once.
+        let headerLength: Int
+
+        /// The feature whose consent this line lacks, or nil when it may go out
+        /// as logged.
+        func missingConsent(in granted: Set<ConsentFeature>) -> ConsentFeature? {
+            switch scope {
+            case .sdk:
+                return nil
+            case .feature(let feature):
+                return granted.contains(feature) ? nil : feature
+            case .anyFeature:
+                return ConsentFeature.allCases.first { !granted.contains($0) }
+            }
+        }
+
+        /// The message this line is uploaded with: as logged when its feature is
+        /// consented to, and the header plus a notice otherwise.
+        ///
+        /// The header is kept because the call a method was made from is what
+        /// makes a gathered log readable, and it names only the SDK's own modules
+        /// and functions.
+        func uploadMessage(in granted: Set<ConsentFeature>) -> String {
+            guard let missing = missingConsent(in: granted) else { return message }
+            return String(message.prefix(headerLength)) + LogGatherer.redactionNotice(missing)
+        }
     }
 
     /// One batch taken out of the buffer, with what it was built from so a refused
@@ -361,7 +467,11 @@ final class LogGatherer {
     // MARK: - Capture
 
     /// Holds one line. Called by the logger for every line anything wants.
-    func capture(_ message: String, level: CountlyLogLevel) {
+    ///
+    /// `scope` and `headerLength` are what the consent check at delivery works
+    /// from. They are taken here rather than resolved later because the module
+    /// a line came from is known only while it is being logged.
+    func capture(_ message: String, level: CountlyLogLevel, scope: LogGatheringScope, headerLength: Int) {
         guard !isTransportWork else { return }
         guard !message.contains(Self.transportMarker) else { return }
 
@@ -382,7 +492,9 @@ final class LogGatherer {
 
         let line = Line(timestamp: Int64(Date().timeIntervalSince1970 * 1000),
                         level: String(levelChar),
-                        message: message.countlyPrefix(Self.maxMessageLength))
+                        message: message.countlyPrefix(Self.maxMessageLength),
+                        scope: scope,
+                        headerLength: headerLength)
         lines.append(line)
         heldChars += line.message.countlyLength
         trimBufferLocked()
@@ -456,10 +568,16 @@ final class LogGatherer {
                 return
             }
 
+            // Read once for the whole delivery: consent granted halfway through
+            // would otherwise redact some lines of a feature and not others, and
+            // the batch would be read as if the user had changed their mind
+            // mid-line.
+            let granted = Set(ConsentFeature.allCases.filter { transport.hasConsent(for: $0) })
+
             // A flush drains the full batches first and the partial tail last, so
             // the tail is never uploaded ahead of older lines.
             while let batch = takeBatch(includePartialBatch: includePartialBatch) {
-                guard let payload = serialize(batch) else {
+                guard let payload = serialize(batch, granted: granted) else {
                     // Putting an unserializable batch back would make it the head of
                     // every later delivery, so it is lost and counted.
                     logger?.w(Self.module, "deliver", "a gathered log batch could not be serialized and is dropped, lineCount: [\(batch.lines.count)]")
@@ -467,7 +585,8 @@ final class LogGatherer {
                     continue
                 }
 
-                logger?.d(Self.module, "deliver", "uploading a gathered log batch, lineCount: [\(batch.lines.count)], droppedCount: [\(batch.dropped)], payloadLength: [\(payload.count)]")
+                let redactedCount = batch.lines.filter { $0.missingConsent(in: granted) != nil }.count
+                logger?.d(Self.module, "deliver", "uploading a gathered log batch, lineCount: [\(batch.lines.count)], redactedLineCount: [\(redactedCount)], droppedCount: [\(batch.dropped)], payloadLength: [\(payload.count)]")
                 guard transport.sendSdkLogs(payload) else {
                     restore(batch)
                     return
@@ -517,9 +636,14 @@ final class LogGatherer {
         droppedCount += batch.lines.count + batch.dropped
     }
 
-    private func serialize(_ batch: Batch) -> String? {
-        let payloadLines: [[String: Any]] = batch.lines.map {
-            [LineKey.timestamp: $0.timestamp, LineKey.level: $0.level, LineKey.message: $0.message]
+    /// Builds the wire payload of a batch, redacting every line whose feature is
+    /// not in `granted`. The held lines keep what they were logged with, so a
+    /// batch the queue refuses can go out whole once consent arrives.
+    private func serialize(_ batch: Batch, granted: Set<ConsentFeature>) -> String? {
+        let payloadLines: [[String: Any]] = batch.lines.map { line in
+            [LineKey.timestamp: line.timestamp,
+             LineKey.level: line.level,
+             LineKey.message: line.uploadMessage(in: granted)]
         }
         let payload: [String: Any] = [
             BatchKey.gatherID: batch.gatherID,
