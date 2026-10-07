@@ -72,6 +72,11 @@ enum TestUtils {
 
     // MARK: - Parsing
 
+    /// The `n` parameter of each request, which is how the queue tests name them.
+    static func names(_ requests: [String]) -> [String?] {
+        requests.map { parseQuery($0)["n"] as? String }
+    }
+
     /// Splits a queued query string into its parameters, percent-decoding both
     /// sides and parsing any value that is a JSON object or array.
     ///
@@ -312,5 +317,16 @@ enum TestUtils {
         default:
             return "\(value)"
         }
+    }
+}
+
+/// A value a `@Sendable` closure records for the test, which reads it only after
+/// waiting on an expectation that closure fulfills. Such a closure cannot write a
+/// captured `var`, which Swift 5.10 reports as an error.
+final class Recorded<Value>: @unchecked Sendable {
+    var value: Value
+
+    init(_ value: Value) {
+        self.value = value
     }
 }

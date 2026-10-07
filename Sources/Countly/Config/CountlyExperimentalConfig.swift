@@ -9,7 +9,8 @@
 import Foundation
 
 /// Features that are still being shaped and may change without a major version.
-public final class CountlyExperimentalConfig {
+@objcMembers
+public final class CountlyExperimentalConfig: NSObject {
 
     /// Adds `previous_view_name` to view segmentation and `previous_event_name`
     /// to event segmentation.
@@ -19,5 +20,5 @@ public final class CountlyExperimentalConfig {
     /// the foreground when the data point was recorded.
     public var enableVisibilityTracking: Bool = false
 
-    public init() {}
+    public override init() {}
 }

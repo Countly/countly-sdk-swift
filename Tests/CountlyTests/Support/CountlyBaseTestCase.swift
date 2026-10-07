@@ -6,6 +6,7 @@
 //  Please visit www.count.ly for more information.
 //
 
+import SQLite3
 import XCTest
 @testable import Countly
 
@@ -28,6 +29,10 @@ class CountlyBaseTestCase: XCTestCase {
     /// Started instances, halted in reverse order at the end of the test.
     private var started: [CountlyInstance] = []
 
+    /// Request queue stores the test opened itself. Each deletes its files in
+    /// `tearDown`, so a sync it still has queued cannot write a file back later.
+    private var openedStores: [RequestQueueStore] = []
+
     override func setUp() {
         super.setUp()
         MockURLProtocol.reset()
@@ -38,6 +43,10 @@ class CountlyBaseTestCase: XCTestCase {
             instance.halt(clearStorage: true)
         }
         started.removeAll()
+        for store in openedStores {
+            store.deleteFile()
+        }
+        openedStores.removeAll()
         MockURLProtocol.reset()
         super.tearDown()
     }
@@ -138,6 +147,85 @@ class CountlyBaseTestCase: XCTestCase {
     /// Every request this instance has queued but not yet had accepted.
     func requestQueue(of instance: CountlyInstance) -> [String] {
         core(of: instance).requestQueueStore.snapshot
+    }
+
+    // MARK: - Request queue files
+
+    /// Opens a request queue store on `namespace`, deleted with its files at the
+    /// end of the test.
+    func openStore(_ namespace: StorageNamespace) -> RequestQueueStore {
+        let store = RequestQueueStore(namespace: namespace, logger: nil)
+        openedStores.append(store)
+        return store
+    }
+
+    /// The files of a namespace's request queue, as the SDK names them.
+    func queueFiles(_ namespace: StorageNamespace) -> RequestQueueDatabase.Files {
+        RequestQueueDatabase.Files(namespace: namespace, directory: StorageLocation.directoryURL(logger: nil))
+    }
+
+    /// A namespace's `Countly.dat`, where the Objective-C SDK keeps its queue.
+    func legacyQueueFileURL(_ namespace: StorageNamespace) -> URL {
+        queueFiles(namespace).legacy
+    }
+
+    /// A namespace's request queue database.
+    func databaseURL(_ namespace: StorageNamespace) -> URL {
+        queueFiles(namespace).database
+    }
+
+    /// Where a namespace's queue goes when its database cannot take it.
+    func pendingFileURL(_ namespace: StorageNamespace) -> URL {
+        queueFiles(namespace).pending
+    }
+
+    /// Replaces a namespace's database with bytes SQLite cannot read, as a fault on
+    /// disk would leave it.
+    func corruptDatabase(_ namespace: StorageNamespace) throws {
+        for file in RequestQueueDatabase.sqliteFiles(of: databaseURL(namespace)) {
+            try? FileManager.default.removeItem(at: file)
+        }
+        try Data(repeating: 0xAB, count: 8192).write(to: databaseURL(namespace))
+    }
+
+    /// Makes a namespace's database unreadable, as data protection does on a locked
+    /// device, until the returned closure is called or the test ends.
+    @discardableResult
+    func makeDatabaseUnreadable(_ namespace: StorageNamespace) throws -> () throws -> Void {
+        let database = databaseURL(namespace)
+        let restore = { try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: database.path) }
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: database.path)
+        addTeardownBlock { try? restore() }
+        return restore
+    }
+
+    /// The requests committed in a namespace's database, in queue order, read over
+    /// a connection of the test's own. What a process killed right now would find.
+    func databaseRows(_ namespace: StorageNamespace, file: StaticString = #filePath, line: UInt = #line) -> [String] {
+        var database: OpaquePointer?
+        defer { sqlite3_close_v2(database) }
+        guard sqlite3_open_v2(databaseURL(namespace).path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+            XCTFail("the database could not be opened", file: file, line: line)
+            return []
+        }
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(database, "SELECT body FROM requests ORDER BY seq", -1, &statement, nil) == SQLITE_OK else {
+            XCTFail("the requests could not be read: \(String(cString: sqlite3_errmsg(database)))", file: file, line: line)
+            return []
+        }
+
+        var rows: [String] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            rows.append(String(cString: sqlite3_column_text(statement, 0)))
+        }
+        return rows
+    }
+
+    /// Sets the POSIX permissions of a file or directory.
+    func setPermissions(_ permissions: Int, _ url: URL) throws {
+        try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: url.path)
     }
 
     /// Reports a crash to one instance the way the signal handler does: the

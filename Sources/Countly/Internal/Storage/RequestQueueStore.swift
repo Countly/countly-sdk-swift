@@ -11,16 +11,18 @@ import Foundation
 /// The persisted request queue: every request the SDK has produced but not yet
 /// had accepted by the server.
 ///
-/// Data must never be lost, so the queue survives process death by being written
-/// to a file in the application support directory (caches on tvOS). The file
-/// format is a keyed archive of `[key: [String]]`, byte compatible with what
-/// earlier Countly SDKs wrote, so the default instance picks up a queue left
-/// behind by a previous SDK version rather than dropping it.
+/// Data must never be lost, so every change reaches disk right after it is made:
+/// the write queue hands the whole queue to `RequestQueueDatabase`, which commits
+/// what changed as one SQLite transaction. See there for the files, and for how the
+/// queue of countly-sdk-ios comes in.
 ///
 /// Reachable from the crash signal handler, so every log line here stays at debug
 /// or lower. Error and warning logging re-enters the health tracker, which uses
 /// dispatch primitives that are not async-signal-safe.
-final class RequestQueueStore {
+///
+/// Unchecked `Sendable`: the queue is guarded by the lock, and the database is only
+/// touched on the write queue.
+final class RequestQueueStore: @unchecked Sendable {
 
     private static let module = "RequestQueue"
 
@@ -28,13 +30,54 @@ final class RequestQueueStore {
     /// work done on the calling thread when a queue is far over its limit.
     private static let removalLoopLimit = 100
 
-    private let namespace: StorageNamespace
     private weak var logger: Logger?
 
-    /// Guards `requests`. A plain lock rather than a queue because the crash path
-    /// needs a synchronous write with no hop.
+    /// Guards the queue and every property below it. A plain lock rather than a
+    /// queue because the crash path needs a synchronous write with no hop, and a
+    /// recursive one because the crash handler can interrupt a thread holding it.
     private let lock = NSRecursiveLock()
-    private var requests: [String] = []
+
+    /// The queue, oldest first, and always in sequence order: a request is only
+    /// ever appended under a new sequence, rewritten in place, or removed.
+    private var entries: [QueuedRequest] = []
+    private var nextSequence: Int64 = 1
+
+    /// Whether the database could not be read yet. The queue then holds only what
+    /// was recorded since, and the database's queue goes in front of it once a sync
+    /// opens it.
+    private var isDetached = false
+
+    /// Changes meant for the whole queue that were made while detached. They are
+    /// made on the database's queue as well once it opens, since its requests were
+    /// not in memory to receive them.
+    private var detachedChanges: [(inout [QueuedRequest]) -> Void] = []
+
+    /// The head of the queue when the database's queue went in front of it. A drain
+    /// may have been sending it, and its removal is still honoured.
+    private var headDisplacedByAttach: String?
+
+    /// Whether a sync is queued that has not taken its copy of the queue yet, and
+    /// so carries every change made meanwhile as well.
+    private var isSyncScheduled = false
+
+    /// Set once the files are deleted, so a sync queued before that cannot write
+    /// them back.
+    private var isDeleted = false
+
+    /// What the crash handler records about the database in a pending file: the
+    /// lineage token the queue was last committed under, and the highest sequence
+    /// known to be on disk. Kept here because the crash handler must not touch the
+    /// database object, whose state the operation it interrupted may be changing.
+    private var durableLineage: String?
+    private var durableMaxSequence: Int64 = 0
+
+    /// The token of a pending file whose requests the queue holds, until a sync
+    /// commits it and the next load knows the file is folded in.
+    private var pendingFileToken: String?
+
+    /// The token the last sync committed. A pending file left under it holds nothing
+    /// the queue does not, so it may be written over.
+    private var committedPendingFileToken: String?
 
     /// Maximum number of requests kept. Older ones are dropped past this.
     ///
@@ -58,12 +101,35 @@ final class RequestQueueStore {
     /// manager does not start sending a request that is about to be rewritten.
     private(set) var isBeingModified: Bool = false
 
+    /// Runs every database operation, one at a time.
+    private let writeQueue = DispatchQueue(label: "ly.count.requestqueue.write", qos: .utility)
+
+    /// Marks this store's write queue. One key per store, so no store takes another
+    /// store's queue for its own.
+    private let writeQueueKey = DispatchSpecificKey<Bool>()
+
+    private let database: RequestQueueDatabase
+
     /// Reads the queue from disk. Called once per instance at init.
     init(namespace: StorageNamespace, logger: Logger?) {
-        self.namespace = namespace
         self.logger = logger
-        writeQueue.setSpecific(key: Self.writeQueueKey, value: true)
-        load()
+        database = RequestQueueDatabase(namespace: namespace, logger: logger)
+        writeQueue.setSpecific(key: writeQueueKey, value: true)
+
+        if let loaded = database.attach(skippingPendingFile: nil) {
+            entries = loaded.queue
+            nextSequence = loaded.nextSequence
+            durableLineage = loaded.lineage
+            durableMaxSequence = loaded.durableMaxSequence
+            pendingFileToken = loaded.pendingFileToken
+        } else {
+            isDetached = true
+        }
+
+        // The load only reads, so whatever it decided to write is left to this sync.
+        lock.lock()
+        scheduleSyncLocked()
+        lock.unlock()
     }
 
     // MARK: - Queue operations
@@ -72,14 +138,14 @@ final class RequestQueueStore {
     var count: Int {
         lock.lock()
         defer { lock.unlock() }
-        return requests.count
+        return entries.count
     }
 
     /// The request that will be sent next, or `nil` when the queue is empty.
     var head: String? {
         lock.lock()
         defer { lock.unlock() }
-        return requests.first
+        return entries.first?.request
     }
 
     /// A copy of the whole queue, oldest first.
@@ -89,7 +155,7 @@ final class RequestQueueStore {
     var snapshot: [String] {
         lock.lock()
         defer { lock.unlock() }
-        return requests
+        return entries.map(\.request)
     }
 
     /// Appends a request, dropping older ones if the queue is over its limit.
@@ -121,23 +187,31 @@ final class RequestQueueStore {
         defer { lock.unlock() }
 
         trimToLimitLocked()
-        requests.append(stamped)
-        logger?.d(Self.module, "enqueue", "request is stored in the queue, queryStringLength: [\(stamped.count)], queuedRequestCount: [\(requests.count)], storedRequestsLimit: [\(storedRequestsLimit)]")
+        appendLocked(stamped)
+        logger?.d(Self.module, "enqueue", "request is stored in the queue, queryStringLength: [\(stamped.count)], queuedRequestCount: [\(entries.count)], storedRequestsLimit: [\(storedRequestsLimit)]")
         return stamped
     }
 
     /// Makes room for one more request, dropping the oldest when the queue is at
     /// its limit. The caller holds the lock.
     private func trimToLimitLocked() {
-        guard requests.count >= storedRequestsLimit else { return }
+        guard entries.count >= storedRequestsLimit else { return }
 
         removeOldAgeRequestsLocked()
-        guard requests.count >= storedRequestsLimit else { return }
+        guard entries.count >= storedRequestsLimit else { return }
 
-        let exceeded = requests.count - storedRequestsLimit
-        let removeCount = min(min(exceeded, Self.removalLoopLimit) + 1, requests.count)
-        logger?.d(Self.module, "trimToLimitLocked", "the oldest queued requests are dropped because the queue is over its limit, queuedRequestCount: [\(requests.count)], storedRequestsLimit: [\(storedRequestsLimit)], droppedRequestCount: [\(removeCount)], exceededBy: [\(exceeded)]")
-        requests.removeFirst(removeCount)
+        let exceeded = entries.count - storedRequestsLimit
+        let removeCount = min(min(exceeded, Self.removalLoopLimit) + 1, entries.count)
+        logger?.d(Self.module, "trimToLimitLocked", "the oldest queued requests are dropped because the queue is over its limit, queuedRequestCount: [\(entries.count)], storedRequestsLimit: [\(storedRequestsLimit)], droppedRequestCount: [\(removeCount)], exceededBy: [\(exceeded)]")
+        entries.removeFirst(removeCount)
+        scheduleSyncLocked()
+    }
+
+    /// Appends a request under the next sequence. The caller holds the lock.
+    private func appendLocked(_ request: String) {
+        entries.append(QueuedRequest(sequence: nextSequence, request: request))
+        nextSequence += 1
+        scheduleSyncLocked()
     }
 
     /// Appends a request exactly as given, skipping the app version stamping and
@@ -155,22 +229,32 @@ final class RequestQueueStore {
         defer { lock.unlock() }
 
         trimToLimitLocked()
-        requests.append(queryString)
-        logger?.d(Self.module, "appendVerbatim", "a request was stored verbatim, queryStringLength: [\(queryString.count)], queuedRequestCount: [\(requests.count)]")
+        appendLocked(queryString)
+        logger?.d(Self.module, "appendVerbatim", "a request was stored verbatim, queryStringLength: [\(queryString.count)], queuedRequestCount: [\(entries.count)]")
     }
 
     /// Removes the request at the head of the queue, but only if it still is the
-    /// one the caller sent. A request that moved is left alone.
+    /// one the caller sent. A request that moved is left alone, apart from one the
+    /// database's queue was put in front of after a drain read it.
     func removeHead(_ queryString: String) {
         lock.lock()
         defer { lock.unlock() }
 
-        guard requests.first == queryString else {
-            logger?.d(Self.module, "removeHead", "the request that was sent is no longer at the head of the queue and nothing is removed, queryStringLength: [\(queryString.count)], queuedRequestCount: [\(requests.count)]")
+        let displaced = headDisplacedByAttach
+        headDisplacedByAttach = nil
+
+        let index: Int
+        if entries.first?.request == queryString {
+            index = 0
+        } else if queryString == displaced, let found = entries.firstIndex(where: { $0.request == queryString }) {
+            index = found
+        } else {
+            logger?.d(Self.module, "removeHead", "the request that was sent is no longer at the head of the queue and nothing is removed, queryStringLength: [\(queryString.count)], queuedRequestCount: [\(entries.count)]")
             return
         }
-        requests.removeFirst()
-        logger?.d(Self.module, "removeHead", "request at the head of the queue is removed, remainingRequestCount: [\(requests.count)]")
+        entries.remove(at: index)
+        scheduleSyncLocked()
+        logger?.d(Self.module, "removeHead", "request at the head of the queue is removed, remainingRequestCount: [\(entries.count)]")
     }
 
     /// Drops every queued request.
@@ -178,10 +262,10 @@ final class RequestQueueStore {
         lock.lock()
         defer { lock.unlock() }
 
-        if !requests.isEmpty {
-            logger?.d(Self.module, "flush", "the request queue is being emptied and everything still in it is dropped, droppedRequestCount: [\(requests.count)]")
+        if !entries.isEmpty {
+            logger?.d(Self.module, "flush", "the request queue is being emptied and everything still in it is dropped, droppedRequestCount: [\(entries.count)]")
         }
-        requests.removeAll()
+        changeWholeQueueLocked(replacingEarlierChanges: true) { $0.removeAll() }
     }
 
     /// Rewrites queued requests that carry the temporary device ID so they report
@@ -196,17 +280,18 @@ final class RequestQueueStore {
         let temporaryType = "&\(QS.deviceIDType)=\(DeviceIDType.temporary.wireValue)"
         let realType = "&\(QS.deviceIDType)=\(typeValue)"
 
-        var replacedCount = 0
-        isBeingModified = true
-        for index in requests.indices where requests[index].contains(temporaryID) {
-            requests[index] = requests[index]
-                .replacingOccurrences(of: temporaryID, with: realID)
-                .replacingOccurrences(of: temporaryType, with: realType)
-            replacedCount += 1
+        let replacedCount = changeWholeQueueLocked { queue -> Int in
+            var replacedCount = 0
+            for index in queue.indices where queue[index].request.contains(temporaryID) {
+                queue[index].request = queue[index].request
+                    .replacingOccurrences(of: temporaryID, with: realID)
+                    .replacingOccurrences(of: temporaryType, with: realType)
+                replacedCount += 1
+            }
+            return replacedCount
         }
-        isBeingModified = false
 
-        logger?.d(Self.module, "replaceTemporaryDeviceIDs", "queued requests carrying the temporary device ID now carry the real one, replacedRequestCount: [\(replacedCount)], queuedRequestCount: [\(requests.count)], deviceIDType: [\(typeValue)]")
+        logger?.d(Self.module, "replaceTemporaryDeviceIDs", "queued requests carrying the temporary device ID now carry the real one, replacedRequestCount: [\(replacedCount)], queuedRequestCount: [\(entries.count)], deviceIDType: [\(typeValue)]")
     }
 
     /// Rewrites queued requests recorded under a different app key so they report
@@ -216,23 +301,24 @@ final class RequestQueueStore {
         defer { lock.unlock() }
 
         let escaped = appKey.urlEscaped
-        var replacedCount = 0
-        var withoutAppKeyCount = 0
-        isBeingModified = true
-        for index in requests.indices {
-            guard let existing = Self.appKey(in: requests[index]) else {
-                withoutAppKeyCount += 1
-                continue
+        let counts = changeWholeQueueLocked { queue -> (replaced: Int, withoutAppKey: Int) in
+            var replacedCount = 0
+            var withoutAppKeyCount = 0
+            for index in queue.indices {
+                guard let existing = Self.appKey(in: queue[index].request) else {
+                    withoutAppKeyCount += 1
+                    continue
+                }
+                guard existing != escaped else { continue }
+                queue[index].request = queue[index].request.replacingOccurrences(
+                    of: "\(QS.appKey)=\(existing)",
+                    with: "\(QS.appKey)=\(escaped)")
+                replacedCount += 1
             }
-            guard existing != escaped else { continue }
-            requests[index] = requests[index].replacingOccurrences(
-                of: "\(QS.appKey)=\(existing)",
-                with: "\(QS.appKey)=\(escaped)")
-            replacedCount += 1
+            return (replacedCount, withoutAppKeyCount)
         }
-        isBeingModified = false
 
-        logger?.d(Self.module, "replaceAllAppKeys", "queued requests recorded under another app key now carry the current one, replacedRequestCount: [\(replacedCount)], requestsWithoutAnAppKey: [\(withoutAppKeyCount)], queuedRequestCount: [\(requests.count)]")
+        logger?.d(Self.module, "replaceAllAppKeys", "queued requests recorded under another app key now carry the current one, replacedRequestCount: [\(counts.replaced)], requestsWithoutAnAppKey: [\(counts.withoutAppKey)], queuedRequestCount: [\(entries.count)]")
     }
 
     /// Drops queued requests recorded under a different app key.
@@ -240,14 +326,12 @@ final class RequestQueueStore {
         lock.lock()
         defer { lock.unlock() }
 
-        let before = requests.count
+        let before = entries.count
         let escaped = appKey.urlEscaped
-        isBeingModified = true
-        requests = requests.filter { Self.appKey(in: $0) == escaped }
-        isBeingModified = false
+        changeWholeQueueLocked { $0.removeAll { Self.appKey(in: $0.request) != escaped } }
 
-        if before > requests.count {
-            logger?.d(Self.module, "removeDifferentAppKeys", "queued requests recorded under another app key are dropped, droppedRequestCount: [\(before - requests.count)], remainingRequestCount: [\(requests.count)]")
+        if before > entries.count {
+            logger?.d(Self.module, "removeDifferentAppKeys", "queued requests recorded under another app key are dropped, droppedRequestCount: [\(before - entries.count)], remainingRequestCount: [\(entries.count)]")
         }
     }
 
@@ -261,7 +345,7 @@ final class RequestQueueStore {
     /// Whether a request is past the configured drop age. Always `false` when age
     /// based dropping is off.
     func isOldRequest(_ queryString: String) -> Bool {
-        guard requestDropAgeHours > 0, isOldRequestInternal(queryString) else { return false }
+        guard requestDropAgeHours > 0, Self.isOld(queryString, dropAgeHours: requestDropAgeHours) else { return false }
 
         // Only the single request path says this. The bulk drop below runs the
         // same check over the whole queue and reports one count instead.
@@ -269,17 +353,44 @@ final class RequestQueueStore {
         return true
     }
 
+    /// Drops the requests past the drop age. Not kept for the database's queue while
+    /// that has not been read: merging applies the drop to all of it. The caller holds
+    /// the lock.
     private func removeOldAgeRequestsLocked() {
-        guard requestDropAgeHours > 0 else { return }
+        let dropAgeHours = requestDropAgeHours
+        guard dropAgeHours > 0 else { return }
 
-        let before = requests.count
+        let before = entries.count
         isBeingModified = true
-        requests = requests.filter { !isOldRequestInternal($0) }
+        entries.removeAll { Self.isOld($0.request, dropAgeHours: dropAgeHours) }
         isBeingModified = false
 
-        if before > requests.count {
-            logger?.d(Self.module, "removeOldAgeRequests", "queued requests past the configured drop age are dropped, droppedRequestCount: [\(before - requests.count)], requestDropAgeHours: [\(requestDropAgeHours)], remainingRequestCount: [\(requests.count)]")
+        if before > entries.count {
+            scheduleSyncLocked()
+            logger?.d(Self.module, "removeOldAgeRequests", "queued requests past the configured drop age are dropped, droppedRequestCount: [\(before - entries.count)], requestDropAgeHours: [\(requestDropAgeHours)], remainingRequestCount: [\(entries.count)]")
         }
+    }
+
+    /// Makes a change meant for the whole queue, and keeps it for the database's
+    /// queue while that has not been read yet, since its requests are not in memory
+    /// to receive it. The caller holds the lock.
+    ///
+    /// - Parameter replacingEarlierChanges: Whether the change leaves nothing of what
+    ///   the changes kept before it did, as a flush does, so they can go.
+    @discardableResult
+    private func changeWholeQueueLocked<Result>(replacingEarlierChanges: Bool = false,
+                                                _ change: @escaping (inout [QueuedRequest]) -> Result) -> Result {
+        isBeingModified = true
+        let result = change(&entries)
+        isBeingModified = false
+        if isDetached {
+            if replacingEarlierChanges {
+                detachedChanges.removeAll()
+            }
+            detachedChanges.append { _ = change(&$0) }
+        }
+        scheduleSyncLocked()
+        return result
     }
 
     /// The app key a queued request carries.
@@ -299,134 +410,175 @@ final class RequestQueueStore {
         return String(value.prefix(while: { $0 != "&" }))
     }
 
-    private func isOldRequestInternal(_ queryString: String) -> Bool {
-        queryString.requestAgeSeconds / 3600.0 >= Double(requestDropAgeHours)
+    /// Whether a request is at least `dropAgeHours` old.
+    private static func isOld(_ request: String, dropAgeHours: Int) -> Bool {
+        request.requestAgeSeconds / 3600.0 >= Double(dropAgeHours)
     }
 
     // MARK: - Persistence
 
-    /// Serializes writes to the backing file.
-    ///
-    /// Snapshot and write have to stay in the same order: two saves racing on a
-    /// concurrent queue can land in the opposite order to their snapshots, which
-    /// either loses a request queued between them or resurrects one already sent.
-    private let writeQueue = DispatchQueue(label: "ly.count.requestqueue.write", qos: .utility)
+    /// Queues a sync unless one is queued already, which then carries this change
+    /// as well. The caller holds the lock.
+    private func scheduleSyncLocked() {
+        guard !isSyncScheduled, !isDeleted else { return }
+        isSyncScheduled = true
+        writeQueue.async { [weak self] in self?.syncNow() }
+    }
 
-    /// Writes the queue to disk off the calling thread.
+    /// Hands the queue as it is now to the database, opening it first if it could
+    /// not be read so far. Runs on the write queue.
+    private func syncNow() {
+        lock.lock()
+        isSyncScheduled = false
+        let deleted = isDeleted
+        let detached = isDetached
+        let ownPendingToken = pendingFileToken
+        lock.unlock()
+
+        guard !deleted else { return }
+
+        if detached {
+            guard let loaded = database.attach(skippingPendingFile: ownPendingToken) else {
+                savePendingFile(onlyWhenNotEmpty: true)
+                return
+            }
+            lock.lock()
+            mergeLocked(loaded)
+            lock.unlock()
+        }
+
+        lock.lock()
+        let queue = entries
+        let pendingToken = pendingFileToken
+        lock.unlock()
+
+        guard let committedLineage = database.sync(queue, pendingToken: pendingToken) else { return }
+
+        lock.lock()
+        durableLineage = committedLineage
+        durableMaxSequence = max(durableMaxSequence, queue.last?.sequence ?? 0)
+        if let pendingToken {
+            committedPendingFileToken = pendingToken
+        }
+        if pendingFileToken == pendingToken {
+            pendingFileToken = nil
+        }
+        lock.unlock()
+    }
+
+    /// Puts the database's queue, now that it could be read, in front of what was
+    /// queued meanwhile, with the whole-queue changes made meanwhile made on it too.
+    /// The caller holds the lock.
+    private func mergeLocked(_ loaded: LoadedQueue) {
+        var queue = loaded.queue
+        for change in detachedChanges {
+            change(&queue)
+        }
+        detachedChanges.removeAll()
+
+        if !queue.isEmpty {
+            headDisplacedByAttach = entries.first?.request
+        }
+        let queuedMeanwhile = entries.count
+        var sequence = loaded.nextSequence
+        for entry in entries {
+            queue.append(QueuedRequest(sequence: sequence, request: entry.request))
+            sequence += 1
+        }
+
+        entries = queue
+        nextSequence = sequence
+        isDetached = false
+        durableLineage = loaded.lineage
+        durableMaxSequence = loaded.durableMaxSequence
+        if let token = loaded.pendingFileToken {
+            pendingFileToken = token
+        }
+        logger?.d(Self.module, "syncNow", "the database could be read at last and its queue goes in front of the requests queued meanwhile, databaseRequestCount: [\(queue.count - queuedMeanwhile)], queuedMeanwhileCount: [\(queuedMeanwhile)]")
+
+        // The limits saw only the requests in memory, so the merged queue gets them now.
+        removeOldAgeRequestsLocked()
+        if entries.count > storedRequestsLimit {
+            let droppedCount = entries.count - storedRequestsLimit
+            entries.removeFirst(droppedCount)
+            logger?.d(Self.module, "syncNow", "the oldest requests of the merged queue are dropped because it is over its limit, droppedRequestCount: [\(droppedCount)], storedRequestsLimit: [\(storedRequestsLimit)]")
+        }
+    }
+
+    /// Writes every change so far to disk off the calling thread.
     ///
     /// Held against suspension for the length of the write. This is the write that
-    /// records a request as sent, so a process suspended between the response and
-    /// this landing rolls the queue back and sends the request again.
-    func save(completion: (() -> Void)? = nil) {
+    /// records a request as sent, so a process suspended before it lands rolls the
+    /// queue back and sends the request again.
+    ///
+    /// - Parameter completion: Called on the write queue once the write is done. It
+    ///   must not call `saveSync()`, which on the write queue is the crash path.
+    func save(completion: (@Sendable () -> Void)? = nil) {
         BackgroundTaskGuard.shared.begin()
         writeQueue.async { [weak self] in
-            self?.saveSync()
+            self?.syncNow()
             BackgroundTaskGuard.shared.end()
             completion?()
         }
     }
 
-    /// Writes the queue to disk on the calling thread. Used when the process is
-    /// about to end, where an async write would not survive.
+    /// Writes every change so far to disk on the calling thread. Used when the
+    /// process is about to end, where an asynchronous write would not survive.
     func saveSync() {
-        // Routed through the same queue as the async path so an in-flight write
-        // cannot overtake this one, and so a flush is never undone by a save that
-        // snapshotted before it.
-        if !isOnWriteQueue {
-            writeQueue.sync { writeSnapshot() }
+        guard DispatchQueue.getSpecific(key: writeQueueKey) == nil else {
+            // Only the crash handler lands here, and waiting on this queue from itself would hang.
+            writeFromCrashHandler()
             return
         }
-        writeSnapshot()
+
+        // Routed through the write queue so an in-flight write cannot overtake this
+        // one, and so a flush is never undone by a sync that copied the queue before it.
+        writeQueue.sync { [self] in syncNow() }
     }
 
-    private var isOnWriteQueue: Bool {
-        DispatchQueue.getSpecific(key: Self.writeQueueKey) != nil
-    }
+    /// Saves the queue into the pending file, for the crash handler on the write
+    /// queue's own thread, where the database is not touched.
+    private func writeFromCrashHandler() {
+        savePendingFile(onlyWhenNotEmpty: false)
 
-    private static let writeQueueKey = DispatchSpecificKey<Bool>()
-
-    private func writeSnapshot() {
+        // Should the process go on after all, the next sync commits the token.
         lock.lock()
-        let snapshot = requests
+        scheduleSyncLocked()
+        lock.unlock()
+    }
+
+    /// Saves the queue into the pending file, for the next launch to fold in: from the
+    /// crash handler, and from every sync while the database cannot be read.
+    private func savePendingFile(onlyWhenNotEmpty: Bool) {
+        lock.lock()
+        let queue = entries
+        let lineage = durableLineage
+        let durable = durableMaxSequence
+        let ownTokens = Set([pendingFileToken, committedPendingFileToken].compactMap { $0 })
+        let deleted = isDeleted
         lock.unlock()
 
-        let payload: [String: Any] = [PersistencyKey.queuedRequests: snapshot]
+        guard !deleted, !(onlyWhenNotEmpty && queue.isEmpty),
+              let token = database.writePendingFile(queue, lineage: lineage, durableMaxSequence: durable, replacing: ownTokens) else { return }
 
-        let data: Data
-        do {
-            data = try NSKeyedArchiver.archivedData(withRootObject: payload, requiringSecureCoding: false)
-        } catch {
-            let failure = error as NSError
-            logger?.d(Self.module, "saveSync", "the request queue could not be archived and nothing is written, the queue stays in memory only, requestCount: [\(snapshot.count)], errorDomain: [\(failure.domain)], errorCode: [\(failure.code)], error: [\(failure.localizedDescription)]")
-            return
-        }
-
-        do {
-            try data.write(to: fileURL, options: .atomic)
-            logger?.d(Self.module, "saveSync", "request queue is written to the persistent storage file, dataSize: [\(data.count)], requestCount: [\(snapshot.count)]")
-        } catch {
-            let failure = error as NSError
-            logger?.d(Self.module, "saveSync", "writing the request queue to the persistent storage file failed, the queue stays in memory only, requestCount: [\(snapshot.count)], dataSize: [\(data.count)], path: [\(fileURL.path)], errorDomain: [\(failure.domain)], errorCode: [\(failure.code)], error: [\(failure.localizedDescription)]")
-        }
+        lock.lock()
+        pendingFileToken = token
+        lock.unlock()
     }
 
-    private func load() {
-        let data: Data
-        do {
-            data = try Data(contentsOf: fileURL)
-        } catch {
-            // Nothing to read is how every first launch starts, so the two are
-            // told apart: a file that exists and will not open is the incident.
-            let failure = error as NSError
-            if FileManager.default.fileExists(atPath: fileURL.path) {
-                logger?.d(Self.module, "load", "the persistent storage file exists but could not be opened, the queue starts empty, path: [\(fileURL.path)], errorDomain: [\(failure.domain)], errorCode: [\(failure.code)], error: [\(failure.localizedDescription)]")
-            } else {
-                logger?.d(Self.module, "load", "no persistent storage file yet, the queue starts empty, path: [\(fileURL.path)]")
-            }
-            return
-        }
-
-        do {
-            let root = try CountlyArchive.decodeRoot(from: data)
-
-            if let dictionary = root as? [String: Any],
-               let stored = dictionary[PersistencyKey.queuedRequests] as? [String] {
-                requests = stored
-                logger?.d(Self.module, "load", "persistent storage file is loaded, dataSize: [\(data.count)], restoredRequestCount: [\(requests.count)]")
-            } else {
-                logger?.d(Self.module, "load", "the persistent storage file does not hold a request queue and will be treated as empty, dataSize: [\(data.count)], rootType: [\(root.map { "\(type(of: $0))" } ?? "none")]")
-            }
-        } catch {
-            let failure = error as NSError
-            logger?.d(Self.module, "load", "persistent storage file could not be read and will be treated as empty, dataSize: [\(data.count)], errorDomain: [\(failure.domain)], errorCode: [\(failure.code)], error: [\(failure.localizedDescription)]")
-        }
-    }
-
-    /// Deletes the backing file. Used by `halt(clearStorage: true)`.
+    /// Deletes every file of the queue, a `Countly.dat` not merged yet included.
+    /// Used by `halt(clearStorage: true)`.
     ///
-    /// Serialized with the writes, so a save that snapshotted before the caller
-    /// asked for the data to be erased cannot re-create the file afterwards.
+    /// A change made before the caller asked for the data to be erased cannot
+    /// re-create a file afterwards: every sync from then on is skipped.
     func deleteFile() {
-        writeQueue.sync {
-            guard FileManager.default.fileExists(atPath: fileURL.path) else {
-                logger?.d(Self.module, "deleteFile", "there is no persistent storage file of the request queue to delete, path: [\(fileURL.path)]")
-                return
-            }
+        lock.lock()
+        isDeleted = true
+        lock.unlock()
 
-            do {
-                try FileManager.default.removeItem(at: fileURL)
-                logger?.d(Self.module, "deleteFile", "the persistent storage file of the request queue is deleted, path: [\(fileURL.path)]")
-            } catch {
-                let failure = error as NSError
-                logger?.d(Self.module, "deleteFile", "the persistent storage file of the request queue was not deleted, path: [\(fileURL.path)], errorDomain: [\(failure.domain)], errorCode: [\(failure.code)], error: [\(failure.localizedDescription)]")
-            }
-        }
+        writeQueue.sync { [database] in database.deleteEverything() }
+        logger?.d(Self.module, "deleteFile", "the database, the pending file and the legacy file of the request queue are deleted")
     }
-
-    private lazy var fileURL: URL = {
-        StorageLocation.directoryURL(logger: logger)
-            .appendingPathComponent(namespace.fileName("Countly", extension: "dat"))
-    }()
 }
 
 /// Where the SDK is allowed to keep files.

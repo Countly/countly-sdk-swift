@@ -14,7 +14,8 @@ import CoreLocation
 /// Nothing here takes effect until the object is handed to
 /// `Countly.initShared(_:)` or `CountlyInstance.start(with:)`. The instance takes
 /// a snapshot at that point, so mutating the config afterwards does nothing.
-public final class CountlyConfig {
+@objcMembers
+public final class CountlyConfig: NSObject {
 
     // MARK: - Required
 
@@ -54,6 +55,14 @@ public final class CountlyConfig {
     /// Features that have to be switched on explicitly, such as push
     /// notifications and crash reporting.
     public var features: [CountlyFeature] = []
+
+    /// `features` for Objective-C, as `CountlyFeature` values.
+    @available(swift, obsoleted: 1)
+    @objc(features)
+    public var objcFeatures: [NSNumber] {
+        get { features.map { NSNumber(value: $0.rawValue) } }
+        set { features = newValue.compactMap { CountlyFeature(rawValue: $0.intValue) } }
+    }
 
     /// Extra metrics merged into the metrics dictionary sent with sessions.
     public var customMetrics: [String: String] = [:]
@@ -117,6 +126,14 @@ public final class CountlyConfig {
     /// Features consented to at init time.
     public var consents: [ConsentFeature] = []
 
+    /// `consents` for Objective-C, as `ConsentFeature` values.
+    @available(swift, obsoleted: 1)
+    @objc(consents)
+    public var objcConsents: [NSNumber] {
+        get { consents.map { NSNumber(value: $0.rawValue) } }
+        set { consents = newValue.compactMap { ConsentFeature(rawValue: $0.intValue) } }
+    }
+
     /// Grants consent for every feature at init time. Overrides `consents`.
     public var enableAllConsents: Bool = false
 
@@ -125,6 +142,14 @@ public final class CountlyConfig {
     /// APNs environment the push token belongs to. Leave `nil` to let the SDK
     /// infer it from the build's provisioning profile.
     public var pushTestMode: PushTestMode?
+
+    /// `pushTestMode` for Objective-C, a `PushTestMode` value or `nil`.
+    @available(swift, obsoleted: 1)
+    @objc(pushTestMode)
+    public var objcPushTestMode: NSNumber? {
+        get { pushTestMode.map { NSNumber(value: $0.rawValue) } }
+        set { pushTestMode = newValue.flatMap { PushTestMode(rawValue: $0.intValue) } }
+    }
 
     /// Sends the push token even when push consent has not been given, so the
     /// server can hold it until consent arrives.
@@ -334,7 +359,7 @@ public final class CountlyConfig {
 
     // MARK: - Init
 
-    public init() {}
+    public override init() {}
 
     /// Convenience initializer for the two values every integration must set.
     public convenience init(appKey: String, host: String) {
