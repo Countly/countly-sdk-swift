@@ -83,3 +83,38 @@ struct StorageNamespace: Equatable {
         return hash
     }
 }
+
+/// Which instance holds each storage namespace, so two SDKs never run over the
+/// same files and keys.
+///
+/// An instance takes its namespace before it opens anything and gives it back at
+/// the very end of its halt. One that starts while the previous holder is still
+/// halting, which `Countly.removeInstance(named:)` makes possible by halting
+/// outside the registry lock, waits for that halt to write its last state rather
+/// than reading files that are still being written. The wait is the length of a
+/// halt, which never needs the waiting thread.
+enum StorageClaims {
+
+    private static let condition = NSCondition()
+    private static var holders: [String: ObjectIdentifier] = [:]
+
+    /// Takes `namespace` for `holder`, waiting while another instance holds it.
+    static func claim(_ namespace: StorageNamespace, for holder: AnyObject) {
+        let id = ObjectIdentifier(holder)
+        condition.lock()
+        defer { condition.unlock() }
+        while let current = holders[namespace.suffix], current != id {
+            condition.wait()
+        }
+        holders[namespace.suffix] = id
+    }
+
+    /// Gives `namespace` back when `holder` is the one holding it.
+    static func release(_ namespace: StorageNamespace, by holder: AnyObject) {
+        condition.lock()
+        defer { condition.unlock() }
+        guard holders[namespace.suffix] == ObjectIdentifier(holder) else { return }
+        holders.removeValue(forKey: namespace.suffix)
+        condition.broadcast()
+    }
+}

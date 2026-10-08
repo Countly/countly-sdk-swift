@@ -78,8 +78,9 @@
 {
     [super setUp];
 
+    NSString *name = [@"objc-" stringByAppendingString:NSUUID.UUID.UUIDString];
     CountlyConfig *config = [[CountlyConfig alloc] initWithAppKey:@"appkey" host:@"https://testing.count.ly"];
-    config.instanceName = [@"objc-" stringByAppendingString:NSUUID.UUID.UUIDString];
+    config.instanceName = name;
     config.deviceID = @"objc-device";
     config.manualSessionHandling = YES;
     config.eventSendThreshold = 1;
@@ -94,7 +95,7 @@
     session.protocolClasses = @[CLYFailingURLProtocol.class];
     config.urlSessionConfiguration = session;
 
-    self.countly = [Countly instanceNamed:config.instanceName];
+    self.countly = [Countly instanceNamed:name];
     [self.countly startWithConfig:config];
 }
 
@@ -122,6 +123,22 @@
     XCTAssertTrue([[Countly listInstances] containsObject:self.countly.name]);
     XCTAssertNotNil(Countly.shared);
     XCTAssertNotEqual(Countly.shared, self.countly, "a named instance is not the default one");
+}
+
+/// Objective-C can still pass nil for the name. It arrives as an empty name, which
+/// is refused rather than read as the default instance.
+- (void)testANilNameIsRefusedRatherThanReadAsTheDefaultInstance
+{
+    NSString *missing = nil;
+    CountlyInstance *refused = [Countly instanceNamed:(NSString * _Nonnull)missing];
+
+    XCTAssertEqual(refused.name.length, 0u, "nil arrives as an empty name");
+    XCTAssertNotEqual(refused, Countly.shared, "a missing name must not reach the default instance");
+    XCTAssertNil([Countly getInstanceNamed:@""]);
+
+    [refused startWithConfig:[[CountlyConfig alloc] initWithAppKey:@"appkey" host:@"https://testing.count.ly"]];
+
+    XCTAssertFalse(refused.isStarted);
 }
 
 - (void)testEventsAndViewsReachTheQueue

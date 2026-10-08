@@ -100,6 +100,12 @@ analytics.start(with: analyticsConfig)
 
 `Countly.instance(named:)` creates the handle but never starts it, so holding a reference cannot begin collecting data by accident. `Countly.shared` is the default instance, and it reads and writes the same storage a previous `countly-sdk-ios` integration used, so an application moving to this SDK keeps its device ID, its cached remote config and its queued requests.
 
+An empty name is refused rather than read as the default instance: the handle you get back cannot be started, and every call on it is ignored and logged. Use `Countly.shared` for the default instance.
+
+`halt(clearStorage:)` keeps the instance registered, so `start(with:)` can be called on the same handle again. `halt(clearStorage: true)` erases the stored data whether the instance is running or not, so following it with `start(with:)` starts over as a first install. The config is copied at start, so passing the same object again starts from what it holds, not from what the server or calls such as `setNewAppKey` changed while the instance ran.
+
+`Countly.removeInstance(named:)` drops a named instance from the registry and keeps its stored data. A handle kept to the removed instance can no longer be started; get a new one with `Countly.instance(named:)`.
+
 ## Going back to countly-sdk-ios
 
 The device ID and the cached remote config stay where `countly-sdk-ios` reads them. The request queue does not: this SDK keeps it in a database of its own. To take the queued requests along, add [`Migration/CountlySwiftSDKMigration.m`](Migration/CountlySwiftSDKMigration.m) to your app target. There is nothing to call. On the first launch it moves the queue to where `countly-sdk-ios` reads it, before that SDK starts, and on every later launch it does nothing.

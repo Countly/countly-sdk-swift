@@ -4,15 +4,15 @@
 
 * Added multi-instance entrypoints on "Countly":
   * "Countly.shared", the default instance, which reads and writes the storage a previous "countly-sdk-ios" integration left behind
-  * "Countly.instance(named:)", which creates the instance if needed. Getting a handle never starts it; the caller always calls "start(with:)".
+  * "Countly.instance(named:)", which creates the instance if needed. Getting a handle never starts it; the caller always calls "start(with:)". An empty name is refused instead of falling back to the default instance.
   * "Countly.getInstance(named:)" / "Countly.listInstances()" / "Countly.haltAllInstances(clearStorage:)"
-  * "Countly.removeInstance(named:)", which stops a named instance and drops it from the registry, keeping its stored data
+  * "Countly.removeInstance(named:)", which stops a named instance and drops it from the registry, keeping its stored data. A handle kept to the removed instance can no longer be started.
   * Each instance owns its app key, server, request queue, device ID, logger, clock and storage namespace. Named instances get their own files and user defaults keys; the default instance keeps the legacy ones.
 
 * Added instance lifecycle on "CountlyInstance":
-  * "start(with:)" / "isStarted"
+  * "start(with:)" / "isStarted". "start(with:)" takes a copy of the config, so one object can start several instances, or the same instance again after a halt.
   * "suspend()" / "resume()"
-  * "halt(clearStorage:)", which tears the instance down and, when asked, wipes every persisted key including those an earlier Objective-C SDK wrote
+  * "halt(clearStorage:)", which tears the instance down and, when asked, wipes every persisted key including those an earlier Objective-C SDK wrote, whether the instance is running or not. The instance stays registered and can be started again.
   * Integration-wide operations: "setNewHost", "setNewAppKey", "setNewURLSessionConfiguration", "addCustomNetworkRequestHeaders", "recordMetrics", "addDirectRequest"
 
 * Added the events API on "countly.events":
@@ -123,7 +123,7 @@
   * A SwiftUI hosting controller is reported under the name of the view it hosts, so `UIHostingController<CheckoutView>` reports as "CheckoutView". A hosted view that also reports itself with "countlyView" is reported twice unless its name is on the exclusion list.
   * A host of an erased "AnyView", which SwiftUI uses for its own sheets and navigation destinations, and any other screen known only by a compiler-generated Swift class name, is not reported; give it a title or adopt "CountlyAutoViewTrackingName"
   * "CountlyConfig.disableSwizzling", which stops the "viewDidAppear" and "viewDidDisappear" exchange. That exchange is the only thing automatic view tracking watches, so this leaves it off, even when SDK behavior settings would switch it on; report screens yourself instead. It applies to its own instance only and does not cover push handling, which "disableAutomaticPushHandling" turns off.
-  * A SwiftUI "countlyView(_:segmentation:instance:)" modifier, because one hosting controller is a single appearance and a SwiftUI screen has to name itself. Works with automatic view tracking on or off.
+  * A SwiftUI "countlyView(_:segmentation:)" modifier, and "countlyView(_:segmentation:instance:)" for a named instance, because one hosting controller is a single appearance and a SwiftUI screen has to name itself. Works with automatic view tracking on or off. The instance is not optional, so a missing one is never replaced by the default instance.
 
 * Added support for "Date" values in segmentation and user properties, sent as epoch milliseconds.
 

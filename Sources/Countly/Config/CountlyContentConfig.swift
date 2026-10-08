@@ -137,4 +137,18 @@ public final class CountlyContentConfig: NSObject {
     public var showWidgetsWithinApp: Bool = false
 
     public override init() {}
+
+    /// Takes every value of `other`, for the snapshot an instance runs on.
+    func copyValues(from other: CountlyContentConfig) {
+        globalContentCallback = other.globalContentCallback
+        zoneTimerInterval = other.zoneTimerInterval
+        overlayCornerRadius = other.overlayCornerRadius
+        webViewDisplayOption = other.webViewDisplayOption
+        enableContentReloadOnStall = other.enableContentReloadOnStall
+        contentReloadOnStallTimeout = other.contentReloadOnStallTimeout
+        disableZoom = other.disableZoom
+        disableRotation = other.disableRotation
+        contentURLHandler = other.contentURLHandler
+        showWidgetsWithinApp = other.showWidgetsWithinApp
+    }
 }

@@ -39,9 +39,26 @@ final class MultiInstanceTests: CountlyBaseTestCase {
         XCTAssertNil(Countly.getInstance(named: "definitely-never-created-\(UUID().uuidString)"))
     }
 
-    func testAnEmptyOrMissingNameIsTheDefaultInstance() {
-        XCTAssertTrue(Countly.instance(named: "") === Countly.shared)
-        XCTAssertTrue(Countly.instance(named: nil) === Countly.shared)
+    /// A name that failed to load must not quietly become the default instance,
+    /// which would report one tenant's data into another tenant's dashboard.
+    func testAnEmptyNameIsRefusedRatherThanReadAsTheDefaultInstance() {
+        let refused = Countly.instance(named: "")
+
+        XCTAssertFalse(refused === Countly.shared)
+        XCTAssertNil(Countly.getInstance(named: ""), "nothing is registered under an empty name")
+
+        refused.start(with: baseConfig())
+
+        XCTAssertFalse(refused.isStarted, "started, it would run a second SDK over the default instance's storage")
+    }
+
+    /// A facade taken from the refused handle stays attached to it, so its calls
+    /// report the empty name rather than a removal that never happened.
+    func testAFacadeOfTheRefusedInstanceStaysAttachedToIt() {
+        let events = Countly.instance(named: "").events
+
+        XCTAssertTrue(events.instance === Countly.instance(named: ""))
+        events.recordEvent("ignored")
     }
 
     func testListingInstancesExcludesTheDefaultOne() {
@@ -183,13 +200,34 @@ final class MultiInstanceTests: CountlyBaseTestCase {
         XCTAssertFalse(countly.isStarted)
         XCTAssertNil(Countly.getInstance(named: name))
         XCTAssertFalse(Countly.instance(named: name) === countly, "the name now yields a new instance")
+
+        // The removed handle may not erase the storage, the fresh one may.
+        Countly.instance(named: name).halt(clearStorage: true)
+    }
+
+    /// A facade the application kept must not take it down once the instance it
+    /// came from is removed and released: the call is ignored instead.
+    func testAFacadeKeptPastRemovalIgnoresCallsRatherThanCrashing() {
+        let name = uniqueInstanceName()
+        weak var removed: CountlyInstance?
+        let events: EventsAPI = autoreleasepool {
+            let countly = Countly.instance(named: name)
+            removed = countly
+            return countly.events
+        }
+
+        autoreleasepool {
+            Countly.removeInstance(named: name)
+        }
+
+        XCTAssertNil(removed, "nothing holds a removed instance any more")
+        events.recordEvent("after removal")
     }
 
     func testTheDefaultInstanceCannotBeRemoved() {
         let shared = Countly.shared
 
         Countly.removeInstance(named: Countly.defaultInstanceName)
-        Countly.removeInstance(named: nil)
 
         XCTAssertTrue(Countly.getInstance(named: Countly.defaultInstanceName) === shared)
     }
@@ -216,6 +254,27 @@ final class MultiInstanceTests: CountlyBaseTestCase {
                       "the erased queue must not come back")
     }
 
+    /// The erasure has to hold against the halted instance itself: a completion
+    /// still in flight when the halt ran writes through the old store, and that
+    /// write must not hand the next start the erased state back.
+    func testAWriteLeftInFlightByAHaltedInstanceCannotUndoClearStorage() {
+        let name = uniqueInstanceName()
+        let first = start(baseConfig(instanceName: name))
+        let haltedStore = core(of: first).keyValueStore
+
+        first.halt(clearStorage: true)
+        haltedStore.deviceID = "written-after-the-erasure"
+        // In the shape the remote config cache reads back, so a write that landed
+        // would be served to the next start rather than discarded as unreadable.
+        haltedStore.remoteConfig = ["written": ["v": "after the erasure", "c": true]]
+
+        let second = start(baseConfig(instanceName: name))
+
+        XCTAssertEqual(second.deviceID.current, Self.deviceID,
+                       "a stored device ID wins over the configured one, so none may be left behind")
+        XCTAssertTrue(core(of: second).keyValueStore.remoteConfig.isEmpty)
+    }
+
     /// An ordinary halt is not a delete: the queue is written out so the data is
     /// still sent on the next launch.
     func testAnOrdinaryHaltKeepsWhatWasQueued() {
@@ -232,6 +291,194 @@ final class MultiInstanceTests: CountlyBaseTestCase {
 
         XCTAssertFalse(requestQueue(of: second).isEmpty,
                        "an ordinary halt must not lose data the server has not accepted")
+    }
+
+    /// An erasure is asked for when the user wants their data gone, which can be
+    /// before the SDK was started this launch or after it was halted.
+    func testClearStorageErasesAnInstanceThatIsNotRunning() {
+        let name = uniqueInstanceName()
+
+        let firstConfig = baseConfig(instanceName: name)
+        firstConfig.deviceID = "to-be-erased"
+        firstConfig.eventSendThreshold = 1
+        let first = start(firstConfig)
+        first.events.recordEvent("to-be-erased")
+        first.halt()
+
+        first.halt(clearStorage: true)
+
+        let secondConfig = baseConfig(instanceName: name)
+        secondConfig.deviceID = "a-fresh-start"
+        let second = start(secondConfig)
+
+        XCTAssertEqual(second.deviceID.current, "a-fresh-start",
+                       "the erased device ID must not come back")
+        XCTAssertTrue(requestQueue(of: second).isEmpty,
+                      "the erased queue must not come back")
+    }
+
+    /// A handle kept past `removeInstance(named:)` can no longer be started: next
+    /// to the instance the registry made since, it would be a second SDK on the
+    /// same storage, sending the same requests twice and wiping the other's files.
+    func testAHandleKeptPastRemovalCanNeitherStartNorErase() {
+        let name = uniqueInstanceName()
+        let removed = start(baseConfig(instanceName: name))
+        Countly.removeInstance(named: name)
+
+        let current = start(baseConfig(instanceName: name))
+        removed.start(with: baseConfig(instanceName: name))
+
+        XCTAssertFalse(removed.isStarted)
+        XCTAssertTrue(current.isStarted)
+
+        removed.halt(clearStorage: true)
+
+        XCTAssertEqual(core(of: current).keyValueStore.deviceID, Self.deviceID,
+                       "the removed handle must not erase the storage the current instance runs on")
+    }
+
+    /// An instance started under a name whose previous instance is still halting
+    /// waits for that halt to write its last state, rather than reading files that
+    /// are still being written.
+    func testAStartWaitsForThePreviousHolderOfItsStorage() {
+        let name = uniqueInstanceName()
+        let namespace = StorageNamespace(instanceName: name)
+        let previousHolder = NSObject()
+        StorageClaims.claim(namespace, for: previousHolder)
+
+        let released = Recorded(false)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) {
+            released.value = true
+            StorageClaims.release(namespace, by: previousHolder)
+        }
+
+        let countly = start(baseConfig(instanceName: name))
+
+        XCTAssertTrue(released.value, "the start went ahead while the previous holder still held the storage")
+        XCTAssertTrue(countly.isStarted)
+    }
+
+    /// A breadcrumb that reaches a halted instance's store after the erasure must
+    /// not bring the crash log back for the next start to attach to a report.
+    func testABreadcrumbLeftInFlightByAHaltedInstanceCannotUndoClearStorage() {
+        let countly = startInstance()
+        let haltedStore = core(of: countly).crashLogStore
+
+        countly.halt(clearStorage: true)
+        haltedStore.append("written after the erasure")
+
+        XCTAssertNil(haltedStore.readAll(), "the halted store must not write the crash log again")
+    }
+
+    /// A send that completes after an ordinary halt belongs to the halted run. Its
+    /// removal must not reach the files the next start reads, where an emptied
+    /// queue would erase what that start is still sending.
+    func testASendCompletingAfterAHaltCannotRemoveTheNextStartsRows() throws {
+        let name = uniqueInstanceName()
+        let config = baseConfig(instanceName: name)
+        config.eventSendThreshold = 1
+        let first = start(config)
+        first.events.recordEvent("in-flight-at-the-halt")
+        let haltedStore = core(of: first).requestQueueStore
+        let inFlight = try XCTUnwrap(haltedStore.headEntry)
+        first.halt()
+
+        _ = start(baseConfig(instanceName: name))
+        haltedStore.removeHead(inFlight)
+        haltedStore.saveSync()
+
+        let files = RequestQueueDatabase.Files(namespace: StorageNamespace(instanceName: name),
+                                               directory: StorageLocation.directoryURL(logger: nil))
+        let connection = try SQLiteConnection(path: files.database.path)
+        defer { connection.close() }
+        let rows = try connection.rows("SELECT body FROM requests") { $0.text(0) ?? "" }
+
+        XCTAssertTrue(rows.contains { $0.contains("in-flight-at-the-halt") },
+                      "the halted run removed a row the next start still has to send")
+    }
+
+    /// Behavior settings that arrive from a halted run are not applied to the run
+    /// started after it.
+    func testSettingsFromAHaltedRunAreNotAppliedToTheNextOne() {
+        let name = uniqueInstanceName()
+        let first = start(baseConfig(instanceName: name))
+        let haltedSettings = core(of: first).serverConfig
+        first.halt()
+
+        let second = start(baseConfig(instanceName: name))
+        second.serverConfigDidChange(haltedSettings, consentBecameRequired: true)
+
+        XCTAssertFalse(requestQueue(of: second).contains { $0.contains("consent=") },
+                       "the halted run's settings resent consent on the next run")
+    }
+
+    #if os(iOS) || os(visionOS) || os(macOS)
+    /// A halt off the main thread leaves closing a widget to the main thread, and
+    /// the halt has released the core by the time that runs. Closing still reads
+    /// the core, so the close has to keep it alive rather than take the
+    /// application down.
+    func testAWidgetClosedAfterTheHaltReleasedTheCoreDoesNotCrash() {
+        var core: SDKCore? = SDKCore(instanceName: uniqueInstanceName(), config: baseConfig())
+        let store = core!.requestQueueStore
+        defer { store.deleteFile() }
+        let module = FeedbackModule(core: core!)
+        module.presentedWidgetManagers = [WebViewManager(core: core!)]
+
+        // The main thread is held until the halt is over, so the close it queues
+        // runs after it, as it does when the application's main thread is busy.
+        let halted = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            module.halt(clearStorage: false)
+            halted.signal()
+        }
+        halted.wait()
+
+        // What `CountlyInstance.halt()` does with the last reference it holds.
+        core = nil
+
+        TestUtils.pump(0.3)
+        XCTAssertTrue(module.presentedWidgetManagers.isEmpty)
+    }
+    #endif
+
+    /// A call that takes a completion answers it even when there is no SDK to do
+    /// the work: a caller awaiting it through a continuation would otherwise wait
+    /// for the life of the process.
+    func testCallsWithACompletionAreAnsweredWhenTheSDKIsNotRunning() {
+        let countly = Countly.instance(named: uniqueInstanceName())
+        let answered = expectation(description: "every completion is called")
+        answered.expectedFulfillmentCount = 7
+
+        countly.remoteConfig.downloadKeys { result, _, _, _ in
+            XCTAssertEqual(result, .error)
+            answered.fulfill()
+        }
+        countly.remoteConfig.downloadSpecificKeys(["key"]) { result, _, _, _ in
+            XCTAssertEqual(result, .error)
+            answered.fulfill()
+        }
+        countly.remoteConfig.downloadOmittingKeys(["key"]) { result, _, _, _ in
+            XCTAssertEqual(result, .error)
+            answered.fulfill()
+        }
+        countly.remoteConfig.testingDownloadVariantInformation { result, _ in
+            XCTAssertEqual(result, .error)
+            answered.fulfill()
+        }
+        countly.remoteConfig.testingDownloadExperimentInformation { result, _ in
+            XCTAssertEqual(result, .error)
+            answered.fulfill()
+        }
+        countly.remoteConfig.testingEnrollIntoVariant(key: "key", variantName: "variant") { result, _ in
+            XCTAssertEqual(result, .error)
+            answered.fulfill()
+        }
+        countly.push.askForNotificationPermission { granted, _ in
+            XCTAssertFalse(granted)
+            answered.fulfill()
+        }
+
+        wait(for: [answered], timeout: 1)
     }
 
     // MARK: - Configuration validation

@@ -12,12 +12,13 @@ import CoreLocation
 /// Shared plumbing of the feature facades.
 ///
 /// A facade holds its instance weakly and resolves the internal module on every
-/// call, so a call made before `start(with:)` or after `halt()` is a logged no-op
-/// rather than a crash. The SDK must never take the host application down over
-/// call ordering.
+/// call, so a call made before `start(with:)`, after `halt()`, or after the
+/// instance was removed from the registry and released is a logged no-op rather
+/// than a crash. The SDK must never take the host application down over call
+/// ordering.
 public class CountlyAPIBase: NSObject {
 
-    unowned let instance: CountlyInstance
+    weak var instance: CountlyInstance?
 
     init(instance: CountlyInstance) {
         self.instance = instance
@@ -25,7 +26,12 @@ public class CountlyAPIBase: NSObject {
     }
 
     func core(_ function: String = #function) -> SDKCore? {
-        instance.requireCore(function)
+        guard let instance else {
+            // Printed rather than logged: the logger went with the instance.
+            Logger.print("[Warning] [Countly] \(function), the instance this was obtained from was removed and no longer exists, the call is ignored")
+            return nil
+        }
+        return instance.requireCore(function)
     }
 }
 

@@ -45,6 +45,17 @@ public final class CountlySDKLimitsConfig: NSObject {
 
     public override init() {}
 
+    /// Takes every value of `other`, for the snapshot an instance runs on.
+    func copyValues(from other: CountlySDKLimitsConfig) {
+        maxKeyLength = other.maxKeyLength
+        maxValueSize = other.maxValueSize
+        maxValueSizePicture = other.maxValueSizePicture
+        maxBreadcrumbCount = other.maxBreadcrumbCount
+        maxSegmentationValues = other.maxSegmentationValues
+        maxStackTraceLineLength = other.maxStackTraceLineLength
+        maxStackTraceLinesPerThread = other.maxStackTraceLinesPerThread
+    }
+
     /// Raises every limit below one back to its default, in place.
     ///
     /// A zero or negative limit would silently discard all data, which is a worse

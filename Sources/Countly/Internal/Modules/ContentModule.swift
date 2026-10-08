@@ -326,7 +326,11 @@ final class ContentModule: ModuleBase {
         }
 
         let requestedSequence = currentSequence()
-        DispatchQueue.main.async { [weak self] in
+        // The core is held until the content is torn down: from a halt off the
+        // main thread this runs after the core was released, and without it the
+        // module would be gone and the content left on screen.
+        DispatchQueue.main.async { [weak self, core] in
+            defer { withExtendedLifetime(core) {} }
             guard let self else { return }
             guard self.currentSequence() == requestedSequence else {
                 self.logD("closeShownContent", "a newer presentation superseded this close request, skipping")

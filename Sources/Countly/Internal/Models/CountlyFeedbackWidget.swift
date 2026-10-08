@@ -118,7 +118,13 @@ public final class CountlyFeedbackWidget: NSObject {
 
     /// Fetches the widget definition, for building a custom interface.
     public func getWidgetData(completion: @escaping ([String: Any]?, Error?) -> Void) {
-        module?.fetchWidgetData(for: self) { [weak self] data, error in
+        // Answered rather than dropped when the instance that listed the widget is
+        // gone, so a caller awaiting the data is never left waiting.
+        guard let module else {
+            completion(nil, CountlyError.feedbackWidgetNotAvailable.asNSError)
+            return
+        }
+        module.fetchWidgetData(for: self) { [weak self] data, error in
             if let data { self?.data = data }
             completion(data, error)
         }

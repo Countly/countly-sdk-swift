@@ -171,11 +171,6 @@ final class ConnectionManager: NSObject {
             return
         }
 
-        if core.requestQueueStore.isBeingModified {
-            abortProcessing("request queue is being modified")
-            return
-        }
-
         stateLock.lock()
         let backingOff = isBackingOff
         stateLock.unlock()
@@ -190,23 +185,34 @@ final class ConnectionManager: NSObject {
             core.logger.d(Self.module, "proceedOnQueue", "queue processing is started, queuedRequestCount: [\(core.requestQueueStore.count)]")
         }
 
-        guard let head = core.requestQueueStore.head else {
-            finishDrain()
-            return
+        // Read under the store's lock, which every bulk rewrite of the queue holds
+        // throughout, so the head is never taken from a half-rewritten queue. Taken
+        // with its sequence, so a rewrite while it is in flight cannot make the
+        // removal miss it and send it a second time.
+        //
+        // Expired requests are dropped in a loop rather than by calling back in: a
+        // device offline for days can hold a thousand of them, and one stack frame
+        // each overflows a secondary thread's stack.
+        var droppedForAge = 0
+        var next = core.requestQueueStore.headEntry
+        while let expired = next, core.requestQueueStore.isOldRequest(expired.request) {
+            core.logger.w(Self.module, "proceedOnQueue", "dropping the request at the head of the queue, reason: request age exceeded the configured drop age, requestDropAgeHours: [\(core.requestQueueStore.requestDropAgeHours)], requestSize: [\(expired.request.count)], queuedRequestCount: [\(core.requestQueueStore.count)]")
+            core.requestQueueStore.removeHead(expired)
+            droppedForAge += 1
+            next = core.requestQueueStore.headEntry
+        }
+        if droppedForAge > 0 {
+            core.requestQueueStore.save()
         }
 
-        if core.requestQueueStore.isOldRequest(head) {
-            core.logger.w(Self.module, "proceedOnQueue", "dropping the request at the head of the queue, reason: request age exceeded the configured drop age, requestDropAgeHours: [\(core.requestQueueStore.requestDropAgeHours)], requestSize: [\(head.count)], queuedRequestCount: [\(core.requestQueueStore.count)]")
-            core.requestQueueStore.removeHead(head)
-            core.requestQueueStore.save()
-            releaseProcessing()
-            proceedOnQueue()
+        guard let head = next else {
+            finishDrain()
             return
         }
 
         // A request recorded before a real device ID was known must wait: sending
         // it now would attribute the data to the placeholder ID.
-        if head.contains("&\(QS.deviceID)=\(TemporaryDeviceID.value)") {
+        if head.request.contains("&\(QS.deviceID)=\(TemporaryDeviceID.value)") {
             abortProcessing("device ID of the request at the head of the queue is the temporary device ID")
             return
         }
@@ -254,15 +260,15 @@ final class ConnectionManager: NSObject {
     /// tick would upload a batch about the last one. The caller may already be
     /// marked, since the delivery loop lands here synchronously, so the mark is
     /// restored on the way out.
-    private func send(head: String) {
-        let isSdkLogsTransport = head.contains("&\(QS.sdkLogs)=")
+    private func send(head: QueuedHead) {
+        let isSdkLogsTransport = head.request.contains("&\(QS.sdkLogs)=")
         core.logGatherer.markingTransportWork(isSdkLogsTransport) {
             sendMarked(head: head, isSdkLogsTransport: isSdkLogsTransport)
         }
     }
 
-    private func sendMarked(head: String, isSdkLogsTransport: Bool) {
-        var queryString = head
+    private func sendMarked(head: QueuedHead, isSdkLogsTransport: Bool) {
+        var queryString = head.request
         var endpoint = Endpoint.input
 
         if let override = extractAndRemoveParameter(&queryString, parameter: QS.newEndPoint) {
@@ -354,7 +360,7 @@ final class ConnectionManager: NSObject {
         logRequest(request)
     }
 
-    private func handleSuccess(head: String,
+    private func handleSuccess(head: QueuedHead,
                                queryString: String,
                                elapsed: TimeInterval,
                                request: URLRequest,

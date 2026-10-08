@@ -101,6 +101,13 @@ public final class CountlyInstance: NSObject {
         self.name = name
     }
 
+    deinit {
+        // Released ahead of the core it holds `unowned`: tearing it down logs
+        // through the core, and stored properties are released in declaration
+        // order, the core first.
+        lifecycleObserver = nil
+    }
+
     /// Whether this instance has been started and not halted.
     @objc
     public var isStarted: Bool {
@@ -118,10 +125,19 @@ public final class CountlyInstance: NSObject {
         guard let current, current.hasStarted else {
             // Deliberately printed rather than logged: without a core there is no
             // logger, and a call before init is exactly the mistake worth seeing.
-            Logger.print("[Warning] [\(Self.module)] \(function), the SDK has not been started yet, the call is ignored")
+            let reason = Countly.isRegistered(self) ? "the SDK has not been started yet" : notRegisteredReason
+            Logger.print("[Warning] [\(Self.module)] \(function), \(reason), the call is ignored")
             return nil
         }
         return current
+    }
+
+    /// Why this instance can never run, for one the registry does not hold.
+    private var notRegisteredReason: String {
+        if name.isEmpty {
+            return "the instance was requested with an empty name and can never be started, use Countly.shared for the default instance"
+        }
+        return "the instance was removed from the registry and can no longer be started, get a new one with Countly.instance(named:), name: [\(name)]"
     }
 
     // MARK: - Starting
@@ -141,6 +157,15 @@ public final class CountlyInstance: NSObject {
             return
         }
 
+        // Only the instance the registry holds under a name may run on that name's
+        // storage. A handle `Countly.removeInstance(named:)` dropped would run a
+        // second SDK over the files and keys of the one the registry made since,
+        // and an empty name maps to the default instance's storage.
+        guard Countly.isRegistered(self) else {
+            Logger.print("[Error] [\(Self.module)] start, \(notRegisteredReason), the call is ignored")
+            return
+        }
+
         // Validated before anything is built, so a misconfigured start leaves no
         // half-initialized state behind.
         if let failure = config.validate() {
@@ -155,7 +180,16 @@ public final class CountlyInstance: NSObject {
             Logger.print("[Warning] [\(Self.module)] start, the instance name in the config does not match the name this instance was created with, configName: [\(configName)], instanceName: [\(name)]")
         }
 
+        // A copy, so the server's behavior settings and calls such as
+        // `setNewAppKey` change this run only: the caller's object starts the next
+        // run as it was given, and a config shared by two instances cannot carry
+        // one's changes into the other.
+        let config = config.snapshot()
         config.sdkInternalLimits.clampToMinimums()
+
+        // Taken before anything is opened. A previous holder still halting is
+        // waited for, so its last write lands before this instance reads.
+        StorageClaims.claim(StorageNamespace(instanceName: name), for: self)
 
         let builtCore = SDKCore(instanceName: name, config: config)
         builtCore.hasStarted = true
@@ -520,16 +554,27 @@ public final class CountlyInstance: NSObject {
 
     /// Stops the SDK and releases everything it holds.
     ///
+    /// The instance stays registered under its name, so `Countly.shared` and any
+    /// reference the application kept go on pointing at it, and `start(with:)` can
+    /// be called on it again: erasing the data and starting over is
+    /// `halt(clearStorage: true)` followed by `start(with:)`. To drop a named
+    /// instance from the registry as well, use `Countly.removeInstance(named:)`.
+    ///
     /// - Parameter clearStorage: When `true`, the persisted device ID, queue and
-    ///   cached state are erased too. The next start looks like a first install.
+    ///   cached state are erased too, also when the instance is not running. The
+    ///   next start looks like a first install.
     @objc
     public func halt(clearStorage: Bool = false) {
         lifecycleLock.lock()
         defer { lifecycleLock.unlock() }
 
         guard let core, core.hasStarted else {
-            // Printed rather than logged for the same reason `requireCore` prints.
-            Logger.print("[Warning] [\(Self.module)] halt, the SDK is not running, the call is ignored")
+            if clearStorage {
+                eraseStoredData()
+            } else {
+                // Printed rather than logged for the same reason `requireCore` prints.
+                Logger.print("[Warning] [\(Self.module)] halt, the SDK is not running, the call is ignored")
+            }
             return
         }
 
@@ -537,6 +582,10 @@ public final class CountlyInstance: NSObject {
 
         lifecycleObserver?.deregister()
         lifecycleObserver = nil
+
+        // A behavior settings answer still on its way belongs to this run, and
+        // would otherwise be applied to the next start of this instance.
+        core.serverConfig.delegate = nil
 
         // First, so a module's halt-time flush lands in the queue and is not sent.
         core.network.halt()
@@ -550,20 +599,52 @@ public final class CountlyInstance: NSObject {
         core.serverConfig.stop()
         core.logGatherer.halt()
 
+        // Every store is closed, not only erased ones: a send that completes, a
+        // download or a breadcrumb that lands after this point belongs to the run
+        // being halted and must not write over what the next start reads.
         if clearStorage {
             core.requestQueueStore.flush()
             core.requestQueueStore.deleteFile()
+            core.crashLogStore.close()
             core.crashLogStore.deleteAll()
             core.keyValueStore.clearAll()
         } else {
-            core.requestQueueStore.saveSync()
+            core.requestQueueStore.close()
+            core.crashLogStore.close()
+            core.keyValueStore.close()
         }
 
         core.hasStarted = false
         core.hasFinishedInit = false
         self.core = nil
 
+        StorageClaims.release(core.namespace, by: self)
+
         core.logger.d(Self.module, "halt", "the SDK is halted, every module is torn down and the network is reset")
+    }
+
+    /// Erases what this instance's storage holds without starting it, for a
+    /// `halt(clearStorage: true)` that finds it not running.
+    ///
+    /// Only the registered instance may: a handle `Countly.removeInstance(named:)`
+    /// dropped would otherwise wipe the files of the instance the registry made
+    /// since, while it runs on them. The namespace is held for the duration, so a
+    /// previous holder still halting finishes its last write first.
+    private func eraseStoredData() {
+        guard Countly.isRegistered(self) else {
+            Logger.print("[Warning] [\(Self.module)] halt, \(notRegisteredReason), its stored data is not erased")
+            return
+        }
+
+        let namespace = StorageNamespace(instanceName: name)
+        StorageClaims.claim(namespace, for: self)
+        defer { StorageClaims.release(namespace, by: self) }
+
+        RequestQueueDatabase(namespace: namespace, logger: nil).deleteEverything()
+        CrashLogStore(namespace: namespace, logger: nil).deleteAll()
+        KeyValueStore(namespace: namespace, logger: nil).clearAll()
+
+        Logger.print("[Info] [\(Self.module)] halt, the SDK is not running, its stored data is erased, name: [\(name)]")
     }
 }
 
@@ -572,7 +653,9 @@ public final class CountlyInstance: NSObject {
 extension CountlyInstance: ServerConfigDelegate {
 
     func serverConfigDidChange(_ serverConfig: ServerConfig, consentBecameRequired: Bool) {
-        guard let core else { return }
+        // An answer the halt could not stop any more comes from the halted run's
+        // settings, and after a restart `core` is already the next run.
+        guard let core, core.serverConfig === serverConfig else { return }
 
         guard core.hasStarted else {
             core.logger.d(Self.module, "serverConfigDidChange", "behavior settings changed while the SDK is not running, they are stored but not applied to it")

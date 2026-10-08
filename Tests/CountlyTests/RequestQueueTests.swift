@@ -137,6 +137,40 @@ final class RequestQueueTests: CountlyBaseTestCase {
         XCTAssertFalse(remaining.contains(0), "the oldest went first")
     }
 
+    // MARK: - Removing what was sent
+
+    /// A request a bulk rewrite changed while the drain was sending it is still the
+    /// one removed once the send succeeds. Matched by its text it would stay, and
+    /// go out a second time under the rewritten app key.
+    func testARequestRewrittenWhileSentIsStillTheOneRemoved() throws {
+        let store = makeStore()
+        enqueue(store, "app_key=old&n=1")
+        enqueue(store, "app_key=old&n=2")
+
+        let sent = try XCTUnwrap(store.headEntry)
+        store.replaceAllAppKeys(with: "new")
+        store.removeHead(sent)
+
+        XCTAssertEqual(store.count, 1)
+        XCTAssertEqual(TestUtils.parseQuery(store.head ?? "")["n"] as? String, "2")
+    }
+
+    /// A closed store keeps its last written state: a send that completes after the
+    /// halt removes its request from memory only, never from the rows the next
+    /// start reads.
+    func testAClosedStoreNoLongerWritesItsFiles() throws {
+        let namespace = makeNamespace()
+        let halted = openStore(namespace)
+        enqueue(halted, "app_key=k&n=1")
+        let sent = try XCTUnwrap(halted.headEntry)
+        halted.close()
+
+        halted.removeHead(sent)
+        halted.saveSync()
+
+        XCTAssertEqual(openStore(namespace).count, 1, "the removal after the close reached the files")
+    }
+
     // MARK: - Age based dropping
 
     func testRequestsPastTheDropAgeAreRemoved() {

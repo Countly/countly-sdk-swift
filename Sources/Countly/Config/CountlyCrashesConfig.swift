@@ -22,4 +22,9 @@ public final class CountlyCrashesConfig: NSObject {
     public var crashFilterCallback: CrashFilterCallback?
 
     public override init() {}
+
+    /// Takes every value of `other`, for the snapshot an instance runs on.
+    func copyValues(from other: CountlyCrashesConfig) {
+        crashFilterCallback = other.crashFilterCallback
+    }
 }
