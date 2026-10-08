@@ -77,24 +77,29 @@ final class Logger {
 
     // MARK: - Level entry points
 
+    /// Logs at error level. A `scope` overrides whose consent the gathered copy needs.
     func e(_ module: String, _ function: String = #function, scope: LogGatheringScope? = nil, _ message: @autoclosure () -> String) {
         healthTracker?.logError()
         emit(.error, module, function, scope, message)
     }
 
+    /// Logs at warning level. A `scope` overrides whose consent the gathered copy needs.
     func w(_ module: String, _ function: String = #function, scope: LogGatheringScope? = nil, _ message: @autoclosure () -> String) {
         healthTracker?.logWarning()
         emit(.warning, module, function, scope, message)
     }
 
+    /// Logs at info level. A `scope` overrides whose consent the gathered copy needs.
     func i(_ module: String, _ function: String = #function, scope: LogGatheringScope? = nil, _ message: @autoclosure () -> String) {
         emit(.info, module, function, scope, message)
     }
 
+    /// Logs at debug level. A `scope` overrides whose consent the gathered copy needs.
     func d(_ module: String, _ function: String = #function, scope: LogGatheringScope? = nil, _ message: @autoclosure () -> String) {
         emit(.debug, module, function, scope, message)
     }
 
+    /// Logs at verbose level. A `scope` overrides whose consent the gathered copy needs.
     func v(_ module: String, _ function: String = #function, scope: LogGatheringScope? = nil, _ message: @autoclosure () -> String) {
         emit(.verbose, module, function, scope, message)
     }

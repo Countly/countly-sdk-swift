@@ -284,6 +284,9 @@ final class LogGatherer {
     /// Lines dropped from the buffer before init decided their consent, by scope.
     private var droppedBeforeInit: [LogGatheringScope: Int] = [:]
 
+    /// Where the lines of a device ID change in progress begin.
+    private var deviceIDChangeMark: UInt64?
+
     /// Serializes deliveries. The timer schedules them on `deliveryQueue`, the
     /// background and terminate paths run them on the caller's thread, and two
     /// deliveries interleaving would queue batches out of order.
@@ -382,6 +385,9 @@ final class LogGatherer {
             lock.unlock()
             logger?.d(Self.module, "apply", "the log gathering directive is unchanged, source: [\(source)], heldLineCount: [\(held)]")
             // A refetch is what turns tracking back on, and a full batch held meanwhile gets no other kick.
+            if holdsFullBatch {
+                scheduleDelivery(includePartialBatch: false)
+            }
             return
         }
 
@@ -493,31 +499,42 @@ final class LogGatherer {
         deliver(includePartialBatch: true)
     }
 
-    /// The capture order the next line will get. A device ID change reads it
-    /// before it logs anything, so the lines it logs can be told apart.
-    var nextCaptureSequence: UInt64 {
+    /// Marks the start of a device ID change, before it logs anything. Until it
+    /// ends, no delivery takes a line it logs, since that line may quote the next
+    /// user's ID.
+    func deviceIDChangeBegins() {
         lock.lock()
-        defer { lock.unlock() }
-        return nextSequence
+        deviceIDChangeMark = nextSequence
+        lock.unlock()
     }
 
-    /// Ends the gather for a device ID change without merge.
+    /// Marks the end of a device ID change. A change that kept the gather leaves
+    /// its lines to be delivered like any other, and a full batch held meanwhile
+    /// goes out now.
+    func deviceIDChangeEnds() {
+        lock.lock()
+        deviceIDChangeMark = nil
+        let holdsFullBatch = state == .gathering && lines.count >= directive.batchSize
+        lock.unlock()
+
+        if holdsFullBatch {
+            scheduleDelivery(includePartialBatch: false)
+        }
+    }
+
+    /// Ends the gather for a device ID change without merge, from inside the
+    /// change.
     ///
-    /// The lines logged since `mark` belong to the change itself and quote the
-    /// next user's ID, so they are dropped. What may be uploaded of the rest is
-    /// queued now, while requests still carry the old device ID, and everything
-    /// else held is dropped, so neither user's lines reach the other's gather.
-    func stopForDeviceIDChange(droppingLinesFrom mark: UInt64) {
+    /// What may be uploaded of the lines logged before the change is queued now,
+    /// while requests still carry the old device ID; the change's own lines, which
+    /// quote the next user's ID, are never taken. Everything else held is then
+    /// dropped, so neither user's lines reach the other's gather.
+    func stopForDeviceIDChange() {
         // Held throughout, so no other delivery can queue a batch once the new device ID is in place.
         deliveryLock.lock()
         defer { deliveryLock.unlock() }
 
         guard isCapturing else { return }
-
-        lock.lock()
-        lines.removeAll { $0.sequence >= mark }
-        heldChars = Self.charCount(of: lines)
-        lock.unlock()
 
         if isGathering {
             deliverSerialized(includePartialBatch: true)
@@ -695,10 +712,13 @@ final class LogGatherer {
         lock.lock()
         defer { lock.unlock() }
 
-        guard state == .gathering, let gatherID = directive.gatherID, !lines.isEmpty else { return nil }
-        if !includePartialBatch, lines.count < directive.batchSize { return nil }
+        guard state == .gathering, let gatherID = directive.gatherID else { return nil }
+        // Lines are held in capture order, so those of a device ID change in progress are the tail.
+        let available = deviceIDChangeMark.flatMap { mark in lines.firstIndex { $0.sequence >= mark } } ?? lines.count
+        guard available > 0 else { return nil }
+        if !includePartialBatch, available < directive.batchSize { return nil }
 
-        let count = min(directive.batchSize, lines.count)
+        let count = min(directive.batchSize, available)
         let taken = Array(lines.prefix(count))
         lines.removeFirst(count)
         heldChars -= Self.charCount(of: taken)

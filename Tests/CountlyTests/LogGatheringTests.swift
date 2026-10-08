@@ -709,6 +709,35 @@ final class LogGatheringTests: CountlyBaseTestCase {
         XCTAssertEqual(uploadedMessages(transport), [line], "the two together are enough, the other features are not needed")
     }
 
+    /// A device ID change logs the next user's ID, so while it runs no delivery
+    /// takes a line it logged: a change without merge drops them, and one that
+    /// keeps the gather lets them go out once it ends.
+    func testNoDeliveryTakesTheLinesOfADeviceIDChangeInProgress() {
+        let transport = FakeTransport()
+        let stopped = makeGatherer(transport)
+        stopped.apply(directive(id: "gather_change"), source: "test")
+        capture(stopped, 2, message: "before the change")
+        stopped.deviceIDChangeBegins()
+        capture(stopped, 2, message: "device ID change value detail, providedDeviceID: [new_user]")
+
+        stopped.flushNow()
+        XCTAssertEqual(uploadedMessages(transport), ["before the change 0", "before the change 1"])
+
+        stopped.stopForDeviceIDChange()
+        stopped.deviceIDChangeEnds()
+        XCTAssertFalse(uploadedMessages(transport).contains { $0.contains("new_user") }, "the next user's ID reached the previous user's gather")
+        XCTAssertEqual(stopped.currentState, .off)
+
+        let mergeTransport = FakeTransport()
+        let merged = makeGatherer(mergeTransport)
+        merged.apply(directive(id: "gather_merge"), source: "test")
+        merged.deviceIDChangeBegins()
+        capture(merged, 2, message: "device ID value detail for the merging change, deviceID: [merged_user]")
+        merged.deviceIDChangeEnds()
+        merged.flushNow()
+        XCTAssertEqual(uploadedMessages(mergeTransport).count, 2, "a merge keeps the gather, and the change's lines with it")
+    }
+
     /// A buffered line answers to its consent until it is uploaded, so
     /// withdrawing that consent takes it back out of the buffer, and giving it
     /// again releases it.
@@ -1097,25 +1126,55 @@ final class LogGatheringTests: CountlyBaseTestCase {
         countly.events.recordEvent("old-user-secret-event")
         core(of: countly).modules.events.sendEventsWithSaveIfNeeded()
         TestUtils.waitUntil("the old user's gather takes the lines of the old user's request") {
-            messages(gatherer(of: countly)).contains { $0.contains("[ConnectionManager]") && $0.contains("old-user-secret-event") }
+            (messages(gatherer(of: countly)) + uploadedMessages(of: countly)).contains { $0.contains("[ConnectionManager]") && $0.contains("old-user-secret-event") }
         }
 
         countly.deviceID.changeWithoutMerge("new_user")
         gatherer(of: countly).apply(directive(id: "gather_new_user"), source: "test")
         let sendsBefore = MockURLProtocol.requests.count
-        core(of: countly).network.proceedOnQueue()
-        TestUtils.waitUntil("the old user's request is sent again") { MockURLProtocol.requests.count > sendsBefore }
+        TestUtils.waitUntil("the old user's request is sent again while the next user's gather runs") {
+            core(of: countly).network.proceedOnQueue()
+            return MockURLProtocol.requests.dropFirst(sendsBefore).contains { $0.query.contains("old-user-secret-event") }
+        }
         TestUtils.pump(0.3)
 
         let gathered = messages(gatherer(of: countly)) + awaitingMessages(gatherer(of: countly))
         XCTAssertFalse(gathered.contains { $0.contains("old-user-secret-event") }, "the next user's gather took the previous user's request")
     }
 
+    /// A request still out when the device ID changes is the previous user's, so
+    /// what its completion logs is not gathered for the next user either.
+    func testTheCompletionOfARequestSentBeforeADeviceIDChangeIsNotGatheredForTheNextUser() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let sink = LogSink()
+        let countly = startArmed(id: "gather_in_flight", batchSize: maxBufferedLines) {
+            $0.loggerDelegate = sink
+            $0.internalLogLevel = .verbose
+        }
+        MockURLProtocol.respond { captured in
+            guard captured.query.contains("in-flight-secret-event") else { return nil }
+            // Slow, so the device ID changes while the request is out.
+            Thread.sleep(forTimeInterval: 0.5)
+            return (500, Data("in-flight-secret-reply".utf8))
+        }
+
+        countly.events.recordEvent("in-flight-secret-event")
+        core(of: countly).modules.events.sendEventsWithSaveIfNeeded()
+        TestUtils.waitUntil("the request is out") { MockURLProtocol.requests.contains { $0.query.contains("in-flight-secret-event") } }
+        countly.deviceID.changeWithoutMerge("new_user")
+        gatherer(of: countly).apply(directive(id: "gather_new_user"), source: "test")
+        TestUtils.waitUntil("the reply to the previous user's request arrived") { sink.lines.contains { $0.contains("in-flight-secret-reply") } }
+
+        let gathered = messages(gatherer(of: countly)) + awaitingMessages(gatherer(of: countly))
+        XCTAssertFalse(gathered.contains { $0.contains("in-flight-secret") }, "the next user's gather took the reply to the previous user's request")
+    }
+
     /// Withdrawing a consent through the public API takes that feature's lines
-    /// back out of the upload buffer.
+    /// back out of the upload buffer. Tracking is off, so no delivery can take
+    /// the line first.
     func testWithdrawingAConsentThroughThePublicAPIRecallsItsLines() throws {
         try skipUnlessNetworkIsInterceptable()
-        let countly = startArmed(id: "gather_withdraw_api", batchSize: maxBufferedLines) {
+        let countly = startArmed(id: "gather_withdraw_api", settings: ServerConfigBuilder().tracking(false)) {
             $0.requiresConsent = true
             $0.consents = [.events, .userDetails]
         }
@@ -1123,9 +1182,8 @@ final class LogGatheringTests: CountlyBaseTestCase {
         XCTAssertTrue(messages(gatherer(of: countly)).contains { $0.contains("withdrawn@example.com") })
 
         countly.consent.cancelConsent(for: [.userDetails])
-        gatherer(of: countly).flushNow()
 
-        XCTAssertFalse(uploadedMessages(of: countly).contains { $0.contains("withdrawn@example.com") })
+        XCTAssertFalse(messages(gatherer(of: countly)).contains { $0.contains("withdrawn@example.com") })
         XCTAssertTrue(awaitingMessages(gatherer(of: countly)).contains { $0.contains("withdrawn@example.com") })
     }
 

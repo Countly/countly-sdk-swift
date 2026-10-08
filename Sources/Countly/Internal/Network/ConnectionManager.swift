@@ -257,19 +257,22 @@ final class ConnectionManager: NSObject {
     /// be marked, since the delivery loop lands here synchronously, so the mark
     /// is restored on the way out.
     private func send(head: String) {
-        let notGathered = head.contains("&\(QS.sdkLogs)=") || !isForCurrentDeviceID(head)
-        core.logGatherer.markingTransportWork(notGathered) {
-            sendMarked(head: head, notGathered: notGathered)
+        let isSdkLogsTransport = head.contains("&\(QS.sdkLogs)=")
+        core.logGatherer.markingTransportWork(isNotGathered(head, isSdkLogsTransport: isSdkLogsTransport)) {
+            sendMarked(head: head, isSdkLogsTransport: isSdkLogsTransport)
         }
     }
 
-    /// Whether a queued request was built with the device ID in use now.
-    private func isForCurrentDeviceID(_ queryString: String) -> Bool {
+    /// Whether what is logged about sending `head` stays out of the gathered
+    /// log: for a gathered log batch, and for a request built with another device
+    /// ID than the one in use now.
+    private func isNotGathered(_ head: String, isSdkLogsTransport: Bool) -> Bool {
+        guard !isSdkLogsTransport else { return true }
         let current = "\(QS.deviceID)=\(core.modules.deviceID.deviceID.urlEscaped)"
-        return queryString.split(separator: "&").contains { $0 == current }
+        return !head.split(separator: "&").contains { $0 == current }
     }
 
-    private func sendMarked(head: String, notGathered: Bool) {
+    private func sendMarked(head: String, isSdkLogsTransport: Bool) {
         var queryString = head
         var endpoint = Endpoint.input
 
@@ -311,8 +314,8 @@ final class ConnectionManager: NSObject {
             self.stateLock.unlock()
 
             // The completion runs on a session thread of its own, which has to be
-            // marked in turn while it deals with a request that is not gathered.
-            self.core.logGatherer.markingTransportWork(notGathered) {
+            // marked in turn, judged again since the device ID may have changed meanwhile.
+            self.core.logGatherer.markingTransportWork(self.isNotGathered(head, isSdkLogsTransport: isSdkLogsTransport)) {
                 let elapsed = Date().timeIntervalSince(startedAt)
                 let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
