@@ -24,15 +24,45 @@ final class ConsentModule: ModuleBase {
     /// Logged on every change: behavior settings can turn this on for an
     /// integration that never asked for it, and from then on every feature is
     /// gated. That is the first thing to check when a feature collects nothing.
-    var requiresConsent: Bool = false {
-        didSet {
-            guard requiresConsent != oldValue else { return }
-            logI("requiresConsent", "consent requirement changed, requiresConsent: [\(requiresConsent)], grantedFeatureCount: [\(granted.count)]")
+    /// A change also releases the gathered log lines no longer waiting for a
+    /// consent.
+    var requiresConsent: Bool {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return _requiresConsent
+        }
+        set {
+            stateLock.lock()
+            let oldValue = _requiresConsent
+            _requiresConsent = newValue
+            stateLock.unlock()
+
+            guard newValue != oldValue else { return }
+            logI("requiresConsent", "consent requirement changed, requiresConsent: [\(newValue)], grantedFeatureCount: [\(granted.count)]")
+            core.logGatherer.releaseLinesAwaitingConsent()
         }
     }
 
     /// Raw per-feature state. Only meaningful while `requiresConsent` is on.
-    private var granted: Set<ConsentFeature> = []
+    private var granted: Set<ConsentFeature> {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return _granted
+        }
+        set {
+            stateLock.lock()
+            _granted = newValue
+            stateLock.unlock()
+        }
+    }
+
+    /// Guards the consent state, which the log gatherer reads for every line it
+    /// captures, on whichever thread logged it. Never held while logging.
+    private let stateLock = NSLock()
+    private var _requiresConsent = false
+    private var _granted: Set<ConsentFeature> = []
 
     /// The order consent is granted in.
     ///
@@ -82,7 +112,8 @@ final class ConsentModule: ModuleBase {
         giveConsent(for: ConsentFeature.allCases)
     }
 
-    /// Grants consent for the named features and reports the new state.
+    /// Grants consent for the named features, reports the new state, and releases
+    /// the gathered log lines that waited for it.
     func giveConsent(for features: [ConsentFeature]) {
         logI("giveConsent", "giving consent for features, featureCount: [\(features.count)], features: [\(Self.describe(features))]")
 
@@ -106,6 +137,7 @@ final class ConsentModule: ModuleBase {
         logD("giveConsent", "consent state after giving consent, grantedBefore: [\(stateBeforeChange)], grantedAfter: [\(Self.describe(granted))]")
 
         sendConsents()
+        core.logGatherer.releaseLinesAwaitingConsent()
     }
 
     /// Withdraws consent for every feature.

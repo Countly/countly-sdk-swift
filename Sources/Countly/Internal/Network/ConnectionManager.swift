@@ -390,9 +390,7 @@ final class ConnectionManager: NSObject {
         core.logger.d(Self.module, "proceedOnQueue", "request failed, endpoint: [\(request.url?.path ?? "")], statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)]")
 
         let body = data.flatMap { String(data: $0, encoding: .utf8) }
-        // The whole query string is in this line, so it quotes whatever feature
-        // the failed request belonged to.
-        core.logger.v(Self.module, "proceedOnQueue", scope: .anyFeature, "failed request detail, fullResponseURL: [\(request.url?.absoluteString ?? "")], serverErrorResponseBody: [\(body ?? "")]")
+        core.logger.v(Self.module, "proceedOnQueue", "failed request detail, fullResponseURL: [\(request.url?.absoluteString ?? "")], serverErrorResponseBody: [\(body ?? "")]")
 
         hasAnyRequestFailed = true
         deliver(callback, callbackID: callbackID, response: body, success: false)
@@ -755,9 +753,7 @@ final class ConnectionManager: NSObject {
             return false
         }
 
-        // Same as the failure path: the URL carries the query string of whichever
-        // feature produced the request.
-        core.logger.v(Self.module, "isRequestSuccessful", scope: .anyFeature, "server reply detail, fullResponseURL: [\(response?.url?.absoluteString ?? "")], parsedServerReply: [\(reply)]")
+        core.logger.v(Self.module, "isRequestSuccessful", "server reply detail, fullResponseURL: [\(response?.url?.absoluteString ?? "")], parsedServerReply: [\(reply)]")
 
         guard let result = reply["result"] else {
             logRejection("reason: the server reply does not contain the result field, statusCode: [\(http.statusCode)], replyKeys: [\(reply.keys.sorted().joined(separator: ", "))]")
@@ -1072,6 +1068,10 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
 
     var isDeviceIDTemporary: Bool {
         core.modules.deviceID.isTemporary
+    }
+
+    var deviceID: String {
+        core.modules.deviceID.deviceID
     }
 
     /// Sends the health check outside the queue.

@@ -219,11 +219,13 @@ final class DeviceIDModule: ModuleBase {
             logI("changeDeviceID", "the previous identity will be merged into the new device ID on the server, previousType: [\(previousType)], newType: [\(deviceIDType)]")
             sendOldDeviceID(oldDeviceID)
         } else {
-            logI("changeDeviceID", "the device ID change starts a new user, the session is restarted, consents are cancelled and timed events are dropped, previousType: [\(previousType)]")
+            logI("changeDeviceID", "the device ID change starts a new user, the session is restarted, consents are cancelled, timed events are dropped and log gathering is stopped, previousType: [\(previousType)]")
 
             // The session belongs to the old identity, so it is closed before the
             // switch and reopened after it.
             core.modules.sessions.suspend()
+            // Before the switch, so the gathered lines it queues carry the old device ID.
+            core.logGatherer.stopForDeviceIDChange()
             apply(resolved)
             core.modules.consent.cancelAllConsentsWithoutSending()
             core.modules.sessions.resume()

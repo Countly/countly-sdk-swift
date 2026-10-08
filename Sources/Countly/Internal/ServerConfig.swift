@@ -329,6 +329,7 @@ final class ServerConfig {
         scheduleRefreshTimerIfNeeded(config: config)
 
         let fetchStart = Date()
+        let requestedDeviceID = transport.deviceID
         transport.fetchServerConfig { [weak self] data, statusCode, error in
             guard let self else { return }
 
@@ -371,8 +372,12 @@ final class ServerConfig {
 
             // Only a live response decides log gathering, never a stored document. A
             // live response without a usable directive decides against it.
-            self.logGatherer?.apply(LogGatheringDirective.parse(response[DocKey.logGathering], logger: self.logger),
-                                    source: "server response")
+            if self.transport?.deviceID == requestedDeviceID {
+                self.logGatherer?.apply(LogGatheringDirective.parse(response[DocKey.logGathering], logger: self.logger),
+                                        source: "server response")
+            } else {
+                self.logger?.d(Self.module, "fetch", "the device ID changed while the fetch was in flight, its log gathering directive belongs to the previous user and is ignored")
+            }
 
             if connectionTestArmed {
                 self.connectionTest?.startBattery(serverConfigLatencyMs: fetchLatencyMs)
@@ -909,5 +914,7 @@ protocol ServerConfigDelegate: AnyObject {
 /// What the behavior settings fetch needs from the networking layer.
 protocol ServerConfigTransport: AnyObject {
     var isDeviceIDTemporary: Bool { get }
+    /// The device ID requests are built with right now.
+    var deviceID: String { get }
     func fetchServerConfig(completion: @escaping (Data?, Int, Error?) -> Void)
 }

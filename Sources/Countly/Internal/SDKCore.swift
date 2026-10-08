@@ -155,10 +155,8 @@ extension SDKCore: LogGatheringTransport {
         serverConfig.trackingEnabled
     }
 
-    var hasAnyConsent: Bool {
-        modules.consent.hasAnyConsent
-    }
-
+    /// Answered by the consent module, whose read neither logs nor waits on a
+    /// lock held while logging, so it is safe inside a capture.
     func hasConsent(for feature: ConsentFeature) -> Bool {
         modules.consent.hasConsent(for: feature)
     }

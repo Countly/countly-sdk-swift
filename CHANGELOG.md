@@ -132,7 +132,7 @@
   * Developer-supplied settings via "CountlyConfig.sdkBehaviorSettings", and "disableSDKBehaviorSettingsUpdates" to pin them
 
 * Added the two server requested diagnostics: log gathering, which uploads the SDK's own internal log lines even when logging is disabled, and the connection test, which checks every endpoint the SDK depends on and reports the results.
-  * A gathered line is uploaded in full only with the consent of the feature whose data it carries, so an event key, a view name or a user property never reaches the server without consent for that feature. A line without it is uploaded with everything after its module and function replaced by a note saying which consent is missing, and lines about the SDK's own working are uploaded unchanged. Console and "CountlyLoggerDelegate" output is not affected.
+  * When consent is required, a gathered log line is uploaded only after the consent of the feature that wrote it is given, and a line that belongs to no single feature needs both the events and user details consents.
 
 * Added networking configuration on "CountlyConfig":
   * "addCustomNetworkRequestHeaders(headers)" and "customNetworkRequestHeaders"

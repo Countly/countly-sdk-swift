@@ -356,15 +356,7 @@ final class EventsModule: ModuleBase {
     /// Which consent a reserved event answers to, or `nil` when the key is not
     /// reserved.
     private func consentForReservedEvent(_ key: String) -> Bool? {
-        let consent = core.modules.consent
-        switch key {
-        case ReservedEventKey.orientation: return consent.hasConsent(for: .userDetails)
-        case ReservedEventKey.ratingWidget, ReservedEventKey.survey, ReservedEventKey.nps:
-            return consent.hasConsent(for: .feedback)
-        case ReservedEventKey.pushAction: return consent.hasConsent(for: .pushNotifications)
-        case ReservedEventKey.view: return consent.hasConsent(for: .viewTracking)
-        default: return nil
-        }
+        ReservedEventKey.owningFeature[key].map { core.modules.consent.hasConsent(for: $0) }
     }
 
     /// A view event whose name is a journey trigger flushes like a trigger event.
