@@ -21,4 +21,10 @@ public final class CountlyExperimentalConfig: NSObject {
     public var enableVisibilityTracking: Bool = false
 
     public override init() {}
+
+    /// Takes every value of `other`, for the snapshot an instance runs on.
+    func copyValues(from other: CountlyExperimentalConfig) {
+        enablePreviousNameRecording = other.enablePreviousNameRecording
+        enableVisibilityTracking = other.enableVisibilityTracking
+    }
 }

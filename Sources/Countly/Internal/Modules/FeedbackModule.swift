@@ -38,8 +38,9 @@ final class FeedbackModule: ModuleBase {
     ///
     /// A widget is dismissed by the page rather than by the SDK, so its presenter
     /// has to outlive the call that created it. Entries are dropped in the
-    /// dismissal callback.
-    private var presentedWidgetManagers: [AnyObject] = []
+    /// dismissal callback. Internal so the suite can hand the module a presenter
+    /// without putting a window on screen.
+    var presentedWidgetManagers: [AnyObject] = []
 
     /// One line per widget, enough to tell why a given one was or was not picked.
     /// Widget names and tags are authored in the dashboard, not by the end user.
@@ -78,8 +79,12 @@ final class FeedbackModule: ModuleBase {
         let request = widgetListRequest()
         logD("getAvailableFeedbackWidgets", "feedback widget list request is started, path: [\(request.url?.path ?? "")]")
 
-        core.network.instantTask(with: request) { [weak self] data, response, error in
-            guard let self else { return }
+        let task = core.network.instantTask(with: request) { [weak self] data, response, error in
+            // The caller is answered even once a halt has released the module.
+            guard let self else {
+                DispatchQueue.main.async { completion(nil, error ?? CountlyError.feedbacksGeneralAPIError.asNSError) }
+                return
+            }
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
             guard error == nil,
@@ -112,7 +117,12 @@ final class FeedbackModule: ModuleBase {
             }
 
             DispatchQueue.main.async { completion(widgets, nil) }
-        }?.resume()
+        }
+        guard let task else {
+            completion(nil, CountlyError.feedbacksGeneralAPIError.asNSError)
+            return
+        }
+        task.resume()
     }
 
     private func widgetListRequest() -> URLRequest {
@@ -242,10 +252,14 @@ final class FeedbackModule: ModuleBase {
         guard !managers.isEmpty else { return }
         logD("halt", "taking the presented feedback widgets off screen, widgetCount: [\(managers.count)]")
 
-        let close = {
+        // The core is held until the widgets are closed. Off the main thread this
+        // runs after the halt has released the core, and closing a widget, its
+        // dismissal included, still reads it.
+        let close = { [core] in
             for manager in managers {
                 (manager as? WebViewManager)?.close()
             }
+            withExtendedLifetime(core) {}
         }
 
         onMainThread(close)
@@ -369,8 +383,12 @@ final class FeedbackModule: ModuleBase {
         let request = core.network.instantRequest(queryString: queryString, path: path)
         logD("fetchWidgetData", "widget data request is started, widgetID: [\(widget.id)], path: [\(path)]")
 
-        core.network.instantTask(with: request) { [weak self] data, response, error in
-            guard let self else { return }
+        let task = core.network.instantTask(with: request) { [weak self] data, response, error in
+            // The caller is answered even once a halt has released the module.
+            guard let self else {
+                DispatchQueue.main.async { completion(nil, error ?? CountlyError.feedbackWidgetNotAvailable.asNSError) }
+                return
+            }
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
             guard error == nil,
@@ -386,7 +404,12 @@ final class FeedbackModule: ModuleBase {
 
             self.logD("fetchWidgetData", "widget data fetched, widgetID: [\(widget.id)], fieldCount: [\(widgetData.count)], fields: [\(widgetData.keys.sorted().joined(separator: ", "))]")
             DispatchQueue.main.async { completion(widgetData, nil) }
-        }?.resume()
+        }
+        guard let task else {
+            completion(nil, CountlyError.feedbackWidgetNotAvailable.asNSError)
+            return
+        }
+        task.resume()
     }
 
     // MARK: - Recording results

@@ -291,6 +291,39 @@ final class ConnectionManagerTests: CountlyBaseTestCase {
                       "a stale request is dropped, not sent")
     }
 
+    /// A long backlog of stale requests is dropped without a nested call per
+    /// request. A device offline for days can hold a thousand of them, and the
+    /// drain runs on threads with small stacks, a URL session's among them.
+    func testABacklogOfStaleRequestsIsDroppedOnASmallStack() {
+        MockURLProtocol.respondToEverything(json: Self.accepted)
+        let countly = startInstance {
+            $0.requestDropAgeHours = 1
+            $0.storedRequestsLimit = 5000
+        }
+
+        let core = core(of: countly)
+        TestUtils.waitUntil("the drain started by init is over") {
+            !core.network.isProcessingQueueForTesting
+        }
+
+        let ancient = Int64((Date().timeIntervalSince1970 - 7200) * 1000)
+        for index in 0..<2000 {
+            core.requestQueueStore.appendVerbatim("app_key=\(Self.appKey)&timestamp=\(ancient)&stale=\(index)")
+        }
+
+        let drained = expectation(description: "the drain returns")
+        let thread = Thread {
+            core.network.proceedOnQueue()
+            drained.fulfill()
+        }
+        thread.stackSize = 256 * 1024
+        thread.start()
+        wait(for: [drained], timeout: 30)
+
+        XCTAssertTrue(requestQueue(of: countly).allSatisfy { !$0.contains("stale=") },
+                      "every stale request is dropped")
+    }
+
     // MARK: - Holding everything back
 
     /// In temporary mode the queue is not drained at all: every request in it is

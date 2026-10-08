@@ -145,7 +145,11 @@ final class PushModule: ModuleBase {
         logD("askForNotificationPermission", "asking the system for notification authorization, resolvedOptions: [\(resolved.rawValue)], defaultsUsed: [\(options == 0)]")
 
         UNUserNotificationCenter.current().requestAuthorization(options: resolved) { [weak self] granted, error in
-            guard let self else { return }
+            // The user's answer is reported even once a halt has released the module.
+            guard let self else {
+                completion?(granted, error)
+                return
+            }
 
             if let error {
                 self.logE("askForNotificationPermission", "notification permission request returned an error, granted: [\(granted)], error: [\(error.localizedDescription)]")

@@ -30,4 +30,12 @@ public final class CountlyAPMConfig: NSObject {
     public var appStartTimestampOverride: Int64 = 0
 
     public override init() {}
+
+    /// Takes every value of `other`, for the snapshot an instance runs on.
+    func copyValues(from other: CountlyAPMConfig) {
+        enableForegroundBackgroundTracking = other.enableForegroundBackgroundTracking
+        enableAppStartTimeTracking = other.enableAppStartTimeTracking
+        enableManualAppLoadedTrigger = other.enableManualAppLoadedTrigger
+        appStartTimestampOverride = other.appStartTimestampOverride
+    }
 }

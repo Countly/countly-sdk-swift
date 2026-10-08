@@ -255,6 +255,217 @@ final class StorageAndConfigTests: CountlyBaseTestCase {
         XCTAssertTrue(first === again, "the registry hands back the same instance")
     }
 
+    // MARK: - The key value store
+
+    /// A write whose change observer waits on another thread must not hold up an
+    /// erasure on that thread. `UserDefaults` runs observers inside the write, so
+    /// a lock held across it turns such an observer into a deadlock.
+    func testAnErasureDoesNotWaitOnAWriteStillRunningItsObservers() {
+        let suite = "countly-kv-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = KeyValueStore(namespace: StorageNamespace(instanceName: uniqueInstanceName()),
+                                  defaults: defaults,
+                                  logger: nil)
+
+        let writer = Recorded<Thread?>(nil)
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let observerWait = Recorded<DispatchTimeoutResult?>(nil)
+        let token = NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification,
+                                                           object: nil,
+                                                           queue: nil) { _ in
+            guard let thread = writer.value, Thread.current == thread, observerWait.value == nil else { return }
+            entered.signal()
+            observerWait.value = release.wait(timeout: .now() + 5)
+        }
+        defer { NotificationCenter.default.removeObserver(token) }
+
+        let written = expectation(description: "the write returns")
+        DispatchQueue.global().async {
+            writer.value = Thread.current
+            store.serverConfig = ["c": ["tracking": true]]
+            written.fulfill()
+        }
+
+        XCTAssertEqual(entered.wait(timeout: .now() + 5), .success, "the write never notified its observer")
+        store.clearAll()
+        release.signal()
+        wait(for: [written], timeout: 10)
+
+        XCTAssertEqual(observerWait.value, .success, "the erasure waited for the write to finish its observers")
+        XCTAssertNil(store.serverConfig, "the write that raced the erasure was not taken back")
+    }
+
+    // MARK: - The config snapshot
+
+    /// What the SDK changes on its config while running stays with that run: the
+    /// caller's object starts the next run, or another instance, as it was given.
+    func testRuntimeChangesNeverReachTheCallersConfig() {
+        let config = baseConfig()
+        let countly = start(config)
+
+        countly.setNewAppKey("changed-at-runtime")
+        countly.setNewHost("https://changed.example")
+
+        XCTAssertEqual(config.appKey, Self.appKey)
+        XCTAssertEqual(config.host, Self.host)
+        XCTAssertEqual(core(of: countly).config.appKey, "changed-at-runtime")
+    }
+
+    /// One config can start two instances: changing it after the first started
+    /// must not redirect that one's data to the second one's app.
+    func testAConfigSharedByTwoInstancesKeepsThemApart() {
+        let config = baseConfig()
+        let first = start(config)
+
+        config.appKey = "second-app-key"
+        config.instanceName = uniqueInstanceName()
+        let second = start(config)
+
+        XCTAssertEqual(core(of: first).config.appKey, Self.appKey)
+        XCTAssertEqual(core(of: second).config.appKey, "second-app-key")
+    }
+
+    /// Every stored property survives the snapshot, so nothing an integration sets
+    /// is dropped when the instance takes its copy. The counts fail when a property
+    /// is added or removed, which is the prompt to copy it and to set it here.
+    func testTheSnapshotCopiesEveryStoredProperty() throws {
+        let original = CountlyConfig()
+        let delegate = SnapshotLoggerDelegate()
+
+        original.host = "https://snapshot.example"
+        original.appKey = "snapshot-app-key"
+        original.instanceName = "snapshot-instance"
+        original.enableDebug = true
+        original.internalLogLevel = .verbose
+        original.loggerDelegate = delegate
+        original.features = [.crashReporting]
+        original.customMetrics = ["metric": "1"]
+        original.sdkName = "bridge"
+        original.sdkVersion = "9.9.9"
+        original.enableAutomaticViewTracking = true
+        original.disableSwizzling = true
+        original.automaticViewTrackingExclusionList = ["Excluded"]
+        original.globalViewSegmentation = ["global": 1]
+        original.disableViewRestartForManualRecording = true
+        original.requiresConsent = true
+        original.consents = [.events]
+        original.enableAllConsents = true
+        original.pushTestMode = .development
+        original.sendPushTokenAlways = true
+        original.disableAutomaticPushHandling = true
+        original.launchNotification = ["launch": 1]
+        original.doNotShowAlertForNotifications = true
+        original.location = CLLocationCoordinate2D(latitude: 1, longitude: 2)
+        original.city = "City"
+        original.isoCountryCode = "TR"
+        original.ipAddress = "192.0.2.1"
+        original.disableLocation = true
+        original.deviceID = "snapshot-device"
+        original.temporaryDeviceIDMode = true
+        original.resetStoredDeviceID = true
+        original.updateSessionPeriod = 7
+        original.eventSendThreshold = 7
+        original.storedRequestsLimit = 7
+        original.requestDropAgeHours = 7
+        original.requestTimeoutDuration = 7
+        original.alwaysUsePOST = true
+        original.manualSessionHandling = true
+        original.enableManualSessionControlHybridMode = true
+        original.providedUserProperties = ["property": 1]
+        original.campaignType = "campaign-type"
+        original.campaignData = "campaign-data"
+        original.indirectAttribution = ["idfa": "value"]
+        original.crashSegmentation = ["crash": 1]
+        original.crashFilter = try NSRegularExpression(pattern: "filtered")
+        original.shouldSendCrashReportCallback = { _ in false }
+        original.pinnedCertificates = ["certificate"]
+        original.secretSalt = "salt"
+        original.urlSessionConfiguration.timeoutIntervalForRequest = 7
+        original.shouldIgnoreTrustCheck = true
+        original.customNetworkRequestHeaders = ["header": "value"]
+        original.enableRemoteConfigAutomaticTriggers = true
+        original.enableRemoteConfigValueCaching = true
+        original.enrollABOnRCDownload = true
+        original.remoteConfigRegisterGlobalCallback { _, _, _, _ in }
+        original.enableOrientationTracking = false
+        original.sdkBehaviorSettings = "{}"
+        original.disableSDKBehaviorSettingsUpdates = true
+        original.disableBackoffMechanism = true
+
+        original.sdkInternalLimits.maxKeyLength = 7
+        original.sdkInternalLimits.maxValueSize = 7
+        original.sdkInternalLimits.maxValueSizePicture = 7
+        original.sdkInternalLimits.maxBreadcrumbCount = 7
+        original.sdkInternalLimits.maxSegmentationValues = 7
+        original.sdkInternalLimits.maxStackTraceLineLength = 7
+        original.sdkInternalLimits.maxStackTraceLinesPerThread = 7
+        original.crashes.crashFilterCallback = { _ in false }
+        original.apm.enableForegroundBackgroundTracking = true
+        original.apm.enableAppStartTimeTracking = true
+        original.apm.enableManualAppLoadedTrigger = true
+        original.apm.appStartTimestampOverride = 7
+        original.content.globalContentCallback = { _, _ in }
+        original.content.zoneTimerInterval = 77
+        original.content.overlayCornerRadius = 7
+        original.content.webViewDisplayOption = original.content.webViewDisplayOption == .immersive ? .safeArea : .immersive
+        original.content.enableContentReloadOnStall = true
+        original.content.contentReloadOnStallTimeout = 7
+        original.content.disableZoom = true
+        original.content.disableRotation = true
+        original.content.contentURLHandler = { _ in true }
+        original.content.showWidgetsWithinApp = true
+        original.experimental.enablePreviousNameRecording = true
+        original.experimental.enableVisibilityTracking = true
+
+        let copy = original.snapshot()
+
+        XCTAssertEqual(Mirror(reflecting: original).children.count, 64)
+        XCTAssertEqual(Mirror(reflecting: original.sdkInternalLimits).children.count, 7)
+        XCTAssertEqual(Mirror(reflecting: original.crashes).children.count, 1)
+        XCTAssertEqual(Mirror(reflecting: original.apm).children.count, 4)
+        XCTAssertEqual(Mirror(reflecting: original.content).children.count, 10)
+        XCTAssertEqual(Mirror(reflecting: original.experimental).children.count, 2)
+
+        assertSameValues(original, copy)
+        XCTAssertFalse(original.urlSessionConfiguration === copy.urlSessionConfiguration,
+                       "the SDK sets timeouts on its session configuration, so the caller's must not be shared")
+        XCTAssertEqual(copy.urlSessionConfiguration.timeoutIntervalForRequest, 7)
+    }
+
+    /// Compares every stored property of two configs, sub-configurations included,
+    /// which must be copies rather than the same objects.
+    private func assertSameValues(_ original: Any, _ copy: Any, path: String = "config",
+                                  file: StaticString = #filePath, line: UInt = #line) {
+        let copied = Dictionary(uniqueKeysWithValues: Mirror(reflecting: copy).children.compactMap { child in
+            child.label.map { ($0, child.value) }
+        })
+
+        for child in Mirror(reflecting: original).children {
+            guard let label = child.label, let copiedValue = copied[label] else {
+                XCTFail("\(path).\(child.label ?? "?") is missing from the copy", file: file, line: line)
+                continue
+            }
+
+            // Only class instances are checked for identity. Casting a struct such
+            // as a coordinate to an object would box it through a bridge.
+            let typeName = String(describing: type(of: child.value))
+            if Mirror(reflecting: child.value).displayStyle == .class {
+                if typeName.contains("URLSessionConfiguration") { continue }
+                if typeName.hasPrefix("Countly") {
+                    XCTAssertFalse((child.value as AnyObject) === (copiedValue as AnyObject),
+                                   "\(path).\(label) is shared rather than copied", file: file, line: line)
+                    assertSameValues(child.value, copiedValue, path: "\(path).\(label)", file: file, line: line)
+                    continue
+                }
+            }
+
+            XCTAssertEqual(String(describing: child.value), String(describing: copiedValue),
+                           "\(path).\(label) differs in the copy", file: file, line: line)
+        }
+    }
+
     // MARK: - SDK identity
 
     /// A bridge SDK reports itself, or every request it makes is attributed to the
@@ -341,4 +552,9 @@ final class StorageAndConfigTests: CountlyBaseTestCase {
         XCTAssertEqual(countly.requestQueue.queuedRequests().count, first.count,
                        "an empty request was queued")
     }
+}
+
+/// A logger delegate for the snapshot test, which only needs one to exist.
+private final class SnapshotLoggerDelegate: NSObject, CountlyLoggerDelegate {
+    func internalLog(_ log: String, level: CountlyLogLevel) {}
 }

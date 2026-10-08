@@ -75,7 +75,7 @@ class CountlyBaseTestCase: XCTestCase {
     /// Starts an instance for `config` and schedules its teardown.
     @discardableResult
     func start(_ config: CountlyConfig) -> CountlyInstance {
-        let instance = Countly.instance(named: config.instanceName)
+        let instance = Countly.instance(named: config.instanceName ?? uniqueInstanceName())
         instance.start(with: config)
         started.append(instance)
         return instance

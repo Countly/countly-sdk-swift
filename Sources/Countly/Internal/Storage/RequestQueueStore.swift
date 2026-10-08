@@ -56,13 +56,18 @@ final class RequestQueueStore: @unchecked Sendable {
     /// may have been sending it, and its removal is still honoured.
     private var headDisplacedByAttach: String?
 
+    /// Counts the merges with the database's queue. A merge renumbers the requests
+    /// queued meanwhile, so a sequence read before one no longer names its request.
+    private var attachEpoch = 0
+
     /// Whether a sync is queued that has not taken its copy of the queue yet, and
     /// so carries every change made meanwhile as well.
     private var isSyncScheduled = false
 
-    /// Set once the files are deleted, so a sync queued before that cannot write
-    /// them back.
-    private var isDeleted = false
+    /// Set once the store is closed by a halt or its files are deleted, so nothing
+    /// that reaches it afterwards, a sync queued before or a send that completes
+    /// late, can write the files again.
+    private var isClosed = false
 
     /// What the crash handler records about the database in a pending file: the
     /// lineage token the queue was last committed under, and the highest sequence
@@ -96,10 +101,6 @@ final class RequestQueueStore: @unchecked Sendable {
             logger?.d(Self.module, "requestDropAgeHours", "the request drop age is set, previousValue: [\(oldValue)], newValue: [\(requestDropAgeHours)], ageBasedDroppingEnabled: [\(requestDropAgeHours > 0)]")
         }
     }
-
-    /// Set while a bulk rewrite of the queue is in progress, so the connection
-    /// manager does not start sending a request that is about to be rewritten.
-    private(set) var isBeingModified: Bool = false
 
     /// Runs every database operation, one at a time.
     private let writeQueue = DispatchQueue(label: "ly.count.requestqueue.write", qos: .utility)
@@ -146,6 +147,15 @@ final class RequestQueueStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return entries.first?.request
+    }
+
+    /// The request that will be sent next, with what still identifies it once a
+    /// bulk rewrite has changed its text. What the drain sends and later removes.
+    var headEntry: QueuedHead? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let first = entries.first else { return nil }
+        return QueuedHead(request: first.request, sequence: first.sequence, attachEpoch: attachEpoch)
     }
 
     /// A copy of the whole queue, oldest first.
@@ -239,7 +249,33 @@ final class RequestQueueStore: @unchecked Sendable {
     func removeHead(_ queryString: String) {
         lock.lock()
         defer { lock.unlock() }
+        removeHeadLocked(queryString)
+    }
 
+    /// Removes the request the drain took with `headEntry`, found by its sequence,
+    /// so one a bulk rewrite changed while it was being sent is removed too rather
+    /// than sent a second time in its rewritten form.
+    func removeHead(_ head: QueuedHead) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        // A merge with the database renumbered the queue since the head was taken,
+        // so only its text can still find it.
+        guard head.attachEpoch == attachEpoch,
+              let index = entries.firstIndex(where: { $0.sequence == head.sequence }) else {
+            removeHeadLocked(head.request)
+            return
+        }
+
+        let rewritten = entries[index].request != head.request
+        headDisplacedByAttach = nil
+        entries.remove(at: index)
+        scheduleSyncLocked()
+        logger?.d(Self.module, "removeHead", "request at the head of the queue is removed, rewrittenWhileSent: [\(rewritten)], remainingRequestCount: [\(entries.count)]")
+    }
+
+    /// `removeHead(_:)` by text. The caller holds the lock.
+    private func removeHeadLocked(_ queryString: String) {
         let displaced = headDisplacedByAttach
         headDisplacedByAttach = nil
 
@@ -361,9 +397,7 @@ final class RequestQueueStore: @unchecked Sendable {
         guard dropAgeHours > 0 else { return }
 
         let before = entries.count
-        isBeingModified = true
         entries.removeAll { Self.isOld($0.request, dropAgeHours: dropAgeHours) }
-        isBeingModified = false
 
         if before > entries.count {
             scheduleSyncLocked()
@@ -380,9 +414,7 @@ final class RequestQueueStore: @unchecked Sendable {
     @discardableResult
     private func changeWholeQueueLocked<Result>(replacingEarlierChanges: Bool = false,
                                                 _ change: @escaping (inout [QueuedRequest]) -> Result) -> Result {
-        isBeingModified = true
         let result = change(&entries)
-        isBeingModified = false
         if isDetached {
             if replacingEarlierChanges {
                 detachedChanges.removeAll()
@@ -420,7 +452,7 @@ final class RequestQueueStore: @unchecked Sendable {
     /// Queues a sync unless one is queued already, which then carries this change
     /// as well. The caller holds the lock.
     private func scheduleSyncLocked() {
-        guard !isSyncScheduled, !isDeleted else { return }
+        guard !isSyncScheduled, !isClosed else { return }
         isSyncScheduled = true
         writeQueue.async { [weak self] in self?.syncNow() }
     }
@@ -430,12 +462,12 @@ final class RequestQueueStore: @unchecked Sendable {
     private func syncNow() {
         lock.lock()
         isSyncScheduled = false
-        let deleted = isDeleted
+        let closed = isClosed
         let detached = isDetached
         let ownPendingToken = pendingFileToken
         lock.unlock()
 
-        guard !deleted else { return }
+        guard !closed else { return }
 
         if detached {
             guard let loaded = database.attach(skippingPendingFile: ownPendingToken) else {
@@ -488,6 +520,7 @@ final class RequestQueueStore: @unchecked Sendable {
 
         entries = queue
         nextSequence = sequence
+        attachEpoch += 1
         isDetached = false
         durableLineage = loaded.lineage
         durableMaxSequence = loaded.durableMaxSequence
@@ -555,15 +588,31 @@ final class RequestQueueStore: @unchecked Sendable {
         let lineage = durableLineage
         let durable = durableMaxSequence
         let ownTokens = Set([pendingFileToken, committedPendingFileToken].compactMap { $0 })
-        let deleted = isDeleted
+        let closed = isClosed
         lock.unlock()
 
-        guard !deleted, !(onlyWhenNotEmpty && queue.isEmpty),
+        guard !closed, !(onlyWhenNotEmpty && queue.isEmpty),
               let token = database.writePendingFile(queue, lineage: lineage, durableMaxSequence: durable, replacing: ownTokens) else { return }
 
         lock.lock()
         pendingFileToken = token
         lock.unlock()
+    }
+
+    /// Writes the queue one last time and closes the store. Used by every halt that
+    /// keeps the data.
+    ///
+    /// A change that reaches the store afterwards, such as a send that completes
+    /// once the halt is over, stays in memory. Written, it would land in the files
+    /// the next start has already read, and a removal could empty the queue that
+    /// start is still sending from.
+    func close() {
+        writeQueue.sync { [self] in
+            syncNow()
+            lock.lock()
+            isClosed = true
+            lock.unlock()
+        }
     }
 
     /// Deletes every file of the queue, a `Countly.dat` not merged yet included.
@@ -573,12 +622,26 @@ final class RequestQueueStore: @unchecked Sendable {
     /// re-create a file afterwards: every sync from then on is skipped.
     func deleteFile() {
         lock.lock()
-        isDeleted = true
+        isClosed = true
         lock.unlock()
 
         writeQueue.sync { [database] in database.deleteEverything() }
         logger?.d(Self.module, "deleteFile", "the database, the pending file and the legacy file of the request queue are deleted")
     }
+}
+
+/// A request the drain took from the head of the queue, with what identifies it
+/// once a bulk rewrite has changed its text.
+struct QueuedHead {
+
+    /// The request as it was when the drain took it, which is what is sent.
+    let request: String
+
+    /// The request's place in the queue, kept by a rewrite.
+    let sequence: Int64
+
+    /// The merges with the database before it was taken, since a merge renumbers.
+    let attachEpoch: Int
 }
 
 /// Where the SDK is allowed to keep files.

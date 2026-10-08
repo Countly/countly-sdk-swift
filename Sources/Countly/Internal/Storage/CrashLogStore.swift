@@ -46,6 +46,10 @@ final class CrashLogStore {
     /// recomputed, so the common append does not read the whole file back.
     private var lineCount = 0
 
+    /// Set by `close()`. Written and read only on `writeQueue`, which is what
+    /// orders it against the appends.
+    private var isClosed = false
+
     init(namespace: StorageNamespace, logger: Logger?) {
         self.namespace = namespace
         self.logger = logger
@@ -107,9 +111,24 @@ final class CrashLogStore {
         }
     }
 
+    /// Refuses every breadcrumb from now on, keeping the file. Used by every halt,
+    /// so a breadcrumb still in flight from the halted instance can neither reach
+    /// the file the next start adopts nor bring back one that was erased.
+    ///
+    /// Synchronous on `writeQueue`: a breadcrumb recorded before this call is on
+    /// disk once it returns, and none recorded after it is written.
+    func close() {
+        writeQueue.sync { isClosed = true }
+    }
+
     // MARK: - On the write queue
 
     private func appendOnQueue(_ line: String) {
+        guard !isClosed else {
+            logger?.d(Self.module, "append", "breadcrumb is dropped, the store is closed by a halt")
+            return
+        }
+
         guard let data = line.data(using: .utf8) else {
             logger?.d(Self.module, "append", "breadcrumb is dropped, it can not be encoded as utf8, lineLength: [\(line.count)]")
             return

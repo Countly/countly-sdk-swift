@@ -269,7 +269,11 @@ final class RemoteConfigModule: ModuleBase {
         logD("downloadValues", "remote config value download is starting, fetchType: [\(isFullUpdate ? "full" : "partial")], keyCount: [\(keys?.count ?? 0)], omitKeyCount: [\(omitKeys?.count ?? 0)], requestedKeys: [\(Self.describe(keys ?? []))], omittedKeys: [\(Self.describe(omitKeys ?? []))], enrollABOnDownload: [\(enrollABOnRCDownload)], completionHandlerProvided: [\(completion != nil)]")
 
         fetch(keys: keys, omitKeys: omitKeys, isLegacy: false) { [weak self] remoteConfig, error in
-            guard let self else { return }
+            // The caller is answered even once a halt has released the module.
+            guard let self else {
+                completion?(.error, error ?? CountlyError.remoteConfigGeneralAPIError.asNSError, isFullUpdate, [:])
+                return
+            }
 
             let downloaded = self.buildMeta(from: remoteConfig ?? [:])
             var result = RequestResult.success
@@ -348,8 +352,12 @@ final class RemoteConfigModule: ModuleBase {
         let request = buildRequest(keys: keys, omitKeys: omitKeys, isLegacy: isLegacy)
         logD("fetch", "remote config request is started, method: [\(request.httpMethod ?? "GET")], path: [\(request.url?.path ?? "")], keyCount: [\(keys?.count ?? 0)], omitKeyCount: [\(omitKeys?.count ?? 0)]")
 
-        core.network.instantTask(with: request) { [weak self] data, response, transportError in
-            guard let self else { return }
+        let task = core.network.instantTask(with: request) { [weak self] data, response, transportError in
+            // The caller is answered even once a halt has released the module.
+            guard let self else {
+                DispatchQueue.main.async { completion(nil, transportError ?? CountlyError.remoteConfigGeneralAPIError.asNSError) }
+                return
+            }
 
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             var parsed: [String: Any]?
@@ -384,7 +392,12 @@ final class RemoteConfigModule: ModuleBase {
                     completion(parsed, nil)
                 }
             }
-        }?.resume()
+        }
+        guard let task else {
+            completion(nil, CountlyError.remoteConfigGeneralAPIError.asNSError)
+            return
+        }
+        task.resume()
     }
 
     private func buildRequest(keys: [String]?, omitKeys: [String]?, isLegacy: Bool) -> URLRequest {
@@ -570,8 +583,12 @@ final class RemoteConfigModule: ModuleBase {
 
         logD("testingDownloadVariantInformation", "variants download is starting, path: [\(request.url?.path ?? "")]")
 
-        core.network.instantTask(with: request) { [weak self] data, response, error in
-            guard let self else { return }
+        let task = core.network.instantTask(with: request) { [weak self] data, response, error in
+            // The caller is answered even once a halt has released the module.
+            guard let self else {
+                DispatchQueue.main.async { completion(.error, error ?? CountlyError.remoteConfigGeneralAPIError.asNSError) }
+                return
+            }
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
             guard error == nil,
@@ -590,7 +607,12 @@ final class RemoteConfigModule: ModuleBase {
             self.stateLock.unlock()
             self.logD("testingDownloadVariantInformation", "variants request successfully completed, the locally cached variants are replaced, variantKeyCount: [\(flattened.count)], variantKeys: [\(Self.describe(flattened.keys))]")
             DispatchQueue.main.async { completion(.success, nil) }
-        }?.resume()
+        }
+        guard let task else {
+            completion(.error, CountlyError.remoteConfigGeneralAPIError.asNSError)
+            return
+        }
+        task.resume()
     }
 
     /// Downloads the experiments this device is part of.
@@ -607,8 +629,12 @@ final class RemoteConfigModule: ModuleBase {
 
         logD("testingDownloadExperimentInformation", "experiment download is starting, path: [\(request.url?.path ?? "")]")
 
-        core.network.instantTask(with: request) { [weak self] data, response, error in
-            guard let self else { return }
+        let task = core.network.instantTask(with: request) { [weak self] data, response, error in
+            // The caller is answered even once a halt has released the module.
+            guard let self else {
+                DispatchQueue.main.async { completion(.error, error ?? CountlyError.remoteConfigGeneralAPIError.asNSError) }
+                return
+            }
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
             guard error == nil, statusCode == 200 else {
@@ -663,7 +689,12 @@ final class RemoteConfigModule: ModuleBase {
 
             self.logD("testingDownloadExperimentInformation", "experiment request successfully completed, the locally cached experiments are replaced, responseShape: [\(responseShape)], experimentCount: [\(experiments.count)], experimentIDs: [\(Self.describe(experiments.keys))]")
             DispatchQueue.main.async { completion(.success, nil) }
-        }?.resume()
+        }
+        guard let task else {
+            completion(.error, CountlyError.remoteConfigGeneralAPIError.asNSError)
+            return
+        }
+        task.resume()
     }
 
     /// Forces this device into a named variant.
@@ -694,8 +725,12 @@ final class RemoteConfigModule: ModuleBase {
 
         logD("testingEnrollIntoVariant", "variant enrollment is starting, key: [\(key)], variantName: [\(variantName)], path: [\(request.url?.path ?? "")]")
 
-        core.network.instantTask(with: request) { [weak self] data, response, error in
-            guard let self else { return }
+        let task = core.network.instantTask(with: request) { [weak self] data, response, error in
+            // The caller is answered even once a halt has released the module.
+            guard let self else {
+                DispatchQueue.main.async { completion(.error, error ?? CountlyError.remoteConfigGeneralAPIError.asNSError) }
+                return
+            }
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
             guard error == nil, statusCode == 200 else {
@@ -713,7 +748,12 @@ final class RemoteConfigModule: ModuleBase {
             self.clearCachedRemoteConfig()
             self.downloadRemoteConfigAutomatically()
             DispatchQueue.main.async { completion(.success, nil) }
-        }?.resume()
+        }
+        guard let task else {
+            completion(.error, CountlyError.remoteConfigGeneralAPIError.asNSError)
+            return
+        }
+        task.resume()
     }
 
     // MARK: - Callbacks
