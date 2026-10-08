@@ -316,20 +316,32 @@ struct LimitsEnforcer {
     let limits: CountlySDKLimitsConfig
     weak var logger: Logger?
 
+    /// Whose consent what this enforcer logs needs when gathered. A value it cut
+    /// belongs to the feature that handed it over, and is often logged before
+    /// that feature checks its own consent.
+    private(set) var scope: LogGatheringScope = .unattributed
+
     private static let module = "Limits"
+
+    /// This enforcer, with what it logs gathered under `scope`.
+    func gathered(as scope: LogGatheringScope) -> LimitsEnforcer {
+        var copy = self
+        copy.scope = scope
+        return copy
+    }
 
     /// Truncates a key to the configured maximum key length.
     func truncatedKey(_ key: String, _ explanation: String) -> String {
         guard key.countlyLength > limits.maxKeyLength else { return key }
-        logger?.d(Self.module, "truncatedKey", "key exceeds the SDK key length limit and will be truncated, target: [\(explanation)], key: [\(key)], keyLength: [\(key.countlyLength)], truncatedTo: [\(limits.maxKeyLength)]")
+        logger?.d(Self.module, "truncatedKey", scope: scope, "key exceeds the SDK key length limit and will be truncated, target: [\(explanation)], key: [\(key)], keyLength: [\(key.countlyLength)], truncatedTo: [\(limits.maxKeyLength)]")
         return key.countlyPrefix(limits.maxKeyLength)
     }
 
     /// Truncates a value to the configured maximum value length.
     func truncatedValue(_ value: String, _ explanation: String) -> String {
         guard value.countlyLength > limits.maxValueSize else { return value }
-        logger?.d(Self.module, "truncatedValue", "value exceeds the SDK value length limit and will be truncated, target: [\(explanation)], valueLength: [\(value.countlyLength)], truncatedTo: [\(limits.maxValueSize)]")
-        logger?.v(Self.module, "truncatedValue", "truncated value detail, target: [\(explanation)], fullValue: [\(value)]")
+        logger?.d(Self.module, "truncatedValue", scope: scope, "value exceeds the SDK value length limit and will be truncated, target: [\(explanation)], valueLength: [\(value.countlyLength)], truncatedTo: [\(limits.maxValueSize)]")
+        logger?.v(Self.module, "truncatedValue", scope: scope, "truncated value detail, target: [\(explanation)], fullValue: [\(value)]")
         return value.countlyPrefix(limits.maxValueSize)
     }
 
@@ -345,7 +357,7 @@ struct LimitsEnforcer {
 
         return frames.map { line in
             guard line.countlyLength > lineLimit else { return line }
-            logger?.d(Self.module, "truncatedStackTrace", "stack trace line exceeds the SDK stack trace line length limit and will be truncated, target: [\(explanation)], lineLength: [\(line.countlyLength)], truncatedTo: [\(lineLimit)]")
+            logger?.d(Self.module, "truncatedStackTrace", scope: scope, "stack trace line exceeds the SDK stack trace line length limit and will be truncated, target: [\(explanation)], lineLength: [\(line.countlyLength)], truncatedTo: [\(lineLimit)]")
             return line.countlyPrefix(lineLimit)
         }
     }
@@ -353,8 +365,8 @@ struct LimitsEnforcer {
     /// Truncates a user profile picture URL, which has its own larger limit.
     func truncatedPictureValue(_ value: String, _ explanation: String) -> String {
         guard value.countlyLength > limits.maxValueSizePicture else { return value }
-        logger?.d(Self.module, "truncatedPictureValue", "value exceeds the SDK picture value limit and will be truncated, target: [\(explanation)], valueLength: [\(value.countlyLength)], truncatedTo: [\(limits.maxValueSizePicture)]")
-        logger?.v(Self.module, "truncatedPictureValue", "truncated picture value detail, target: [\(explanation)], fullValue: [\(value)]")
+        logger?.d(Self.module, "truncatedPictureValue", scope: scope, "value exceeds the SDK picture value limit and will be truncated, target: [\(explanation)], valueLength: [\(value.countlyLength)], truncatedTo: [\(limits.maxValueSizePicture)]")
+        logger?.v(Self.module, "truncatedPictureValue", scope: scope, "truncated picture value detail, target: [\(explanation)], fullValue: [\(value)]")
         return value.countlyPrefix(limits.maxValueSizePicture)
     }
 
@@ -388,7 +400,7 @@ struct LimitsEnforcer {
 
         let kept = Set(keys.prefix(limits.maxSegmentationValues))
         let dropped = keys.filter { !kept.contains($0) }
-        logger?.d(Self.module, "limited", "segmentation exceeds the SDK segmentation value limit and will be trimmed, target: [\(explanation)], keyCount: [\(keys.count)], trimmedTo: [\(limits.maxSegmentationValues)], droppedKeyCount: [\(dropped.count)], droppedKeys: [\(dropped)]")
+        logger?.d(Self.module, "limited", scope: scope, "segmentation exceeds the SDK segmentation value limit and will be trimmed, target: [\(explanation)], keyCount: [\(keys.count)], trimmedTo: [\(limits.maxSegmentationValues)], droppedKeyCount: [\(dropped.count)], droppedKeys: [\(dropped)]")
 
         return dictionary.filter { kept.contains($0.key) }
     }
@@ -428,11 +440,11 @@ struct LimitsEnforcer {
             } else if let array = value as? [Any] {
                 result[key] = filterSupportedDataTypes(array)
             } else if value is Date {
-                logger?.d(Self.module, "filterSupportedDataTypes", "dropping dictionary entry with a date that has no representable epoch value, key: [\(key)]")
+                logger?.d(Self.module, "filterSupportedDataTypes", scope: scope, "dropping dictionary entry with a date that has no representable epoch value, key: [\(key)]")
             } else if value is NSNumber {
-                logger?.d(Self.module, "filterSupportedDataTypes", "dropping dictionary entry with a number JSON cannot represent, key: [\(key)]")
+                logger?.d(Self.module, "filterSupportedDataTypes", scope: scope, "dropping dictionary entry with a number JSON cannot represent, key: [\(key)]")
             } else {
-                logger?.d(Self.module, "filterSupportedDataTypes", "dropping dictionary entry with an unsupported value type, key: [\(key)], receivedType: [\(type(of: value))]")
+                logger?.d(Self.module, "filterSupportedDataTypes", scope: scope, "dropping dictionary entry with an unsupported value type, key: [\(key)], receivedType: [\(type(of: value))]")
             }
         }
         return result
@@ -442,7 +454,7 @@ struct LimitsEnforcer {
     func filterSupportedDataTypes(_ array: [Any]) -> [Any] {
         array.compactMap { element in
             if let converted = supportedValue(element) { return converted }
-            logger?.d(Self.module, "filterSupportedDataTypes", "dropping array element with an unsupported type, only numbers, strings and dates are allowed, receivedType: [\(type(of: element))]")
+            logger?.d(Self.module, "filterSupportedDataTypes", scope: scope, "dropping array element with an unsupported type, only numbers, strings and dates are allowed, receivedType: [\(type(of: element))]")
             return nil
         }
     }

@@ -115,7 +115,7 @@ final class AttributionModule: ModuleBase {
             logD("recordIndirectAttribution", "indirect attribution keys with an empty value are dropped rather than overwriting what the server already holds, droppedKeyCount: [\(attribution.count - nonEmpty.count)]")
         }
 
-        let sanitized = core.limits.truncatedAndLimited(nonEmpty, "Indirect attribution")
+        let sanitized = limits.truncatedAndLimited(nonEmpty, "Indirect attribution")
 
         indirectAttribution = sanitized.compactMapValues { $0 as? String }
         sendIndirectAttribution()

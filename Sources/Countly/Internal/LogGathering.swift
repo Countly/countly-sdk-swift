@@ -114,7 +114,7 @@ struct LogGatheringDirective: Equatable {
 /// Log gathering never gets a consent of its own: a consent for logging could
 /// override the choices the user actually made. A line waits for the consent of
 /// the feature that wrote it instead.
-enum LogGatheringScope: Equatable {
+enum LogGatheringScope: Hashable {
 
     /// A line one feature wrote. Needs that feature's consent.
     case feature(ConsentFeature)
@@ -204,8 +204,9 @@ protocol LogGatheringTransport: AnyObject {
 ///
 /// Consent is decided per line when it is captured. A line whose consent is
 /// given joins the buffer; any other waits apart, never uploaded, until that
-/// consent is given. Lines captured before init finishes are decided when it
-/// does, because the consent state is only complete then.
+/// consent is given, and a buffered line goes back to waiting when its consent
+/// is withdrawn. Lines captured before init finishes are decided when it does,
+/// because the consent state is only complete then.
 ///
 /// Wire shape of a batch: `{"i":gatherID,"d":dropped,"l":[{"t":ms,"l":"e","m":message}]}`.
 /// Nothing here is persisted: the arm is held in memory and re-learned from the
@@ -270,8 +271,8 @@ final class LogGatherer {
     private var heldChars = 0
     private var droppedCount = 0
 
-    /// Lines whose consent was not given when they were decided. Kept apart from
-    /// `lines` so no batch can carry one, and moved there once it is given.
+    /// Lines whose consent is not given as things stand. Kept apart from `lines`
+    /// so no batch can carry one, and moved there once it is given.
     private var awaitingConsent: [Line] = []
     private var awaitingChars = 0
 
@@ -279,6 +280,9 @@ final class LogGatherer {
     private var directive = LogGatheringDirective.off
     private var initFinished = false
     private var nextSequence: UInt64 = 0
+
+    /// Lines dropped from the buffer before init decided their consent, by scope.
+    private var droppedBeforeInit: [LogGatheringScope: Int] = [:]
 
     /// Serializes deliveries. The timer schedules them on `deliveryQueue`, the
     /// background and terminate paths run them on the caller's thread, and two
@@ -378,9 +382,6 @@ final class LogGatherer {
             lock.unlock()
             logger?.d(Self.module, "apply", "the log gathering directive is unchanged, source: [\(source)], heldLineCount: [\(held)]")
             // A refetch is what turns tracking back on, and a full batch held meanwhile gets no other kick.
-            if holdsFullBatch {
-                scheduleDelivery(includePartialBatch: false)
-            }
             return
         }
 
@@ -429,8 +430,9 @@ final class LogGatherer {
     /// The request queue is usable and the consent state complete from here on,
     /// so this is the first chance for the lines gathered during init to go out.
     ///
-    /// Their consent is decided here, under the lock `capture` decides in, so a
-    /// line is decided exactly once: here, or when it is captured.
+    /// Their consent is decided here, under the lock `capture` decides in, so
+    /// every line is decided either here or when it is captured. A line dropped
+    /// before this counts toward `d` only if its consent turns out to be given.
     func sdkInitFinished() {
         lock.lock()
         guard !initFinished else {
@@ -438,7 +440,9 @@ final class LogGatherer {
             return
         }
         initFinished = true
-        decideConsentOfInitLinesLocked()
+        redecideConsentLocked()
+        droppedCount += droppedBeforeInit.reduce(0) { $0 + (isConsentGiven(for: $1.key) ? $1.value : 0) }
+        droppedBeforeInit.removeAll()
         let gathering = state == .gathering
         let awaiting = awaitingConsent.count
         lock.unlock()
@@ -449,27 +453,26 @@ final class LogGatherer {
         }
     }
 
-    /// Moves the lines whose consent is given by now into the buffer, in the
-    /// order they were logged among the lines already there. Called when a
-    /// consent is given and when whether consent is required changes.
-    func releaseLinesAwaitingConsent() {
+    /// Re-decides every held line against the consent state now. Called when a
+    /// consent is given or withdrawn and when whether consent is required
+    /// changes: a line whose consent is given joins the buffer in the order it
+    /// was logged, and a line whose consent was withdrawn goes back to waiting.
+    func consentDidChange() {
         lock.lock()
-        let (released, stillAwaiting) = splitByConsentLocked(awaitingConsent)
-        guard !released.isEmpty else {
+        // Before init finishes nothing is decided yet, and init finishing decides every line.
+        guard initFinished else {
             lock.unlock()
             return
         }
-
         let bufferedBefore = lines.count
-        awaitingConsent = stillAwaiting
-        awaitingChars = Self.charCount(of: stillAwaiting)
-        lines = (lines + released).sorted { $0.sequence < $1.sequence }
-        heldChars += Self.charCount(of: released)
-        trimBufferLocked()
+        let (released, recalled) = redecideConsentLocked()
         let completesBatch = completesBatchLocked(bufferedBefore: bufferedBefore)
+        let awaiting = awaitingConsent.count
         lock.unlock()
 
-        logger?.d(Self.module, "releaseLinesAwaitingConsent", "gathered lines whose consent is now given join the buffer, releasedLineCount: [\(released.count)], stillAwaitingLineCount: [\(stillAwaiting.count)]")
+        if released > 0 || recalled > 0 {
+            logger?.d(Self.module, "consentDidChange", "gathered lines are re-decided against the consent state, releasedLineCount: [\(released)], recalledLineCount: [\(recalled)], awaitingConsentLineCount: [\(awaiting)]")
+        }
 
         if completesBatch {
             scheduleDelivery(includePartialBatch: false)
@@ -490,16 +493,32 @@ final class LogGatherer {
         deliver(includePartialBatch: true)
     }
 
-    /// Ends the gather for a device ID change without merge. What may be uploaded
-    /// is queued now, while requests still carry the old device ID, and the rest
-    /// is dropped, so no line of one user is uploaded under the next user's ID
-    /// and consent.
-    func stopForDeviceIDChange() {
+    /// The capture order the next line will get. A device ID change reads it
+    /// before it logs anything, so the lines it logs can be told apart.
+    var nextCaptureSequence: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return nextSequence
+    }
+
+    /// Ends the gather for a device ID change without merge.
+    ///
+    /// The lines logged since `mark` belong to the change itself and quote the
+    /// next user's ID, so they are dropped. What may be uploaded of the rest is
+    /// queued now, while requests still carry the old device ID, and everything
+    /// else held is dropped, so neither user's lines reach the other's gather.
+    func stopForDeviceIDChange(droppingLinesFrom mark: UInt64) {
         // Held throughout, so no other delivery can queue a batch once the new device ID is in place.
         deliveryLock.lock()
         defer { deliveryLock.unlock() }
 
         guard isCapturing else { return }
+
+        lock.lock()
+        lines.removeAll { $0.sequence >= mark }
+        heldChars = Self.charCount(of: lines)
+        lock.unlock()
+
         if isGathering {
             deliverSerialized(includePartialBatch: true)
         }
@@ -699,6 +718,8 @@ final class LogGatherer {
         heldChars += Self.charCount(of: batch.lines)
         droppedCount += batch.dropped
         trimBufferLocked()
+        // A consent withdrawn while the batch was out found nothing of it to recall.
+        redecideConsentLocked()
     }
 
     /// Accounts a batch that can never be sent as dropped lines, so the loss still
@@ -731,23 +752,34 @@ final class LogGatherer {
     }
 
     /// Enforces both ceilings by dropping the oldest lines and counting them.
+    /// Before init a drop is only tallied, since it counts toward `d` only if its
+    /// consent turns out to be given when init decides.
     private func trimBufferLocked() {
-        droppedCount += Self.trim(&lines, chars: &heldChars)
+        let removed = Self.trim(&lines, chars: &heldChars)
+        if initFinished {
+            droppedCount += removed.count
+        } else {
+            for line in removed {
+                droppedBeforeInit[line.scope, default: 0] += 1
+            }
+        }
     }
 
     /// Enforces both ceilings on the lines awaiting consent. Not counted as
     /// dropped: a line whose consent was never given was never gathered.
     private func trimAwaitingConsentLocked() {
-        _ = Self.trim(&awaitingConsent, chars: &awaitingChars)
+        Self.trim(&awaitingConsent, chars: &awaitingChars)
     }
 
     /// Drops the oldest of `lines` until both ceilings hold, keeping `chars` in
-    /// step, and returns how many went.
-    private static func trim(_ lines: inout [Line], chars: inout Int) -> Int {
-        var removed = 0
+    /// step, and returns what went.
+    @discardableResult
+    private static func trim(_ lines: inout [Line], chars: inout Int) -> [Line] {
+        var removed: [Line] = []
         while lines.count > LogGatheringDirective.maxBufferedLines || (chars > charCeiling && lines.count > 1) {
-            chars -= lines.removeFirst().message.countlyLength
-            removed += 1
+            let line = lines.removeFirst()
+            chars -= line.message.countlyLength
+            removed.append(line)
         }
         return removed
     }
@@ -759,15 +791,22 @@ final class LogGatherer {
         state == .gathering && bufferedBefore < directive.batchSize && lines.count >= directive.batchSize
     }
 
-    /// Decides the lines captured before init finished: those whose consent is
-    /// given stay in the buffer, and the others move to wait for it.
-    private func decideConsentOfInitLinesLocked() {
-        let (consented, awaiting) = splitByConsentLocked(lines)
-        lines = consented
-        heldChars = Self.charCount(of: consented)
-        awaitingConsent += awaiting
+    /// Puts every held line where the consent state puts it now: in the buffer
+    /// when its consent is given, waiting otherwise, each list in the order the
+    /// lines were logged. Returns how many lines moved each way.
+    @discardableResult
+    private func redecideConsentLocked() -> (released: Int, recalled: Int) {
+        let (kept, recalled) = splitByConsentLocked(lines)
+        let (released, stillAwaiting) = splitByConsentLocked(awaitingConsent)
+        guard !released.isEmpty || !recalled.isEmpty else { return (0, 0) }
+
+        lines = (kept + released).sorted { $0.sequence < $1.sequence }
+        heldChars = Self.charCount(of: lines)
+        awaitingConsent = (stillAwaiting + recalled).sorted { $0.sequence < $1.sequence }
         awaitingChars = Self.charCount(of: awaitingConsent)
+        trimBufferLocked()
         trimAwaitingConsentLocked()
+        return (released.count, recalled.count)
     }
 
     /// Splits `lines` by whether their consent is given now, each part keeping
@@ -809,6 +848,7 @@ final class LogGatherer {
         lines.removeAll()
         heldChars = 0
         droppedCount = 0
+        droppedBeforeInit.removeAll()
         awaitingConsent.removeAll()
         awaitingChars = 0
     }

@@ -24,8 +24,7 @@ final class ConsentModule: ModuleBase {
     /// Logged on every change: behavior settings can turn this on for an
     /// integration that never asked for it, and from then on every feature is
     /// gated. That is the first thing to check when a feature collects nothing.
-    /// A change also releases the gathered log lines no longer waiting for a
-    /// consent.
+    /// A change also re-decides which gathered log lines may be uploaded.
     var requiresConsent: Bool {
         get {
             stateLock.lock()
@@ -40,7 +39,7 @@ final class ConsentModule: ModuleBase {
 
             guard newValue != oldValue else { return }
             logI("requiresConsent", "consent requirement changed, requiresConsent: [\(newValue)], grantedFeatureCount: [\(granted.count)]")
-            core.logGatherer.releaseLinesAwaitingConsent()
+            core.logGatherer.consentDidChange()
         }
     }
 
@@ -137,7 +136,7 @@ final class ConsentModule: ModuleBase {
         logD("giveConsent", "consent state after giving consent, grantedBefore: [\(stateBeforeChange)], grantedAfter: [\(Self.describe(granted))]")
 
         sendConsents()
-        core.logGatherer.releaseLinesAwaitingConsent()
+        core.logGatherer.consentDidChange()
     }
 
     /// Withdraws consent for every feature.
@@ -155,7 +154,8 @@ final class ConsentModule: ModuleBase {
         cancelConsent(for: ConsentFeature.allCases, skipSendingRequest: true)
     }
 
-    /// Withdraws consent for the named features and reports the new state.
+    /// Withdraws consent for the named features, reports the new state, and takes
+    /// the gathered log lines of those features back out of the upload buffer.
     func cancelConsent(for features: [ConsentFeature], skipSendingRequest: Bool = false) {
         logI("cancelConsent", "cancelling consent for features, featureCount: [\(features.count)], features: [\(Self.describe(features))], skipSendingConsentsRequest: [\(skipSendingRequest)]")
 
@@ -182,6 +182,7 @@ final class ConsentModule: ModuleBase {
         if !skipSendingRequest {
             sendConsents()
         }
+        core.logGatherer.consentDidChange()
     }
 
     /// Reports the full consent state to the server.

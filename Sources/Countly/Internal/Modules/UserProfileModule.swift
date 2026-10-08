@@ -99,8 +99,8 @@ final class UserProfileModule: ModuleBase {
 
         let isPicture = key == UserProfileKey.picture || key == UserProfileKey.picturePath
         return isPicture
-            ? core.limits.truncatedPictureValue(stringValue, explanation)
-            : core.limits.truncatedValue(stringValue, explanation)
+            ? limits.truncatedPictureValue(stringValue, explanation)
+            : limits.truncatedValue(stringValue, explanation)
     }
 
     /// Sets one property, routing predefined keys to their own fields.
@@ -174,7 +174,7 @@ final class UserProfileModule: ModuleBase {
                 continue
             }
 
-            customProperties[core.limits.truncatedKey(key, "setProperties")] = storable
+            customProperties[limits.truncatedKey(key, "setProperties")] = storable
             appliedCount += 1
         }
         lock.unlock()
@@ -211,7 +211,7 @@ final class UserProfileModule: ModuleBase {
         let stored = truncatedValue(storable, forKey: key, "setCustomProperty")
 
         lock.lock()
-        customProperties[core.limits.truncatedKey(key, "setCustomProperty")] = stored
+        customProperties[limits.truncatedKey(key, "setCustomProperty")] = stored
         let total = customProperties.count
         lock.unlock()
 
@@ -223,7 +223,7 @@ final class UserProfileModule: ModuleBase {
         logI("unsetCustomProperty", "custom user property will be unset, key: [\(key)]")
 
         lock.lock()
-        let truncatedKey = core.limits.truncatedKey(key, "unsetCustomProperty")
+        let truncatedKey = limits.truncatedKey(key, "unsetCustomProperty")
         customProperties[truncatedKey] = NSNull()
         let total = customProperties.count
         lock.unlock()
@@ -280,10 +280,10 @@ final class UserProfileModule: ModuleBase {
 
         var stored = storable
         if let stringValue = storable as? String {
-            stored = core.limits.truncatedValue(stringValue, "modify")
+            stored = limits.truncatedValue(stringValue, "modify")
         }
 
-        let truncatedKey = core.limits.truncatedKey(key, "modify")
+        let truncatedKey = limits.truncatedKey(key, "modify")
 
         lock.lock()
         defer { lock.unlock() }
@@ -474,7 +474,7 @@ final class UserProfileModule: ModuleBase {
         var custom: [String: Any] = [:]
         if !customProperties.isEmpty {
             // Both limits apply here; the modifiers below take neither, on either reference.
-            custom.merge(core.limits.limited(cappedCustomProperties(), "user details custom properties")) { _, new in new }
+            custom.merge(limits.limited(cappedCustomProperties(), "user details custom properties")) { _, new in new }
         }
         if !customModifications.isEmpty {
             custom.merge(customModifications) { _, new in new }
@@ -558,7 +558,7 @@ final class UserProfileModule: ModuleBase {
             let converted = list.compactMap(storableValue)
             return converted.count == list.count ? converted : nil
         }
-        return core.limits.supportedValue(value)
+        return limits.supportedValue(value)
     }
 
     // MARK: - Lifecycle

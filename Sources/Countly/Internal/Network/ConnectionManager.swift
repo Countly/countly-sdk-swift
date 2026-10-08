@@ -251,17 +251,25 @@ final class ConnectionManager: NSObject {
     /// Sends the head of the queue.
     ///
     /// Lines logged while sending a gathered log batch are not gathered, or every
-    /// tick would upload a batch about the last one. The caller may already be
-    /// marked, since the delivery loop lands here synchronously, so the mark is
-    /// restored on the way out.
+    /// tick would upload a batch about the last one. Nor are those of a request
+    /// queued under another device ID: it is a previous user's, and what it
+    /// carries must not reach the current user's gather. The caller may already
+    /// be marked, since the delivery loop lands here synchronously, so the mark
+    /// is restored on the way out.
     private func send(head: String) {
-        let isSdkLogsTransport = head.contains("&\(QS.sdkLogs)=")
-        core.logGatherer.markingTransportWork(isSdkLogsTransport) {
-            sendMarked(head: head, isSdkLogsTransport: isSdkLogsTransport)
+        let notGathered = head.contains("&\(QS.sdkLogs)=") || !isForCurrentDeviceID(head)
+        core.logGatherer.markingTransportWork(notGathered) {
+            sendMarked(head: head, notGathered: notGathered)
         }
     }
 
-    private func sendMarked(head: String, isSdkLogsTransport: Bool) {
+    /// Whether a queued request was built with the device ID in use now.
+    private func isForCurrentDeviceID(_ queryString: String) -> Bool {
+        let current = "\(QS.deviceID)=\(core.modules.deviceID.deviceID.urlEscaped)"
+        return queryString.split(separator: "&").contains { $0 == current }
+    }
+
+    private func sendMarked(head: String, notGathered: Bool) {
         var queryString = head
         var endpoint = Endpoint.input
 
@@ -303,8 +311,8 @@ final class ConnectionManager: NSObject {
             self.stateLock.unlock()
 
             // The completion runs on a session thread of its own, which has to be
-            // marked in turn while it deals with a gathered log batch.
-            self.core.logGatherer.markingTransportWork(isSdkLogsTransport) {
+            // marked in turn while it deals with a request that is not gathered.
+            self.core.logGatherer.markingTransportWork(notGathered) {
                 let elapsed = Date().timeIntervalSince(startedAt)
                 let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 

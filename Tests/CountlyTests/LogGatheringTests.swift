@@ -677,7 +677,7 @@ final class LogGatheringTests: CountlyBaseTestCase {
 
         gatherer.capture(laterEvent, level: .debug, scope: .feature(.events))
         transport.granted = [.events, .userDetails]
-        gatherer.releaseLinesAwaitingConsent()
+        gatherer.consentDidChange()
 
         XCTAssertTrue(awaitingMessages(gatherer).isEmpty)
         XCTAssertEqual(messages(gatherer), [firstProperty, secondProperty, laterEvent],
@@ -698,15 +698,78 @@ final class LogGatheringTests: CountlyBaseTestCase {
         XCTAssertTrue(transport.payloads.isEmpty, "the events consent alone does not cover a line no single feature owns")
 
         transport.granted = [.userDetails]
-        gatherer.releaseLinesAwaitingConsent()
+        gatherer.consentDidChange()
         gatherer.flushNow()
         XCTAssertTrue(transport.payloads.isEmpty, "nor does the user details consent alone")
         XCTAssertEqual(awaitingMessages(gatherer), [line])
 
         transport.granted = [.events, .userDetails]
-        gatherer.releaseLinesAwaitingConsent()
+        gatherer.consentDidChange()
         gatherer.flushNow()
         XCTAssertEqual(uploadedMessages(transport), [line], "the two together are enough, the other features are not needed")
+    }
+
+    /// A buffered line answers to its consent until it is uploaded, so
+    /// withdrawing that consent takes it back out of the buffer, and giving it
+    /// again releases it.
+    func testWithdrawingAConsentTakesItsLinesBackOutOfTheBuffer() {
+        let transport = FakeTransport()
+        transport.granted = [.events, .userDetails]
+        let gatherer = makeGatherer(transport)
+        gatherer.apply(directive(id: "gather_withdraw"), source: "test")
+
+        let property = "[UserProfile] setProperty, value: [withdrawn@example.com]"
+        let event = "[Events] recordEvent, key: [purchase]"
+        gatherer.capture(property, level: .debug, scope: .feature(.userDetails))
+        gatherer.capture(event, level: .debug, scope: .feature(.events))
+        XCTAssertEqual(messages(gatherer), [property, event])
+
+        transport.granted = [.events]
+        gatherer.consentDidChange()
+        XCTAssertEqual(messages(gatherer), [event])
+        XCTAssertEqual(awaitingMessages(gatherer), [property], "the withdrawn line waits again instead of going out")
+        gatherer.flushNow()
+        XCTAssertEqual(uploadedMessages(transport), [event])
+
+        transport.granted = [.events, .userDetails]
+        gatherer.consentDidChange()
+        gatherer.flushNow()
+        XCTAssertEqual(uploadedMessages(transport), [event, property])
+    }
+
+    /// A batch out for upload holds no line a withdrawal could recall, so when the
+    /// queue refuses it, its lines come back decided against the consent then.
+    func testARefusedBatchComesBackDecidedAgainstTheConsentAsItIsThen() {
+        let transport = FakeTransport()
+        transport.granted = [.events, .userDetails]
+        let gatherer = makeGatherer(transport)
+        gatherer.apply(directive(id: "gather_refused_withdrawn"), source: "test")
+        let property = "[UserProfile] setProperty, value: [withdrawn@example.com]"
+        gatherer.capture(property, level: .debug, scope: .feature(.userDetails))
+
+        transport.refuses = true
+        transport.granted = [.events]
+        gatherer.flushNow()
+
+        XCTAssertTrue(transport.payloads.isEmpty)
+        XCTAssertTrue(messages(gatherer).isEmpty)
+        XCTAssertEqual(awaitingMessages(gatherer), [property])
+    }
+
+    /// Before init no line can be decided yet, so a line dropped then counts
+    /// toward `d` only once init shows that its consent is given.
+    func testADropBeforeInitCountsOnlyForALineWhoseConsentTurnsOutGiven() {
+        let transport = FakeTransport()
+        transport.granted = [.events]
+        let gatherer = makeGatherer(transport, initFinished: false)
+
+        // The 15 oldest go: 10 lines no single feature owns, then 5 events lines.
+        capture(gatherer, 10, scope: .unattributed)
+        capture(gatherer, 5, scope: .feature(.events))
+        capture(gatherer, maxBufferedLines, scope: .feature(.events))
+        gatherer.sdkInitFinished()
+
+        XCTAssertEqual(gatherer.pendingDroppedCount, 5, "a dropped line that would have waited for its consent is no loss to report")
     }
 
     /// The waiting lines are bounded like the buffer, by lines and by characters,
@@ -1006,6 +1069,66 @@ final class LogGatheringTests: CountlyBaseTestCase {
         XCTAssertTrue(awaitingMessages(gatherer(of: countly)).isEmpty, "nothing waits while consent is not required")
     }
 
+    /// The limits cut a value on behalf of the feature that handed it over, here
+    /// before the crash consent is ever checked, so the line they log about it
+    /// answers to that feature rather than to events and user details.
+    func testALimitsLineAnswersToTheConsentOfTheFeatureWhoseValueItCut() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startArmed(id: "gather_limits") {
+            $0.requiresConsent = true
+            $0.consents = [.events, .userDetails]
+        }
+
+        countly.crashes.setCrashSegmentation(["note": String(repeating: "x", count: 300) + "SECRET-CRASH-SEGMENTATION"])
+        gatherer(of: countly).flushNow()
+
+        XCTAssertFalse(uploadedMessages(of: countly).contains { $0.contains("SECRET-CRASH-SEGMENTATION") },
+                       "crash data reached the server on the events and user details consent")
+        let cut = try XCTUnwrap(gatherer(of: countly).linesAwaitingConsent.first { $0.message.contains("[Limits]") && $0.message.contains("SECRET-CRASH-SEGMENTATION") })
+        XCTAssertEqual(cut.scope, .feature(.crashReporting))
+    }
+
+    /// A request queued for the previous user still goes out after a change
+    /// without merge, and what its send logs quotes that user's data, so only
+    /// the gather of the user it was queued for takes those lines.
+    func testARequestQueuedForThePreviousDeviceIDIsNotGatheredForTheNextUser() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startArmed(id: "gather_old_user", batchSize: maxBufferedLines)
+        countly.events.recordEvent("old-user-secret-event")
+        core(of: countly).modules.events.sendEventsWithSaveIfNeeded()
+        TestUtils.waitUntil("the old user's gather takes the lines of the old user's request") {
+            messages(gatherer(of: countly)).contains { $0.contains("[ConnectionManager]") && $0.contains("old-user-secret-event") }
+        }
+
+        countly.deviceID.changeWithoutMerge("new_user")
+        gatherer(of: countly).apply(directive(id: "gather_new_user"), source: "test")
+        let sendsBefore = MockURLProtocol.requests.count
+        core(of: countly).network.proceedOnQueue()
+        TestUtils.waitUntil("the old user's request is sent again") { MockURLProtocol.requests.count > sendsBefore }
+        TestUtils.pump(0.3)
+
+        let gathered = messages(gatherer(of: countly)) + awaitingMessages(gatherer(of: countly))
+        XCTAssertFalse(gathered.contains { $0.contains("old-user-secret-event") }, "the next user's gather took the previous user's request")
+    }
+
+    /// Withdrawing a consent through the public API takes that feature's lines
+    /// back out of the upload buffer.
+    func testWithdrawingAConsentThroughThePublicAPIRecallsItsLines() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startArmed(id: "gather_withdraw_api", batchSize: maxBufferedLines) {
+            $0.requiresConsent = true
+            $0.consents = [.events, .userDetails]
+        }
+        countly.userProfile.setProperty("email", value: "withdrawn@example.com")
+        XCTAssertTrue(messages(gatherer(of: countly)).contains { $0.contains("withdrawn@example.com") })
+
+        countly.consent.cancelConsent(for: [.userDetails])
+        gatherer(of: countly).flushNow()
+
+        XCTAssertFalse(uploadedMessages(of: countly).contains { $0.contains("withdrawn@example.com") })
+        XCTAssertTrue(awaitingMessages(gatherer(of: countly)).contains { $0.contains("withdrawn@example.com") })
+    }
+
     /// A change without merge is a new user: what the old one may upload goes out
     /// under the old device ID, and the gather does not follow the next user.
     func testADeviceIDChangeWithoutMergeUploadsUnderTheOldIDAndThenStops() throws {
@@ -1018,6 +1141,7 @@ final class LogGatheringTests: CountlyBaseTestCase {
         let logRequests = TestUtils.requests(requestQueue(of: countly), carrying: "sdk_logs")
         XCTAssertTrue(uploadedMessages(of: countly).contains { $0.contains("old-user-event") }, "the held lines go out before the switch")
         XCTAssertTrue(logRequests.allSatisfy { ($0["device_id"] as? String) == Self.deviceID }, "every gathered line belongs to the old user")
+        XCTAssertFalse(uploadedMessages(of: countly).contains { $0.contains("new_user") }, "the next user's ID never lands in the previous user's gather")
         XCTAssertEqual(gatherer(of: countly).currentState, .off)
         XCTAssertEqual(gatherer(of: countly).heldLineCount, 0)
 

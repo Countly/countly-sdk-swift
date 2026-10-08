@@ -123,6 +123,7 @@ final class DeviceIDModule: ModuleBase {
     /// a different user, so no merge. Replacing a generated ID means the same
     /// person just identified themselves, so the histories are merged.
     func setID(_ newID: String) {
+        let mark = core.logGatherer.nextCaptureSequence
         logI("setID", "changing the device ID, valueProvided: [\(!newID.isEmpty)]")
         logV("setID", "device ID value detail for the change whose merge behavior the SDK chooses, deviceID: [\(newID)]")
 
@@ -133,31 +134,36 @@ final class DeviceIDModule: ModuleBase {
 
         let merge = deviceIDType != .developerSupplied
         logD("setID", "merge behavior resolved from the origin of the current device ID, currentType: [\(deviceIDType)], onServerMerge: [\(merge)]")
-        changeDeviceID(newID, onServer: merge)
+        changeDeviceID(newID, onServer: merge, startedAt: mark)
     }
 
     /// Changes the ID and asks the server to merge the old identity into it.
     func changeDeviceIDWithMerge(_ newID: String?) {
+        let mark = core.logGatherer.nextCaptureSequence
         logI("changeDeviceIDWithMerge", "changing the device ID with a server side merge, valueProvided: [\(!(newID ?? "").isEmpty)]")
         logV("changeDeviceIDWithMerge", "device ID value detail for the merging change, deviceID: [\(newID ?? "")]")
-        changeDeviceID(newID, onServer: true)
+        changeDeviceID(newID, onServer: true, startedAt: mark)
     }
 
     /// Changes the ID and starts a fresh identity, discarding user scoped state.
     func changeDeviceIDWithoutMerge(_ newID: String?) {
+        let mark = core.logGatherer.nextCaptureSequence
         logI("changeDeviceIDWithoutMerge", "changing the device ID without a server side merge, valueProvided: [\(!(newID ?? "").isEmpty)]")
         logV("changeDeviceIDWithoutMerge", "device ID value detail for the non merging change, deviceID: [\(newID ?? "")]")
-        changeDeviceID(newID, onServer: false)
+        changeDeviceID(newID, onServer: false, startedAt: mark)
     }
 
     /// Switches into temporary mode: nothing leaves the device until a real ID is
     /// set, and everything recorded meanwhile is rewritten to that ID.
     func enableTemporaryDeviceIDMode() {
+        let mark = core.logGatherer.nextCaptureSequence
         logI("enableTemporaryDeviceIDMode", "switching to temporary device ID mode, currentType: [\(deviceIDType)], alreadyTemporary: [\(isTemporary)]")
-        changeDeviceID(TemporaryDeviceID.value, onServer: false)
+        changeDeviceID(TemporaryDeviceID.value, onServer: false, startedAt: mark)
     }
 
-    private func changeDeviceID(_ candidate: String?, onServer: Bool) {
+    /// Applies a change. `mark` is where the lines the change logs begin in the
+    /// gathered log, read before the public call logged anything.
+    private func changeDeviceID(_ candidate: String?, onServer: Bool, startedAt mark: UInt64) {
         var onServer = onServer
         let previousType = deviceIDType
 
@@ -225,7 +231,7 @@ final class DeviceIDModule: ModuleBase {
             // switch and reopened after it.
             core.modules.sessions.suspend()
             // Before the switch, so the gathered lines it queues carry the old device ID.
-            core.logGatherer.stopForDeviceIDChange()
+            core.logGatherer.stopForDeviceIDChange(droppingLinesFrom: mark)
             apply(resolved)
             core.modules.consent.cancelAllConsentsWithoutSending()
             core.modules.sessions.resume()
@@ -256,7 +262,7 @@ final class DeviceIDModule: ModuleBase {
         guard let provided = temporaryExitAfterInit else { return }
         temporaryExitAfterInit = nil
         logD("didInit", "leaving the temporary device ID mode found in storage with the ID provided at init")
-        changeDeviceID(provided, onServer: false)
+        changeDeviceID(provided, onServer: false, startedAt: core.logGatherer.nextCaptureSequence)
     }
 
     override func halt(clearStorage: Bool) {

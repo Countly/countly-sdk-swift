@@ -77,26 +77,26 @@ final class Logger {
 
     // MARK: - Level entry points
 
-    func e(_ module: String, _ function: String = #function, _ message: @autoclosure () -> String) {
+    func e(_ module: String, _ function: String = #function, scope: LogGatheringScope? = nil, _ message: @autoclosure () -> String) {
         healthTracker?.logError()
-        emit(.error, module, function, message)
+        emit(.error, module, function, scope, message)
     }
 
-    func w(_ module: String, _ function: String = #function, _ message: @autoclosure () -> String) {
+    func w(_ module: String, _ function: String = #function, scope: LogGatheringScope? = nil, _ message: @autoclosure () -> String) {
         healthTracker?.logWarning()
-        emit(.warning, module, function, message)
+        emit(.warning, module, function, scope, message)
     }
 
-    func i(_ module: String, _ function: String = #function, _ message: @autoclosure () -> String) {
-        emit(.info, module, function, message)
+    func i(_ module: String, _ function: String = #function, scope: LogGatheringScope? = nil, _ message: @autoclosure () -> String) {
+        emit(.info, module, function, scope, message)
     }
 
-    func d(_ module: String, _ function: String = #function, _ message: @autoclosure () -> String) {
-        emit(.debug, module, function, message)
+    func d(_ module: String, _ function: String = #function, scope: LogGatheringScope? = nil, _ message: @autoclosure () -> String) {
+        emit(.debug, module, function, scope, message)
     }
 
-    func v(_ module: String, _ function: String = #function, _ message: @autoclosure () -> String) {
-        emit(.verbose, module, function, message)
+    func v(_ module: String, _ function: String = #function, scope: LogGatheringScope? = nil, _ message: @autoclosure () -> String) {
+        emit(.verbose, module, function, scope, message)
     }
 
     // MARK: - Emission
@@ -104,6 +104,7 @@ final class Logger {
     private func emit(_ requested: CountlyLogLevel,
                       _ module: String,
                       _ function: String,
+                      _ scope: LogGatheringScope?,
                       _ message: () -> String) {
         let wantsConsole = isEnabled(requested)
         let wantsCapture = gatherer?.isCapturing ?? false
@@ -114,7 +115,7 @@ final class Logger {
         // Captured before the level prefix is added: a gathered line carries its
         // level in its own field and the dashboard renders it from there.
         if wantsCapture {
-            gatherer?.capture(body, level: requested, scope: LogGatheringScope.of(module: module, function: function, message: body))
+            gatherer?.capture(body, level: requested, scope: scope ?? LogGatheringScope.of(module: module, function: function, message: body))
         }
 
         guard wantsConsole else { return }

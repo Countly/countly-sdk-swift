@@ -99,7 +99,7 @@ final class EventsModule: ModuleBase {
         }
 
         let filtered = core.serverConfig.filterSegmentation(segmentation, eventKey: key)
-        let sanitized = core.limits.sanitized(filtered, "Event segmentation")
+        let sanitized = limits.sanitized(filtered, "Event segmentation")
 
         let providedKeyCount = segmentation?.count ?? 0
         let acceptedKeyCount = sanitized?.count ?? 0
@@ -139,7 +139,7 @@ final class EventsModule: ModuleBase {
             return
         }
         recordReservedEvent(key,
-                            segmentation: core.limits.sanitized(segmentation, "Reserved event segmentation"),
+                            segmentation: limits.sanitized(segmentation, "Reserved event segmentation"),
                             count: count,
                             sum: sum,
                             duration: duration)
@@ -304,7 +304,7 @@ final class EventsModule: ModuleBase {
             return
         }
 
-        let truncatedKey = core.limits.truncatedKey(key, "Event key")
+        let truncatedKey = limits.truncatedKey(key, "Event key")
 
         // The chain update and the enqueue happen under one lock so two threads
         // recording at once cannot produce two events claiming the same
