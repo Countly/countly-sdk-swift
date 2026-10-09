@@ -904,6 +904,21 @@ final class LogGatheringTests: CountlyBaseTestCase {
         }
     }
 
+    /// Every line the gather `gatherID` holds or ever handed over: held, waiting,
+    /// queued in a batch, or already taken by the mock, since an accepted batch
+    /// leaves the queue.
+    private func gatheredMessages(of instance: CountlyInstance, gatherID: String) -> [String] {
+        let gatherer = gatherer(of: instance)
+        let held = gatherer.currentDirective.gatherID == gatherID ? messages(gatherer) + awaitingMessages(gatherer) : []
+        let handedOver = (requestQueue(of: instance) + MockURLProtocol.requests.map(\.query))
+            .map(TestUtils.parseQuery)
+            .compactMap { $0["sdk_logs"] as? [String: Any] }
+            .filter { ($0["i"] as? String) == gatherID }
+            .flatMap { lines(in: $0) }
+            .compactMap { $0["m"] as? String }
+        return held + handedOver
+    }
+
     /// Whether a captured request is an ordinary one carrying `key`, rather than
     /// a gathered log batch quoting a line about it.
     private func isEventRequest(_ captured: MockURLProtocol.Captured, carrying key: String) -> Bool {
@@ -1140,8 +1155,11 @@ final class LogGatheringTests: CountlyBaseTestCase {
         acceptGatheredBatches()
         countly.events.recordEvent("old-user-secret-event")
         core(of: countly).modules.events.sendEventsWithSaveIfNeeded()
+        var oldGatherTookTheRequest = false
         TestUtils.waitUntil("the old user's gather takes the lines of the old user's request") {
-            (messages(gatherer(of: countly)) + uploadedMessages(of: countly)).contains { $0.contains("[ConnectionManager]") && $0.contains("old-user-secret-event") }
+            oldGatherTookTheRequest = oldGatherTookTheRequest || gatheredMessages(of: countly, gatherID: "gather_old_user")
+                .contains { $0.contains("[ConnectionManager]") && $0.contains("old-user-secret-event") }
+            return oldGatherTookTheRequest
         }
 
         countly.deviceID.changeWithoutMerge("new_user")
@@ -1153,8 +1171,8 @@ final class LogGatheringTests: CountlyBaseTestCase {
         }
         TestUtils.pump(0.3)
 
-        let gathered = messages(gatherer(of: countly)) + awaitingMessages(gatherer(of: countly))
-        XCTAssertFalse(gathered.contains { $0.contains("old-user-secret-event") }, "the next user's gather took the previous user's request")
+        XCTAssertFalse(gatheredMessages(of: countly, gatherID: "gather_new_user").contains { $0.contains("old-user-secret-event") },
+                       "the next user's gather took the previous user's request")
     }
 
     /// A request still out when the device ID changes is the previous user's, so
@@ -1181,8 +1199,8 @@ final class LogGatheringTests: CountlyBaseTestCase {
         gatherer(of: countly).apply(directive(id: "gather_new_user"), source: "test")
         TestUtils.waitUntil("the reply to the previous user's request arrived") { sink.lines.contains { $0.contains("in-flight-secret-reply") } }
 
-        let gathered = messages(gatherer(of: countly)) + awaitingMessages(gatherer(of: countly))
-        XCTAssertFalse(gathered.contains { $0.contains("in-flight-secret") }, "the next user's gather took the reply to the previous user's request")
+        XCTAssertFalse(gatheredMessages(of: countly, gatherID: "gather_new_user").contains { $0.contains("in-flight-secret") },
+                       "the next user's gather took the reply to the previous user's request")
     }
 
     /// Withdrawing a consent through the public API takes that feature's lines
