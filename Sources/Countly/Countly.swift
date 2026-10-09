@@ -21,7 +21,8 @@ import UserNotifications
 /// Getting an instance never starts it. Starting is always an explicit
 /// `start(with:)` by the caller, so an accidental reference cannot begin
 /// collecting data.
-public enum Countly {
+@objcMembers
+public final class Countly: NSObject {
 
     /// Registry key of the default instance.
     ///
@@ -31,6 +32,8 @@ public enum Countly {
 
     private static let lock = NSLock()
     private static var instances: [String: CountlyInstance] = [:]
+
+    private override init() {}
 
     // MARK: - Access
 
@@ -46,28 +49,48 @@ public enum Countly {
     /// The instance under this name, created uninitialized if it does not exist.
     ///
     /// A natural choice of name is the app key, which gives one isolated instance
-    /// per dashboard application. Passing `nil` or an empty name returns the
-    /// default instance.
-    public static func instance(named name: String?) -> CountlyInstance {
-        var key = defaultInstanceName
-        if let name, !name.isEmpty {
-            key = name
+    /// per dashboard application. The default instance is `Countly.shared`, or
+    /// this method with `Countly.defaultInstanceName`.
+    ///
+    /// An empty name is refused rather than read as the default instance: a name
+    /// that failed to load would otherwise route one tenant's data to another
+    /// dashboard without a word. The returned instance then belongs to no name and
+    /// refuses to start, so every call on it is ignored and logged.
+    @objc(instanceNamed:)
+    public static func instance(named name: String) -> CountlyInstance {
+        guard !name.isEmpty else {
+            Logger.print("[Error] [Countly] instance, the provided instance name is empty, the returned instance is not registered and can not be started so every call on it is ignored, use Countly.shared for the default instance")
+            return refusedInstance
         }
 
         lock.lock()
         defer { lock.unlock() }
 
-        if let existing = instances[key] { return existing }
+        if let existing = instances[name] { return existing }
 
-        let created = CountlyInstance(name: key)
-        instances[key] = created
+        let created = CountlyInstance(name: name)
+        instances[name] = created
         return created
+    }
+
+    /// What `instance(named:)` answers an empty name with. One shared object
+    /// rather than a new one per call, so a facade taken from it stays attached and
+    /// its calls report the empty name rather than a released instance.
+    private static let refusedInstance = CountlyInstance(name: "")
+
+    /// Whether `instance` is the one the registry holds under its name, the only
+    /// one that may run on that name's storage.
+    static func isRegistered(_ instance: CountlyInstance) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return instances[instance.name] === instance
     }
 
     /// The instance under this name, or `nil` when it does not exist.
     ///
     /// Unlike `instance(named:)` this never creates one, which is what a caller
     /// checking whether an instance was set up should use.
+    @objc(getInstanceNamed:)
     public static func getInstance(named name: String) -> CountlyInstance? {
         lock.lock()
         defer { lock.unlock() }
@@ -84,12 +107,12 @@ public enum Countly {
     /// Halts every instance.
     ///
     /// Intended for tests and for tearing an application down deliberately.
-    /// Halting the default instance leaves it started-but-empty, so anything still
-    /// holding a reference to it will find its calls ignored until it is started
+    /// Every instance stays registered, as after `halt(clearStorage:)`, so a
+    /// reference still held to one finds its calls ignored until it is started
     /// again.
     ///
-    /// - Parameter clearStorage: When `true`, every instance's persisted data is
-    ///   erased as well.
+    /// - Parameter clearStorage: When `true`, the persisted data of every
+    ///   registered instance is erased as well, whether it was running or not.
     public static func haltAllInstances(clearStorage: Bool = false) {
         lock.lock()
         let all = Array(instances.values)
@@ -103,12 +126,20 @@ public enum Countly {
     /// Stops a named instance and drops it from the registry.
     ///
     /// The next `instance(named:)` under the same name hands back a fresh,
-    /// unstarted instance. Stored data is kept: deregistering must not throw away
-    /// what the instance recorded but has not sent yet, so a caller who wants it
-    /// gone calls `halt(clearStorage: true)` on the instance first. The default
-    /// instance cannot be removed; `halt()` resets it.
-    public static func removeInstance(named name: String?) {
-        guard let name, !name.isEmpty, name != defaultInstanceName else {
+    /// unstarted instance, and a handle kept to the removed one can no longer be
+    /// started: two SDKs would run over the same storage. Stored data is kept:
+    /// deregistering must not throw away what the instance recorded but has not
+    /// sent yet, so a caller who wants it gone calls `halt(clearStorage: true)` on
+    /// the instance first, or on the fresh one afterwards. The default instance
+    /// cannot be removed; `halt()` resets it.
+    @objc(removeInstanceNamed:)
+    public static func removeInstance(named name: String) {
+        guard !name.isEmpty else {
+            Logger.print("[Warning] [Countly] removeInstance, the provided instance name is empty, nothing is registered under it, the call is ignored")
+            return
+        }
+
+        guard name != defaultInstanceName else {
             Logger.print("[Warning] [Countly] removeInstance, the default instance can not be removed, use halt() to reset it, the call is ignored")
             return
         }
@@ -126,7 +157,12 @@ public enum Countly {
         }
 
         // Outside the lock: the halt does real work and must not block creation.
-        removed.halt(clearStorage: false)
+        // A fresh instance started under the name meanwhile waits for this halt to
+        // give the storage back. One that is not running holds nothing, and halting
+        // it would only report that it is not running.
+        if removed.isStarted {
+            removed.halt(clearStorage: false)
+        }
     }
 
     // MARK: - Push notification plumbing

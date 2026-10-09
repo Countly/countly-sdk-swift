@@ -198,11 +198,12 @@ final class ContentScenarioDriver: XCTestCase {
     // MARK: - Plumbing
 
     private func start(deviceID: String, sink: LogSink) -> CountlyInstance {
+        let name = "scenario-\(deviceID)"
         let config = CountlyConfig()
         config.host = Self.host
         config.appKey = Self.appKey
         config.deviceID = deviceID
-        config.instanceName = "scenario-\(deviceID)"
+        config.instanceName = name
         config.enableDebug = true
         config.internalLogLevel = .debug
         config.loggerDelegate = sink
@@ -218,7 +219,7 @@ final class ContentScenarioDriver: XCTestCase {
         // runs of this driver.
         config.manualSessionHandling = true
 
-        let instance = Countly.instance(named: config.instanceName)
+        let instance = Countly.instance(named: name)
         instance.start(with: config)
         return instance
     }

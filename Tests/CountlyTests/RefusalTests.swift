@@ -162,23 +162,45 @@ final class RefusalTests: CountlyBaseTestCase {
                        "the request is kept for the next launch rather than started now")
     }
 
-    /// While the queue is being rewritten, which happens when a device ID or app
-    /// key changes, the drain has to stand off: sending a request that is about to
-    /// be rewritten would send the old form.
-    func testTheQueueIsNotDrainedWhileItIsBeingRewritten() throws {
+    /// A request the queue is rewritten under while it is being sent, as an app key
+    /// change does, was delivered in its old form. It leaves the queue on success
+    /// rather than going out a second time in its new form, under another app key.
+    func testARequestRewrittenWhileItIsSentIsSentOnce() throws {
         try skipUnlessNetworkIsInterceptable()
         MockURLProtocol.respondToEverything(json: Self.accepted)
 
-        let countly = startInstance { $0.eventSendThreshold = 1 }
-        countly.events.recordEvent("queued")
-
-        // Rewriting is what a device ID change does, and it holds the flag for the
-        // duration. Observed through the public call that performs one.
-        countly.requestQueue.replaceAllAppKeysInQueueWithCurrentAppKey()
-
-        TestUtils.waitUntil("the queue drains once the rewrite is done") {
-            self.requestQueue(of: countly).isEmpty
+        let inFlight = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let holdLock = NSLock()
+        let held = Recorded(false)
+        MockURLProtocol.respond { captured in
+            guard captured.path.hasSuffix("/i"), captured.query.contains("rewritten-in-flight") else { return nil }
+            holdLock.lock()
+            let isFirst = !held.value
+            held.value = true
+            holdLock.unlock()
+            if isFirst {
+                inFlight.signal()
+                _ = release.wait(timeout: .now() + 10)
+            }
+            return (200, Data(Self.accepted.utf8))
         }
+
+        let countly = startInstance { $0.eventSendThreshold = 1 }
+        countly.events.recordEvent("rewritten-in-flight")
+        XCTAssertEqual(inFlight.wait(timeout: .now() + 10), .success, "the event never reached the transport")
+
+        countly.setNewAppKey("another-app-key")
+        countly.requestQueue.replaceAllAppKeysInQueueWithCurrentAppKey()
+        release.signal()
+
+        TestUtils.waitUntil("the request leaves the queue") {
+            self.requestQueue(of: countly).allSatisfy { !$0.contains("rewritten-in-flight") }
+        }
+        TestUtils.pump(0.3)
+
+        XCTAssertEqual(MockURLProtocol.requests.filter { $0.query.contains("rewritten-in-flight") }.count, 1,
+                       "a request is delivered once, whatever the queue was rewritten to while it was in flight")
     }
 
     // MARK: - Custom headers

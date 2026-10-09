@@ -17,11 +17,12 @@ import Foundation
 ///
 /// Obtained from `Countly.shared` or `Countly.instance(named:)`, never
 /// constructed directly.
-public final class CountlyInstance {
+public final class CountlyInstance: NSObject {
 
     private static let module = "Countly"
 
     /// Registry key of this instance.
+    @objc
     public let name: String
 
     /// Built by `start(with:)` and released by `halt()`.
@@ -35,48 +36,63 @@ public final class CountlyInstance {
     // MARK: - Feature facades
 
     /// Custom events.
+    @objc
     public private(set) lazy var events = EventsAPI(instance: self)
 
     /// Sessions.
+    @objc
     public private(set) lazy var sessions = SessionsAPI(instance: self)
 
     /// View tracking.
+    @objc
     public private(set) lazy var views = ViewsAPI(instance: self)
 
     /// The user profile.
+    @objc
     public private(set) lazy var userProfile = UserProfileAPI(instance: self)
 
     /// Consent.
+    @objc
     public private(set) lazy var consent = ConsentAPI(instance: self)
 
     /// The device ID.
+    @objc
     public private(set) lazy var deviceID = DeviceIDAPI(instance: self)
 
     /// Location.
+    @objc
     public private(set) lazy var location = LocationAPI(instance: self)
 
     /// Crash reporting.
+    @objc
     public private(set) lazy var crashes = CrashesAPI(instance: self)
 
     /// Remote config and A/B testing.
+    @objc
     public private(set) lazy var remoteConfig = RemoteConfigAPI(instance: self)
 
     /// Attribution.
+    @objc
     public private(set) lazy var attribution = AttributionAPI(instance: self)
 
     /// Performance monitoring.
+    @objc
     public private(set) lazy var performance = APMAPI(instance: self)
 
     /// Feedback widgets.
+    @objc
     public private(set) lazy var feedback = FeedbackAPI(instance: self)
 
     /// Content zone.
+    @objc
     public private(set) lazy var content = ContentAPI(instance: self)
 
     /// Push notifications.
+    @objc
     public private(set) lazy var push = PushAPI(instance: self)
 
     /// The request queue.
+    @objc
     public private(set) lazy var requestQueue = RequestQueueAPI(instance: self)
 
     // MARK: - Init
@@ -85,7 +101,15 @@ public final class CountlyInstance {
         self.name = name
     }
 
+    deinit {
+        // Released ahead of the core it holds `unowned`: tearing it down logs
+        // through the core, and stored properties are released in declaration
+        // order, the core first.
+        lifecycleObserver = nil
+    }
+
     /// Whether this instance has been started and not halted.
+    @objc
     public var isStarted: Bool {
         lifecycleLock.lock()
         defer { lifecycleLock.unlock() }
@@ -101,10 +125,19 @@ public final class CountlyInstance {
         guard let current, current.hasStarted else {
             // Deliberately printed rather than logged: without a core there is no
             // logger, and a call before init is exactly the mistake worth seeing.
-            Logger.print("[Warning] [\(Self.module)] \(function), the SDK has not been started yet, the call is ignored")
+            let reason = Countly.isRegistered(self) ? "the SDK has not been started yet" : notRegisteredReason
+            Logger.print("[Warning] [\(Self.module)] \(function), \(reason), the call is ignored")
             return nil
         }
         return current
+    }
+
+    /// Why this instance can never run, for one the registry does not hold.
+    private var notRegisteredReason: String {
+        if name.isEmpty {
+            return "the instance was requested with an empty name and can never be started, use Countly.shared for the default instance"
+        }
+        return "the instance was removed from the registry and can no longer be started, get a new one with Countly.instance(named:), name: [\(name)]"
     }
 
     // MARK: - Starting
@@ -114,12 +147,22 @@ public final class CountlyInstance {
     /// A second call is ignored rather than restarting: an already running
     /// instance has a session open and a queue in flight, and tearing that down
     /// silently would lose data.
+    @objc(startWithConfig:)
     public func start(with config: CountlyConfig) {
         lifecycleLock.lock()
         defer { lifecycleLock.unlock() }
 
         if let core, core.hasStarted {
             core.logger.w(Self.module, "start", "omitting the call, the SDK has already been started")
+            return
+        }
+
+        // Only the instance the registry holds under a name may run on that name's
+        // storage. A handle `Countly.removeInstance(named:)` dropped would run a
+        // second SDK over the files and keys of the one the registry made since,
+        // and an empty name maps to the default instance's storage.
+        guard Countly.isRegistered(self) else {
+            Logger.print("[Error] [\(Self.module)] start, \(notRegisteredReason), the call is ignored")
             return
         }
 
@@ -137,7 +180,16 @@ public final class CountlyInstance {
             Logger.print("[Warning] [\(Self.module)] start, the instance name in the config does not match the name this instance was created with, configName: [\(configName)], instanceName: [\(name)]")
         }
 
+        // A copy, so the server's behavior settings and calls such as
+        // `setNewAppKey` change this run only: the caller's object starts the next
+        // run as it was given, and a config shared by two instances cannot carry
+        // one's changes into the other.
+        let config = config.snapshot()
         config.sdkInternalLimits.clampToMinimums()
+
+        // Taken before anything is opened. A previous holder still halting is
+        // waited for, so its last write lands before this instance reads.
+        StorageClaims.claim(StorageNamespace(instanceName: name), for: self)
 
         let builtCore = SDKCore(instanceName: name, config: config)
         builtCore.hasStarted = true
@@ -379,6 +431,7 @@ public final class CountlyInstance {
     ///
     /// Requests already queued keep going to their original destination only if
     /// they have already been sent; anything still queued goes to the new host.
+    @objc
     public func setNewHost(_ host: String) {
         guard let core = requireCore() else { return }
         guard !host.isEmpty else {
@@ -394,6 +447,7 @@ public final class CountlyInstance {
     /// Queued requests keep the app key they were recorded under, so data already
     /// collected still lands where it belongs. Use the request queue API to rewrite
     /// or drop them.
+    @objc
     public func setNewAppKey(_ appKey: String) {
         guard let core = requireCore() else { return }
         guard !appKey.isEmpty else {
@@ -409,6 +463,7 @@ public final class CountlyInstance {
     }
 
     /// Replaces the session configuration used for every request.
+    @objc
     public func setNewURLSessionConfiguration(_ configuration: URLSessionConfiguration) {
         guard let core = requireCore() else { return }
         core.logger.i(Self.module, "setNewURLSessionConfiguration", "a custom URL session configuration is being applied and the cached sessions will be rebuilt, customHeaderCount: [\(configuration.httpAdditionalHeaders?.count ?? 0)]")
@@ -417,6 +472,7 @@ public final class CountlyInstance {
     }
 
     /// Adds headers to every request the SDK makes.
+    @objc
     public func addCustomNetworkRequestHeaders(_ headers: [String: String]?) {
         guard let core = requireCore() else { return }
         core.logger.i(Self.module, "addCustomNetworkRequestHeaders", "custom network request headers are being set through the public API, providedHeaderCount: [\(headers?.count ?? 0)]")
@@ -424,6 +480,7 @@ public final class CountlyInstance {
     }
 
     /// Reports the device metrics again, optionally overriding some of them.
+    @objc
     public func recordMetrics(_ metricsOverride: [String: String]? = nil) {
         guard let core = requireCore() else { return }
 
@@ -449,6 +506,7 @@ public final class CountlyInstance {
     ///
     /// Keys the SDK owns are stripped, because a request that overrides the device
     /// ID or the timestamp would be attributed to the wrong user or moment.
+    @objc
     public func addDirectRequest(_ parameters: [String: String]?) {
         guard let core = requireCore() else { return }
         guard let parameters, !parameters.isEmpty else {
@@ -479,6 +537,7 @@ public final class CountlyInstance {
     }
 
     /// Suspends tracking: flushes what is pending and closes the session.
+    @objc
     public func suspend() {
         guard let core = requireCore() else { return }
         core.logger.i(Self.module, "suspend", "the public suspend call is received, pending data will be flushed and the session closed")
@@ -486,6 +545,7 @@ public final class CountlyInstance {
     }
 
     /// Resumes tracking after a suspend.
+    @objc
     public func resume() {
         guard let core = requireCore() else { return }
         core.logger.i(Self.module, "resume", "the public resume call is received, session handling will be restarted")
@@ -494,15 +554,27 @@ public final class CountlyInstance {
 
     /// Stops the SDK and releases everything it holds.
     ///
+    /// The instance stays registered under its name, so `Countly.shared` and any
+    /// reference the application kept go on pointing at it, and `start(with:)` can
+    /// be called on it again: erasing the data and starting over is
+    /// `halt(clearStorage: true)` followed by `start(with:)`. To drop a named
+    /// instance from the registry as well, use `Countly.removeInstance(named:)`.
+    ///
     /// - Parameter clearStorage: When `true`, the persisted device ID, queue and
-    ///   cached state are erased too. The next start looks like a first install.
+    ///   cached state are erased too, also when the instance is not running. The
+    ///   next start looks like a first install.
+    @objc
     public func halt(clearStorage: Bool = false) {
         lifecycleLock.lock()
         defer { lifecycleLock.unlock() }
 
         guard let core, core.hasStarted else {
-            // Printed rather than logged for the same reason `requireCore` prints.
-            Logger.print("[Warning] [\(Self.module)] halt, the SDK is not running, the call is ignored")
+            if clearStorage {
+                eraseStoredData()
+            } else {
+                // Printed rather than logged for the same reason `requireCore` prints.
+                Logger.print("[Warning] [\(Self.module)] halt, the SDK is not running, the call is ignored")
+            }
             return
         }
 
@@ -510,6 +582,10 @@ public final class CountlyInstance {
 
         lifecycleObserver?.deregister()
         lifecycleObserver = nil
+
+        // A behavior settings answer still on its way belongs to this run, and
+        // would otherwise be applied to the next start of this instance.
+        core.serverConfig.delegate = nil
 
         // First, so a module's halt-time flush lands in the queue and is not sent.
         core.network.halt()
@@ -523,20 +599,52 @@ public final class CountlyInstance {
         core.serverConfig.stop()
         core.logGatherer.halt()
 
+        // Every store is closed, not only erased ones: a send that completes, a
+        // download or a breadcrumb that lands after this point belongs to the run
+        // being halted and must not write over what the next start reads.
         if clearStorage {
             core.requestQueueStore.flush()
             core.requestQueueStore.deleteFile()
+            core.crashLogStore.close()
             core.crashLogStore.deleteAll()
             core.keyValueStore.clearAll()
         } else {
-            core.requestQueueStore.saveSync()
+            core.requestQueueStore.close()
+            core.crashLogStore.close()
+            core.keyValueStore.close()
         }
 
         core.hasStarted = false
         core.hasFinishedInit = false
         self.core = nil
 
+        StorageClaims.release(core.namespace, by: self)
+
         core.logger.d(Self.module, "halt", "the SDK is halted, every module is torn down and the network is reset")
+    }
+
+    /// Erases what this instance's storage holds without starting it, for a
+    /// `halt(clearStorage: true)` that finds it not running.
+    ///
+    /// Only the registered instance may: a handle `Countly.removeInstance(named:)`
+    /// dropped would otherwise wipe the files of the instance the registry made
+    /// since, while it runs on them. The namespace is held for the duration, so a
+    /// previous holder still halting finishes its last write first.
+    private func eraseStoredData() {
+        guard Countly.isRegistered(self) else {
+            Logger.print("[Warning] [\(Self.module)] halt, \(notRegisteredReason), its stored data is not erased")
+            return
+        }
+
+        let namespace = StorageNamespace(instanceName: name)
+        StorageClaims.claim(namespace, for: self)
+        defer { StorageClaims.release(namespace, by: self) }
+
+        RequestQueueDatabase(namespace: namespace, logger: nil).deleteEverything()
+        CrashLogStore(namespace: namespace, logger: nil).deleteAll()
+        KeyValueStore(namespace: namespace, logger: nil).clearAll()
+
+        Logger.print("[Info] [\(Self.module)] halt, the SDK is not running, its stored data is erased, name: [\(name)]")
     }
 }
 
@@ -545,7 +653,9 @@ public final class CountlyInstance {
 extension CountlyInstance: ServerConfigDelegate {
 
     func serverConfigDidChange(_ serverConfig: ServerConfig, consentBecameRequired: Bool) {
-        guard let core else { return }
+        // An answer the halt could not stop any more comes from the halted run's
+        // settings, and after a restart `core` is already the next run.
+        guard let core, core.serverConfig === serverConfig else { return }
 
         guard core.hasStarted else {
             core.logger.d(Self.module, "serverConfigDidChange", "behavior settings changed while the SDK is not running, they are stored but not applied to it")

@@ -13,7 +13,8 @@ import Foundation
 /// The defaults are the cross-SDK values. Raising a limit means larger requests
 /// and more server-side storage per data point, so the server may still reject or
 /// trim what it receives.
-public final class CountlySDKLimitsConfig {
+@objcMembers
+public final class CountlySDKLimitsConfig: NSObject {
 
     /// Maximum length of any key: event names, segmentation keys, user property
     /// names, view names, trace names. Default 128.
@@ -42,7 +43,18 @@ public final class CountlySDKLimitsConfig {
     /// value is not consulted.
     public var maxStackTraceLinesPerThread: Int = DefaultLimits.maxStackTraceLinesPerThread
 
-    public init() {}
+    public override init() {}
+
+    /// Takes every value of `other`, for the snapshot an instance runs on.
+    func copyValues(from other: CountlySDKLimitsConfig) {
+        maxKeyLength = other.maxKeyLength
+        maxValueSize = other.maxValueSize
+        maxValueSizePicture = other.maxValueSizePicture
+        maxBreadcrumbCount = other.maxBreadcrumbCount
+        maxSegmentationValues = other.maxSegmentationValues
+        maxStackTraceLineLength = other.maxStackTraceLineLength
+        maxStackTraceLinesPerThread = other.maxStackTraceLinesPerThread
+    }
 
     /// Raises every limit below one back to its default, in place.
     ///

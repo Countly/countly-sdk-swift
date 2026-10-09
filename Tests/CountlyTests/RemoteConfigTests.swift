@@ -614,7 +614,7 @@ final class RemoteConfigTests: CountlyBaseTestCase {
     /// whole session, which is exactly when a cache was supposed to help.
     ///
     /// The stand-in below is archived under the old class's Objective-C name, which
-    /// is what `@objc(CountlyRCData)` on `LegacyArchivedRCData` exists to match.
+    /// `CountlyArchive` maps to `ArchivedRCData` on every read.
     func testACacheWrittenByThePreviousObjectiveCSDKIsStillReadable() throws {
         let name = uniqueInstanceName()
         let namespace = StorageNamespace(instanceName: name)
@@ -647,11 +647,9 @@ final class RemoteConfigTests: CountlyBaseTestCase {
 }
 
 /// Stands in for the Objective-C SDK's `CountlyRCData` when writing a legacy
-/// archive. It cannot be the real type: `LegacyArchivedRCData` has only
-/// `init?(coder:)`, by design, because nothing in the SDK should ever create one.
-// An explicit Objective-C name because `NSCoding` needs a stable one. It is not
-// the legacy name: that is applied per archive with `setClassName`, so this type
-// cannot collide with the real `@objc(CountlyRCData)`.
+/// archive, so the fixture is produced by a class other than the one that reads
+/// it back.
+// An explicit Objective-C name because `NSCoding` needs a stable one; the legacy name is applied per archive.
 @objc(CountlyTestLegacyRCStandIn)
 private final class LegacyRCStandIn: NSObject, NSCoding {
 

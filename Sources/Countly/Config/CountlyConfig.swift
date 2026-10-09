@@ -12,9 +12,12 @@ import CoreLocation
 /// Everything the SDK needs at init, in one object.
 ///
 /// Nothing here takes effect until the object is handed to
-/// `Countly.initShared(_:)` or `CountlyInstance.start(with:)`. The instance takes
-/// a snapshot at that point, so mutating the config afterwards does nothing.
-public final class CountlyConfig {
+/// `CountlyInstance.start(with:)`. The instance takes a snapshot at that point, so
+/// mutating the config afterwards does nothing, and neither the server's behavior
+/// settings nor calls such as `setNewAppKey` change it: one object can start
+/// several instances, or the same instance again after a halt.
+@objcMembers
+public final class CountlyConfig: NSObject {
 
     // MARK: - Required
 
@@ -30,7 +33,9 @@ public final class CountlyConfig {
     ///
     /// Advisory. The registry key passed to `Countly.instance(named:)` is what
     /// actually decides storage isolation; this is validated against it at init
-    /// and a mismatch is logged. Leave it unset for the default instance.
+    /// and a mismatch is logged. Leave it unset for the default instance, which is
+    /// reached through `Countly.shared`: `Countly.instance(named:)` refuses an
+    /// empty name, and a `nil` passed from Objective-C arrives as one.
     public var instanceName: String?
 
     // MARK: - Logging
@@ -54,6 +59,14 @@ public final class CountlyConfig {
     /// Features that have to be switched on explicitly, such as push
     /// notifications and crash reporting.
     public var features: [CountlyFeature] = []
+
+    /// `features` for Objective-C, as `CountlyFeature` values.
+    @available(swift, obsoleted: 1)
+    @objc(features)
+    public var objcFeatures: [NSNumber] {
+        get { features.map { NSNumber(value: $0.rawValue) } }
+        set { features = newValue.compactMap { CountlyFeature(rawValue: $0.intValue) } }
+    }
 
     /// Extra metrics merged into the metrics dictionary sent with sessions.
     public var customMetrics: [String: String] = [:]
@@ -117,6 +130,14 @@ public final class CountlyConfig {
     /// Features consented to at init time.
     public var consents: [ConsentFeature] = []
 
+    /// `consents` for Objective-C, as `ConsentFeature` values.
+    @available(swift, obsoleted: 1)
+    @objc(consents)
+    public var objcConsents: [NSNumber] {
+        get { consents.map { NSNumber(value: $0.rawValue) } }
+        set { consents = newValue.compactMap { ConsentFeature(rawValue: $0.intValue) } }
+    }
+
     /// Grants consent for every feature at init time. Overrides `consents`.
     public var enableAllConsents: Bool = false
 
@@ -125,6 +146,14 @@ public final class CountlyConfig {
     /// APNs environment the push token belongs to. Leave `nil` to let the SDK
     /// infer it from the build's provisioning profile.
     public var pushTestMode: PushTestMode?
+
+    /// `pushTestMode` for Objective-C, a `PushTestMode` value or `nil`.
+    @available(swift, obsoleted: 1)
+    @objc(pushTestMode)
+    public var objcPushTestMode: NSNumber? {
+        get { pushTestMode.map { NSNumber(value: $0.rawValue) } }
+        set { pushTestMode = newValue.flatMap { PushTestMode(rawValue: $0.intValue) } }
+    }
 
     /// Sends the push token even when push consent has not been given, so the
     /// server can hold it until consent arrives.
@@ -291,7 +320,7 @@ public final class CountlyConfig {
     public var enrollABOnRCDownload: Bool = false
 
     /// Callbacks notified after each remote config download.
-    public private(set) var remoteConfigGlobalCallbacks: [RCDownloadCallback] = []
+    public internal(set) var remoteConfigGlobalCallbacks: [RCDownloadCallback] = []
 
     /// Registers a callback notified after each remote config download.
     public func remoteConfigRegisterGlobalCallback(_ callback: @escaping RCDownloadCallback) {
@@ -334,7 +363,7 @@ public final class CountlyConfig {
 
     // MARK: - Init
 
-    public init() {}
+    public override init() {}
 
     /// Convenience initializer for the two values every integration must set.
     public convenience init(appKey: String, host: String) {
@@ -379,5 +408,103 @@ public final class CountlyConfig {
             result.removeLast()
         }
         return result
+    }
+
+    // MARK: - Snapshot
+
+    /// The copy an instance runs on, so that what the SDK changes on it while
+    /// running, the server's behavior settings among them, never reaches the
+    /// caller's object.
+    ///
+    /// Every stored property is copied, and each sub-configuration as a copy of
+    /// its own. The session configuration is copied too, since the SDK sets its
+    /// timeouts. Callbacks and the logger delegate are shared, not copied.
+    func snapshot() -> CountlyConfig {
+        let copy = CountlyConfig()
+
+        copy.host = host
+        copy.appKey = appKey
+        copy.instanceName = instanceName
+
+        copy.enableDebug = enableDebug
+        copy.internalLogLevel = internalLogLevel
+        copy.loggerDelegate = loggerDelegate
+
+        copy.features = features
+        copy.customMetrics = customMetrics
+
+        copy.sdkName = sdkName
+        copy.sdkVersion = sdkVersion
+
+        copy.enableAutomaticViewTracking = enableAutomaticViewTracking
+        copy.disableSwizzling = disableSwizzling
+        copy.automaticViewTrackingExclusionList = automaticViewTrackingExclusionList
+        copy.globalViewSegmentation = globalViewSegmentation
+        copy.disableViewRestartForManualRecording = disableViewRestartForManualRecording
+
+        copy.requiresConsent = requiresConsent
+        copy.consents = consents
+        copy.enableAllConsents = enableAllConsents
+
+        copy.pushTestMode = pushTestMode
+        copy.sendPushTokenAlways = sendPushTokenAlways
+        copy.disableAutomaticPushHandling = disableAutomaticPushHandling
+        copy.launchNotification = launchNotification
+        copy.doNotShowAlertForNotifications = doNotShowAlertForNotifications
+
+        copy.location = location
+        copy.city = city
+        copy.isoCountryCode = isoCountryCode
+        copy.ipAddress = ipAddress
+        copy.disableLocation = disableLocation
+
+        copy.deviceID = deviceID
+        copy.temporaryDeviceIDMode = temporaryDeviceIDMode
+        copy.resetStoredDeviceID = resetStoredDeviceID
+
+        copy.updateSessionPeriod = updateSessionPeriod
+        copy.eventSendThreshold = eventSendThreshold
+        copy.storedRequestsLimit = storedRequestsLimit
+        copy.requestDropAgeHours = requestDropAgeHours
+        copy.requestTimeoutDuration = requestTimeoutDuration
+        copy.alwaysUsePOST = alwaysUsePOST
+
+        copy.manualSessionHandling = manualSessionHandling
+        copy.enableManualSessionControlHybridMode = enableManualSessionControlHybridMode
+
+        copy.providedUserProperties = providedUserProperties
+
+        copy.campaignType = campaignType
+        copy.campaignData = campaignData
+        copy.indirectAttribution = indirectAttribution
+
+        copy.crashSegmentation = crashSegmentation
+        copy.crashFilter = crashFilter
+        copy.shouldSendCrashReportCallback = shouldSendCrashReportCallback
+
+        copy.pinnedCertificates = pinnedCertificates
+        copy.secretSalt = secretSalt
+        copy.urlSessionConfiguration = (urlSessionConfiguration.copy() as? URLSessionConfiguration) ?? urlSessionConfiguration
+        copy.shouldIgnoreTrustCheck = shouldIgnoreTrustCheck
+        copy.customNetworkRequestHeaders = customNetworkRequestHeaders
+
+        copy.enableRemoteConfigAutomaticTriggers = enableRemoteConfigAutomaticTriggers
+        copy.enableRemoteConfigValueCaching = enableRemoteConfigValueCaching
+        copy.enrollABOnRCDownload = enrollABOnRCDownload
+        copy.remoteConfigGlobalCallbacks = remoteConfigGlobalCallbacks
+
+        copy.enableOrientationTracking = enableOrientationTracking
+
+        copy.sdkBehaviorSettings = sdkBehaviorSettings
+        copy.disableSDKBehaviorSettingsUpdates = disableSDKBehaviorSettingsUpdates
+        copy.disableBackoffMechanism = disableBackoffMechanism
+
+        copy.sdkInternalLimits.copyValues(from: sdkInternalLimits)
+        copy.crashes.copyValues(from: crashes)
+        copy.apm.copyValues(from: apm)
+        copy.content.copyValues(from: content)
+        copy.experimental.copyValues(from: experimental)
+
+        return copy
     }
 }

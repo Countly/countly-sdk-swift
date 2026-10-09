@@ -43,6 +43,7 @@ let package = Package(
                 .linkedFramework("CoreLocation"),
                 .linkedFramework("WebKit", .when(platforms: [.iOS, .visionOS, .macOS])),
                 .linkedFramework("CoreTelephony", .when(platforms: [.iOS])),
+                .linkedLibrary("sqlite3"),
             ]),
 
         .target(
@@ -50,10 +51,25 @@ let package = Package(
             dependencies: [],
             path: "Sources/CountlyNotificationService"),
 
+        // The file an application going back to countly-sdk-ios adds to its own
+        // target. No product ships it; it is built here for the tests.
+        .target(
+            name: "CountlySwiftSDKMigration",
+            dependencies: [],
+            path: "Migration",
+            cSettings: [.define("COUNTLY_MIGRATION_NO_AUTORUN")],
+            linkerSettings: [.linkedLibrary("sqlite3")]),
+
         .testTarget(
             name: "CountlyTests",
-            dependencies: ["Countly"],
+            dependencies: ["Countly", "CountlySwiftSDKMigration"],
             path: "Tests/CountlyTests"
+        ),
+
+        .testTarget(
+            name: "CountlyObjCTests",
+            dependencies: ["Countly"],
+            path: "Tests/CountlyObjCTests"
         ),
     ]
 )

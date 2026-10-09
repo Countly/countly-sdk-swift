@@ -211,9 +211,8 @@ final class FoundationTests: XCTestCase {
         XCTAssertFalse(first.isStarted)
     }
 
-    func testEmptyNameResolvesToTheDefaultInstance() {
-        XCTAssertTrue(Countly.instance(named: "") === Countly.shared)
-        XCTAssertTrue(Countly.instance(named: nil) === Countly.shared)
+    func testEmptyNameDoesNotResolveToTheDefaultInstance() {
+        XCTAssertFalse(Countly.instance(named: "") === Countly.shared)
     }
 
     func testGetInstanceDoesNotCreate() {

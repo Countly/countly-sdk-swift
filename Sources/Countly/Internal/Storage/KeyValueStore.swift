@@ -22,6 +22,18 @@ final class KeyValueStore {
 
     private static let module = "KeyValueStore"
 
+    /// Guards `isClosed` and nothing else. Never held across a `UserDefaults`
+    /// call: those post their change notification synchronously on the writing
+    /// thread, and an observer waiting on another thread would then deadlock
+    /// against a write or an erasure on that thread.
+    private let closeLock = NSLock()
+
+    /// Set by `close()` and never reset. A restart builds a new store, so any write
+    /// reaching this one afterwards comes from the halted instance, such as a
+    /// completion that was still in flight, and would overwrite what the next
+    /// start reads or put back what was erased.
+    private var isClosed = false
+
     init(namespace: StorageNamespace, defaults: UserDefaults = .standard, logger: Logger?) {
         self.namespace = namespace
         self.defaults = defaults
@@ -99,7 +111,16 @@ final class KeyValueStore {
         "kCountlyStartedEventsPersistencyKey",
     ]
 
-    /// Removes everything this instance owns. Used by `halt(clearStorage: true)`.
+    /// Refuses every write from now on, keeping what is stored. Used by every halt,
+    /// so the halted instance cannot write over what the next start reads.
+    func close() {
+        closeLock.lock()
+        isClosed = true
+        closeLock.unlock()
+    }
+
+    /// Closes the store and removes everything this instance owns. Used by
+    /// `halt(clearStorage: true)`.
     func clearAll() {
         let keys = [
             PersistencyKey.storedDeviceID,
@@ -110,6 +131,11 @@ final class KeyValueStore {
             PersistencyKey.serverConfig,
             PersistencyKey.healthCheckState,
         ] + Self.legacyKeys
+
+        // Closed before the removal: a write already past its check takes itself
+        // back once it sees the flag, so nothing written outlives the erasure.
+        close()
+
         // Counted before the removal, because an erasure that was asked for and
         // found nothing to erase is a different answer to "was my data deleted"
         // than one that cleared a stored device ID.
@@ -117,6 +143,7 @@ final class KeyValueStore {
         for key in keys {
             defaults.removeObject(forKey: namespace.key(key))
         }
+
         logger?.d(Self.module, "clearAll", "stored key value state is cleared, keyCount: [\(keys.count)], clearedKeyCount: [\(clearedKeys.count)], clearedKeys: [\(clearedKeys.joined(separator: ", "))]")
     }
 
@@ -126,20 +153,51 @@ final class KeyValueStore {
     /// tracker persists its counters through here from its own queue, and those
     /// two levels would count the write as another incident.
     private func set(_ value: Any?, _ key: String) {
-        let namespacedKey = namespace.key(key)
+        guard write(value, key, function: "set") else { return }
+
         if let value {
-            defaults.set(value, forKey: namespacedKey)
             logger?.d(Self.module, "set", "a value is written to the key value store, key: [\(key)], valueType: [\(type(of: value))]")
         } else {
-            defaults.removeObject(forKey: namespacedKey)
             logger?.d(Self.module, "set", "a key is removed from the key value store, key: [\(key)]")
         }
     }
 
+    /// Whether `close()` has run.
+    private var closed: Bool {
+        closeLock.lock()
+        defer { closeLock.unlock() }
+        return isClosed
+    }
+
+    /// Stores `value` under `key`, or removes the key for `nil`, unless the store
+    /// is closed.
+    ///
+    /// The flag is checked on both sides of the write rather than held across it,
+    /// because `UserDefaults` runs change observers inside the write. A write that
+    /// raced `clearAll()` and landed after the erasure removes itself again.
+    ///
+    /// - Returns: Whether the value was kept.
+    private func write(_ value: Any?, _ key: String, function: String) -> Bool {
+        let namespacedKey = namespace.key(key)
+        guard !closed else {
+            logger?.d(Self.module, function, "the write is dropped, the store is closed by a halt, key: [\(key)]")
+            return false
+        }
+
+        defaults.set(value, forKey: namespacedKey)
+
+        guard !closed else {
+            defaults.removeObject(forKey: namespacedKey)
+            logger?.d(Self.module, function, "the write is taken back, the store was closed by a halt while it ran, key: [\(key)]")
+            return false
+        }
+        return true
+    }
+
     private func archive(_ value: [String: Any], _ key: String) {
         do {
-            let data = try NSKeyedArchiver.archivedData(withRootObject: value, requiringSecureCoding: false)
-            defaults.set(data, forKey: namespace.key(key))
+            let data = try CountlyArchive.encodeRoot(value)
+            guard write(data, key, function: "archive") else { return }
             logger?.d(Self.module, "archive", "value is archived into the key value store, key: [\(key)], entryCount: [\(value.count)], dataSize: [\(data.count)]")
         } catch {
             let failure = error as NSError

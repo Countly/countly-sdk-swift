@@ -27,8 +27,8 @@ final class CrashTests: CountlyBaseTestCase {
         TestUtils.requests(requestQueue(of: instance), carrying: "crash").count
     }
 
-    /// Crash requests in the instance's queue file, read back from disk by a store
-    /// of its own. What a process killed right now would find on the next launch,
+    /// Crash requests in the instance's queue on disk, read back by a store of its
+    /// own. What a process killed right now would find on the next launch,
     /// which the in-memory queue does not show.
     private func crashCountOnDisk(of instance: CountlyInstance) -> Int {
         let fromDisk = RequestQueueStore(namespace: core(of: instance).namespace, logger: nil)

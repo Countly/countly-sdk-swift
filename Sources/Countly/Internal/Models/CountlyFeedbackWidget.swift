@@ -9,7 +9,7 @@
 import Foundation
 
 /// Kind of feedback widget.
-public enum FeedbackWidgetType: Int, Sendable {
+@objc public enum FeedbackWidgetType: Int, Sendable {
     case survey
     case nps
     case rating
@@ -43,7 +43,7 @@ public enum FeedbackWidgetType: Int, Sendable {
 }
 
 /// Whether a widget just appeared or was dismissed.
-public enum WidgetState: Int, Sendable {
+@objc public enum WidgetState: Int, Sendable {
     case appeared
     case closed
 }
@@ -56,10 +56,12 @@ public typealias WidgetCallback = (_ state: WidgetState) -> Void
 /// Obtained from `feedback.getAvailableFeedbackWidgets`. Presenting it, or
 /// recording a result for it, goes back through the instance that produced it, so
 /// the answers land on the right server.
-public final class CountlyFeedbackWidget {
+@objcMembers
+public final class CountlyFeedbackWidget: NSObject {
 
     public let type: FeedbackWidgetType
-    public let id: String
+    /// `ID` in Objective-C, as the Objective-C SDK names it, since `id` is a type there.
+    @objc(ID) public let id: String
     public let name: String
     public let tags: [String]
 
@@ -116,7 +118,13 @@ public final class CountlyFeedbackWidget {
 
     /// Fetches the widget definition, for building a custom interface.
     public func getWidgetData(completion: @escaping ([String: Any]?, Error?) -> Void) {
-        module?.fetchWidgetData(for: self) { [weak self] data, error in
+        // Answered rather than dropped when the instance that listed the widget is
+        // gone, so a caller awaiting the data is never left waiting.
+        guard let module else {
+            completion(nil, CountlyError.feedbackWidgetNotAvailable.asNSError)
+            return
+        }
+        module.fetchWidgetData(for: self) { [weak self] data, error in
             if let data { self?.data = data }
             completion(data, error)
         }

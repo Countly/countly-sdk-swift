@@ -14,7 +14,8 @@ import Foundation
 /// longer describe the new user. `isCurrentUsersData` is `false` until a fresh
 /// download replaces them, which lets the host application decide whether to use
 /// a stale value or wait.
-public final class CountlyRCData {
+@objcMembers
+public final class CountlyRCData: NSObject {
 
     /// The value as the server sent it: a string, number, boolean, array or
     /// dictionary. `nil` when the key is not known.
@@ -30,22 +31,28 @@ public final class CountlyRCData {
     }
 }
 
-/// Decodes the cache entries an earlier Objective-C Countly SDK left behind.
+/// One cached remote config value as it is archived: exactly as the Objective-C
+/// Countly SDK archives its `CountlyRCData`, under the same class name and keys.
 ///
-/// That SDK archived `CountlyRCData` objects into user defaults where this one
-/// archives plain dictionaries. An archive naming a class the running process does
-/// not have decodes to nothing at all, so without a stand-in registered under the
-/// same Objective-C name an application migrating from it silently loses every
-/// cached remote config value and reads `nil` for every key until the next
-/// download.
-///
-/// Read only. The values are rewritten in this SDK's own shape as soon as they are
-/// loaded, so the conversion happens once.
-@objc(CountlyRCData)
-final class LegacyArchivedRCData: NSObject, NSCoding {
+/// Both SDKs read and write the same user defaults key, so the shape is shared. An
+/// application moving from that SDK keeps its cached values, and one going back to
+/// it finds them again: that SDK takes any entry for its own class, and anything
+/// else ends in an unrecognized selector crash there. `CountlyArchive` applies the
+/// class name.
+final class ArchivedRCData: NSObject, NSCoding {
+
+    /// The class name archives carry, the Objective-C SDK's own.
+    static let archivedClassName = "CountlyRCData"
 
     let value: Any?
     let isCurrentUsersData: Bool
+
+    /// A cache entry for `value`, marked as the current user's or another's.
+    init(value: Any?, isCurrentUsersData: Bool) {
+        self.value = value
+        self.isCurrentUsersData = isCurrentUsersData
+        super.init()
+    }
 
     init?(coder: NSCoder) {
         // The key names are the selector names the reference encoded under.
@@ -61,7 +68,8 @@ final class LegacyArchivedRCData: NSObject, NSCoding {
 }
 
 /// One A/B experiment and the variant this device is in.
-public final class CountlyExperimentInformation {
+@objcMembers
+public final class CountlyExperimentInformation: NSObject {
 
     public let experimentID: String
     public let experimentName: String
@@ -97,8 +105,26 @@ public final class CountlyExperimentInformation {
 /// the reference SDKs' "hand the same function back" form has no equivalent here;
 /// this is the identity instead. Opaque on purpose: nothing outside the SDK has a
 /// reason to construct or inspect one.
-public struct RCCallbackToken: Hashable, Sendable {
+///
+/// Unchecked `Sendable`: its one property is immutable.
+public final class RCCallbackToken: NSObject, @unchecked Sendable {
     let value: UInt64
+
+    /// The token of the registration numbered `value`.
+    init(value: UInt64) {
+        self.value = value
+        super.init()
+    }
+
+    /// Equal to another token of the same registration.
+    public override func isEqual(_ object: Any?) -> Bool {
+        (object as? RCCallbackToken)?.value == value
+    }
+
+    /// Hashes the registration, matching `isEqual(_:)`.
+    public override var hash: Int {
+        value.hashValue
+    }
 }
 
 public typealias RCDownloadCallback = (_ result: RequestResult,

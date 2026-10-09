@@ -66,8 +66,9 @@ public enum CountlyPushKey {
 /// ```
 ///
 /// A notification without a Countly payload is passed through untouched, so the
-/// extension can be installed unconditionally.
-public enum CountlyNotificationService {
+/// extension can be installed unconditionally. An Objective-C extension calls
+/// `didReceiveNotificationRequest:withContentHandler:`, as with the Objective-C SDK.
+public final class CountlyNotificationService: NSObject {
 
     /// How long the attachment download is allowed to take.
     ///
@@ -76,6 +77,8 @@ public enum CountlyNotificationService {
     /// means a slow image still yields a notification with its buttons instead of
     /// one with neither.
     private static let attachmentTimeout: TimeInterval = 20
+
+    private override init() {}
 
     /// Deadline for the whole job, covering the parts no URL session timeout does.
     ///
@@ -92,6 +95,7 @@ public enum CountlyNotificationService {
     /// when the user expands it, not when it arrives.
     private static let maxRetainedCategories = 32
 
+    @objc(didReceiveNotificationRequest:withContentHandler:)
     public static func didReceive(_ request: UNNotificationRequest,
                                   withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void) {
         log("didReceive, handling a notification request, requestIdentifier: [\(request.identifier)], title: [\(request.content.title)], subtitle: [\(request.content.subtitle)], body: [\(request.content.body)], category: [\(request.content.categoryIdentifier)], userInfoKeys: [\(request.content.userInfo.keys.map { "\($0)" }.sorted())]")

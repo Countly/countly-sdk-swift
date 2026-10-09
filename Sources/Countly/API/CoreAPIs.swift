@@ -12,25 +12,33 @@ import CoreLocation
 /// Shared plumbing of the feature facades.
 ///
 /// A facade holds its instance weakly and resolves the internal module on every
-/// call, so a call made before `start(with:)` or after `halt()` is a logged no-op
-/// rather than a crash. The SDK must never take the host application down over
-/// call ordering.
-public class CountlyAPIBase {
+/// call, so a call made before `start(with:)`, after `halt()`, or after the
+/// instance was removed from the registry and released is a logged no-op rather
+/// than a crash. The SDK must never take the host application down over call
+/// ordering.
+public class CountlyAPIBase: NSObject {
 
-    unowned let instance: CountlyInstance
+    weak var instance: CountlyInstance?
 
     init(instance: CountlyInstance) {
         self.instance = instance
+        super.init()
     }
 
     func core(_ function: String = #function) -> SDKCore? {
-        instance.requireCore(function)
+        guard let instance else {
+            // Printed rather than logged: the logger went with the instance.
+            Logger.print("[Warning] [Countly] \(function), the instance this was obtained from was removed and no longer exists, the call is ignored")
+            return nil
+        }
+        return instance.requireCore(function)
     }
 }
 
 // MARK: - Events
 
 /// Records custom events.
+@objcMembers
 public final class EventsAPI: CountlyAPIBase {
 
     private static let module = "Events"
@@ -50,6 +58,21 @@ public final class EventsAPI: CountlyAPIBase {
                             sum: Double = 0,
                             duration: TimeInterval = 0) {
         core()?.modules.events.recordEvent(key, segmentation: segmentation, count: count, sum: sum, duration: duration)
+    }
+
+    /// `recordEvent` for Objective-C with only a key, which has no default arguments.
+    @available(swift, obsoleted: 1)
+    @objc(recordEvent:)
+    public func objcRecordEvent(_ key: String) {
+        recordEvent(key)
+    }
+
+    /// `recordEvent` for Objective-C with a key and segmentation, which has no default
+    /// arguments.
+    @available(swift, obsoleted: 1)
+    @objc(recordEvent:segmentation:)
+    public func objcRecordEvent(_ key: String, segmentation: [String: Any]?) {
+        recordEvent(key, segmentation: segmentation)
     }
 
     /// The recorded events not yet moved into the request queue, oldest first, each
@@ -150,6 +173,7 @@ public enum CountlyReservedEvent: String, CaseIterable, Sendable {
 /// session by hand alongside the automatic one produces overlapping sessions and
 /// double-counted durations, so the two are mutually exclusive rather than
 /// additive.
+@objcMembers
 public final class SessionsAPI: CountlyAPIBase {
 
     private static let module = "Sessions"
@@ -190,6 +214,7 @@ public final class SessionsAPI: CountlyAPIBase {
 // MARK: - Views
 
 /// Reports which screens the user is on.
+@objcMembers
 public final class ViewsAPI: CountlyAPIBase {
 
     /// Starts a view that stays open until stopped.
@@ -271,6 +296,7 @@ public final class ViewsAPI: CountlyAPIBase {
 // MARK: - User profile
 
 /// Sets what is known about the current user.
+@objcMembers
 public final class UserProfileAPI: CountlyAPIBase {
 
     /// Sets one property. Predefined keys such as `name` and `email` are stored as
@@ -355,6 +381,7 @@ public final class UserProfileAPI: CountlyAPIBase {
 // MARK: - Consent
 
 /// Grants and withdraws consent per feature.
+@objcMembers
 public final class ConsentAPI: CountlyAPIBase {
 
     private static let module = "Consent"
@@ -367,6 +394,13 @@ public final class ConsentAPI: CountlyAPIBase {
     /// Grants consent for several features.
     public func giveConsent(for features: [ConsentFeature]) {
         core()?.modules.consent.giveConsent(for: features)
+    }
+
+    /// `giveConsent(for:)` for Objective-C, with the features as `ConsentFeature` values.
+    @available(swift, obsoleted: 1)
+    @objc(giveConsentForFeatures:)
+    public func objcGiveConsent(for features: [NSNumber]) {
+        giveConsent(for: features.compactMap { ConsentFeature(rawValue: $0.intValue) })
     }
 
     /// Grants consent for every feature.
@@ -384,6 +418,13 @@ public final class ConsentAPI: CountlyAPIBase {
     /// Withdraws consent for several features.
     public func cancelConsent(for features: [ConsentFeature]) {
         core()?.modules.consent.cancelConsent(for: features)
+    }
+
+    /// `cancelConsent(for:)` for Objective-C, with the features as `ConsentFeature` values.
+    @available(swift, obsoleted: 1)
+    @objc(cancelConsentForFeatures:)
+    public func objcCancelConsent(for features: [NSNumber]) {
+        cancelConsent(for: features.compactMap { ConsentFeature(rawValue: $0.intValue) })
     }
 
     /// Withdraws consent for every feature.
@@ -407,6 +448,7 @@ public final class ConsentAPI: CountlyAPIBase {
 // MARK: - Device ID
 
 /// Reads and changes the identity data is attributed to.
+@objcMembers
 public final class DeviceIDAPI: CountlyAPIBase {
 
     private static let module = "DeviceID"
@@ -428,6 +470,13 @@ public final class DeviceIDAPI: CountlyAPIBase {
         let deviceIDType = core.modules.deviceID.deviceIDType
         core.logger.d(Self.module, "type", "the device ID type was read through the public API, typeWireValue: [\(deviceIDType.wireValue)]")
         return deviceIDType
+    }
+
+    /// `type` for Objective-C, a `DeviceIDType` value, or `nil` before the instance starts.
+    @available(swift, obsoleted: 1)
+    @objc(type)
+    public var objcType: NSNumber? {
+        type.map { NSNumber(value: $0.rawValue) }
     }
 
     /// Whether the SDK is holding data back until a real device ID is set.
@@ -472,6 +521,7 @@ public final class DeviceIDAPI: CountlyAPIBase {
 // MARK: - Location
 
 /// Reports where the user is, when the host application knows.
+@objcMembers
 public final class LocationAPI: CountlyAPIBase {
 
     /// Records a location and reports it.
@@ -495,6 +545,7 @@ public final class LocationAPI: CountlyAPIBase {
 // MARK: - Request queue
 
 /// Operations on the queue of requests waiting to be sent.
+@objcMembers
 public final class RequestQueueAPI: CountlyAPIBase {
 
     private static let module = "RequestQueue"
