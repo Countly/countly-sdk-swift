@@ -896,6 +896,20 @@ final class LogGatheringTests: CountlyBaseTestCase {
         }
     }
 
+    /// Accepts every gathered log batch, so one queued at init end cannot stay
+    /// failing at the head of the queue and hold back the requests behind it.
+    private func acceptGatheredBatches() {
+        MockURLProtocol.respond { captured in
+            captured.query.contains("\(QS.sdkLogs)=") ? (200, Data(#"{"result":"Success"}"#.utf8)) : nil
+        }
+    }
+
+    /// Whether a captured request is an ordinary one carrying `key`, rather than
+    /// a gathered log batch quoting a line about it.
+    private func isEventRequest(_ captured: MockURLProtocol.Captured, carrying key: String) -> Bool {
+        captured.query.contains(key) && !captured.query.contains("\(QS.sdkLogs)=")
+    }
+
     /// Starts an instance whose behavior settings fetch arms gathering, and waits
     /// until the directive landed.
     private func startArmed(id: String = "gather_live",
@@ -1123,6 +1137,7 @@ final class LogGatheringTests: CountlyBaseTestCase {
     func testARequestQueuedForThePreviousDeviceIDIsNotGatheredForTheNextUser() throws {
         try skipUnlessNetworkIsInterceptable()
         let countly = startArmed(id: "gather_old_user", batchSize: maxBufferedLines)
+        acceptGatheredBatches()
         countly.events.recordEvent("old-user-secret-event")
         core(of: countly).modules.events.sendEventsWithSaveIfNeeded()
         TestUtils.waitUntil("the old user's gather takes the lines of the old user's request") {
@@ -1134,7 +1149,7 @@ final class LogGatheringTests: CountlyBaseTestCase {
         let sendsBefore = MockURLProtocol.requests.count
         TestUtils.waitUntil("the old user's request is sent again while the next user's gather runs") {
             core(of: countly).network.proceedOnQueue()
-            return MockURLProtocol.requests.dropFirst(sendsBefore).contains { $0.query.contains("old-user-secret-event") }
+            return MockURLProtocol.requests.dropFirst(sendsBefore).contains { isEventRequest($0, carrying: "old-user-secret-event") }
         }
         TestUtils.pump(0.3)
 
@@ -1151,8 +1166,9 @@ final class LogGatheringTests: CountlyBaseTestCase {
             $0.loggerDelegate = sink
             $0.internalLogLevel = .verbose
         }
+        acceptGatheredBatches()
         MockURLProtocol.respond { captured in
-            guard captured.query.contains("in-flight-secret-event") else { return nil }
+            guard self.isEventRequest(captured, carrying: "in-flight-secret-event") else { return nil }
             // Slow, so the device ID changes while the request is out.
             Thread.sleep(forTimeInterval: 0.5)
             return (500, Data("in-flight-secret-reply".utf8))
@@ -1160,7 +1176,7 @@ final class LogGatheringTests: CountlyBaseTestCase {
 
         countly.events.recordEvent("in-flight-secret-event")
         core(of: countly).modules.events.sendEventsWithSaveIfNeeded()
-        TestUtils.waitUntil("the request is out") { MockURLProtocol.requests.contains { $0.query.contains("in-flight-secret-event") } }
+        TestUtils.waitUntil("the request is out") { MockURLProtocol.requests.contains { isEventRequest($0, carrying: "in-flight-secret-event") } }
         countly.deviceID.changeWithoutMerge("new_user")
         gatherer(of: countly).apply(directive(id: "gather_new_user"), source: "test")
         TestUtils.waitUntil("the reply to the previous user's request arrived") { sink.lines.contains { $0.contains("in-flight-secret-reply") } }
