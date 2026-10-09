@@ -99,7 +99,7 @@ final class EventsModule: ModuleBase {
         }
 
         let filtered = core.serverConfig.filterSegmentation(segmentation, eventKey: key)
-        let sanitized = core.limits.sanitized(filtered, "Event segmentation")
+        let sanitized = limits.sanitized(filtered, "Event segmentation")
 
         let providedKeyCount = segmentation?.count ?? 0
         let acceptedKeyCount = sanitized?.count ?? 0
@@ -139,7 +139,7 @@ final class EventsModule: ModuleBase {
             return
         }
         recordReservedEvent(key,
-                            segmentation: core.limits.sanitized(segmentation, "Reserved event segmentation"),
+                            segmentation: limits.sanitized(segmentation, "Reserved event segmentation"),
                             count: count,
                             sum: sum,
                             duration: duration)
@@ -304,7 +304,7 @@ final class EventsModule: ModuleBase {
             return
         }
 
-        let truncatedKey = core.limits.truncatedKey(key, "Event key")
+        let truncatedKey = limits.truncatedKey(key, "Event key")
 
         // The chain update and the enqueue happen under one lock so two threads
         // recording at once cannot produce two events claiming the same
@@ -356,15 +356,7 @@ final class EventsModule: ModuleBase {
     /// Which consent a reserved event answers to, or `nil` when the key is not
     /// reserved.
     private func consentForReservedEvent(_ key: String) -> Bool? {
-        let consent = core.modules.consent
-        switch key {
-        case ReservedEventKey.orientation: return consent.hasConsent(for: .userDetails)
-        case ReservedEventKey.ratingWidget, ReservedEventKey.survey, ReservedEventKey.nps:
-            return consent.hasConsent(for: .feedback)
-        case ReservedEventKey.pushAction: return consent.hasConsent(for: .pushNotifications)
-        case ReservedEventKey.view: return consent.hasConsent(for: .viewTracking)
-        default: return nil
-        }
+        ReservedEventKey.owningFeature[key].map { core.modules.consent.hasConsent(for: $0) }
     }
 
     /// A view event whose name is a journey trigger flushes like a trigger event.

@@ -140,7 +140,7 @@ final class SDKCore {
     /// the limits can change under behavior settings.
     private func sanitizedCustomMetrics() -> [String: String] {
         guard !config.customMetrics.isEmpty else { return [:] }
-        return limits.truncatedAndLimited(config.customMetrics, "Custom metric")
+        return limits.gathered(as: .feature(.metrics)).truncatedAndLimited(config.customMetrics, "Custom metric")
             .compactMapValues { $0 as? String }
     }
 }
@@ -155,8 +155,10 @@ extension SDKCore: LogGatheringTransport {
         serverConfig.trackingEnabled
     }
 
-    var hasAnyConsent: Bool {
-        modules.consent.hasAnyConsent
+    /// Answered by the consent module, whose read neither logs nor waits on a
+    /// lock held while logging, so it is safe inside a capture.
+    func hasConsent(for feature: ConsentFeature) -> Bool {
+        modules.consent.hasConsent(for: feature)
     }
 
     func sendSdkLogs(_ payload: String) -> Bool {
@@ -241,6 +243,10 @@ class ModuleBase {
     }
 
     var log: Logger { core.logger }
+
+    /// The SDK limits, with what they log about a value they cut gathered under
+    /// this module's consent, since the value is this module's.
+    var limits: LimitsEnforcer { core.limits.gathered(as: LogGatheringScope.ofModule(Self.moduleName)) }
 
     // MARK: - Convenience log helpers
 

@@ -88,7 +88,7 @@ final class CrashModule: ModuleBase {
         logD("setCrashSegmentation", "global crash segmentation keys, keys: [\(segmentation.keys.sorted().joined(separator: ", "))]")
         logV("setCrashSegmentation", "global crash segmentation detail, segmentation: [\(segmentation)]")
 
-        let sanitized = core.limits.truncatedAndLimited(segmentation, "Crash segmentation")
+        let sanitized = limits.truncatedAndLimited(segmentation, "Crash segmentation")
         if sanitized.count < segmentation.count {
             logD("setCrashSegmentation", "some global crash segmentation keys were dropped by the SDK limits, keptKeyCount: [\(sanitized.count)], requestedKeyCount: [\(segmentation.count)]")
         }
@@ -172,7 +172,7 @@ final class CrashModule: ModuleBase {
         let frames = stackTrace ?? exception.callStackSymbols
         logD("recordException", "stack trace resolved for the exception, suppliedByCaller: [\(stackTrace != nil)], frameCount: [\(frames.count)]")
 
-        let overrides = core.limits.sanitized(segmentation, "Exception segmentation")
+        let overrides = limits.sanitized(segmentation, "Exception segmentation")
 
         handle(name: exception.name.rawValue,
                description: exception.reason ?? exception.name.rawValue,
@@ -246,7 +246,7 @@ final class CrashModule: ModuleBase {
 
         // Limited before anything reads it, so the regular expression filter, the
         // filter callback and the wire report all see the same trace.
-        let stackTrace = core.limits.truncatedStackTrace(stackTrace, "Crash stack trace")
+        let stackTrace = limits.truncatedStackTrace(stackTrace, "Crash stack trace")
         let stackTraceJoined = stackTrace.joined(separator: "\n")
 
         var matchesFilter = false
@@ -277,7 +277,7 @@ final class CrashModule: ModuleBase {
             stackTrace: stackTraceJoined,
             name: name,
             crashDescription: description,
-            crashSegmentation: core.limits.sanitized(custom, "Exception segmentation") ?? [:],
+            crashSegmentation: limits.sanitized(custom, "Exception segmentation") ?? [:],
             breadcrumbs: currentBreadcrumbs,
             crashMetrics: crashMetrics(),
             fatal: isFatal,
@@ -341,7 +341,7 @@ final class CrashModule: ModuleBase {
         // value JSON cannot carry would otherwise make the whole report
         // serialize to nothing.
         var report = hadFilterCallback
-            ? core.limits.filterSupportedDataTypes(crashData.crashMetrics)
+            ? limits.filterSupportedDataTypes(crashData.crashMetrics)
             : crashData.crashMetrics
         report[Key.error] = crashData.stackTrace
         let symbolication = binaryImages(for: stackTrace)
@@ -371,7 +371,7 @@ final class CrashModule: ModuleBase {
             // dictionary is still exactly what was sanitized on the way in, and
             // redoing that is pure rework on every recorded error.
             report[Key.custom] = hadFilterCallback
-                ? (core.limits.sanitized(crashData.crashSegmentation, "Crash segmentation") ?? [:])
+                ? (limits.sanitized(crashData.crashSegmentation, "Crash segmentation") ?? [:])
                 : crashData.crashSegmentation
         }
 
@@ -397,7 +397,7 @@ final class CrashModule: ModuleBase {
             return
         }
 
-        let truncated = core.limits.truncatedValue(text, "Custom Crash log")
+        let truncated = limits.truncatedValue(text, "Custom Crash log")
         logV("log", "breadcrumb text detail, log: [\(truncated)]")
 
         stateLock.lock()

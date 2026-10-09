@@ -19,7 +19,23 @@ final class DeviceIDModule: ModuleBase {
     override class var moduleName: String { "DeviceID" }
 
     /// The identity sent as `device_id`. Never empty once init has run.
-    private(set) var deviceID: String = ""
+    private(set) var deviceID: String {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return _deviceID
+        }
+        set {
+            stateLock.lock()
+            _deviceID = newValue
+            stateLock.unlock()
+        }
+    }
+
+    /// Guards the ID, which requests are built and judged with on other threads
+    /// while a change replaces it.
+    private let stateLock = NSLock()
+    private var _deviceID = ""
 
     /// Whether the SDK is holding everything back until a real ID arrives.
     var isTemporary: Bool { deviceID == TemporaryDeviceID.value }
@@ -123,6 +139,8 @@ final class DeviceIDModule: ModuleBase {
     /// a different user, so no merge. Replacing a generated ID means the same
     /// person just identified themselves, so the histories are merged.
     func setID(_ newID: String) {
+        core.logGatherer.deviceIDChangeBegins()
+        defer { core.logGatherer.deviceIDChangeEnds() }
         logI("setID", "changing the device ID, valueProvided: [\(!newID.isEmpty)]")
         logV("setID", "device ID value detail for the change whose merge behavior the SDK chooses, deviceID: [\(newID)]")
 
@@ -138,6 +156,8 @@ final class DeviceIDModule: ModuleBase {
 
     /// Changes the ID and asks the server to merge the old identity into it.
     func changeDeviceIDWithMerge(_ newID: String?) {
+        core.logGatherer.deviceIDChangeBegins()
+        defer { core.logGatherer.deviceIDChangeEnds() }
         logI("changeDeviceIDWithMerge", "changing the device ID with a server side merge, valueProvided: [\(!(newID ?? "").isEmpty)]")
         logV("changeDeviceIDWithMerge", "device ID value detail for the merging change, deviceID: [\(newID ?? "")]")
         changeDeviceID(newID, onServer: true)
@@ -145,6 +165,8 @@ final class DeviceIDModule: ModuleBase {
 
     /// Changes the ID and starts a fresh identity, discarding user scoped state.
     func changeDeviceIDWithoutMerge(_ newID: String?) {
+        core.logGatherer.deviceIDChangeBegins()
+        defer { core.logGatherer.deviceIDChangeEnds() }
         logI("changeDeviceIDWithoutMerge", "changing the device ID without a server side merge, valueProvided: [\(!(newID ?? "").isEmpty)]")
         logV("changeDeviceIDWithoutMerge", "device ID value detail for the non merging change, deviceID: [\(newID ?? "")]")
         changeDeviceID(newID, onServer: false)
@@ -153,6 +175,8 @@ final class DeviceIDModule: ModuleBase {
     /// Switches into temporary mode: nothing leaves the device until a real ID is
     /// set, and everything recorded meanwhile is rewritten to that ID.
     func enableTemporaryDeviceIDMode() {
+        core.logGatherer.deviceIDChangeBegins()
+        defer { core.logGatherer.deviceIDChangeEnds() }
         logI("enableTemporaryDeviceIDMode", "switching to temporary device ID mode, currentType: [\(deviceIDType)], alreadyTemporary: [\(isTemporary)]")
         changeDeviceID(TemporaryDeviceID.value, onServer: false)
     }
@@ -219,11 +243,13 @@ final class DeviceIDModule: ModuleBase {
             logI("changeDeviceID", "the previous identity will be merged into the new device ID on the server, previousType: [\(previousType)], newType: [\(deviceIDType)]")
             sendOldDeviceID(oldDeviceID)
         } else {
-            logI("changeDeviceID", "the device ID change starts a new user, the session is restarted, consents are cancelled and timed events are dropped, previousType: [\(previousType)]")
+            logI("changeDeviceID", "the device ID change starts a new user, the session is restarted, consents are cancelled, timed events are dropped and log gathering is stopped, previousType: [\(previousType)]")
 
             // The session belongs to the old identity, so it is closed before the
             // switch and reopened after it.
             core.modules.sessions.suspend()
+            // Before the switch, so the gathered lines it queues carry the old device ID.
+            core.logGatherer.stopForDeviceIDChange()
             apply(resolved)
             core.modules.consent.cancelAllConsentsWithoutSending()
             core.modules.sessions.resume()
@@ -254,6 +280,8 @@ final class DeviceIDModule: ModuleBase {
         guard let provided = temporaryExitAfterInit else { return }
         temporaryExitAfterInit = nil
         logD("didInit", "leaving the temporary device ID mode found in storage with the ID provided at init")
+        core.logGatherer.deviceIDChangeBegins()
+        defer { core.logGatherer.deviceIDChangeEnds() }
         changeDeviceID(provided, onServer: false)
     }
 

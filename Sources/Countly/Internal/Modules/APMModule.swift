@@ -257,7 +257,7 @@ final class APMModule: ModuleBase {
             logW("recordNetworkTrace", "network trace response time is negative, the start and end timestamps are likely swapped, traceName: [\(traceName)], responseTimeMs: [\(responseTime)]")
         }
 
-        let truncatedName = core.limits.truncatedKey(traceName, "Network trace name")
+        let truncatedName = limits.truncatedKey(traceName, "Network trace name")
 
         logD("recordNetworkTrace", "network trace recorded, traceName: [\(truncatedName)], responseTimeMs: [\(responseTime)]")
 
@@ -326,8 +326,8 @@ final class APMModule: ModuleBase {
             return
         }
 
-        let truncatedName = core.limits.truncatedKey(traceName, "Custom trace name")
-        var payloadMetrics = core.limits.sanitized(metrics, "Custom trace metric") ?? [:]
+        let truncatedName = limits.truncatedKey(traceName, "Custom trace name")
+        var payloadMetrics = limits.sanitized(metrics, "Custom trace metric") ?? [:]
 
         let endTime = core.clock.nowMs()
         let duration = endTime - startTime

@@ -257,14 +257,25 @@ final class ConnectionManager: NSObject {
     /// Sends the head of the queue.
     ///
     /// Lines logged while sending a gathered log batch are not gathered, or every
-    /// tick would upload a batch about the last one. The caller may already be
-    /// marked, since the delivery loop lands here synchronously, so the mark is
-    /// restored on the way out.
+    /// tick would upload a batch about the last one. Nor are those of a request
+    /// queued under another device ID: it is a previous user's, and what it
+    /// carries must not reach the current user's gather. The caller may already
+    /// be marked, since the delivery loop lands here synchronously, so the mark
+    /// is restored on the way out.
     private func send(head: QueuedHead) {
         let isSdkLogsTransport = head.request.contains("&\(QS.sdkLogs)=")
-        core.logGatherer.markingTransportWork(isSdkLogsTransport) {
+        core.logGatherer.markingTransportWork(isNotGathered(head, isSdkLogsTransport: isSdkLogsTransport)) {
             sendMarked(head: head, isSdkLogsTransport: isSdkLogsTransport)
         }
+    }
+
+    /// Whether what is logged about sending `head` stays out of the gathered
+    /// log: for a gathered log batch, and for a request built with another device
+    /// ID than the one in use now.
+    private func isNotGathered(_ head: QueuedHead, isSdkLogsTransport: Bool) -> Bool {
+        guard !isSdkLogsTransport else { return true }
+        let current = "\(QS.deviceID)=\(core.modules.deviceID.deviceID.urlEscaped)"
+        return !head.request.split(separator: "&").contains { $0 == current }
     }
 
     private func sendMarked(head: QueuedHead, isSdkLogsTransport: Bool) {
@@ -309,8 +320,8 @@ final class ConnectionManager: NSObject {
             self.stateLock.unlock()
 
             // The completion runs on a session thread of its own, which has to be
-            // marked in turn while it deals with a gathered log batch.
-            self.core.logGatherer.markingTransportWork(isSdkLogsTransport) {
+            // marked in turn, judged again since the device ID may have changed meanwhile.
+            self.core.logGatherer.markingTransportWork(self.isNotGathered(head, isSdkLogsTransport: isSdkLogsTransport)) {
                 let elapsed = Date().timeIntervalSince(startedAt)
                 let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
@@ -1074,6 +1085,10 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
 
     var isDeviceIDTemporary: Bool {
         core.modules.deviceID.isTemporary
+    }
+
+    var deviceID: String {
+        core.modules.deviceID.deviceID
     }
 
     /// Sends the health check outside the queue.

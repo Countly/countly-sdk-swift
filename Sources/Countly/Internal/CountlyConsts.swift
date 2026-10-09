@@ -107,7 +107,18 @@ enum ReservedEventKey {
     static let survey = "[CLY]_survey"
     static let pushAction = "[CLY]_push_action"
 
-    static let all: Set<String> = [orientation, view, ratingWidget, nps, survey, pushAction]
+    /// The feature each reserved event belongs to. The event answers to that
+    /// feature's consent, and so does a gathered log line quoting its key.
+    static let owningFeature: [String: ConsentFeature] = [
+        orientation: .userDetails,
+        view: .viewTracking,
+        ratingWidget: .feedback,
+        nps: .feedback,
+        survey: .feedback,
+        pushAction: .pushNotifications,
+    ]
+
+    static let all = Set(owningFeature.keys)
 }
 
 /// Keys of the Countly payload carried inside a push notification.

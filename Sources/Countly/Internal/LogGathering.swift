@@ -109,19 +109,104 @@ struct LogGatheringDirective: Equatable {
     }
 }
 
-/// What the gatherer needs from the rest of the SDK to deliver a batch.
+/// Whose consent a gathered log line needs before it may be gathered.
+///
+/// Log gathering never gets a consent of its own: a consent for logging could
+/// override the choices the user actually made. A line waits for the consent of
+/// the feature that wrote it instead.
+enum LogGatheringScope: Hashable {
+
+    /// A line one feature wrote. Needs that feature's consent.
+    case feature(ConsentFeature)
+
+    /// A line attributed to no single feature, such as one from the request
+    /// path, the stores or init, which can quote any feature's data. Needs both
+    /// the events and the user details consent.
+    case unattributed
+
+    /// The scope of a line, from the module and function that wrote it.
+    ///
+    /// Two kinds of line are logged before the consent they belong to is
+    /// checked, so they answer to that consent rather than to their module's: an
+    /// events line naming a reserved event, whose key and segmentation belong to
+    /// the feature owning the event, and the orientation lines of the views
+    /// module, which belong to user details like the orientation event.
+    static func of(module: String, function: String, message: String) -> LogGatheringScope {
+        if module == ViewsModule.moduleName, function == "recordOrientation" {
+            return .feature(.userDetails)
+        }
+        let scope = ofModule(module)
+        guard scope == .feature(.events), let owner = ownerOfReservedEvent(namedIn: message) else { return scope }
+        return .feature(owner)
+    }
+
+    /// The scope of the lines a log module writes.
+    ///
+    /// Attribution is by module because the module is the one thing the logger
+    /// already holds for every line, and in this SDK a module is a feature. A
+    /// module this table does not name owns no single feature, so a module added
+    /// later cannot start gathering user data by being forgotten here.
+    static func ofModule(_ module: String) -> LogGatheringScope {
+        switch module {
+        case EventsModule.moduleName: return .feature(.events)
+        case ViewsModule.moduleName: return .feature(.viewTracking)
+        case UserProfileModule.moduleName: return .feature(.userDetails)
+        case SessionsModule.moduleName: return .feature(.sessions)
+        case LocationModule.moduleName: return .feature(.location)
+        // The crash log store writes the breadcrumbs it was handed.
+        case CrashModule.moduleName, "CrashLogStore": return .feature(.crashReporting)
+        case PushModule.moduleName, "PushRuntime": return .feature(.pushNotifications)
+        case AttributionModule.moduleName: return .feature(.attribution)
+        case APMModule.moduleName: return .feature(.performanceMonitoring)
+        case FeedbackModule.moduleName: return .feature(.feedback)
+        case RemoteConfigModule.moduleName: return .feature(.remoteConfig)
+        case ContentModule.moduleName: return .feature(.content)
+        case "DeviceMetrics": return .feature(.metrics)
+        default: return .unattributed
+        }
+    }
+
+    /// Each reserved event as its key reads in a `key: [...]` field.
+    private static let reservedKeyFields = ReservedEventKey.owningFeature.map { (field: $0.key + "]", owner: $0.value) }
+
+    /// The feature owning the reserved event a line names in its `key: [...]`
+    /// field, or nil when it names none. Only that field counts, so a custom key
+    /// or a segmentation value that merely contains a reserved key moves nothing.
+    private static func ownerOfReservedEvent(namedIn message: String) -> ConsentFeature? {
+        guard let field = message.range(of: "key: [") else { return nil }
+        let named = message[field.upperBound...]
+        return reservedKeyFields.first { named.hasPrefix($0.field) }?.owner
+    }
+
+    /// Whether a line of this scope may be gathered, given which features are
+    /// consented to.
+    func isConsented(_ hasConsent: (ConsentFeature) -> Bool) -> Bool {
+        switch self {
+        case .feature(let feature): return hasConsent(feature)
+        case .unattributed: return hasConsent(.events) && hasConsent(.userDetails)
+        }
+    }
+}
+
+/// What the gatherer needs from the rest of the SDK to gather and deliver lines.
 protocol LogGatheringTransport: AnyObject {
     /// Whether behavior settings allow requests to be queued at all.
     var isTrackingEnabled: Bool { get }
-    /// Whether any consent is given. Gathered lines quote event keys, segmentation
-    /// and whole requests, so they are user data.
-    var hasAnyConsent: Bool { get }
+    /// Whether one feature is consented to, which is always true while consent
+    /// is not required. Asked while a line is being captured, so it must not log.
+    func hasConsent(for feature: ConsentFeature) -> Bool
     /// Queues one `sdk_logs` batch. Returns whether the queue took it.
     func sendSdkLogs(_ payload: String) -> Bool
 }
 
 /// Gathers the SDK's own log lines for one instance and uploads them as
 /// `sdk_logs` batches when a live behavior settings response asks for them.
+///
+/// Consent is decided per line when it is captured. A line whose consent is
+/// given joins the buffer; any other waits apart, never uploaded, until that
+/// consent is given, and a buffered line goes back to waiting when its consent
+/// is withdrawn. Lines captured before init finishes are decided when it does,
+/// because the consent state is only complete then.
 ///
 /// Wire shape of a batch: `{"i":gatherID,"d":dropped,"l":[{"t":ms,"l":"e","m":message}]}`.
 /// Nothing here is persisted: the arm is held in memory and re-learned from the
@@ -161,6 +246,14 @@ final class LogGatherer {
         let timestamp: Int64
         let level: String
         let message: String
+
+        /// Whose consent this line needs, checked when it is captured, or when
+        /// init finishes for a line captured before that.
+        let scope: LogGatheringScope
+
+        /// Capture order. Released lines are put back by it, since the wall clock
+        /// shares a millisecond between lines and can step backwards.
+        let sequence: UInt64
     }
 
     /// One batch taken out of the buffer, with what it was built from so a refused
@@ -177,9 +270,22 @@ final class LogGatherer {
     private var lines: [Line] = []
     private var heldChars = 0
     private var droppedCount = 0
+
+    /// Lines whose consent is not given as things stand. Kept apart from `lines`
+    /// so no batch can carry one, and moved there once it is given.
+    private var awaitingConsent: [Line] = []
+    private var awaitingChars = 0
+
     private var state: LogGatheringState = .undecided
     private var directive = LogGatheringDirective.off
     private var initFinished = false
+    private var nextSequence: UInt64 = 0
+
+    /// Lines dropped from the buffer before init decided their consent, by scope.
+    private var droppedBeforeInit: [LogGatheringScope: Int] = [:]
+
+    /// Where the lines of a device ID change in progress begin.
+    private var deviceIDChangeMark: UInt64?
 
     /// Serializes deliveries. The timer schedules them on `deliveryQueue`, the
     /// background and terminate paths run them on the caller's thread, and two
@@ -239,6 +345,13 @@ final class LogGatherer {
         return lines.count
     }
 
+    /// A copy of the lines waiting for their consent, oldest first.
+    var linesAwaitingConsent: [Line] {
+        lock.lock()
+        defer { lock.unlock() }
+        return awaitingConsent
+    }
+
     /// Lines dropped since the last upload, reported as `d` with the next batch.
     var pendingDroppedCount: Int {
         lock.lock()
@@ -257,18 +370,24 @@ final class LogGatherer {
 
     /// Applies a directive from a live response to what is held.
     ///
-    /// Off drops everything held speculatively. Gathering adopts the held lines,
-    /// filtered to the requested levels, unless they belong to a different gather
-    /// that was already running, in which case they are dropped because the
-    /// server rejects a batch attributed to a gather that ended.
+    /// Off drops everything held speculatively. Gathering adopts the held lines
+    /// and those awaiting consent, filtered to the requested levels, unless they
+    /// belong to a different gather that was already running, in which case they
+    /// are dropped because the server rejects a batch attributed to a gather that
+    /// ended.
     func apply(_ directive: LogGatheringDirective, source: String) {
         let newState: LogGatheringState = directive.isGathering ? .gathering : .off
 
         lock.lock()
         guard state != newState || self.directive != directive else {
             let held = lines.count
+            let holdsFullBatch = state == .gathering && held >= directive.batchSize
             lock.unlock()
             logger?.d(Self.module, "apply", "the log gathering directive is unchanged, source: [\(source)], heldLineCount: [\(held)]")
+            // A refetch is what turns tracking back on, and a full batch held meanwhile gets no other kick.
+            if holdsFullBatch {
+                scheduleDelivery(includePartialBatch: false)
+            }
             return
         }
 
@@ -285,9 +404,10 @@ final class LogGatherer {
             trimBufferLocked()
         }
         let held = lines.count
+        let awaiting = awaitingConsent.count
         lock.unlock()
 
-        logger?.d(Self.module, "apply", "the log gathering directive is applied, source: [\(source)], gathering: [\(directive.isGathering)], gatherID: [\(directive.gatherID ?? "none")], levels: [\(directive.levels)], batchSize: [\(directive.batchSize)], heldLineCount: [\(held)]")
+        logger?.d(Self.module, "apply", "the log gathering directive is applied, source: [\(source)], gathering: [\(directive.isGathering)], gatherID: [\(directive.gatherID ?? "none")], levels: [\(directive.levels)], batchSize: [\(directive.batchSize)], heldLineCount: [\(held)], awaitingConsentLineCount: [\(awaiting)]")
 
         if newState == .gathering {
             // Adoption may hand over a buffer already past the batch size. Partial
@@ -313,17 +433,55 @@ final class LogGatherer {
 
     // MARK: - Lifecycle
 
-    /// The request queue is usable from here on, so this is the first chance for
-    /// the lines gathered during init to go out.
+    /// The request queue is usable and the consent state complete from here on,
+    /// so this is the first chance for the lines gathered during init to go out.
+    ///
+    /// Their consent is decided here, under the lock `capture` decides in, so
+    /// every line is decided either here or when it is captured. A line dropped
+    /// before this counts toward `d` only if its consent turns out to be given.
     func sdkInitFinished() {
         lock.lock()
+        guard !initFinished else {
+            lock.unlock()
+            return
+        }
         initFinished = true
+        redecideConsentLocked()
+        droppedCount += droppedBeforeInit.reduce(0) { $0 + (isConsentGiven(for: $1.key) ? $1.value : 0) }
+        droppedBeforeInit.removeAll()
         let gathering = state == .gathering
+        let awaiting = awaitingConsent.count
         lock.unlock()
 
         if gathering {
-            logger?.d(Self.module, "sdkInitFinished", "init finished while gathering, the lines held so far will be uploaded")
+            logger?.d(Self.module, "sdkInitFinished", "init finished while gathering, the consented lines held so far will be uploaded, awaitingConsentLineCount: [\(awaiting)]")
             scheduleDelivery(includePartialBatch: true)
+        }
+    }
+
+    /// Re-decides every held line against the consent state now. Called when a
+    /// consent is given or withdrawn and when whether consent is required
+    /// changes: a line whose consent is given joins the buffer in the order it
+    /// was logged, and a line whose consent was withdrawn goes back to waiting.
+    func consentDidChange() {
+        lock.lock()
+        // Before init finishes nothing is decided yet, and init finishing decides every line.
+        guard initFinished else {
+            lock.unlock()
+            return
+        }
+        let bufferedBefore = lines.count
+        let (released, recalled) = redecideConsentLocked()
+        let completesBatch = completesBatchLocked(bufferedBefore: bufferedBefore)
+        let awaiting = awaitingConsent.count
+        lock.unlock()
+
+        if released > 0 || recalled > 0 {
+            logger?.d(Self.module, "consentDidChange", "gathered lines are re-decided against the consent state, releasedLineCount: [\(released)], recalledLineCount: [\(recalled)], awaitingConsentLineCount: [\(awaiting)]")
+        }
+
+        if completesBatch {
+            scheduleDelivery(includePartialBatch: false)
         }
     }
 
@@ -341,6 +499,54 @@ final class LogGatherer {
         deliver(includePartialBatch: true)
     }
 
+    /// Marks the start of a device ID change, before it logs anything. Until it
+    /// ends, no delivery takes a line it logs, since that line may quote the next
+    /// user's ID.
+    func deviceIDChangeBegins() {
+        lock.lock()
+        deviceIDChangeMark = nextSequence
+        lock.unlock()
+    }
+
+    /// Marks the end of a device ID change. A change that kept the gather leaves
+    /// its lines to be delivered like any other, and a full batch held meanwhile
+    /// goes out now.
+    func deviceIDChangeEnds() {
+        lock.lock()
+        deviceIDChangeMark = nil
+        let holdsFullBatch = state == .gathering && lines.count >= directive.batchSize
+        lock.unlock()
+
+        if holdsFullBatch {
+            scheduleDelivery(includePartialBatch: false)
+        }
+    }
+
+    /// Ends the gather for a device ID change without merge, from inside the
+    /// change.
+    ///
+    /// What may be uploaded of the lines logged before the change is queued now,
+    /// while requests still carry the old device ID; the change's own lines, which
+    /// quote the next user's ID, are never taken. Everything else held is then
+    /// dropped, so neither user's lines reach the other's gather.
+    func stopForDeviceIDChange() {
+        // Held throughout, so no other delivery can queue a batch once the new device ID is in place.
+        deliveryLock.lock()
+        defer { deliveryLock.unlock() }
+
+        guard isCapturing else { return }
+
+        if isGathering {
+            deliverSerialized(includePartialBatch: true)
+        }
+
+        lock.lock()
+        resetLocked(to: .off)
+        lock.unlock()
+
+        logger?.d(Self.module, "stopForDeviceIDChange", "log gathering is stopped for a device ID change without merge, the lines that could not be uploaded under the previous device ID are dropped")
+    }
+
     /// Ends the run: the held lines are discarded without a tail upload and
     /// nothing is captured or delivered any more. The next start builds a new
     /// core with a gatherer of its own, so nothing about a gather outlives its run.
@@ -351,7 +557,7 @@ final class LogGatherer {
         lock.unlock()
     }
 
-    /// Moves to `state` with the default directive and an empty buffer.
+    /// Moves to `state` with the default directive and empty lists.
     private func resetLocked(to newState: LogGatheringState) {
         state = newState
         directive = .off
@@ -361,12 +567,16 @@ final class LogGatherer {
     // MARK: - Capture
 
     /// Holds one line. Called by the logger for every line anything wants.
-    func capture(_ message: String, level: CountlyLogLevel) {
+    ///
+    /// A line whose consent `scope` says is given joins the buffer, and any other
+    /// waits apart for it. Before init finishes every line joins the buffer and
+    /// is decided in `sdkInitFinished`. `scope` is only worked out for a line
+    /// that is kept.
+    func capture(_ message: String, level: CountlyLogLevel, scope: @autoclosure () -> LogGatheringScope) {
         guard !isTransportWork else { return }
         guard !message.contains(Self.transportMarker) else { return }
 
         let levelChar = level.gatheringLevel
-        var batchIsFull = false
 
         lock.lock()
         guard state != .off else {
@@ -382,16 +592,36 @@ final class LogGatherer {
 
         let line = Line(timestamp: Int64(Date().timeIntervalSince1970 * 1000),
                         level: String(levelChar),
-                        message: message.countlyPrefix(Self.maxMessageLength))
+                        message: message.countlyPrefix(Self.maxMessageLength),
+                        scope: scope(),
+                        sequence: nextSequence)
+        nextSequence += 1
+
+        if initFinished, !isConsentGiven(for: line.scope) {
+            awaitingConsent.append(line)
+            awaitingChars += line.message.countlyLength
+            trimAwaitingConsentLocked()
+            lock.unlock()
+            return
+        }
+
+        let bufferedBefore = lines.count
         lines.append(line)
         heldChars += line.message.countlyLength
         trimBufferLocked()
-        batchIsFull = state == .gathering && lines.count >= directive.batchSize
+        let completesBatch = completesBatchLocked(bufferedBefore: bufferedBefore)
         lock.unlock()
 
-        if batchIsFull {
+        if completesBatch {
             scheduleDelivery(includePartialBatch: false)
         }
+    }
+
+    /// Whether a line of `scope` may be gathered now. No while there is no
+    /// transport to ask, so a line is never gathered on a guess.
+    private func isConsentGiven(for scope: LogGatheringScope) -> Bool {
+        guard let transport else { return false }
+        return scope.isConsented(transport.hasConsent(for:))
     }
 
     // MARK: - Transport mark
@@ -436,23 +666,22 @@ final class LogGatherer {
         }
     }
 
-    /// Uploads one batch, then keeps going while full batches remain. Lines stay
-    /// held while the request queue would drop them: tracking off, or no consent
-    /// given yet.
+    /// Runs one delivery, serialized with every other.
     private func deliver(includePartialBatch: Bool) {
-        guard isInitFinished, let transport else { return }
-
         deliveryLock.lock()
         defer { deliveryLock.unlock() }
+        deliverSerialized(includePartialBatch: includePartialBatch)
+    }
+
+    /// Uploads one batch, then keeps going while full batches remain. Lines stay
+    /// held while tracking is off, because the request queue would drop them.
+    /// Called with `deliveryLock` held.
+    private func deliverSerialized(includePartialBatch: Bool) {
+        guard isInitFinished, let transport else { return }
 
         markingTransportWork(true) {
             guard transport.isTrackingEnabled else {
                 logger?.d(Self.module, "deliver", "tracking is disabled by behavior settings, the gathered lines stay held, heldLineCount: [\(heldLineCount)]")
-                return
-            }
-
-            guard transport.hasAnyConsent else {
-                logger?.d(Self.module, "deliver", "no consent is given, the gathered lines stay held, heldLineCount: [\(heldLineCount)]")
                 return
             }
 
@@ -483,10 +712,13 @@ final class LogGatherer {
         lock.lock()
         defer { lock.unlock() }
 
-        guard state == .gathering, let gatherID = directive.gatherID, !lines.isEmpty else { return nil }
-        if !includePartialBatch, lines.count < directive.batchSize { return nil }
+        guard state == .gathering, let gatherID = directive.gatherID else { return nil }
+        // Lines are held in capture order, so those of a device ID change in progress are the tail.
+        let available = deviceIDChangeMark.flatMap { mark in lines.firstIndex { $0.sequence >= mark } } ?? lines.count
+        guard available > 0 else { return nil }
+        if !includePartialBatch, available < directive.batchSize { return nil }
 
-        let count = min(directive.batchSize, lines.count)
+        let count = min(directive.batchSize, available)
         let taken = Array(lines.prefix(count))
         lines.removeFirst(count)
         heldChars -= Self.charCount(of: taken)
@@ -506,6 +738,8 @@ final class LogGatherer {
         heldChars += Self.charCount(of: batch.lines)
         droppedCount += batch.dropped
         trimBufferLocked()
+        // A consent withdrawn while the batch was out found nothing of it to recall.
+        redecideConsentLocked()
     }
 
     /// Accounts a batch that can never be sent as dropped lines, so the loss still
@@ -538,28 +772,105 @@ final class LogGatherer {
     }
 
     /// Enforces both ceilings by dropping the oldest lines and counting them.
+    /// Before init a drop is only tallied, since it counts toward `d` only if its
+    /// consent turns out to be given when init decides.
     private func trimBufferLocked() {
-        while lines.count > LogGatheringDirective.maxBufferedLines
-            || (heldChars > Self.charCeiling && lines.count > 1) {
-            heldChars -= lines.removeFirst().message.countlyLength
-            droppedCount += 1
+        let removed = Self.trim(&lines, chars: &heldChars)
+        if initFinished {
+            droppedCount += removed.count
+        } else {
+            for line in removed {
+                droppedBeforeInit[line.scope, default: 0] += 1
+            }
         }
     }
 
-    /// Drops held lines of unwanted levels. Not counted as dropped: they were
-    /// never wanted.
+    /// Enforces both ceilings on the lines awaiting consent. Not counted as
+    /// dropped: a line whose consent was never given was never gathered.
+    private func trimAwaitingConsentLocked() {
+        Self.trim(&awaitingConsent, chars: &awaitingChars)
+    }
+
+    /// Drops the oldest of `lines` until both ceilings hold, keeping `chars` in
+    /// step, and returns what went.
+    @discardableResult
+    private static func trim(_ lines: inout [Line], chars: inout Int) -> [Line] {
+        var removed: [Line] = []
+        while lines.count > LogGatheringDirective.maxBufferedLines || (chars > charCeiling && lines.count > 1) {
+            let line = lines.removeFirst()
+            chars -= line.message.countlyLength
+            removed.append(line)
+        }
+        return removed
+    }
+
+    /// Whether the lines just added brought the buffer to a full batch. Only that
+    /// moment asks for a delivery, so a full buffer held back while tracking is
+    /// off does not queue one delivery per line.
+    private func completesBatchLocked(bufferedBefore: Int) -> Bool {
+        state == .gathering && bufferedBefore < directive.batchSize && lines.count >= directive.batchSize
+    }
+
+    /// Puts every held line where the consent state puts it now: in the buffer
+    /// when its consent is given, waiting otherwise, each list in the order the
+    /// lines were logged. Returns how many lines moved each way.
+    @discardableResult
+    private func redecideConsentLocked() -> (released: Int, recalled: Int) {
+        let (kept, recalled) = splitByConsentLocked(lines)
+        let (released, stillAwaiting) = splitByConsentLocked(awaitingConsent)
+        guard !released.isEmpty || !recalled.isEmpty else { return (0, 0) }
+
+        lines = (kept + released).sorted { $0.sequence < $1.sequence }
+        heldChars = Self.charCount(of: lines)
+        awaitingConsent = (stillAwaiting + recalled).sorted { $0.sequence < $1.sequence }
+        awaitingChars = Self.charCount(of: awaitingConsent)
+        trimBufferLocked()
+        trimAwaitingConsentLocked()
+        return (released.count, recalled.count)
+    }
+
+    /// Splits `lines` by whether their consent is given now, each part keeping
+    /// the order of `lines`.
+    private func splitByConsentLocked(_ lines: [Line]) -> (consented: [Line], awaiting: [Line]) {
+        var consented: [Line] = []
+        var awaiting: [Line] = []
+        for line in lines {
+            if isConsentGiven(for: line.scope) {
+                consented.append(line)
+            } else {
+                awaiting.append(line)
+            }
+        }
+        return (consented, awaiting)
+    }
+
+    /// Drops held and awaiting lines of unwanted levels. Not counted as dropped:
+    /// they were never wanted.
     private func filterBufferLocked() {
+        heldChars -= Self.removeLines(notIn: directive.levels, from: &lines)
+        awaitingChars -= Self.removeLines(notIn: directive.levels, from: &awaitingConsent)
+    }
+
+    /// Removes the lines whose level is not in `levels` and returns how many
+    /// characters they held.
+    private static func removeLines(notIn levels: String, from lines: inout [Line]) -> Int {
+        var removedChars = 0
         lines.removeAll { line in
-            guard let character = line.level.first, !directive.levels.contains(character) else { return false }
-            heldChars -= line.message.countlyLength
+            guard let character = line.level.first, !levels.contains(character) else { return false }
+            removedChars += line.message.countlyLength
             return true
         }
+        return removedChars
     }
 
+    /// Drops every line, those awaiting consent included, and the drop count.
     private func clearBufferLocked() {
         lines.removeAll()
         heldChars = 0
         droppedCount = 0
+        droppedBeforeInit.removeAll()
+        awaitingConsent.removeAll()
+        awaitingChars = 0
     }
 }
 

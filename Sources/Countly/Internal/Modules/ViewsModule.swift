@@ -324,7 +324,7 @@ final class ViewsModule: ModuleBase {
 
         stopAutoStoppedView()
 
-        let truncatedName = core.limits.truncatedKey(viewName, "View name")
+        let truncatedName = limits.truncatedKey(viewName, "View name")
 
         var segmentation = globalViewSegmentation
         if let customSegmentation {
@@ -332,7 +332,7 @@ final class ViewsModule: ModuleBase {
             logD("startViewInternal", "start segmentation will be merged over the global view segmentation, name: [\(truncatedName)], startKeys: [\(filtered.keys.sorted())], overriddenGlobalKeys: [\(filtered.keys.filter { globalViewSegmentation[$0] != nil }.sorted())]")
             segmentation.merge(filtered) { _, new in new }
         }
-        segmentation = core.limits.truncatedAndLimited(segmentation, "View segmentation")
+        segmentation = limits.truncatedAndLimited(segmentation, "View segmentation")
 
         segmentation[SegKey.name] = truncatedName
         segmentation[SegKey.segment] = DeviceMetrics.osName
@@ -393,7 +393,7 @@ final class ViewsModule: ModuleBase {
             segmentation.merge(filtered) { _, new in new }
         }
 
-        segmentation = core.limits.truncatedAndLimited(segmentation, "View segmentation")
+        segmentation = limits.truncatedAndLimited(segmentation, "View segmentation")
         segmentation[SegKey.name] = viewData.viewName
         segmentation[SegKey.segment] = DeviceMetrics.osName
 
@@ -539,7 +539,7 @@ final class ViewsModule: ModuleBase {
     /// Every entry point that accepts view segmentation applies both, in that
     /// order.
     private func sanitized(_ segmentation: [String: Any], context: String) -> [String: Any] {
-        core.limits.filterSupportedDataTypes(stripReservedKeys(segmentation, context: context))
+        limits.filterSupportedDataTypes(stripReservedKeys(segmentation, context: context))
     }
 
     private func stripReservedKeys(_ segmentation: [String: Any], context: String) -> [String: Any] {
@@ -667,7 +667,7 @@ final class ViewsModule: ModuleBase {
         // Compared against the truncated form: that is what was stored when the
         // view started, so a long screen name would never match its own view and
         // would restart on every appearance.
-        if currentView?.viewName == core.limits.truncatedKey(title, "View name") {
+        if currentView?.viewName == limits.truncatedKey(title, "View name") {
             logD("handleAutoTrackedViewController", "appeared view controller is already the current view, it will not be started again, name: [\(title)]")
             return
         }

@@ -442,7 +442,7 @@ final class FeedbackModule: ModuleBase {
         var result = segmentation
         for (key, value) in segmentation {
             guard let text = value as? String else { continue }
-            result[key] = core.limits.truncatedValue(text, explanation + " value")
+            result[key] = limits.truncatedValue(text, explanation + " value")
         }
         return result
     }
@@ -492,8 +492,8 @@ final class FeedbackModule: ModuleBase {
         segmentation[Key.appVersion] = DeviceMetrics.appVersion
         segmentation[Key.rating] = rating
         segmentation[Key.widgetID] = widgetID
-        segmentation[Key.email] = email.map { core.limits.truncatedValue($0, "rating widget email") }
-        segmentation[Key.comment] = comment.map { core.limits.truncatedValue($0, "rating widget comment") }
+        segmentation[Key.email] = email.map { limits.truncatedValue($0, "rating widget email") }
+        segmentation[Key.comment] = comment.map { limits.truncatedValue($0, "rating widget comment") }
         segmentation[Key.contactMe] = userCanBeContacted
 
         // The rating, the comment and the email are what the end user typed.

@@ -11,7 +11,8 @@ import XCTest
 
 /// Per user SDK log gathering: the tri-state the SDK starts in, the speculative
 /// buffer that makes the init lines available, adoption and discard, directive
-/// sanitising, the two buffer ceilings, and the shape of the uploaded batch.
+/// sanitising, the two buffer ceilings, the consent each line waits for, and the
+/// shape of the uploaded batch.
 ///
 /// The state machine is exercised on a gatherer of its own with a fake transport,
 /// so the assertions are about the lines a test injected and nothing else. The
@@ -36,19 +37,38 @@ final class LogGatheringTests: CountlyBaseTestCase {
     private final class FakeTransport: LogGatheringTransport {
         private let lock = NSLock()
         private var _tracking = true
-        private var _consent = true
+        private var _trackingReads = 0
+        private var _granted = Set(ConsentFeature.allCases)
         private var _refuse = false
         private var _payloads: [String] = []
         private var _threads: [Thread] = []
 
+        /// Every delivery run reads this exactly once, which is what
+        /// `deliveryRunCount` counts.
         var isTrackingEnabled: Bool {
-            get { lock.lock(); defer { lock.unlock() }; return _tracking }
+            get { lock.lock(); defer { lock.unlock() }; _trackingReads += 1; return _tracking }
             set { lock.lock(); _tracking = newValue; lock.unlock() }
         }
 
-        var hasAnyConsent: Bool {
-            get { lock.lock(); defer { lock.unlock() }; return _consent }
-            set { lock.lock(); _consent = newValue; lock.unlock() }
+        /// How many delivery runs have started, whether or not they sent anything.
+        var deliveryRunCount: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return _trackingReads
+        }
+
+        /// The features consented to. Every feature by default, which is what the
+        /// SDK reports while consent is not required.
+        var granted: Set<ConsentFeature> {
+            get { lock.lock(); defer { lock.unlock() }; return _granted }
+            set { lock.lock(); _granted = newValue; lock.unlock() }
+        }
+
+        /// Whether `granted` holds the feature.
+        func hasConsent(for feature: ConsentFeature) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return _granted.contains(feature)
         }
 
         /// When set, the queue refuses every batch, as it does when tracking flips
@@ -84,9 +104,14 @@ final class LogGatheringTests: CountlyBaseTestCase {
         }
     }
 
+    /// Every fake handed to a gatherer, kept for the whole test: a gatherer holds
+    /// its transport weakly, and asks it for consent on every line.
+    private var transports: [FakeTransport] = []
+
     /// A gatherer past init, wired to `transport`, with no logger of its own so
     /// only the lines a test injects are ever held.
     private func makeGatherer(_ transport: FakeTransport = FakeTransport(), initFinished: Bool = true) -> LogGatherer {
+        transports.append(transport)
         let gatherer = LogGatherer(logger: nil)
         gatherer.transport = transport
         if initFinished { gatherer.sdkInitFinished() }
@@ -100,9 +125,14 @@ final class LogGatheringTests: CountlyBaseTestCase {
         return LogGatheringDirective.parse(raw, logger: nil)
     }
 
-    private func capture(_ gatherer: LogGatherer, _ count: Int, level: CountlyLogLevel = .debug, message: String? = nil) {
+    /// Captures `count` numbered lines of one level and scope.
+    private func capture(_ gatherer: LogGatherer,
+                         _ count: Int,
+                         level: CountlyLogLevel = .debug,
+                         message: String? = nil,
+                         scope: LogGatheringScope = .unattributed) {
         for index in 0..<count {
-            gatherer.capture("\(message ?? harnessPrefix) \(index)", level: level)
+            gatherer.capture("\(message ?? harnessPrefix) \(index)", level: level, scope: scope)
         }
     }
 
@@ -297,7 +327,7 @@ final class LogGatheringTests: CountlyBaseTestCase {
 
     func testALongMessageIsCutNotDropped() throws {
         let gatherer = makeGatherer()
-        gatherer.capture("xxx" + String(repeating: "x", count: maxMessageLength + 500), level: .debug)
+        gatherer.capture("xxx" + String(repeating: "x", count: maxMessageLength + 500), level: .debug, scope: .unattributed)
 
         let stored = try XCTUnwrap(gatherer.heldLines.first?.message)
         XCTAssertEqual(stored.utf16.count, maxMessageLength)
@@ -307,7 +337,7 @@ final class LogGatheringTests: CountlyBaseTestCase {
     func testTheCutNeverSplitsASurrogatePair() throws {
         let gatherer = makeGatherer()
         // One code unit short of the limit, then an emoji that needs two.
-        gatherer.capture(String(repeating: "a", count: maxMessageLength - 1) + "😀", level: .debug)
+        gatherer.capture(String(repeating: "a", count: maxMessageLength - 1) + "😀", level: .debug, scope: .unattributed)
 
         let stored = try XCTUnwrap(gatherer.heldLines.first?.message)
         XCTAssertLessThanOrEqual(stored.utf16.count, maxMessageLength)
@@ -321,8 +351,8 @@ final class LogGatheringTests: CountlyBaseTestCase {
         let gatherer = makeGatherer()
         gatherer.apply(directive(id: "gather_marker"), source: "test")
 
-        gatherer.capture("request started &sdk_logs={\"i\":\"x\"}", level: .debug)
-        gatherer.capture("plain line", level: .debug)
+        gatherer.capture("request started &sdk_logs={\"i\":\"x\"}", level: .debug, scope: .unattributed)
+        gatherer.capture("plain line", level: .debug, scope: .unattributed)
 
         XCTAssertEqual(messages(gatherer), ["plain line"])
     }
@@ -479,7 +509,9 @@ final class LogGatheringTests: CountlyBaseTestCase {
         XCTAssertEqual(TestUtils.int(transport.batches[1]["d"]), 0)
     }
 
-    func testLinesAreHeldWhileTrackingIsOffOrNoConsentIsGiven() {
+    /// The request queue drops everything while tracking is off, so the gathered
+    /// lines stay buffered until it is back on.
+    func testTheBufferIsHeldWhileTrackingIsOff() {
         let transport = FakeTransport()
         let gatherer = makeGatherer(transport)
         gatherer.apply(directive(id: "gather_gated", batchSize: minBatchSize), source: "test")
@@ -492,15 +524,353 @@ final class LogGatheringTests: CountlyBaseTestCase {
         XCTAssertEqual(gatherer.heldLineCount, minBatchSize)
 
         transport.isTrackingEnabled = true
-        transport.hasAnyConsent = false
-        gatherer.flushNow()
-        XCTAssertTrue(transport.payloads.isEmpty, "gathered lines quote event keys and whole requests, they are user data")
-        XCTAssertEqual(gatherer.heldLineCount, minBatchSize)
-
-        transport.hasAnyConsent = true
         gatherer.flushNow()
         XCTAssertEqual(transport.payloads.count, 1)
         XCTAssertEqual(gatherer.heldLineCount, 0)
+    }
+
+    /// A buffer held back while tracking is off keeps growing past the batch size,
+    /// and each further line asking for a delivery would queue hundreds of no-ops.
+    /// The refetch that turns tracking back on is what sends the held batches.
+    func testOnlyTheLineThatCompletesABatchAsksForADeliveryAndARefetchSendsWhatIsHeld() {
+        let transport = FakeTransport()
+        let gatherer = makeGatherer(transport)
+        gatherer.apply(directive(id: "gather_held", batchSize: minBatchSize), source: "test")
+        TestUtils.waitUntil("adoption ran its delivery") { transport.deliveryRunCount == 1 }
+
+        transport.isTrackingEnabled = false
+        capture(gatherer, minBatchSize * 5)
+        TestUtils.waitUntil("the line completing the first batch ran a delivery") { transport.deliveryRunCount == 2 }
+        TestUtils.pump(0.3)
+        XCTAssertEqual(transport.deliveryRunCount, 2, "a full buffer held back while tracking is off must not queue a delivery per line")
+        XCTAssertEqual(gatherer.heldLineCount, minBatchSize * 5)
+
+        transport.isTrackingEnabled = true
+        gatherer.apply(directive(id: "gather_held", batchSize: minBatchSize), source: "test")
+        TestUtils.waitUntil("the refetch drains the held full batches") { transport.payloads.count == 5 }
+        XCTAssertEqual(gatherer.heldLineCount, 0)
+    }
+
+    // MARK: - Consent, per line
+
+    /// Collects what the developer facing sink was handed, so a test can compare
+    /// it against what the same call uploaded.
+    private final class LogSink: CountlyLoggerDelegate {
+        private let lock = NSLock()
+        private var _lines: [String] = []
+
+        var lines: [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return _lines
+        }
+
+        /// Keeps every line the SDK hands to the developer facing sink.
+        func internalLog(_ log: String, level: CountlyLogLevel) {
+            lock.lock()
+            _lines.append(log)
+            lock.unlock()
+        }
+    }
+
+    /// The messages of every uploaded batch, oldest first.
+    private func uploadedMessages(_ transport: FakeTransport) -> [String] {
+        transport.batches.flatMap { lines(in: $0) }.compactMap { $0["m"] as? String }
+    }
+
+    /// The messages of the lines waiting for their consent, oldest first.
+    private func awaitingMessages(_ gatherer: LogGatherer) -> [String] {
+        gatherer.linesAwaitingConsent.map(\.message)
+    }
+
+    /// The scope table is the whole of the per feature rule, so a module that
+    /// writes user data and is missing from it is the bug this guards against. A
+    /// module that owns no single feature needs the events and user details
+    /// consent, and so does a name nobody has classified.
+    func testEveryLogModuleIsClassified() {
+        let byFeature: [String: ConsentFeature] = [
+            "Events": .events, "Views": .viewTracking, "UserProfile": .userDetails,
+            "Sessions": .sessions, "Location": .location, "Crash": .crashReporting,
+            "CrashLogStore": .crashReporting, "Push": .pushNotifications,
+            "PushRuntime": .pushNotifications, "Attribution": .attribution,
+            "APM": .performanceMonitoring, "Feedback": .feedback,
+            "RemoteConfig": .remoteConfig, "Content": .content, "DeviceMetrics": .metrics,
+        ]
+        for (module, feature) in byFeature {
+            XCTAssertEqual(LogGatheringScope.ofModule(module), .feature(feature), "module \(module)")
+        }
+
+        let noSingleFeature = ["Countly", "Consent", "DeviceID", "ConnectionTest", "ConnectionManager",
+                               "RequestBuilder", "RequestQueue", "KeyValueStore", "Storage", "ServerConfig",
+                               "HealthTracker", "Lifecycle", "WebView", "LogGathering", "Utils", "Limits",
+                               "Module", "SomethingAddedLater"]
+        for module in noSingleFeature {
+            XCTAssertEqual(LogGatheringScope.ofModule(module), .unattributed, "module \(module)")
+        }
+
+        // A module added to the registry and left out of the table would gather its feature's data as unattributed.
+        let ownWorking = [ConsentModule.moduleName, DeviceIDModule.moduleName, ConnectionTestModule.moduleName]
+        for module in core(of: startInstance()).modules.all.map({ type(of: $0).moduleName }) where !ownWorking.contains(module) {
+            XCTAssertNotEqual(LogGatheringScope.ofModule(module), .unattributed, "module \(module) is missing from the scope table")
+        }
+    }
+
+    /// The public event calls log the key and segmentation before a reserved
+    /// event's own consent is checked, so an events line naming a reserved event
+    /// answers to the feature that owns the event.
+    func testAnEventsLineNamingAReservedEventNeedsTheConsentOfThatEventsFeature() {
+        let owners: [String: ConsentFeature] = [
+            "[CLY]_view": .viewTracking, "[CLY]_orientation": .userDetails,
+            "[CLY]_star_rating": .feedback, "[CLY]_nps": .feedback, "[CLY]_survey": .feedback,
+            "[CLY]_push_action": .pushNotifications,
+        ]
+        for (key, owner) in owners {
+            let line = "[Events] recordEvent, event segmentation detail, key: [\(key)], segmentation: [[\"name\": \"Checkout\"]]"
+            XCTAssertEqual(eventsScope(line), .feature(owner), "key \(key)")
+        }
+
+        XCTAssertEqual(eventsScope("[Events] recordEvent, recording an event, key: [purchase]"), .feature(.events))
+        XCTAssertEqual(eventsScope("[Events] recordEvent, recording an event, key: [[CLY]_viewed_product]"), .feature(.events),
+                       "a custom key that only starts like a reserved one is a custom event")
+        XCTAssertEqual(eventsScope("[Events] recordEvent, event segmentation detail, key: [checkout], segmentation: [[\"from\": \"[CLY]_view\"]]"),
+                       .feature(.events), "a segmentation value naming a reserved event does not make the event reserved")
+        XCTAssertEqual(LogGatheringScope.of(module: "Limits", function: "truncatedKey", message: "[Limits] truncatedKey, key: [[CLY]_view]"),
+                       .unattributed, "only an events line is attributed by the event it names")
+    }
+
+    /// The views module logs the orientation before it checks the user details
+    /// consent that the orientation event answers to.
+    func testTheOrientationLinesOfTheViewsModuleNeedTheUserDetailsConsent() {
+        XCTAssertEqual(LogGatheringScope.of(module: "Views", function: "recordOrientation",
+                                            message: "[Views] recordOrientation, interface orientation changed, mode: [landscape]"),
+                       .feature(.userDetails))
+        XCTAssertEqual(LogGatheringScope.of(module: "Views", function: "startView",
+                                            message: "[Views] startView, start view requested, name: [Checkout]"),
+                       .feature(.viewTracking), "every other views line stays with the views consent")
+    }
+
+    /// The scope of a line the events module wrote from `recordEvent`.
+    private func eventsScope(_ message: String) -> LogGatheringScope {
+        LogGatheringScope.of(module: "Events", function: "recordEvent", message: message)
+    }
+
+    /// A line without its consent is held whole rather than redacted, because it
+    /// is the debugging value, and it is never part of a batch until released.
+    func testALineWaitsApartForItsConsentAndJoinsTheBufferInLoggedOrderOnceItIsGiven() {
+        let transport = FakeTransport()
+        transport.granted = [.events]
+        let gatherer = makeGatherer(transport)
+        gatherer.apply(directive(id: "gather_feature"), source: "test")
+
+        let firstProperty = "[UserProfile] setProperty, value: [first@example.com]"
+        let event = "[Events] recordEvent, key: [purchase]"
+        let secondProperty = "[UserProfile] setProperty, value: [second@example.com]"
+        let laterEvent = "[Events] recordEvent, key: [refund]"
+
+        gatherer.capture(firstProperty, level: .debug, scope: .feature(.userDetails))
+        gatherer.capture(event, level: .debug, scope: .feature(.events))
+        gatherer.capture(secondProperty, level: .debug, scope: .feature(.userDetails))
+        gatherer.flushNow()
+
+        XCTAssertEqual(uploadedMessages(transport), [event], "the events consent covers the events line and nothing else")
+        XCTAssertEqual(awaitingMessages(gatherer), [firstProperty, secondProperty], "the others wait whole, neither dropped nor redacted")
+
+        gatherer.capture(laterEvent, level: .debug, scope: .feature(.events))
+        transport.granted = [.events, .userDetails]
+        gatherer.consentDidChange()
+
+        XCTAssertTrue(awaitingMessages(gatherer).isEmpty)
+        XCTAssertEqual(messages(gatherer), [firstProperty, secondProperty, laterEvent],
+                       "a released line takes its place by when it was logged, within one millisecond too")
+    }
+
+    /// A line no single feature owns can quote an event or a user property, so it
+    /// needs both consents, and only those two.
+    func testAnUnknownLineUploadsWithNeitherTheEventsNorTheUserDetailsConsentAlone() {
+        let transport = FakeTransport()
+        transport.granted = [.events]
+        let gatherer = makeGatherer(transport)
+        gatherer.apply(directive(id: "gather_unknown"), source: "test")
+
+        let line = "[SomethingAddedLater] work, a value it was handed: [secret-value]"
+        gatherer.capture(line, level: .debug, scope: LogGatheringScope.of(module: "SomethingAddedLater", function: "work", message: line))
+        gatherer.flushNow()
+        XCTAssertTrue(transport.payloads.isEmpty, "the events consent alone does not cover a line no single feature owns")
+
+        transport.granted = [.userDetails]
+        gatherer.consentDidChange()
+        gatherer.flushNow()
+        XCTAssertTrue(transport.payloads.isEmpty, "nor does the user details consent alone")
+        XCTAssertEqual(awaitingMessages(gatherer), [line])
+
+        transport.granted = [.events, .userDetails]
+        gatherer.consentDidChange()
+        gatherer.flushNow()
+        XCTAssertEqual(uploadedMessages(transport), [line], "the two together are enough, the other features are not needed")
+    }
+
+    /// A device ID change logs the next user's ID, so while it runs no delivery
+    /// takes a line it logged: a change without merge drops them, and one that
+    /// keeps the gather lets them go out once it ends.
+    func testNoDeliveryTakesTheLinesOfADeviceIDChangeInProgress() {
+        let transport = FakeTransport()
+        let stopped = makeGatherer(transport)
+        stopped.apply(directive(id: "gather_change"), source: "test")
+        capture(stopped, 2, message: "before the change")
+        stopped.deviceIDChangeBegins()
+        capture(stopped, 2, message: "device ID change value detail, providedDeviceID: [new_user]")
+
+        stopped.flushNow()
+        XCTAssertEqual(uploadedMessages(transport), ["before the change 0", "before the change 1"])
+
+        stopped.stopForDeviceIDChange()
+        stopped.deviceIDChangeEnds()
+        XCTAssertFalse(uploadedMessages(transport).contains { $0.contains("new_user") }, "the next user's ID reached the previous user's gather")
+        XCTAssertEqual(stopped.currentState, .off)
+
+        let mergeTransport = FakeTransport()
+        let merged = makeGatherer(mergeTransport)
+        merged.apply(directive(id: "gather_merge"), source: "test")
+        merged.deviceIDChangeBegins()
+        capture(merged, 2, message: "device ID value detail for the merging change, deviceID: [merged_user]")
+        merged.deviceIDChangeEnds()
+        merged.flushNow()
+        XCTAssertEqual(uploadedMessages(mergeTransport).count, 2, "a merge keeps the gather, and the change's lines with it")
+    }
+
+    /// A buffered line answers to its consent until it is uploaded, so
+    /// withdrawing that consent takes it back out of the buffer, and giving it
+    /// again releases it.
+    func testWithdrawingAConsentTakesItsLinesBackOutOfTheBuffer() {
+        let transport = FakeTransport()
+        transport.granted = [.events, .userDetails]
+        let gatherer = makeGatherer(transport)
+        gatherer.apply(directive(id: "gather_withdraw"), source: "test")
+
+        let property = "[UserProfile] setProperty, value: [withdrawn@example.com]"
+        let event = "[Events] recordEvent, key: [purchase]"
+        gatherer.capture(property, level: .debug, scope: .feature(.userDetails))
+        gatherer.capture(event, level: .debug, scope: .feature(.events))
+        XCTAssertEqual(messages(gatherer), [property, event])
+
+        transport.granted = [.events]
+        gatherer.consentDidChange()
+        XCTAssertEqual(messages(gatherer), [event])
+        XCTAssertEqual(awaitingMessages(gatherer), [property], "the withdrawn line waits again instead of going out")
+        gatherer.flushNow()
+        XCTAssertEqual(uploadedMessages(transport), [event])
+
+        transport.granted = [.events, .userDetails]
+        gatherer.consentDidChange()
+        gatherer.flushNow()
+        XCTAssertEqual(uploadedMessages(transport), [event, property])
+    }
+
+    /// A batch out for upload holds no line a withdrawal could recall, so when the
+    /// queue refuses it, its lines come back decided against the consent then.
+    func testARefusedBatchComesBackDecidedAgainstTheConsentAsItIsThen() {
+        let transport = FakeTransport()
+        transport.granted = [.events, .userDetails]
+        let gatherer = makeGatherer(transport)
+        gatherer.apply(directive(id: "gather_refused_withdrawn"), source: "test")
+        let property = "[UserProfile] setProperty, value: [withdrawn@example.com]"
+        gatherer.capture(property, level: .debug, scope: .feature(.userDetails))
+
+        transport.refuses = true
+        transport.granted = [.events]
+        gatherer.flushNow()
+
+        XCTAssertTrue(transport.payloads.isEmpty)
+        XCTAssertTrue(messages(gatherer).isEmpty)
+        XCTAssertEqual(awaitingMessages(gatherer), [property])
+    }
+
+    /// Before init no line can be decided yet, so a line dropped then counts
+    /// toward `d` only once init shows that its consent is given.
+    func testADropBeforeInitCountsOnlyForALineWhoseConsentTurnsOutGiven() {
+        let transport = FakeTransport()
+        transport.granted = [.events]
+        let gatherer = makeGatherer(transport, initFinished: false)
+
+        // The 15 oldest go: 10 lines no single feature owns, then 5 events lines.
+        capture(gatherer, 10, scope: .unattributed)
+        capture(gatherer, 5, scope: .feature(.events))
+        capture(gatherer, maxBufferedLines, scope: .feature(.events))
+        gatherer.sdkInitFinished()
+
+        XCTAssertEqual(gatherer.pendingDroppedCount, 5, "a dropped line that would have waited for its consent is no loss to report")
+    }
+
+    /// The waiting lines are bounded like the buffer, by lines and by characters,
+    /// but what they lose is not reported, since it was never gathered.
+    func testTheAwaitingLinesAreCappedLikeTheBufferWithoutCountingTheDrops() {
+        let transport = FakeTransport()
+        transport.granted = []
+        let gatherer = makeGatherer(transport)
+
+        capture(gatherer, maxBufferedLines + 25, scope: .feature(.events))
+        XCTAssertEqual(awaitingMessages(gatherer).count, maxBufferedLines)
+        XCTAssertEqual(awaitingMessages(gatherer).first, "\(harnessPrefix) 25", "the oldest go first")
+        XCTAssertEqual(gatherer.pendingDroppedCount, 0, "a line whose consent was never given was never gathered, so it is no loss to report")
+
+        let long = String(repeating: "c", count: maxMessageLength - 100)
+        capture(gatherer, 40, message: long, scope: .feature(.events))
+        XCTAssertLessThanOrEqual(awaitingMessages(gatherer).reduce(0) { $0 + $1.utf16.count }, charCeiling)
+        XCTAssertEqual(awaitingMessages(gatherer).last, "\(long) 39")
+        XCTAssertEqual(gatherer.pendingDroppedCount, 0)
+        XCTAssertEqual(gatherer.heldLineCount, 0)
+    }
+
+    /// A waiting line belongs to the gather it was captured in, so it is filtered,
+    /// kept and dropped exactly like a buffered one.
+    func testTheAwaitingLinesFollowTheGatherLikeTheBuffer() {
+        let transport = FakeTransport()
+        transport.granted = []
+
+        let gatherer = makeGatherer(transport)
+        capture(gatherer, 2, level: .debug, scope: .feature(.events))
+        capture(gatherer, 3, level: .error, scope: .feature(.events))
+        gatherer.apply(directive(id: "gather_a", levels: "e"), source: "test")
+        XCTAssertEqual(gatherer.linesAwaitingConsent.map(\.level), ["e", "e", "e"], "adoption filters them by level")
+
+        gatherer.apply(directive(id: "gather_a", levels: "e"), source: "test")
+        XCTAssertEqual(awaitingMessages(gatherer).count, 3, "a repeated directive keeps them")
+
+        gatherer.apply(directive(id: "gather_b", levels: "e"), source: "test")
+        XCTAssertTrue(awaitingMessages(gatherer).isEmpty, "they belong to the gather that ended")
+
+        capture(gatherer, 2, level: .error, scope: .feature(.events))
+        gatherer.apply(.off, source: "test")
+        XCTAssertTrue(awaitingMessages(gatherer).isEmpty, "a stop drops them")
+
+        let undecided = makeGatherer(transport)
+        capture(undecided, 2, scope: .feature(.events))
+        undecided.decideOffIfUndecided("test")
+        XCTAssertTrue(awaitingMessages(undecided).isEmpty, "deciding off drops them")
+    }
+
+    /// The consents a configuration names are given at the end of init, so a line
+    /// decided before that would be decided against an incomplete state.
+    func testLinesCapturedBeforeInitFinishesAreDecidedWhenItDoes() {
+        let transport = FakeTransport()
+        transport.granted = []
+        let gatherer = makeGatherer(transport, initFinished: false)
+        gatherer.apply(directive(id: "gather_init"), source: "test")
+
+        let event = "[Events] recordEvent, key: [purchase]"
+        let property = "[UserProfile] setProperty, value: [someone@example.com]"
+        gatherer.capture(event, level: .debug, scope: .feature(.events))
+        gatherer.capture(property, level: .debug, scope: .feature(.userDetails))
+        XCTAssertEqual(messages(gatherer), [event, property], "nothing is decided while the consent state is still being built")
+        XCTAssertTrue(awaitingMessages(gatherer).isEmpty)
+
+        // The consents a configuration names are given at the very end of init.
+        transport.granted = [.events]
+        gatherer.sdkInitFinished()
+
+        XCTAssertEqual(awaitingMessages(gatherer), [property])
+        TestUtils.waitUntil("init finishing uploads what its consent allows") { transport.payloads.count == 1 }
+        XCTAssertEqual(uploadedMessages(transport), [event])
     }
 
     // MARK: - Wired into the SDK
@@ -514,11 +884,45 @@ final class LogGatheringTests: CountlyBaseTestCase {
         requestQueue(of: instance).map(TestUtils.parseQuery).compactMap { $0["sdk_logs"] as? [String: Any] }
     }
 
+    /// The messages of every line this instance queued for upload, oldest first.
+    private func uploadedMessages(of instance: CountlyInstance) -> [String] {
+        uploadedBatches(of: instance).flatMap { lines(in: $0) }.compactMap { $0["m"] as? String }
+    }
+
     private func respondToBehaviorSettings(with json: String) {
         MockURLProtocol.respond { captured in
             guard captured.path.contains("/o/sdk"), captured.query.contains("method=sc") else { return nil }
             return (200, Data(json.utf8))
         }
+    }
+
+    /// Accepts every gathered log batch, so one queued at init end cannot stay
+    /// failing at the head of the queue and hold back the requests behind it.
+    private func acceptGatheredBatches() {
+        MockURLProtocol.respond { captured in
+            captured.query.contains("\(QS.sdkLogs)=") ? (200, Data(#"{"result":"Success"}"#.utf8)) : nil
+        }
+    }
+
+    /// Every line the gather `gatherID` holds or ever handed over: held, waiting,
+    /// queued in a batch, or already taken by the mock, since an accepted batch
+    /// leaves the queue.
+    private func gatheredMessages(of instance: CountlyInstance, gatherID: String) -> [String] {
+        let gatherer = gatherer(of: instance)
+        let held = gatherer.currentDirective.gatherID == gatherID ? messages(gatherer) + awaitingMessages(gatherer) : []
+        let handedOver = (requestQueue(of: instance) + MockURLProtocol.requests.map(\.query))
+            .map(TestUtils.parseQuery)
+            .compactMap { $0["sdk_logs"] as? [String: Any] }
+            .filter { ($0["i"] as? String) == gatherID }
+            .flatMap { lines(in: $0) }
+            .compactMap { $0["m"] as? String }
+        return held + handedOver
+    }
+
+    /// Whether a captured request is an ordinary one carrying `key`, rather than
+    /// a gathered log batch quoting a line about it.
+    private func isEventRequest(_ captured: MockURLProtocol.Captured, carrying key: String) -> Bool {
+        captured.query.contains(key) && !captured.query.contains("\(QS.sdkLogs)=")
     }
 
     /// Starts an instance whose behavior settings fetch arms gathering, and waits
@@ -586,24 +990,322 @@ final class LogGatheringTests: CountlyBaseTestCase {
         let held = messages(gatherer(of: countly))
         XCTAssertTrue(held.allSatisfy { !$0.contains("sdk_logs") }, "held a line describing the upload: \(held.filter { $0.contains("sdk_logs") })")
         XCTAssertTrue(held.allSatisfy { !$0.contains("sendSdkLogs") }, "held the request path's own commentary: \(held.filter { $0.contains("sendSdkLogs") })")
-        let uploaded = uploadedBatches(of: countly).flatMap { lines(in: $0) }.compactMap { $0["m"] as? String }
-        XCTAssertTrue(uploaded.allSatisfy { !$0.contains("sdk_logs") }, "a batch nested the previous one")
+        XCTAssertTrue(uploadedMessages(of: countly).allSatisfy { !$0.contains("sdk_logs") }, "a batch nested the previous one")
     }
 
-    func testLinesAreHeldUntilAnyConsentIsGiven() throws {
+    /// The events module's lines answer to the events consent, while a line the
+    /// SDK logged about itself still needs the user details consent too.
+    func testAnEventsLineUploadsWithTheEventsConsentAlone() throws {
         try skipUnlessNetworkIsInterceptable()
-        let countly = startArmed(id: "gather_consent") { $0.requiresConsent = true }
+        let countly = startArmed(id: "gather_events") {
+            $0.requiresConsent = true
+            $0.consents = [.events]
+        }
+
+        countly.events.recordEvent("purchase_completed")
+        gatherer(of: countly).flushNow()
+
+        let uploaded = uploadedMessages(of: countly)
+        XCTAssertTrue(uploaded.contains { $0.contains("[Events]") && $0.contains("purchase_completed") },
+                      "the events consent covers the lines the events module wrote")
+        XCTAssertFalse(uploaded.contains { $0.contains("initializing, appKey") },
+                       "a line no single feature owns needs the user details consent as well")
+        XCTAssertTrue(awaitingMessages(gatherer(of: countly)).contains { $0.contains("initializing, appKey") })
+    }
+
+    /// Giving a consent through the public API releases the lines that waited for
+    /// it, so nothing logged before the consent is lost.
+    func testAUserPropertyLineWaitsForTheUserDetailsConsentAndIsReleasedOnceItIsGiven() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startArmed(id: "gather_users") {
+            $0.requiresConsent = true
+            $0.consents = [.events]
+        }
+        let propertyLine = "single user property value detail, key: [email], value: [someone@example.com]"
+
+        countly.userProfile.setProperty("email", value: "someone@example.com")
+        gatherer(of: countly).flushNow()
+        XCTAssertFalse(uploadedMessages(of: countly).contains { $0.contains("someone@example.com") })
+        XCTAssertTrue(awaitingMessages(gatherer(of: countly)).contains { $0.contains(propertyLine) })
+
+        countly.consent.giveConsent(for: [.userDetails])
+        gatherer(of: countly).flushNow()
+
+        XCTAssertTrue(uploadedMessages(of: countly).contains { $0.contains(propertyLine) }, "giving the consent releases the line that waited for it")
+        XCTAssertFalse(awaitingMessages(gatherer(of: countly)).contains { $0.contains(propertyLine) })
+    }
+
+    /// Only the uploaded copy waits for consent: the developer log keeps showing
+    /// every call in full.
+    func testWithOnlySessionsConsentNoSecretIsUploadedAndEachWaitsWhileTheLocalLogKeepsIt() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let sink = LogSink()
+        let countly = startArmed(id: "gather_secrets") {
+            $0.requiresConsent = true
+            $0.consents = [.sessions]
+            $0.loggerDelegate = sink
+            $0.internalLogLevel = .verbose
+        }
+
+        countly.sessions.beginSession()
+        countly.events.recordEvent("purchase", segmentation: ["sku": "secret-sku"])
+        _ = countly.views.startView("secret checkout screen")
+        countly.userProfile.setProperty("email", value: "secret@example.com")
+        gatherer(of: countly).flushNow()
+
+        let uploaded = uploadedMessages(of: countly)
+        XCTAssertTrue(uploaded.contains { $0.contains("[Sessions]") }, "the sessions consent lets the sessions lines out")
+        let awaiting = awaitingMessages(gatherer(of: countly))
+        for secret in ["secret-sku", "secret checkout screen", "secret@example.com"] {
+            XCTAssertFalse(uploaded.contains { $0.contains(secret) }, "[\(secret)] reached the server without the consent it belongs to")
+            XCTAssertTrue(awaiting.contains { $0.contains(secret) }, "[\(secret)] waits for its consent instead of being dropped")
+            XCTAssertTrue(sink.lines.contains { $0.contains(secret) }, "the local log lost [\(secret)]")
+        }
+    }
+
+    /// Recording `[CLY]_view` through the events API logs the view name before the
+    /// views consent is checked, so that line answers to the views consent.
+    func testAViewNameRecordedUnderTheReservedViewKeyWaitsForTheViewsConsent() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startArmed(id: "gather_reserved") {
+            $0.requiresConsent = true
+            $0.consents = [.events, .userDetails]
+        }
+
+        countly.events.recordEvent("[CLY]_view", segmentation: ["name": "secret-view-name"])
+        gatherer(of: countly).flushNow()
+        XCTAssertFalse(uploadedMessages(of: countly).contains { $0.contains("secret-view-name") },
+                       "the events module logs a reserved event before it checks the views consent the event answers to")
+        XCTAssertTrue(awaitingMessages(gatherer(of: countly)).contains { $0.contains("secret-view-name") })
+
+        countly.consent.giveConsent(for: [.viewTracking])
+        gatherer(of: countly).flushNow()
+        XCTAssertTrue(uploadedMessages(of: countly).contains { $0.contains("secret-view-name") })
+    }
+
+    /// Init logs before it reads whether consent is required, and those lines must
+    /// not go out as if it were not.
+    func testWithConsentRequiredAndNoneGivenNoInitLineIsUploaded() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startArmed(id: "gather_init_consent") { $0.requiresConsent = true }
 
         gatherer(of: countly).flushNow()
-        XCTAssertTrue(uploadedBatches(of: countly).isEmpty, "gathered lines quote event keys and whole requests, they are user data")
-        XCTAssertGreaterThan(gatherer(of: countly).heldLineCount, 0)
 
-        countly.consent.giveConsent(for: [.events])
+        XCTAssertTrue(uploadedBatches(of: countly).isEmpty, "every line needs a consent, those logged before init read the consent requirement too")
+        XCTAssertTrue(awaitingMessages(gatherer(of: countly)).contains { $0.contains("developer configuration before any behavior setting is applied") })
+    }
+
+    /// A change of the consent requirement re-decides every waiting line, as
+    /// giving a consent does.
+    func testLinesAwaitingConsentAreReleasedWhenConsentIsNoLongerRequired() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startArmed(id: "gather_requirement") { $0.requiresConsent = true }
+        countly.events.recordEvent("waiting-event")
+        XCTAssertTrue(awaitingMessages(gatherer(of: countly)).contains { $0.contains("waiting-event") })
+
+        core(of: countly).modules.consent.requiresConsent = false
         gatherer(of: countly).flushNow()
 
-        let batches = uploadedBatches(of: countly)
-        XCTAssertFalse(batches.isEmpty, "any consent at all releases them")
-        XCTAssertEqual(batches.first?["i"] as? String, "gather_consent")
+        XCTAssertTrue(uploadedMessages(of: countly).contains { $0.contains("waiting-event") })
+        XCTAssertTrue(awaitingMessages(gatherer(of: countly)).isEmpty)
+    }
+
+    /// Without a consent requirement every feature counts as consented, so no
+    /// line waits.
+    func testWithoutConsentRequiredEveryLineUploads() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startArmed(id: "gather_open")
+
+        countly.events.recordEvent("purchase")
+        countly.userProfile.setProperty("email", value: "someone@example.com")
+        gatherer(of: countly).flushNow()
+
+        let uploaded = uploadedMessages(of: countly)
+        XCTAssertTrue(uploaded.contains { $0.contains("[Events]") && $0.contains("purchase") })
+        XCTAssertTrue(uploaded.contains { $0.contains("someone@example.com") })
+        XCTAssertTrue(uploaded.contains { $0.contains("initializing, appKey") })
+        XCTAssertTrue(awaitingMessages(gatherer(of: countly)).isEmpty, "nothing waits while consent is not required")
+    }
+
+    /// The limits cut a value on behalf of the feature that handed it over, here
+    /// before the crash consent is ever checked, so the line they log about it
+    /// answers to that feature rather than to events and user details.
+    func testALimitsLineAnswersToTheConsentOfTheFeatureWhoseValueItCut() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startArmed(id: "gather_limits") {
+            $0.requiresConsent = true
+            $0.consents = [.events, .userDetails]
+        }
+
+        countly.crashes.setCrashSegmentation(["note": String(repeating: "x", count: 300) + "SECRET-CRASH-SEGMENTATION"])
+        gatherer(of: countly).flushNow()
+
+        XCTAssertFalse(uploadedMessages(of: countly).contains { $0.contains("SECRET-CRASH-SEGMENTATION") },
+                       "crash data reached the server on the events and user details consent")
+        let cut = try XCTUnwrap(gatherer(of: countly).linesAwaitingConsent.first { $0.message.contains("[Limits]") && $0.message.contains("SECRET-CRASH-SEGMENTATION") })
+        XCTAssertEqual(cut.scope, .feature(.crashReporting))
+    }
+
+    /// A request queued for the previous user still goes out after a change
+    /// without merge, and what its send logs quotes that user's data, so only
+    /// the gather of the user it was queued for takes those lines.
+    func testARequestQueuedForThePreviousDeviceIDIsNotGatheredForTheNextUser() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startArmed(id: "gather_old_user", batchSize: maxBufferedLines)
+        acceptGatheredBatches()
+        countly.events.recordEvent("old-user-secret-event")
+        core(of: countly).modules.events.sendEventsWithSaveIfNeeded()
+        var oldGatherTookTheRequest = false
+        TestUtils.waitUntil("the old user's gather takes the lines of the old user's request") {
+            oldGatherTookTheRequest = oldGatherTookTheRequest || gatheredMessages(of: countly, gatherID: "gather_old_user")
+                .contains { $0.contains("[ConnectionManager]") && $0.contains("old-user-secret-event") }
+            return oldGatherTookTheRequest
+        }
+
+        countly.deviceID.changeWithoutMerge("new_user")
+        gatherer(of: countly).apply(directive(id: "gather_new_user"), source: "test")
+        let sendsBefore = MockURLProtocol.requests.count
+        TestUtils.waitUntil("the old user's request is sent again while the next user's gather runs") {
+            core(of: countly).network.proceedOnQueue()
+            return MockURLProtocol.requests.dropFirst(sendsBefore).contains { isEventRequest($0, carrying: "old-user-secret-event") }
+        }
+        TestUtils.pump(0.3)
+
+        XCTAssertFalse(gatheredMessages(of: countly, gatherID: "gather_new_user").contains { $0.contains("old-user-secret-event") },
+                       "the next user's gather took the previous user's request")
+    }
+
+    /// A request still out when the device ID changes is the previous user's, so
+    /// what its completion logs is not gathered for the next user either.
+    func testTheCompletionOfARequestSentBeforeADeviceIDChangeIsNotGatheredForTheNextUser() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let sink = LogSink()
+        let countly = startArmed(id: "gather_in_flight", batchSize: maxBufferedLines) {
+            $0.loggerDelegate = sink
+            $0.internalLogLevel = .verbose
+        }
+        acceptGatheredBatches()
+        MockURLProtocol.respond { captured in
+            guard self.isEventRequest(captured, carrying: "in-flight-secret-event") else { return nil }
+            // Slow, so the device ID changes while the request is out.
+            Thread.sleep(forTimeInterval: 0.5)
+            return (500, Data("in-flight-secret-reply".utf8))
+        }
+
+        countly.events.recordEvent("in-flight-secret-event")
+        core(of: countly).modules.events.sendEventsWithSaveIfNeeded()
+        TestUtils.waitUntil("the request is out") { MockURLProtocol.requests.contains { isEventRequest($0, carrying: "in-flight-secret-event") } }
+        countly.deviceID.changeWithoutMerge("new_user")
+        gatherer(of: countly).apply(directive(id: "gather_new_user"), source: "test")
+        TestUtils.waitUntil("the reply to the previous user's request arrived") { sink.lines.contains { $0.contains("in-flight-secret-reply") } }
+
+        XCTAssertFalse(gatheredMessages(of: countly, gatherID: "gather_new_user").contains { $0.contains("in-flight-secret") },
+                       "the next user's gather took the reply to the previous user's request")
+    }
+
+    /// Withdrawing a consent through the public API takes that feature's lines
+    /// back out of the upload buffer. Tracking is off, so no delivery can take
+    /// the line first.
+    func testWithdrawingAConsentThroughThePublicAPIRecallsItsLines() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startArmed(id: "gather_withdraw_api", settings: ServerConfigBuilder().tracking(false)) {
+            $0.requiresConsent = true
+            $0.consents = [.events, .userDetails]
+        }
+        countly.userProfile.setProperty("email", value: "withdrawn@example.com")
+        XCTAssertTrue(messages(gatherer(of: countly)).contains { $0.contains("withdrawn@example.com") })
+
+        countly.consent.cancelConsent(for: [.userDetails])
+
+        XCTAssertFalse(messages(gatherer(of: countly)).contains { $0.contains("withdrawn@example.com") })
+        XCTAssertTrue(awaitingMessages(gatherer(of: countly)).contains { $0.contains("withdrawn@example.com") })
+    }
+
+    /// A change without merge is a new user: what the old one may upload goes out
+    /// under the old device ID, and the gather does not follow the next user.
+    func testADeviceIDChangeWithoutMergeUploadsUnderTheOldIDAndThenStops() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startArmed(id: "gather_old_user")
+        countly.events.recordEvent("old-user-event")
+
+        countly.deviceID.changeWithoutMerge("new_user")
+
+        let logRequests = TestUtils.requests(requestQueue(of: countly), carrying: "sdk_logs")
+        XCTAssertTrue(uploadedMessages(of: countly).contains { $0.contains("old-user-event") }, "the held lines go out before the switch")
+        XCTAssertTrue(logRequests.allSatisfy { ($0["device_id"] as? String) == Self.deviceID }, "every gathered line belongs to the old user")
+        XCTAssertFalse(uploadedMessages(of: countly).contains { $0.contains("new_user") }, "the next user's ID never lands in the previous user's gather")
+        XCTAssertEqual(gatherer(of: countly).currentState, .off)
+        XCTAssertEqual(gatherer(of: countly).heldLineCount, 0)
+
+        countly.events.recordEvent("new-user-event")
+        gatherer(of: countly).flushNow()
+        XCTAssertEqual(TestUtils.requests(requestQueue(of: countly), carrying: "sdk_logs").count, logRequests.count,
+                       "the next user is not part of the old user's gather")
+    }
+
+    /// The next user's consent must never release a line the previous user did
+    /// not consent to.
+    func testADeviceIDChangeWithoutMergeDropsTheLinesAwaitingConsent() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startArmed(id: "gather_old_user_consent") {
+            $0.requiresConsent = true
+            $0.consents = [.sessions]
+        }
+        countly.events.recordEvent("old-user-secret")
+        XCTAssertTrue(awaitingMessages(gatherer(of: countly)).contains { $0.contains("old-user-secret") })
+
+        countly.deviceID.changeWithoutMerge("new_user")
+        countly.consent.giveConsent(for: [.events, .userDetails])
+        gatherer(of: countly).flushNow()
+
+        XCTAssertFalse(uploadedMessages(of: countly).contains { $0.contains("old-user-secret") },
+                       "the old user's lines never go out under the next user's consent")
+        XCTAssertTrue(awaitingMessages(gatherer(of: countly)).isEmpty)
+        XCTAssertEqual(gatherer(of: countly).currentState, .off)
+    }
+
+    /// A directive fetched for the previous device ID belongs to that user, so it
+    /// must not arm a gather for the next one.
+    func testADirectiveFetchedBeforeADeviceIDChangeIsIgnored() throws {
+        try skipUnlessNetworkIsInterceptable()
+        MockURLProtocol.respond { captured in
+            guard captured.path.contains("/o/sdk"), captured.query.contains("method=sc") else { return nil }
+            // Slow, so the device ID changes while the fetch is in flight.
+            Thread.sleep(forTimeInterval: 0.5)
+            return (200, Data(ServerConfigBuilder().armLogGathering(id: "gather_previous_user").json().utf8))
+        }
+        let sink = LogSink()
+        let countly = startInstance {
+            $0.loggerDelegate = sink
+            $0.internalLogLevel = .debug
+        }
+
+        countly.deviceID.changeWithoutMerge("new_user")
+        TestUtils.waitUntil("the answer to the fetch made for the previous device ID arrived") {
+            sink.lines.contains { $0.contains("the device ID changed while the fetch was in flight") }
+        }
+
+        XCTAssertEqual(gatherer(of: countly).currentState, .off, "the previous user's directive never arms a gather for the next user")
+    }
+
+    /// Temporary mode drops the identity like a change without merge, while a
+    /// merge keeps the same user and so the same gather.
+    func testEnteringTemporaryIDModeStopsLikeAChangeWithoutMergeAndAMergeKeepsGathering() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let temporary = startArmed(id: "gather_temporary")
+        temporary.events.recordEvent("before-temporary-mode")
+
+        temporary.deviceID.enableTemporaryIDMode()
+
+        let logRequests = TestUtils.requests(requestQueue(of: temporary), carrying: "sdk_logs")
+        XCTAssertTrue(uploadedMessages(of: temporary).contains { $0.contains("before-temporary-mode") })
+        XCTAssertTrue(logRequests.allSatisfy { ($0["device_id"] as? String) == Self.deviceID })
+        XCTAssertEqual(gatherer(of: temporary).currentState, .off)
+
+        let merged = startArmed(id: "gather_merge")
+        merged.deviceID.changeWithMerge("merged_user")
+        XCTAssertEqual(gatherer(of: merged).currentState, .gathering, "a merge is the same user, so the gather goes on")
+        XCTAssertEqual(gatherer(of: merged).currentDirective.gatherID, "gather_merge")
     }
 
     func testLinesAreHeldWhileTrackingIsOff() throws {
