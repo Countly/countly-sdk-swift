@@ -106,7 +106,6 @@ final class UserProfileModule: ModuleBase {
     /// Sets one property, routing predefined keys to their own fields.
     func setProperty(_ key: String, value: Any?) {
         logI("setProperty", "user property will be set, key: [\(key)], valueProvided: [\(value != nil)]")
-        logV("setProperty", "single user property value detail, key: [\(key)], value: [\(value ?? "nil")]")
 
         guard let value else {
             logW("setProperty", "omitting the call, a nil value can not be set, use the unset call to clear a property, key: [\(key)]")
@@ -128,7 +127,6 @@ final class UserProfileModule: ModuleBase {
         }
 
         logI("setProperties", "user properties will be applied, keys: [\(data.keys.sorted())], count: [\(data.count)]")
-        logV("setProperties", "user properties value detail, data: [\(data)]")
 
         var appliedCount = 0
         var skippedCount = 0
@@ -175,6 +173,7 @@ final class UserProfileModule: ModuleBase {
             }
 
             customProperties[limits.truncatedKey(key, "setProperties")] = storable
+            logV("setProperties", "custom user property value detail as stored, key: [\(key)], value: [\(storable)]")
             appliedCount += 1
         }
         lock.unlock()
@@ -191,7 +190,6 @@ final class UserProfileModule: ModuleBase {
     /// pending events, which is what a caller batching many properties wants.
     func setCustomProperty(_ key: String, value: Any?) {
         logI("setCustomProperty", "custom user property will be set, key: [\(key)], valueProvided: [\(value != nil)]")
-        logV("setCustomProperty", "custom user property value detail, key: [\(key)], value: [\(value ?? "nil")]")
 
         guard let value else {
             logW("setCustomProperty", "call will be ignored as value is nil, key: [\(key)]")
@@ -209,6 +207,7 @@ final class UserProfileModule: ModuleBase {
         }
 
         let stored = truncatedValue(storable, forKey: key, "setCustomProperty")
+        logV("setCustomProperty", "custom user property value detail as stored, key: [\(key)], value: [\(stored)]")
 
         lock.lock()
         customProperties[limits.truncatedKey(key, "setCustomProperty")] = stored
@@ -266,7 +265,6 @@ final class UserProfileModule: ModuleBase {
     /// overwriting, so pushing three values before a save sends all three.
     private func modify(_ modifier: UserPropertyModifier, key: String, value: Any) {
         logI("modify", "user property modifier will be applied, modifier: [\(modifier.rawValue)], key: [\(key)]")
-        logV("modify", "modifier operand value detail, modifier: [\(modifier.rawValue)], key: [\(key)], value: [\(value)]")
 
         guard let storable = storableValue(value) else {
             logW("modify", "modifier value type is not supported, modifier: [\(modifier.rawValue)], key: [\(key)], type: [\(type(of: value))], omitting call")
@@ -284,6 +282,7 @@ final class UserProfileModule: ModuleBase {
         }
 
         let truncatedKey = limits.truncatedKey(key, "modify")
+        logV("modify", "modifier operand value detail as stored, modifier: [\(modifier.rawValue)], key: [\(truncatedKey)], value: [\(stored)]")
 
         lock.lock()
         defer { lock.unlock() }
@@ -339,6 +338,11 @@ final class UserProfileModule: ModuleBase {
                 pictureLocalPath = nil
                 return true
             }
+            #if !(os(iOS) || os(visionOS))
+            // Nothing uploads a local file on this platform, and sent as text the path would leak a folder name.
+            logW("assignPredefined", "a local picture path can only be uploaded on iOS and visionOS, the value is dropped")
+            return false
+            #else
             let path = String(describing: value)
             // An unreadable path would produce a multipart request with no file,
             // which the server rejects, so it is dropped here instead.
@@ -349,6 +353,7 @@ final class UserProfileModule: ModuleBase {
                 pictureLocalPath = path
             }
             return true
+            #endif
 
         case UserProfileKey.birthYear:
             guard !isNull else {

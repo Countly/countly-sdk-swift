@@ -61,27 +61,31 @@ final class ConnectionTestModule: ModuleBase {
         let feature: String
         /// Rows with no legitimate 4xx answer, where anything but a 2xx is a fault.
         let requiresSuccessStatus: Bool
+        /// Pages and assets a web view loads. The web view sends none of the SDK's
+        /// custom headers and does not use its certificate pinning, so these rows
+        /// are probed without either, the way the web view reaches them.
+        let loadedByWebView: Bool
         /// Empty for the `sc` row, which is measured from the fetch that armed us.
         let paths: [String]
     }
 
     /// Feature rows in report order.
     static let rows: [ProbeRow] = [
-        ProbeRow(feature: "core", requiresSuccessStatus: true, paths: ["/o/ping"]),
-        ProbeRow(feature: "core-write", requiresSuccessStatus: false, paths: ["/i"]),
-        ProbeRow(feature: "sc", requiresSuccessStatus: false, paths: []),
-        ProbeRow(feature: "rc", requiresSuccessStatus: false, paths: ["/o/sdk?method=rc"]),
-        ProbeRow(feature: "ab", requiresSuccessStatus: false, paths: ["/o/sdk?method=ab_fetch_variants"]),
-        ProbeRow(feature: "feedback", requiresSuccessStatus: false, paths: ["/o/sdk?method=feedback"]),
-        ProbeRow(feature: "feedback-widget", requiresSuccessStatus: false,
-                 paths: ["/o/surveys/nps/widget", "/o/surveys/survey/widget", "/o/feedback/widget"]),
-        ProbeRow(feature: "feedback-submit", requiresSuccessStatus: false, paths: ["/i/feedback/inputs"]),
-        ProbeRow(feature: "content", requiresSuccessStatus: false, paths: ["/o/sdk/content"]),
-        ProbeRow(feature: "feedback-page", requiresSuccessStatus: false,
+        ProbeRow(feature: "core", requiresSuccessStatus: true, loadedByWebView: false, paths: ["/o/ping"]),
+        ProbeRow(feature: "core-write", requiresSuccessStatus: false, loadedByWebView: false, paths: ["/i"]),
+        ProbeRow(feature: "sc", requiresSuccessStatus: false, loadedByWebView: false, paths: []),
+        ProbeRow(feature: "rc", requiresSuccessStatus: false, loadedByWebView: false, paths: ["/o/sdk?method=rc"]),
+        ProbeRow(feature: "ab", requiresSuccessStatus: false, loadedByWebView: false, paths: ["/o/sdk?method=ab_fetch_variants"]),
+        ProbeRow(feature: "feedback", requiresSuccessStatus: false, loadedByWebView: false, paths: ["/o/sdk?method=feedback"]),
+        ProbeRow(feature: "feedback-widget", requiresSuccessStatus: false, loadedByWebView: false,
+                 paths: ["/o/surveys/nps/widget", "/o/surveys/survey/widget", "/o/feedback/widget", "/o/surveys/rating/widget"]),
+        ProbeRow(feature: "feedback-submit", requiresSuccessStatus: false, loadedByWebView: false, paths: ["/i/feedback/inputs"]),
+        ProbeRow(feature: "content", requiresSuccessStatus: false, loadedByWebView: false, paths: ["/o/sdk/content"]),
+        ProbeRow(feature: "feedback-page", requiresSuccessStatus: false, loadedByWebView: true,
                  paths: ["/feedback/nps", "/feedback/survey", "/feedback/rating"]),
-        ProbeRow(feature: "feedback-assets", requiresSuccessStatus: true,
+        ProbeRow(feature: "feedback-assets", requiresSuccessStatus: true, loadedByWebView: true,
                  paths: ["/surveys/images/ct-probe.png", "/star-rating/images/ct-probe.png"]),
-        ProbeRow(feature: "content-page", requiresSuccessStatus: false, paths: ["/_external/content/"]),
+        ProbeRow(feature: "content-page", requiresSuccessStatus: false, loadedByWebView: true, paths: ["/_external/content/"]),
     ]
 
     /// Raw outcome of one probe request, before grading.
@@ -159,13 +163,24 @@ final class ConnectionTestModule: ModuleBase {
 
     /// Runs the battery off the calling thread, once per delivery.
     ///
-    /// - Parameter serverConfigLatencyMs: Wall clock of the fetch that delivered
-    ///   `ct`, reported as the `sc` row. Negative when unknown, which omits the row.
-    func startBattery(serverConfigLatencyMs: Int64) {
+    /// - Parameters:
+    ///   - serverConfigLatencyMs: Wall clock of the fetch that delivered `ct`,
+    ///     reported as the `sc` row. Negative when unknown, which omits the row.
+    ///   - identity: the user the arming fetch was made for, whom the report is
+    ///     filed under; `nil` files it under the current one.
+    ///   - mergesAtArming: the device ID merges counted when the arming fetch was
+    ///     made. A merge since then cancels the run on the server, so the report is
+    ///     dropped.
+    func startBattery(serverConfigLatencyMs: Int64, armedFor identity: ArmedIdentity? = nil, mergesAtArming: Int? = nil) {
         // The spec does not cover it: honouring the operator's own kill switch was
         // judged safer than probe traffic.
         guard core.serverConfig.networkingEnabled else {
             logD("startBattery", "networking is disabled by behavior settings, the armed connection test is ignored")
+            return
+        }
+
+        guard core.serverConfig.trackingEnabled else {
+            logW("startBattery", "tracking is disabled by behavior settings, so the report could not be queued, the armed connection test is skipped")
             return
         }
 
@@ -174,6 +189,7 @@ final class ConnectionTestModule: ModuleBase {
             return
         }
 
+        let mergesAtArming = mergesAtArming ?? core.modules.deviceID.mergeCount
         logI("startBattery", "connection test armed by the server, running the probe battery, serverConfigLatencyMs: [\(serverConfigLatencyMs)]")
 
         // The core is captured strongly for the life of the battery: the module
@@ -181,14 +197,21 @@ final class ConnectionTestModule: ModuleBase {
         // running. The halted flag then drops the report.
         DispatchQueue.global(qos: .utility).async { [weak self, core] in
             guard let self else { return }
-            self.runBatteryAndReport(serverConfigLatencyMs: serverConfigLatencyMs, serverURL: core.config.normalizedHost)
+            self.runBatteryAndReport(serverConfigLatencyMs: serverConfigLatencyMs,
+                                     armedFor: identity,
+                                     mergesAtArming: mergesAtArming,
+                                     serverURL: core.config.normalizedHost)
             self.releaseBattery()
         }
     }
 
     /// Runs every row in order and queues the report, unless the instance was
-    /// halted meanwhile.
-    func runBatteryAndReport(serverConfigLatencyMs: Int64, serverURL: String) {
+    /// halted or the armed user was merged away meanwhile.
+    ///
+    /// - Parameters:
+    ///   - identity: the user the report is filed under, `nil` for the current one.
+    ///   - mergesAtArming: the device ID merges counted when the test was armed.
+    func runBatteryAndReport(serverConfigLatencyMs: Int64, armedFor identity: ArmedIdentity?, mergesAtArming: Int, serverURL: String) {
         let results = runBattery(serverConfigLatencyMs: serverConfigLatencyMs, serverURL: serverURL)
 
         guard !isHalted else {
@@ -196,9 +219,14 @@ final class ConnectionTestModule: ModuleBase {
             return
         }
 
+        guard core.modules.deviceID.mergeCount == mergesAtArming else {
+            logD("runBatteryAndReport", "the device ID was changed with merge during the battery, which cancels the run on the server, the report is dropped")
+            return
+        }
+
         let report = buildReport(results)
         logD("runBatteryAndReport", "queueing the connection test report, rowCount: [\(results.count)], reportLength: [\(report.count)]")
-        core.network.sendConnectionTestResults(report)
+        core.network.sendConnectionTestResults(report, armedFor: identity)
     }
 
     /// Probes every row sequentially against `serverURL`. Rows not reached before
@@ -240,7 +268,7 @@ final class ConnectionTestModule: ModuleBase {
             if isHalted { break }
 
             let url = Self.probeURL(path: path, serverURL: serverURL)
-            let outcome = transport.probe(url, timeout: perRequestTimeout)
+            let outcome = transport.probe(url, timeout: perRequestTimeout, loadedByWebView: row.loadedByWebView)
             result.latencyMs += outcome.latencyMs
 
             let failure = Self.grade(status: outcome.status, failure: outcome.failure, requiresSuccessStatus: row.requiresSuccessStatus)
@@ -353,14 +381,18 @@ final class ConnectionTestModule: ModuleBase {
 /// Issues one probe. A protocol so tests can swap the network out.
 protocol ProbeTransport: AnyObject {
     /// One bare GET, waited for synchronously.
-    func probe(_ url: URL, timeout: TimeInterval) -> ConnectionTestModule.ProbeOutcome
+    ///
+    /// - Parameter loadedByWebView: whether a web view loads this path, which then
+    ///   goes out without the SDK's custom headers and certificate pinning.
+    func probe(_ url: URL, timeout: TimeInterval, loadedByWebView: Bool) -> ConnectionTestModule.ProbeOutcome
     /// Called once the battery is over, so a transport can release what it built.
     func batteryFinished()
 }
 
 /// The default transport: a session built from the SDK's own configuration, so
 /// probes ride the same custom headers and, through the delegate, the same
-/// certificate pinning. Caching is off and redirects are not followed.
+/// certificate pinning, and a bare one for what a web view loads. Caching is off
+/// and redirects are not followed.
 final class URLSessionProbeTransport: NSObject, ProbeTransport {
 
     /// Held weakly: the core owns the module that owns this transport, and a
@@ -369,13 +401,14 @@ final class URLSessionProbeTransport: NSObject, ProbeTransport {
 
     private let sessionLock = NSLock()
     private var session: URLSession?
+    private var webViewSession: URLSession?
 
     init(core: SDKCore) {
         self.core = core
         super.init()
     }
 
-    func probe(_ url: URL, timeout: TimeInterval) -> ConnectionTestModule.ProbeOutcome {
+    func probe(_ url: URL, timeout: TimeInterval, loadedByWebView: Bool) -> ConnectionTestModule.ProbeOutcome {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
@@ -387,7 +420,8 @@ final class URLSessionProbeTransport: NSObject, ProbeTransport {
         var failure: String?
         let start = Date()
 
-        let task = probeSession(timeout: timeout).dataTask(with: request) { _, response, error in
+        let session = loadedByWebView ? webViewProbeSession(timeout: timeout) : probeSession(timeout: timeout)
+        let task = session.dataTask(with: request) { _, response, error in
             resultLock.lock()
             if let error {
                 failure = (error as NSError).code == NSURLErrorTimedOut ? ConnectionTestModule.Reason.timeout : ConnectionTestModule.Reason.transport
@@ -422,10 +456,13 @@ final class URLSessionProbeTransport: NSObject, ProbeTransport {
 
     func batteryFinished() {
         sessionLock.lock()
-        let built = session
+        let built = [session, webViewSession]
         session = nil
+        webViewSession = nil
         sessionLock.unlock()
-        built?.finishTasksAndInvalidate()
+        for session in built {
+            session?.finishTasksAndInvalidate()
+        }
     }
 
     /// One session per battery, on a copy of the SDK's configuration so its
@@ -457,6 +494,36 @@ final class URLSessionProbeTransport: NSObject, ProbeTransport {
         session = built
         return built
     }
+
+    /// One session per battery for what a web view loads: no custom headers and
+    /// default trust handling, as the web view has. A URL protocol the application
+    /// installed still applies, so an offline setup keeps routing these too.
+    private func webViewProbeSession(timeout: TimeInterval) -> URLSession {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        if let webViewSession { return webViewSession }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        if let protocolClasses = core?.config.urlSessionConfiguration.protocolClasses {
+            configuration.protocolClasses = protocolClasses
+        }
+        configuration.timeoutIntervalForRequest = timeout
+        configuration.timeoutIntervalForResource = timeout
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        configuration.urlCache = nil
+        configuration.httpShouldSetCookies = false
+
+        let built = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+        webViewSession = built
+        return built
+    }
+
+    /// Whether `session` is the one for what a web view loads.
+    private func isWebViewSession(_ session: URLSession) -> Bool {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        return session === webViewSession
+    }
 }
 
 extension URLSessionProbeTransport: URLSessionTaskDelegate {
@@ -477,7 +544,7 @@ extension URLSessionProbeTransport: URLSessionTaskDelegate {
     func urlSession(_ session: URLSession,
                     didReceive challenge: URLAuthenticationChallenge,
                     completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-        guard let core, !core.config.pinnedCertificates.isEmpty else {
+        guard let core, !core.config.pinnedCertificates.isEmpty, !isWebViewSession(session) else {
             completionHandler(.performDefaultHandling, nil)
             return
         }

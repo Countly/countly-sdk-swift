@@ -230,6 +230,13 @@ final class FeedbackModule: ModuleBase {
                                 self.logI("present", "widget dismissed, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
                                 self.recordDismissal(for: widget)
                                 self.presentedWidgetManagers.removeAll { $0 === manager }
+                            },
+                            refused: { [weak self, weak manager] in
+                                // Never shown, so nothing is recorded: a dismissal would count as an answer the user never gave.
+                                callback?(.closed)
+                                guard let self else { return }
+                                self.logI("present", "widget is not shown, another content or feedback overlay is on screen, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
+                                self.presentedWidgetManagers.removeAll { $0 === manager }
                             })
         }
         #else
@@ -271,7 +278,7 @@ final class FeedbackModule: ModuleBase {
     /// - Parameter surface: the size the widget will be shown in. It goes into
     ///   `custom` because the widget templates lay themselves out from it, not from
     ///   anything they can measure on their own.
-    private func widgetURL(for widget: CountlyFeedbackWidget, surface: CGSize) -> URL? {
+    func widgetURL(for widget: CountlyFeedbackWidget, surface: CGSize) -> URL? {
         var urlString = "\(core.config.normalizedHost)\(Endpoint.feedback)/\(widget.type.wireName)"
 
         var queryItems = [
@@ -298,8 +305,13 @@ final class FeedbackModule: ModuleBase {
 
         // Tells the page it is being shown inside the SDK's own container, and for
         // a newer widget version that it should render its own close control.
-        let custom = Self.customParameters(rendersOwnCloseControl: widget.widgetVersion != nil,
+        var custom = Self.customParameters(rendersOwnCloseControl: widget.widgetVersion != nil,
                                            surface: surface)
+        // The page records the answers itself, so the global segmentation has to travel to it.
+        let globalSegmentation = core.modules.content.currentGlobalSegmentation
+        if !globalSegmentation.isEmpty {
+            custom["sg"] = globalSegmentation
+        }
         urlString += "&custom=\(CountlyJSON.escapedString(from: custom, logger: log))"
 
         let finalURL = DeviceMetrics.urlStringByAppendingThemeMode(urlString)
@@ -458,6 +470,7 @@ final class FeedbackModule: ModuleBase {
         payload[Key.platform] = DeviceMetrics.osName
         payload[Key.appVersion] = DeviceMetrics.appVersion
         payload[Key.widgetID] = widget.id
+        payload = core.modules.content.withGlobalSegmentation(payload) ?? payload
 
         logI("recordWidgetEvent", "widget result submitted, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)], submittedFieldCount: [\(segmentation.count)]")
 
@@ -495,6 +508,7 @@ final class FeedbackModule: ModuleBase {
         segmentation[Key.email] = email.map { limits.truncatedValue($0, "rating widget email") }
         segmentation[Key.comment] = comment.map { limits.truncatedValue($0, "rating widget comment") }
         segmentation[Key.contactMe] = userCanBeContacted
+        segmentation = core.modules.content.withGlobalSegmentation(segmentation) ?? segmentation
 
         // The rating, the comment and the email are what the end user typed.
         logV("recordRatingWidget", "rating widget result detail, widgetID: [\(widgetID)], rating: [\(rating)], email: [\(email ?? "")], comment: [\(comment ?? "")]")

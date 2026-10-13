@@ -74,8 +74,6 @@ final class EventsModule: ModuleBase {
                      sum: Double = 0,
                      duration: TimeInterval = 0) {
         logI("recordEvent", "recording an event, key: [\(key)], segmentationKeyCount: [\(segmentation?.count ?? 0)], count: [\(count)], sum: [\(sum.logValue)], duration: [\(duration.logSeconds)]")
-        logD("recordEvent", "event segmentation keys, key: [\(key)], segmentationKeys: [\(segmentation?.keys.sorted() ?? [])]")
-        logV("recordEvent", "event segmentation detail, key: [\(key)], segmentation: [\(segmentation ?? [:])]")
 
         if let reservedConsent = consentForReservedEvent(key) {
             guard reservedConsent else {
@@ -106,6 +104,7 @@ final class EventsModule: ModuleBase {
         if providedKeyCount != acceptedKeyCount {
             logD("recordEvent", "some segmentation entries were removed by the server config filter or the segmentation limits, key: [\(key)], providedKeyCount: [\(providedKeyCount)], acceptedKeyCount: [\(acceptedKeyCount)], acceptedKeys: [\(sanitized?.keys.sorted() ?? [])]")
         }
+        logV("recordEvent", "event segmentation detail as recorded, key: [\(key)], segmentation: [\(sanitized ?? [:])]")
 
         record(key: key,
                segmentation: sanitized,
@@ -198,7 +197,6 @@ final class EventsModule: ModuleBase {
     func endEvent(_ key: String, segmentation: [String: Any]? = nil, count: Int = 1, sum: Double = 0) {
         logI("endEvent", "ending a timed event, key: [\(key)], segmentationKeyCount: [\(segmentation?.count ?? 0)], count: [\(count)], sum: [\(sum.logValue)]")
         logD("endEvent", "timed event end segmentation keys, key: [\(key)], segmentationKeys: [\(segmentation?.keys.sorted() ?? [])]")
-        logV("endEvent", "timed event end segmentation detail, key: [\(key)], segmentation: [\(segmentation ?? [:])]")
 
         guard core.modules.consent.hasConsent(for: .events) else {
             logD("endEvent", "no consent given for events, the timed event will not be ended, key: [\(key)]")

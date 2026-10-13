@@ -89,22 +89,30 @@ final class CrashHandlerInstaller {
     // MARK: - Installation
 
     private func install() {
-        previousUncaughtExceptionHandler = NSGetUncaughtExceptionHandler()
-        NSSetUncaughtExceptionHandler(countlyUncaughtExceptionHandler)
+        let currentExceptionHandler = NSGetUncaughtExceptionHandler()
+        // Still ours when a handler installed after the last uninstall kept it in its chain; its saved predecessor stands.
+        if !Self.isCountlyExceptionHandler(currentExceptionHandler) {
+            previousUncaughtExceptionHandler = currentExceptionHandler
+            NSSetUncaughtExceptionHandler(countlyUncaughtExceptionHandler)
+        }
 
         #if os(iOS) || os(tvOS) || os(visionOS) || os(macOS)
-        previousSignalActions.removeAll()
         for signalCode in Self.handledSignals {
-            var previous = sigaction()
-            sigaction(signalCode, nil, &previous)
+            var current = sigaction()
+            sigaction(signalCode, nil, &current)
+
+            if Self.isCountlySignalAction(current) { continue }
 
             // A host that ignores a signal has decided the process survives it,
             // SIGPIPE on a closed socket being the usual case. A handler here
             // would report a crash that never happens, and the default action
             // restored afterwards would kill the process on the next one.
-            guard !Self.isIgnored(previous) else { continue }
+            guard !Self.isIgnored(current) else {
+                previousSignalActions.removeValue(forKey: signalCode)
+                continue
+            }
 
-            previousSignalActions[signalCode] = previous
+            previousSignalActions[signalCode] = current
             signal(signalCode, countlySignalHandler)
         }
         #endif
@@ -116,15 +124,36 @@ final class CrashHandlerInstaller {
         return unsafeBitCast(handler, to: Int.self) == unsafeBitCast(SIG_IGN, to: Int.self)
     }
 
+    /// Whether a disposition is the SDK's own signal handler.
+    static func isCountlySignalAction(_ action: sigaction) -> Bool {
+        guard let handler = action.__sigaction_u.__sa_handler else { return false }
+        return unsafeBitCast(handler, to: Int.self) == unsafeBitCast(countlySignalHandler, to: Int.self)
+    }
+
+    /// Whether an uncaught exception handler is the SDK's own.
+    static func isCountlyExceptionHandler(_ handler: (@convention(c) (NSException) -> Void)?) -> Bool {
+        guard let handler else { return false }
+        return unsafeBitCast(handler, to: Int.self) == unsafeBitCast(countlyUncaughtExceptionHandler, to: Int.self)
+    }
+
     /// Puts back the disposition every handled signal had before the SDK's.
     ///
     /// A host's or another SDK's handler gets its signal again, and one that was
     /// left at the default goes back to the default. Safe to repeat, and called
     /// from the signal handler, where only `sigaction` is used.
-    fileprivate func restorePreviousSignalActions() {
+    ///
+    /// - Parameter onlyWhereLive: puts a disposition back only while the SDK's
+    ///   own is the live one. A handler installed later chains to the SDK's, and
+    ///   restoring over it would cut it out.
+    fileprivate func restorePreviousSignalActions(onlyWhereLive: Bool = false) {
         #if os(iOS) || os(tvOS) || os(visionOS) || os(macOS)
         for signalCode in Self.handledSignals {
             guard var previous = previousSignalActions[signalCode] else { continue }
+            if onlyWhereLive {
+                var current = sigaction()
+                sigaction(signalCode, nil, &current)
+                guard Self.isCountlySignalAction(current) else { continue }
+            }
             sigaction(signalCode, &previous, nil)
         }
         #endif
@@ -134,8 +163,10 @@ final class CrashHandlerInstaller {
         // The pointer is left in place: `uninstall` runs from inside the crash
         // path (the handler stops reporting once it has recorded), and the handler
         // still has to chain to it afterwards.
-        NSSetUncaughtExceptionHandler(previousUncaughtExceptionHandler)
-        restorePreviousSignalActions()
+        if Self.isCountlyExceptionHandler(NSGetUncaughtExceptionHandler()) {
+            NSSetUncaughtExceptionHandler(previousUncaughtExceptionHandler)
+        }
+        restorePreviousSignalActions(onlyWhereLive: true)
     }
 
     /// Chains to whatever handler was installed before the SDK's.

@@ -118,6 +118,8 @@ Add `.pushNotifications` to `config.features` and the SDK takes over the two app
 
 Set `config.disableAutomaticPushHandling = true` to keep the SDK out of both delegates and forward the callbacks yourself.
 
+Push belongs to the default instance, `Countly.shared`. The token and the notification taps belong to the whole process, so a named instance that enables push registers for nothing and reports nothing.
+
 Action buttons and media attachments need a notification service extension:
 
 ```swift

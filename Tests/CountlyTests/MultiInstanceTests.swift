@@ -406,7 +406,7 @@ final class MultiInstanceTests: CountlyBaseTestCase {
         first.halt()
 
         let second = start(baseConfig(instanceName: name))
-        second.serverConfigDidChange(haltedSettings, consentBecameRequired: true)
+        second.serverConfigDidChange(haltedSettings, consentBecameRequired: true, changedKeys: [ServerConfig.Key.consentRequired])
 
         XCTAssertFalse(requestQueue(of: second).contains { $0.contains("consent=") },
                        "the halted run's settings resent consent on the next run")

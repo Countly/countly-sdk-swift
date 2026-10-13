@@ -239,6 +239,25 @@ final class NetworkingTests: CountlyBaseTestCase {
         XCTAssertEqual(request["app_key"] as? String, Self.appKey)
     }
 
+    /// Keys and values are encoded by the SDK, so a value carrying the query
+    /// separators arrives whole instead of splitting into parameters of its own.
+    func testADirectRequestEncodesItsKeysAndValues() throws {
+        let countly = startInstance()
+
+        countly.addDirectRequest([
+            "note": "a&b=c d+e/ü",
+            "spaced key": "1",
+        ])
+
+        let raw = try XCTUnwrap(requestQueue(of: countly).last { $0.contains("dr=1") })
+        XCTAssertTrue(raw.contains("&note=a%26b%3Dc%20d%2Be%2F%C3%BC"), raw)
+        XCTAssertTrue(raw.contains("&spaced%20key=1"), raw)
+        let request = TestUtils.parseQuery(raw)
+        XCTAssertEqual(request["note"] as? String, "a&b=c d+e/ü")
+        XCTAssertNil(request["b"], "the value split into a parameter of its own")
+        TestUtils.assertBaseParameters(request)
+    }
+
     func testAnEmptyDirectRequestQueuesNothing() {
         let countly = startInstance()
         let before = requestQueue(of: countly).count

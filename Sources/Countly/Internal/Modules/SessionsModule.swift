@@ -21,6 +21,10 @@ final class SessionsModule: ModuleBase {
     /// Whether a session is currently open.
     private(set) var isSessionStarted = false
 
+    /// Whether the open session was begun by the SDK rather than by the host
+    /// application, which is the only kind a runtime switch to manual sessions ends.
+    private var isSessionStartedAutomatically = false
+
     /// When the current stretch of foreground time began.
     private var lastSessionStartTime: TimeInterval = 0
 
@@ -96,15 +100,14 @@ final class SessionsModule: ModuleBase {
     /// Nothing is sent while suspended: `suspend` has already flushed the events
     /// and closed the session, and a tick landing afterwards would reopen work the
     /// SDK just finished.
-    private func onUpdateTimer() {
-        // Every tick uploads the gathered log lines too, for a buffer that never
-        // reaches the batch size.
-        core.logGatherer.scheduleFlush()
-
+    func onUpdateTimer() {
         guard !isSuspended else {
             logD("onUpdateTimer", "the SDK is suspended, this session update tick will be skipped entirely")
             return
         }
+
+        // Only in the foreground: a suspended app that kept flushing would queue a batch of its own lines every tick.
+        core.logGatherer.scheduleFlush()
 
         if core.serverConfig.automaticSessionTrackingEnabled || core.config.enableManualSessionControlHybridMode {
             updateSession()
@@ -118,7 +121,10 @@ final class SessionsModule: ModuleBase {
     // MARK: - Session lifecycle
 
     /// Opens a session.
-    func beginSession() {
+    ///
+    /// - Parameter automatically: whether the SDK begins it on its own, as automatic
+    ///   session tracking does, rather than the host application.
+    func beginSession(automatically: Bool = false) {
         logI("beginSession", "session begin requested, isSessionStarted: [\(isSessionStarted)], automaticSessionTracking: [\(core.serverConfig.automaticSessionTrackingEnabled)]")
 
         guard core.modules.consent.hasConsent(for: .sessions) else {
@@ -149,6 +155,7 @@ final class SessionsModule: ModuleBase {
         }
 
         isSessionStarted = true
+        isSessionStartedAutomatically = automatically
         lastSessionStartTime = Date().timeIntervalSince1970
         unsentSessionLength = 0
 
@@ -222,6 +229,7 @@ final class SessionsModule: ModuleBase {
         }
 
         isSessionStarted = false
+        isSessionStartedAutomatically = false
 
         let duration = sessionLengthInSeconds()
         var queryString = core.network.builder.queryEssentials()
@@ -314,13 +322,33 @@ final class SessionsModule: ModuleBase {
         logD("resume", "restarting session handling after resume, automaticSessions: [\(core.serverConfig.automaticSessionTrackingEnabled)]")
 
         if core.serverConfig.automaticSessionTrackingEnabled {
-            beginSession()
+            beginSession(automatically: true)
         } else {
             logD("resume", "sessions are driven manually, no session will be started on resume, hybridMode: [\(core.config.enableManualSessionControlHybridMode)]")
         }
 
         core.modules.views.applicationWillEnterForeground()
         isSuspended = false
+    }
+
+    /// Brings the session in line with automatic session tracking after the
+    /// behavior settings switched it at runtime.
+    ///
+    /// Switched on, a session begins unless one is open or the SDK is suspended.
+    /// Switched off, a session the SDK began itself ends; one the host application
+    /// began is left to it.
+    func applyAutomaticSessionTracking() {
+        guard core.hasStarted else { return }
+
+        if core.serverConfig.automaticSessionTrackingEnabled {
+            guard !isSuspended, !isSessionStarted else { return }
+            logD("applyAutomaticSessionTracking", "automatic session tracking is on and no session is running, a session will be started")
+            beginSession(automatically: true)
+        } else if isSessionStarted, isSessionStartedAutomatically {
+            logD("applyAutomaticSessionTracking", "automatic session tracking is off, the session the SDK started will be ended")
+            core.modules.events.sendEventsWithSaveIfNeeded()
+            endSession()
+        }
     }
 
     // MARK: - Lifecycle
@@ -341,6 +369,7 @@ final class SessionsModule: ModuleBase {
         logD("halt", "sessions module is halting, the session state will be dropped without an end session request, isSessionStarted: [\(isSessionStarted)], unsentSessionLengthSeconds: [\(unsentSessionLength.logSeconds)]")
         stopUpdateTimer()
         isSessionStarted = false
+        isSessionStartedAutomatically = false
         isSuspended = false
         unsentSessionLength = 0
         lastSessionStartTime = 0

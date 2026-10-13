@@ -341,7 +341,8 @@ final class ConnectionManager: NSObject {
                                        request: request,
                                        callback: callback,
                                        callbackID: callbackID,
-                                       response: response)
+                                       response: response,
+                                       isSdkLogsTransport: isSdkLogsTransport)
                 } else {
                     self.handleServerFailure(statusCode: statusCode,
                                              data: data,
@@ -377,7 +378,8 @@ final class ConnectionManager: NSObject {
                                request: URLRequest,
                                callback: RequestCallback?,
                                callbackID: String?,
-                               response: URLResponse?) {
+                               response: URLResponse?,
+                               isSdkLogsTransport: Bool) {
         core.logger.d(Self.module, "proceedOnQueue", "request completed successfully and will be removed from the queue, endpoint: [\(request.url?.path ?? "")], statusCode: [\((response as? HTTPURLResponse)?.statusCode ?? 0)], duration: [\(elapsed.logSeconds)]")
 
         deliver(callback, callbackID: callbackID, response: response.map { String(describing: $0) }, success: true)
@@ -388,6 +390,10 @@ final class ConnectionManager: NSObject {
         // The flag is released only after the head is gone. Releasing it earlier
         // would let a concurrent caller re-send the request that just succeeded.
         releaseProcessing()
+
+        if isSdkLogsTransport {
+            core.logGatherer.queuedBatchWasSent()
+        }
 
         if core.serverConfig.backoffMechanism, shouldBackOff(responseTimeSeconds: Int(elapsed), queryString: queryString) {
             core.logger.d(Self.module, "proceedOnQueue", "stopping queue processing, reason: backoff is triggered, responseTimeSeconds: [\(Int(elapsed))], queuedRequestCount: [\(core.requestQueueStore.count)]")
@@ -532,13 +538,19 @@ final class ConnectionManager: NSObject {
 
     // MARK: - Operator armed diagnostics
 
-    /// Queues one connection test report as its own request.
+    /// Queues one connection test report as its own request, filed under the user
+    /// the server armed the test for.
     ///
     /// No consent gate, by cross SDK rule: the report describes the network the
     /// device is on, not the user, and the health check bypasses consent on the
-    /// same grounds. The queue's own rules still govern it.
-    func sendConnectionTestResults(_ resultsJSON: String) {
-        guard enqueueDiagnostic(key: QS.connectionTestResults, payload: resultsJSON) else {
+    /// same grounds. Like every request it carries the device ID. The queue's own
+    /// rules still govern it.
+    ///
+    /// - Parameter identity: the user the arming fetch was made for, `nil` for the
+    ///   current one.
+    func sendConnectionTestResults(_ resultsJSON: String, armedFor identity: ArmedIdentity?) {
+        let essentials = identity.map { builder.queryEssentials(deviceID: $0.deviceID, typeValue: $0.typeValue) }
+        guard enqueueDiagnostic(key: QS.connectionTestResults, payload: resultsJSON, essentials: essentials) else {
             core.logger.d(Self.module, "sendConnectionTestResults", "the connection test report is dropped, the instance is halted or tracking is disabled, reportLength: [\(resultsJSON.count)]")
             return
         }
@@ -548,9 +560,12 @@ final class ConnectionManager: NSObject {
     /// Queues one operator armed diagnostic payload as its own request and starts
     /// a drain. Returns whether the store took it: a halted instance and tracking
     /// switched off are the two reasons it would not.
-    private func enqueueDiagnostic(key: String, payload: String) -> Bool {
+    ///
+    /// - Parameter essentials: the base parameters to file it under, `nil` for the
+    ///   current user's.
+    private func enqueueDiagnostic(key: String, payload: String, essentials: String? = nil) -> Bool {
         guard core.hasStarted, core.serverConfig.trackingEnabled else { return false }
-        enqueueAndProceed("\(builder.queryEssentials())&\(key)=\(payload.urlEscaped)")
+        enqueueAndProceed("\(essentials ?? builder.queryEssentials())&\(key)=\(payload.urlEscaped)")
         return true
     }
 
@@ -1077,6 +1092,12 @@ extension ConnectionManager {
         core.logger.d(Self.module, "sendSdkLogs", "a gathered log batch is queued, payloadLength: [\(payload.count)]")
         return true
     }
+
+    /// Whether a gathered log batch still waits in the request queue.
+    var hasQueuedSdkLogs: Bool {
+        let marker = "&\(QS.sdkLogs)="
+        return core.requestQueueStore.containsRequest { $0.contains(marker) }
+    }
 }
 
 // MARK: - Instant requests
@@ -1089,6 +1110,14 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
 
     var deviceID: String {
         core.modules.deviceID.deviceID
+    }
+
+    var deviceIDTypeValue: Int {
+        core.modules.deviceID.deviceIDType.wireValue
+    }
+
+    var deviceIDMergeCount: Int {
+        core.modules.deviceID.mergeCount
     }
 
     /// Sends the health check outside the queue.

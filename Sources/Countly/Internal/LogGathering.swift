@@ -197,6 +197,8 @@ protocol LogGatheringTransport: AnyObject {
     func hasConsent(for feature: ConsentFeature) -> Bool
     /// Queues one `sdk_logs` batch. Returns whether the queue took it.
     func sendSdkLogs(_ payload: String) -> Bool
+    /// Whether a gathered batch still waits in the request queue.
+    var hasQueuedSdkLogs: Bool { get }
 }
 
 /// Gathers the SDK's own log lines for one instance and uploads them as
@@ -237,6 +239,10 @@ final class LogGatherer {
     /// message long, so a line count alone is not a bound on memory.
     static let charCeiling = 128 * 1024
 
+    /// Held characters that ask for a delivery before a batch is full, so long
+    /// lines go out instead of being trimmed at the ceiling first.
+    static let deliveryCharThreshold = charCeiling * 3 / 4
+
     /// A line that quotes an uploaded batch is never gathered, or every batch
     /// would nest the previous one and an idle SDK would gather forever.
     static let transportMarker = QS.sdkLogs
@@ -264,6 +270,19 @@ final class LogGatherer {
         let gatherID: String
     }
 
+    /// The scope and level of a line dropped before both were decided on.
+    private struct DropKey: Hashable {
+        let scope: LogGatheringScope
+        let level: String
+    }
+
+    /// What became of a batch handed to the request queue.
+    private enum UploadOutcome {
+        case queued
+        case refused
+        case unserializable
+    }
+
     /// Guards every field below it. Nothing is logged while it is held: logging
     /// re-enters `capture`, which takes the same lock.
     private let lock = NSLock()
@@ -281,8 +300,19 @@ final class LogGatherer {
     private var initFinished = false
     private var nextSequence: UInt64 = 0
 
-    /// Lines dropped from the buffer before init decided their consent, by scope.
-    private var droppedBeforeInit: [LogGatheringScope: Int] = [:]
+    /// Lines dropped before init decided their consent or a directive decided the
+    /// wanted levels. Only the consented, wanted ones count toward `d`.
+    private var undecidedDrops: [DropKey: Int] = [:]
+
+    /// Whether a delivery left lines behind for a batch still in the request queue,
+    /// so the next one runs once that batch is sent.
+    private var awaitsQueuedBatch = false
+
+    /// Lines captured before this were held when a flush found a batch still in
+    /// the request queue. The deliveries that follow take a partial batch only
+    /// while one of them is left, so the lines logged meanwhile, sending
+    /// included, cannot keep the chain going.
+    private var flushThroughSequence: UInt64?
 
     /// Where the lines of a device ID change in progress begin.
     private var deviceIDChangeMark: UInt64?
@@ -370,11 +400,12 @@ final class LogGatherer {
 
     /// Applies a directive from a live response to what is held.
     ///
-    /// Off drops everything held speculatively. Gathering adopts the held lines
-    /// and those awaiting consent, filtered to the requested levels, unless they
-    /// belong to a different gather that was already running, in which case they
-    /// are dropped because the server rejects a batch attributed to a gather that
-    /// ended.
+    /// Off drops everything held speculatively, and a running gather's consented
+    /// lines go out once as its last batch, which the server still accepts under
+    /// that gather's id for a while. Gathering adopts the held lines and those
+    /// awaiting consent, filtered to the requested levels, unless they belong to a
+    /// different gather that was already running, in which case they are dropped
+    /// because re-arming deletes the previous gather on the server.
     func apply(_ directive: LogGatheringDirective, source: String) {
         let newState: LogGatheringState = directive.isGathering ? .gathering : .off
 
@@ -396,18 +427,28 @@ final class LogGatherer {
         state = newState
         self.directive = directive
 
+        var tail: Batch?
         let gatherReplaced = wasGathering && previousGatherID != directive.gatherID
+        if newState == .off, wasGathering, let previousGatherID, initFinished {
+            // The server accepts the last lines of a stopped gather under its id for a while; a new gather deletes the old one's.
+            tail = takeTailLocked(gatherID: previousGatherID)
+        }
         if newState == .off || gatherReplaced {
             clearBufferLocked()
         } else {
             filterBufferLocked()
+            adoptUndecidedDropsLocked()
             trimBufferLocked()
         }
         let held = lines.count
         let awaiting = awaitingConsent.count
         lock.unlock()
 
-        logger?.d(Self.module, "apply", "the log gathering directive is applied, source: [\(source)], gathering: [\(directive.isGathering)], gatherID: [\(directive.gatherID ?? "none")], levels: [\(directive.levels)], batchSize: [\(directive.batchSize)], heldLineCount: [\(held)], awaitingConsentLineCount: [\(awaiting)]")
+        logger?.d(Self.module, "apply", "the log gathering directive is applied, source: [\(source)], gathering: [\(directive.isGathering)], gatherID: [\(directive.gatherID ?? "none")], levels: [\(directive.levels)], batchSize: [\(directive.batchSize)], heldLineCount: [\(held)], awaitingConsentLineCount: [\(awaiting)], tailLineCount: [\(tail?.lines.count ?? 0)]")
+
+        if let tail {
+            deliverTail(tail)
+        }
 
         if newState == .gathering {
             // Adoption may hand over a buffer already past the batch size. Partial
@@ -447,8 +488,10 @@ final class LogGatherer {
         }
         initFinished = true
         redecideConsentLocked()
-        droppedCount += droppedBeforeInit.reduce(0) { $0 + (isConsentGiven(for: $1.key) ? $1.value : 0) }
-        droppedBeforeInit.removeAll()
+        undecidedDrops = undecidedDrops.filter { isConsentGiven(for: $0.key.scope) }
+        if state == .gathering {
+            adoptUndecidedDropsLocked()
+        }
         let gathering = state == .gathering
         let awaiting = awaitingConsent.count
         lock.unlock()
@@ -471,8 +514,9 @@ final class LogGatherer {
             return
         }
         let bufferedBefore = lines.count
+        let charsBefore = heldChars
         let (released, recalled) = redecideConsentLocked()
-        let completesBatch = completesBatchLocked(bufferedBefore: bufferedBefore)
+        let due = deliveryDueLocked(bufferedBefore: bufferedBefore, charsBefore: charsBefore)
         let awaiting = awaitingConsent.count
         lock.unlock()
 
@@ -480,8 +524,8 @@ final class LogGatherer {
             logger?.d(Self.module, "consentDidChange", "gathered lines are re-decided against the consent state, releasedLineCount: [\(released)], recalledLineCount: [\(recalled)], awaitingConsentLineCount: [\(awaiting)]")
         }
 
-        if completesBatch {
-            scheduleDelivery(includePartialBatch: false)
+        if due.isDue {
+            scheduleDelivery(includePartialBatch: due.includePartialBatch)
         }
     }
 
@@ -494,9 +538,27 @@ final class LogGatherer {
     /// Synchronous flush, for the paths where the process may not come back:
     /// entering the background and terminating. Nothing is persisted, so getting
     /// the tail into the request queue now is the only way it survives.
-    func flushNow() {
+    ///
+    /// - Parameter ignoringQueuedBatch: queues everything held even while a batch
+    ///   still waits in the request queue, for termination, after which nothing
+    ///   else could.
+    func flushNow(ignoringQueuedBatch: Bool = false) {
         guard isGathering else { return }
-        deliver(includePartialBatch: true)
+        deliver(includePartialBatch: true, ignoringQueuedBatch: ignoringQueuedBatch)
+    }
+
+    /// Called once a gathered batch has left the request queue. Runs the delivery
+    /// that batch held back. A partial batch goes too while lines a flush asked
+    /// for are left, since nothing else sends them while the app is in the
+    /// background.
+    func queuedBatchWasSent() {
+        lock.lock()
+        let awaited = awaitsQueuedBatch
+        awaitsQueuedBatch = false
+        lock.unlock()
+
+        guard awaited else { return }
+        scheduleDelivery(includePartialBatch: false, continuingFlush: true)
     }
 
     /// Marks the start of a device ID change, before it logs anything. Until it
@@ -537,7 +599,7 @@ final class LogGatherer {
         guard isCapturing else { return }
 
         if isGathering {
-            deliverSerialized(includePartialBatch: true)
+            deliverSerialized(includePartialBatch: true, ignoringQueuedBatch: true)
         }
 
         lock.lock()
@@ -606,14 +668,15 @@ final class LogGatherer {
         }
 
         let bufferedBefore = lines.count
+        let charsBefore = heldChars
         lines.append(line)
         heldChars += line.message.countlyLength
         trimBufferLocked()
-        let completesBatch = completesBatchLocked(bufferedBefore: bufferedBefore)
+        let due = deliveryDueLocked(bufferedBefore: bufferedBefore, charsBefore: charsBefore)
         lock.unlock()
 
-        if completesBatch {
-            scheduleDelivery(includePartialBatch: false)
+        if due.isDue {
+            scheduleDelivery(includePartialBatch: due.includePartialBatch)
         }
     }
 
@@ -656,28 +719,41 @@ final class LogGatherer {
 
     // MARK: - Delivery
 
-    private func scheduleDelivery(includePartialBatch: Bool) {
+    private func scheduleDelivery(includePartialBatch: Bool, continuingFlush: Bool = false) {
         // The request queue is not usable before init finishes; the tail goes out
         // from `sdkInitFinished`.
         guard isInitFinished else { return }
 
         deliveryQueue.async { [weak self] in
-            self?.deliver(includePartialBatch: includePartialBatch)
+            self?.deliver(includePartialBatch: includePartialBatch, continuingFlush: continuingFlush)
         }
     }
 
     /// Runs one delivery, serialized with every other.
-    private func deliver(includePartialBatch: Bool) {
+    private func deliver(includePartialBatch: Bool, ignoringQueuedBatch: Bool = false, continuingFlush: Bool = false) {
         deliveryLock.lock()
         defer { deliveryLock.unlock() }
-        deliverSerialized(includePartialBatch: includePartialBatch)
+        deliverSerialized(includePartialBatch: includePartialBatch,
+                          ignoringQueuedBatch: ignoringQueuedBatch,
+                          continuingFlush: continuingFlush)
     }
 
-    /// Uploads one batch, then keeps going while full batches remain. Lines stay
-    /// held while tracking is off, because the request queue would drop them.
-    /// Called with `deliveryLock` held.
-    private func deliverSerialized(includePartialBatch: Bool) {
+    /// Uploads what is due, one batch at a time. While an earlier batch still waits
+    /// in the request queue nothing is uploaded and the next delivery runs once it
+    /// is sent, so a device that cannot send fills the capped buffer rather than
+    /// the queue. Lines stay held while tracking is off, because the request
+    /// queue would drop them. Called with `deliveryLock` held.
+    ///
+    /// - Parameters:
+    ///   - ignoringQueuedBatch: uploads everything held, oldest first, for the
+    ///     paths after which nothing else could: a device ID change and
+    ///     termination.
+    ///   - continuingFlush: takes a partial batch while lines an earlier flush
+    ///     asked for are left, for the delivery a sent batch releases.
+    private func deliverSerialized(includePartialBatch: Bool, ignoringQueuedBatch: Bool = false, continuingFlush: Bool = false) {
         guard isInitFinished, let transport else { return }
+        // A flush asks for what is held now; what is logged while it runs waits for the next one.
+        let flushThrough = includePartialBatch ? currentSequence : nil
 
         markingTransportWork(true) {
             guard transport.isTrackingEnabled else {
@@ -685,44 +761,157 @@ final class LogGatherer {
                 return
             }
 
-            // A flush drains the full batches first and the partial tail last, so
-            // the tail is never uploaded ahead of older lines.
-            while let batch = takeBatch(includePartialBatch: includePartialBatch) {
-                guard let payload = serialize(batch) else {
-                    // Putting an unserializable batch back would make it the head of
-                    // every later delivery, so it is lost and counted.
-                    logger?.w(Self.module, "deliver", "a gathered log batch could not be serialized and is dropped, lineCount: [\(batch.lines.count)]")
-                    countAsDropped(batch)
-                    continue
+            // Full batches go first and the partial tail last, so the tail is never uploaded ahead of older lines.
+            while true {
+                if !ignoringQueuedBatch, transport.hasQueuedSdkLogs {
+                    let hasMore = holdForQueuedBatch(flushThrough: flushThrough)
+                    if hasMore {
+                        logger?.d(Self.module, "deliver", "a gathered log batch still waits in the request queue, the next one goes out once it is sent, heldLineCount: [\(heldLineCount)]")
+                    }
+                    return
                 }
 
-                logger?.d(Self.module, "deliver", "uploading a gathered log batch, lineCount: [\(batch.lines.count)], droppedCount: [\(batch.dropped)], payloadLength: [\(payload.count)]")
-                guard transport.sendSdkLogs(payload) else {
-                    restore(batch)
+                guard let batch = takeBatch(includePartialBatch: includePartialBatch, continuingFlush: continuingFlush) else {
+                    setAwaitsQueuedBatch(false)
+                    return
+                }
+
+                switch upload(batch, through: transport) {
+                case .unserializable, .queued:
+                    continue
+                case .refused:
                     return
                 }
             }
         }
     }
 
+    /// Hands one batch to the request queue, putting it back if the queue refuses
+    /// it. A batch that cannot be serialized is counted as dropped instead: put
+    /// back, it would head every later delivery.
+    private func upload(_ batch: Batch, through transport: LogGatheringTransport) -> UploadOutcome {
+        guard let payload = serialize(batch) else {
+            logger?.w(Self.module, "deliver", "a gathered log batch could not be serialized and is dropped, lineCount: [\(batch.lines.count)]")
+            countAsDropped(batch)
+            return .unserializable
+        }
+
+        logger?.d(Self.module, "deliver", "uploading a gathered log batch, lineCount: [\(batch.lines.count)], droppedCount: [\(batch.dropped)], payloadLength: [\(payload.count)]")
+        guard transport.sendSdkLogs(payload) else {
+            restore(batch)
+            return .refused
+        }
+        return .queued
+    }
+
+    /// Queues the last lines of a stopped gather once, under its id, after any
+    /// delivery already running. They are gone if the queue refuses them, since
+    /// their gather has ended.
+    private func deliverTail(_ tail: Batch) {
+        deliveryQueue.async { [weak self] in
+            guard let self, let transport = self.transport else { return }
+            self.deliveryLock.lock()
+            defer { self.deliveryLock.unlock() }
+
+            self.markingTransportWork(true) {
+                guard let payload = self.serialize(tail) else {
+                    self.logger?.d(Self.module, "deliverTail", "the last lines of the stopped gather could not be serialized and are dropped, lineCount: [\(tail.lines.count)]")
+                    return
+                }
+                self.logger?.d(Self.module, "deliverTail", "uploading the last lines of the stopped gather under its id, lineCount: [\(tail.lines.count)], droppedCount: [\(tail.dropped)]")
+                if !transport.sendSdkLogs(payload) {
+                    self.logger?.d(Self.module, "deliverTail", "the request queue refused the last lines of the stopped gather, they are dropped, lineCount: [\(tail.lines.count)]")
+                }
+            }
+        }
+    }
+
+    /// The sequence the next captured line gets.
+    private var currentSequence: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return nextSequence
+    }
+
+    /// With a batch still in the request queue, arranges for the next delivery
+    /// to run once it is sent, and returns whether anything is left for that
+    /// delivery: a full batch, or a line held when a flush asked for everything.
+    ///
+    /// - Parameter flushThrough: the sequence a flush held back here was asked
+    ///   to send up to, `nil` for a delivery of full batches.
+    private func holdForQueuedBatch(flushThrough: UInt64?) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard state == .gathering else {
+            awaitsQueuedBatch = false
+            return false
+        }
+        if let flushThrough {
+            flushThroughSequence = max(flushThroughSequence ?? 0, flushThrough)
+        }
+        awaitsQueuedBatch = deliverableCountLocked() >= directive.batchSize || holdsFlushRemainderLocked()
+        return awaitsQueuedBatch
+    }
+
+    /// Whether a line an earlier flush asked for is still deliverable, forgetting
+    /// that flush once none is.
+    private func holdsFlushRemainderLocked() -> Bool {
+        guard let flushThrough = flushThroughSequence else { return false }
+        if deliverableCountLocked() > 0, let oldest = lines.first, oldest.sequence < flushThrough {
+            return true
+        }
+        flushThroughSequence = nil
+        return false
+    }
+
+    /// Records whether a delivery waits for the batch in the request queue to be sent.
+    private func setAwaitsQueuedBatch(_ awaits: Bool) {
+        lock.lock()
+        awaitsQueuedBatch = awaits
+        lock.unlock()
+    }
+
     /// Takes up to one batch of the oldest lines, or `nil` when there is nothing
     /// to upload. The drop count travels with the batch that follows the loss and
     /// is reported once.
-    private func takeBatch(includePartialBatch: Bool) -> Batch? {
+    ///
+    /// - Parameter continuingFlush: takes a partial batch too while lines an
+    ///   earlier flush asked for are left.
+    private func takeBatch(includePartialBatch: Bool, continuingFlush: Bool = false) -> Batch? {
         lock.lock()
         defer { lock.unlock() }
 
         guard state == .gathering, let gatherID = directive.gatherID else { return nil }
-        // Lines are held in capture order, so those of a device ID change in progress are the tail.
-        let available = deviceIDChangeMark.flatMap { mark in lines.firstIndex { $0.sequence >= mark } } ?? lines.count
+        // A consent withdrawn since these lines were buffered takes them back out before they can leave.
+        redecideConsentLocked()
+        let available = deliverableCountLocked()
         guard available > 0 else { return nil }
-        if !includePartialBatch, available < directive.batchSize { return nil }
+        let mayTakePartial = includePartialBatch || (continuingFlush && holdsFlushRemainderLocked())
+        if !mayTakePartial, available < directive.batchSize { return nil }
 
         let count = min(directive.batchSize, available)
         let taken = Array(lines.prefix(count))
         lines.removeFirst(count)
         heldChars -= Self.charCount(of: taken)
         let batch = Batch(lines: taken, dropped: droppedCount, gatherID: gatherID)
+        droppedCount = 0
+        return batch
+    }
+
+    /// How many of the oldest held lines a delivery may take. Lines are held in
+    /// capture order, so those of a device ID change in progress are the tail.
+    private func deliverableCountLocked() -> Int {
+        deviceIDChangeMark.flatMap { mark in lines.firstIndex { $0.sequence >= mark } } ?? lines.count
+    }
+
+    /// Takes every held line as the last batch of a gather, its consent decided
+    /// first, or `nil` when none is left.
+    private func takeTailLocked(gatherID: String) -> Batch? {
+        redecideConsentLocked()
+        guard !lines.isEmpty else { return nil }
+        let batch = Batch(lines: lines, dropped: droppedCount, gatherID: gatherID)
+        lines.removeAll()
+        heldChars = 0
         droppedCount = 0
         return batch
     }
@@ -772,17 +961,30 @@ final class LogGatherer {
     }
 
     /// Enforces both ceilings by dropping the oldest lines and counting them.
-    /// Before init a drop is only tallied, since it counts toward `d` only if its
-    /// consent turns out to be given when init decides.
+    /// Until init has decided their consent and a directive the wanted levels, a
+    /// drop is only tallied by scope and level, since it counts toward `d` only
+    /// for a consented scope and a wanted level.
     private func trimBufferLocked() {
         let removed = Self.trim(&lines, chars: &heldChars)
-        if initFinished {
+        if initFinished, state == .gathering {
             droppedCount += removed.count
         } else {
             for line in removed {
-                droppedBeforeInit[line.scope, default: 0] += 1
+                undecidedDrops[DropKey(scope: line.scope, level: line.level), default: 0] += 1
             }
         }
+    }
+
+    /// Counts the tallied drops of the wanted levels toward `d` once init has
+    /// decided their consent, or before it keeps only those levels for init.
+    private func adoptUndecidedDropsLocked() {
+        let wanted = undecidedDrops.filter { directive.levels.contains($0.key.level) }
+        guard initFinished else {
+            undecidedDrops = wanted
+            return
+        }
+        droppedCount += wanted.values.reduce(0, +)
+        undecidedDrops.removeAll()
     }
 
     /// Enforces both ceilings on the lines awaiting consent. Not counted as
@@ -804,11 +1006,15 @@ final class LogGatherer {
         return removed
     }
 
-    /// Whether the lines just added brought the buffer to a full batch. Only that
-    /// moment asks for a delivery, so a full buffer held back while tracking is
-    /// off does not queue one delivery per line.
-    private func completesBatchLocked(bufferedBefore: Int) -> Bool {
-        state == .gathering && bufferedBefore < directive.batchSize && lines.count >= directive.batchSize
+    /// Whether the lines just added brought the buffer to a full batch, or its
+    /// characters past the delivery threshold, which a long line reaches long
+    /// before the batch size. Only that moment asks for a delivery, so a full
+    /// buffer held back while tracking is off does not queue one delivery per line.
+    private func deliveryDueLocked(bufferedBefore: Int, charsBefore: Int) -> (isDue: Bool, includePartialBatch: Bool) {
+        guard state == .gathering else { return (false, false) }
+        let completesBatch = bufferedBefore < directive.batchSize && lines.count >= directive.batchSize
+        let reachesCharThreshold = charsBefore < Self.deliveryCharThreshold && heldChars >= Self.deliveryCharThreshold
+        return (completesBatch || reachesCharThreshold, reachesCharThreshold)
     }
 
     /// Puts every held line where the consent state puts it now: in the buffer
@@ -868,9 +1074,11 @@ final class LogGatherer {
         lines.removeAll()
         heldChars = 0
         droppedCount = 0
-        droppedBeforeInit.removeAll()
+        undecidedDrops.removeAll()
         awaitingConsent.removeAll()
         awaitingChars = 0
+        awaitsQueuedBatch = false
+        flushThroughSequence = nil
     }
 }
 

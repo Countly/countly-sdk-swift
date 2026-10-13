@@ -43,12 +43,28 @@ final class PushTests: CountlyBaseTestCase {
         TestUtils.requests(requestQueue(of: instance), carrying: "token_session")
     }
 
+    /// Starts the default instance, the only one that handles push.
+    ///
+    /// Its storage outlives a crashed run, so the stored device ID is reset. The
+    /// token is reported without asking for the permission state, because
+    /// `UNUserNotificationCenter.current()` aborts under `swift test`, and the
+    /// process token an earlier test broadcast reaches every new registration.
+    @discardableResult
+    private func startPushInstance(_ adjust: (CountlyConfig) -> Void = { _ in }) -> CountlyInstance {
+        startInstance {
+            $0.instanceName = Countly.defaultInstanceName
+            $0.resetStoredDeviceID = true
+            $0.sendPushTokenAlways = true
+            adjust($0)
+        }
+    }
+
     // MARK: - Recording an action
 
     /// A tap on the notification body is button index zero, which is how the
     /// dashboard tells a body tap from an action button.
     func testTappingTheBodyIsRecordedAsButtonZero() {
-        let countly = startInstance { $0.eventSendThreshold = 1 }
+        let countly = startPushInstance { $0.eventSendThreshold = 1 }
 
         countly.push.recordAction(for: notification(id: "n-1"), clickedButtonIndex: 0)
 
@@ -62,7 +78,7 @@ final class PushTests: CountlyBaseTestCase {
     }
 
     func testTappingAnActionButtonCarriesItsIndex() {
-        let countly = startInstance { $0.eventSendThreshold = 1 }
+        let countly = startPushInstance { $0.eventSendThreshold = 1 }
 
         countly.push.recordAction(for: notification(id: "n-2",
                                                     buttons: [["t": "Open"], ["t": "Later"]]),
@@ -76,7 +92,7 @@ final class PushTests: CountlyBaseTestCase {
     /// present but empty is as unusable as a missing one: either would reach the
     /// dashboard as a click nothing can be attributed to.
     func testANotificationWithNoUsableIDRecordsNothing() {
-        let countly = startInstance { $0.eventSendThreshold = 1 }
+        let countly = startPushInstance { $0.eventSendThreshold = 1 }
 
         countly.push.recordAction(for: ["something": "else"], clickedButtonIndex: 0)
         countly.push.recordAction(for: [CountlyPushKey.countlyPayload: [String: Any]()],
@@ -87,7 +103,7 @@ final class PushTests: CountlyBaseTestCase {
     }
 
     func testNoActionIsRecordedWithoutPushConsent() {
-        let countly = startInstance {
+        let countly = startPushInstance {
             $0.eventSendThreshold = 1
             $0.requiresConsent = true
         }
@@ -110,7 +126,7 @@ final class PushTests: CountlyBaseTestCase {
         #if !(os(iOS) || os(visionOS) || os(macOS))
         throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
         #else
-        let countly = startInstance {
+        let countly = startPushInstance {
             $0.sendPushTokenAlways = true
             $0.pushTestMode = .development
         }
@@ -132,7 +148,7 @@ final class PushTests: CountlyBaseTestCase {
         #if !(os(iOS) || os(visionOS) || os(macOS))
         throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
         #else
-        let countly = startInstance { $0.sendPushTokenAlways = true }
+        let countly = startPushInstance { $0.sendPushTokenAlways = true }
 
         core(of: countly).modules.push.didReceive(.value("abc123"))
 
@@ -146,7 +162,7 @@ final class PushTests: CountlyBaseTestCase {
         #if !(os(iOS) || os(visionOS) || os(macOS))
         throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
         #else
-        let countly = startInstance { $0.sendPushTokenAlways = true }
+        let countly = startPushInstance { $0.sendPushTokenAlways = true }
 
         core(of: countly).modules.push.didReceive(.failed)
 
@@ -159,7 +175,7 @@ final class PushTests: CountlyBaseTestCase {
     }
 
     func testClearingTheTokenSendsAnEmptyOne() {
-        let countly = startInstance()
+        let countly = startPushInstance()
 
         core(of: countly).modules.push.clearToken()
 
@@ -167,7 +183,7 @@ final class PushTests: CountlyBaseTestCase {
     }
 
     func testNoTokenIsSentWithoutPushConsent() {
-        let countly = startInstance {
+        let countly = startPushInstance {
             $0.requiresConsent = true
             $0.sendPushTokenAlways = true
         }
@@ -183,7 +199,7 @@ final class PushTests: CountlyBaseTestCase {
         #if !(os(iOS) || os(visionOS) || os(macOS))
         throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
         #else
-        let countly = startInstance { $0.sendPushTokenAlways = true }
+        let countly = startPushInstance { $0.sendPushTokenAlways = true }
         let before = tokenRequests(of: countly).count
 
         // No token has been received by this instance, and the process-wide runtime
@@ -200,7 +216,7 @@ final class PushTests: CountlyBaseTestCase {
     /// The permission request answers even when it refuses, because a caller that
     /// wrapped it in a continuation would otherwise hang for good.
     func testAskingForPermissionWithoutConsentStillAnswers() {
-        let countly = startInstance { $0.requiresConsent = true }
+        let countly = startPushInstance { $0.requiresConsent = true }
 
         let answered = expectation(description: "the permission request answers")
         countly.push.askForNotificationPermission { granted, error in
@@ -214,36 +230,101 @@ final class PushTests: CountlyBaseTestCase {
 
     // MARK: - The runtime
 
-    /// The runtime holds the token for the process, not for one instance, because
-    /// the token belongs to the application. Every registered instance hears about
-    /// it.
-    func testTheTokenReachesEveryRegisteredInstance() throws {
+    /// The token and the taps belong to the process, so only the default instance
+    /// handles push. A named instance that asks for it registers for nothing, and
+    /// reports no token, no cleared token and no tap, so no second server receives
+    /// a token or a tap for a notification it never sent.
+    func testOnlyTheDefaultInstanceHandlesPush() throws {
         #if !(os(iOS) || os(visionOS) || os(macOS))
         throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
         #else
-        let first = startInstance {
+        let main = startPushInstance {
             $0.sendPushTokenAlways = true
+            $0.eventSendThreshold = 1
             $0.features = [.pushNotifications]
             $0.disableAutomaticPushHandling = true
         }
-        let second = startInstance {
+        let named = startInstance {
             $0.sendPushTokenAlways = true
+            $0.eventSendThreshold = 1
             $0.features = [.pushNotifications]
             $0.disableAutomaticPushHandling = true
         }
 
         Countly.didRegisterForRemoteNotifications(deviceToken: Data([0xAB, 0xCD]))
+        named.push.recordPushNotificationToken()
+        named.push.clearPushNotificationToken()
+        named.push.recordAction(for: notification(id: "n-named"), clickedButtonIndex: 0)
+        main.push.recordAction(for: notification(id: "n-main"), clickedButtonIndex: 0)
 
-        XCTAssertEqual(tokenRequests(of: first).last?["ios_token"] as? String, "abcd")
-        XCTAssertEqual(tokenRequests(of: second).last?["ios_token"] as? String, "abcd")
+        XCTAssertEqual(tokenRequests(of: main).last?["ios_token"] as? String, "abcd")
+        XCTAssertTrue(tokenRequests(of: named).isEmpty, "a named instance must not report the process token")
+        XCTAssertTrue(events(of: named).isEmpty, "a named instance must not record taps")
+        XCTAssertEqual(events(of: main).filter { $0["key"] as? String == "[CLY]_push_action" }.count, 1)
         #endif
     }
 
-    func testAFailedRegistrationReachesEveryRegisteredInstance() throws {
+    /// The server keeps a token on the user that sent it last, so after a device ID
+    /// change without merge the token goes out again, under the new user, or the
+    /// previous user's pushes would keep reaching this device.
+    func testAChangeWithoutMergeSendsTheTokenAgainForTheNewUser() throws {
         #if !(os(iOS) || os(visionOS) || os(macOS))
         throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
         #else
-        let countly = startInstance {
+        let countly = startPushInstance {
+            $0.sendPushTokenAlways = true
+            $0.features = [.pushNotifications]
+            $0.disableAutomaticPushHandling = true
+        }
+        Countly.didRegisterForRemoteNotifications(deviceToken: Data([0x0C, 0x0D]))
+        XCTAssertEqual(tokenRequests(of: countly).last?["device_id"] as? String, Self.deviceID)
+
+        countly.deviceID.changeWithMerge("merged-user")
+        let afterMerge = tokenRequests(of: countly).count
+        XCTAssertEqual(afterMerge, 1, "a merge moves the token on the server, so nothing is sent again")
+
+        countly.deviceID.changeWithoutMerge("next-user")
+
+        let resent = try XCTUnwrap(tokenRequests(of: countly).last)
+        XCTAssertEqual(tokenRequests(of: countly).count, afterMerge + 1)
+        XCTAssertEqual(resent["device_id"] as? String, "next-user")
+        XCTAssertEqual(resent["ios_token"] as? String, "0c0d")
+        #endif
+    }
+
+    /// With consent required, a change without merge withdraws every consent, so
+    /// the token waits until push consent is given for the new user.
+    func testAChangeWithoutMergeUnderRequiredConsentWaitsForThePushConsent() throws {
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
+        #else
+        let countly = startPushInstance {
+            $0.sendPushTokenAlways = true
+            $0.features = [.pushNotifications]
+            $0.disableAutomaticPushHandling = true
+            $0.requiresConsent = true
+            $0.consents = [.pushNotifications]
+        }
+        Countly.didRegisterForRemoteNotifications(deviceToken: Data([0x0E, 0x0F]))
+        let before = tokenRequests(of: countly).count
+
+        countly.deviceID.changeWithoutMerge("consent-user")
+        XCTAssertEqual(tokenRequests(of: countly).count, before, "no push consent for the new user yet")
+
+        countly.consent.giveConsent(for: .pushNotifications)
+        XCTAssertEqual(tokenRequests(of: countly).last?["device_id"] as? String, "consent-user")
+        XCTAssertEqual(tokenRequests(of: countly).last?["ios_token"] as? String, "0e0f")
+        #endif
+    }
+
+    /// A failed registration reports an empty token through the default
+    /// instance, so the server stops trying to reach a device that cannot
+    /// receive anything.
+    func testAFailedRegistrationReachesTheDefaultInstance() throws {
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
+        #else
+        let countly = startPushInstance {
             $0.sendPushTokenAlways = true
             $0.features = [.pushNotifications]
             $0.disableAutomaticPushHandling = true
@@ -277,7 +358,7 @@ final class PushTests: CountlyBaseTestCase {
         #if !(os(iOS) || os(visionOS) || os(macOS))
         throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
         #else
-        let countly = startInstance {
+        let countly = startPushInstance {
             $0.sendPushTokenAlways = true
             // Deliberately not `.pushNotifications`.
             $0.features = [.crashReporting]
@@ -298,7 +379,7 @@ final class PushTests: CountlyBaseTestCase {
         #if !(os(iOS) || os(visionOS) || os(macOS))
         throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
         #else
-        let countly = startInstance {
+        let countly = startPushInstance {
             $0.sendPushTokenAlways = true
             $0.features = [.pushNotifications]
             $0.requiresConsent = true
@@ -328,7 +409,7 @@ final class PushTests: CountlyBaseTestCase {
         #if !(os(iOS) || os(visionOS) || os(macOS))
         throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
         #else
-        let countly = startInstance {
+        let countly = startPushInstance {
             $0.sendPushTokenAlways = true
             $0.features = [.pushNotifications]
             $0.disableAutomaticPushHandling = true
@@ -367,7 +448,7 @@ final class PushTests: CountlyBaseTestCase {
         // `bundleProxyForCurrentProcess is nil` rather than returning an error. That
         // is also why the permission branches of `sendToken` are uncovered and
         // cannot be covered from a unit test.
-        let manual = startInstance {
+        let manual = startPushInstance {
             $0.sendPushTokenAlways = true
             $0.features = [.pushNotifications]
             $0.disableAutomaticPushHandling = true
@@ -395,7 +476,7 @@ final class PushTests: CountlyBaseTestCase {
         #if !(canImport(UserNotifications) && (os(iOS) || os(visionOS) || os(macOS)))
         throw XCTSkip("the push runtime only exists on iOS, visionOS and macOS")
         #else
-        let countly = startInstance {
+        let countly = startPushInstance {
             $0.eventSendThreshold = 1
             $0.features = [.pushNotifications]
             $0.disableAutomaticPushHandling = true
@@ -418,7 +499,7 @@ final class PushTests: CountlyBaseTestCase {
         #if !(canImport(UserNotifications) && (os(iOS) || os(visionOS) || os(macOS)))
         throw XCTSkip("the push runtime only exists on iOS, visionOS and macOS")
         #else
-        let countly = startInstance {
+        let countly = startPushInstance {
             $0.eventSendThreshold = 1
             $0.features = [.pushNotifications]
             $0.disableAutomaticPushHandling = true
@@ -441,7 +522,7 @@ final class PushTests: CountlyBaseTestCase {
         #if !(canImport(UserNotifications) && (os(iOS) || os(visionOS) || os(macOS)))
         throw XCTSkip("the push runtime only exists on iOS, visionOS and macOS")
         #else
-        let countly = startInstance {
+        let countly = startPushInstance {
             $0.eventSendThreshold = 1
             $0.features = [.pushNotifications]
             $0.disableAutomaticPushHandling = true
@@ -463,7 +544,7 @@ final class PushTests: CountlyBaseTestCase {
         #if !(canImport(UserNotifications) && (os(iOS) || os(visionOS) || os(macOS)))
         throw XCTSkip("the push runtime only exists on iOS, visionOS and macOS")
         #else
-        let countly = startInstance {
+        let countly = startPushInstance {
             $0.eventSendThreshold = 1
             $0.features = [.pushNotifications]
             $0.disableAutomaticPushHandling = true

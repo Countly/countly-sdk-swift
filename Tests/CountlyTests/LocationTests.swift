@@ -26,7 +26,7 @@ final class LocationTests: CountlyBaseTestCase {
     private func locationRequests(of instance: CountlyInstance) -> [[String: Any]] {
         requestQueue(of: instance)
             .map(TestUtils.parseQuery)
-            .filter { $0["location"] != nil || $0["city"] != nil || $0["country_code"] != nil || $0["ip"] != nil }
+            .filter { $0["location"] != nil || $0["city"] != nil || $0["country_code"] != nil || $0["ip_address"] != nil }
     }
 
     // MARK: - Recording
@@ -48,7 +48,7 @@ final class LocationTests: CountlyBaseTestCase {
         XCTAssertEqual(request["location"] as? String, "41.008200,28.978400")
         XCTAssertEqual(request["city"] as? String, "Istanbul")
         XCTAssertEqual(request["country_code"] as? String, "TR")
-        XCTAssertEqual(request["ip"] as? String, "10.1.2.3")
+        XCTAssertEqual(request["ip_address"] as? String, "10.1.2.3")
     }
 
     /// Fields the caller did not supply are omitted rather than sent empty, so the
@@ -65,7 +65,7 @@ final class LocationTests: CountlyBaseTestCase {
         XCTAssertNotNil(request["location"])
         XCTAssertNil(request["city"])
         XCTAssertNil(request["country_code"])
-        XCTAssertNil(request["ip"])
+        XCTAssertNil(request["ip_address"])
     }
 
     /// An invalid coordinate is not a location. It is dropped rather than sent as
@@ -103,7 +103,7 @@ final class LocationTests: CountlyBaseTestCase {
         XCTAssertEqual(request["location"] as? String, "")
         XCTAssertNil(request["city"])
         XCTAssertNil(request["country_code"])
-        XCTAssertNil(request["ip"])
+        XCTAssertNil(request["ip_address"])
     }
 
     func testDisablingLocationInTheConfigMeansTheFirstRequestAlreadyCarriesTheEmptyForm() {

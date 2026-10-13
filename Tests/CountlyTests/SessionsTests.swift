@@ -182,6 +182,50 @@ final class SessionsTests: CountlyBaseTestCase {
         XCTAssertTrue(requestQueue(of: countly).isEmpty)
     }
 
+    /// The server can switch automatic sessions in a running build. On, a session
+    /// begins at once; off, the session the SDK began ends, while a session the
+    /// application began itself is left to it.
+    func testTheServerCanSwitchAutomaticSessionsAtRuntime() throws {
+        try skipUnlessNetworkIsInterceptable()
+        var answer = ServerConfigBuilder().json()
+        MockURLProtocol.respond { captured in
+            captured.query.contains("method=sc") ? (200, Data(answer.utf8)) : nil
+        }
+        let countly = startInstance()
+        let core = core(of: countly)
+        // An automatic session is refused while the application reads as in the background.
+        AppState.setActive(true)
+        TestUtils.waitUntil("the first fetch goes out") { MockURLProtocol.requests.contains { $0.query.contains("method=sc") } }
+        TestUtils.pump(0.2)
+
+        /// Answers a fetch with the switch and waits until it is applied.
+        func serverSwitches(automaticSessions: Bool) {
+            answer = ServerConfigBuilder().automaticSessionTracking(automaticSessions).json()
+            core.serverConfig.fetch(config: core.config)
+            TestUtils.waitUntil("the switch lands") { core.serverConfig.automaticSessionTrackingEnabled == automaticSessions }
+            TestUtils.pump(0.2)
+        }
+        /// How many queued requests carry `key`.
+        func count(_ key: String) -> Int {
+            TestUtils.requests(requestQueue(of: countly), carrying: key).count
+        }
+
+        serverSwitches(automaticSessions: true)
+        XCTAssertEqual(count("begin_session"), 1, "switched on, a session begins at once")
+
+        serverSwitches(automaticSessions: false)
+        XCTAssertEqual(count("end_session"), 1, "switched off, the session the SDK began ends")
+
+        countly.sessions.beginSession()
+        XCTAssertEqual(count("begin_session"), 2)
+        serverSwitches(automaticSessions: true)
+        serverSwitches(automaticSessions: false)
+
+        XCTAssertEqual(count("begin_session"), 2, "a session already open is not begun twice")
+        XCTAssertEqual(count("end_session"), 1, "a session the application began is left to it")
+        XCTAssertTrue(core.modules.sessions.isSessionStarted)
+    }
+
     // MARK: - Ordering against other features
 
     /// An event recorded before a session ends has to reach the server before the

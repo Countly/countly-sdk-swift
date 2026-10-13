@@ -158,6 +158,13 @@ final class RequestQueueStore: @unchecked Sendable {
         return QueuedHead(request: first.request, sequence: first.sequence, attachEpoch: attachEpoch)
     }
 
+    /// Whether any queued request matches `predicate`, read under the lock.
+    func containsRequest(where predicate: (String) -> Bool) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries.contains { predicate($0.request) }
+    }
+
     /// A copy of the whole queue, oldest first.
     ///
     /// Taken under the lock so a caller iterating it cannot observe a queue that a

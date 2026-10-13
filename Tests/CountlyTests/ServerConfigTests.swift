@@ -311,6 +311,75 @@ final class ServerConfigTests: CountlyBaseTestCase {
                        "the cached document is what the server actually said")
     }
 
+    // MARK: - What an answer changed
+
+    /// Records the keys of every change notification.
+    private final class RecordingDelegate: ServerConfigDelegate {
+        private(set) var changedKeys: [Set<String>] = []
+
+        /// Keeps the keys this notification reports as changed.
+        func serverConfigDidChange(_ serverConfig: ServerConfig, consentBecameRequired: Bool, changedKeys: Set<String>) {
+            self.changedKeys.append(changedKeys)
+        }
+    }
+
+    /// Answers every fetch at once with the next queued body.
+    private final class CannedTransport: ServerConfigTransport {
+        var answers: [String] = []
+        let isDeviceIDTemporary = false
+        let deviceID = CountlyBaseTestCase.deviceID
+        let deviceIDTypeValue = DeviceIDType.developerSupplied.rawValue
+        let deviceIDMergeCount = 0
+
+        /// Answers synchronously with the next queued body, or an empty object.
+        func fetchServerConfig(completion: @escaping (Data?, Int, Error?) -> Void) {
+            let body = answers.isEmpty ? "{}" : answers.removeFirst()
+            completion(Data(body.utf8), 200, nil)
+        }
+    }
+
+    /// Only the keys whose value an answer changed are reported, so a refresh
+    /// repeating the stored settings moves nothing that depends on them, a content
+    /// zone the application entered above all.
+    func testOnlyTheKeysWhoseValueAnAnswerChangedAreReported() {
+        let store = KeyValueStore(namespace: StorageNamespace(instanceName: uniqueInstanceName()), logger: nil)
+        let serverConfig = ServerConfig(store: store, logger: nil)
+        addTeardownBlock {
+            serverConfig.stop()
+            store.clearAll()
+        }
+        let delegate = RecordingDelegate()
+        let transport = CannedTransport()
+        serverConfig.delegate = delegate
+        serverConfig.transport = transport
+        let config = baseConfig()
+        config.sdkBehaviorSettings = ServerConfigBuilder().sessionUpdateInterval(90).json()
+
+        serverConfig.retrieveFromStorage(config: config)
+        XCTAssertEqual(delegate.changedKeys, [["sui"]])
+
+        /// The whole document each time, as a refresh carries it.
+        func zone() -> ServerConfigBuilder {
+            ServerConfigBuilder().sessionUpdateInterval(90).enterContentZone(true).contentZoneInterval(45)
+        }
+        transport.answers = [
+            ServerConfigBuilder().sessionUpdateInterval(90).json(),
+            ServerConfigBuilder().sessionUpdateInterval(90).enterContentZone(true).json(),
+            zone().json(),
+            zone().eventBlacklist(["noise"]).json(),
+            zone().eventBlacklist(["noise"]).json(),
+            zone().eventWhitelist(["noise"]).json(),
+        ]
+        for _ in transport.answers {
+            serverConfig.fetch(config: config)
+        }
+
+        XCTAssertEqual(delegate.changedKeys, [["sui"], ["ecz"], ["czi"], ["eb"], ["ew"]],
+                       "an answer repeating what is in effect reports no change at all")
+        XCTAssertTrue(serverConfig.enterContentZone)
+        XCTAssertEqual(config.content.zoneTimerInterval, 45)
+    }
+
     // MARK: - Fetching
 
     /// The fetch is an instant request on the read endpoint, because a build that

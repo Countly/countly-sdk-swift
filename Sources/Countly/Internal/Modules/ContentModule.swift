@@ -75,6 +75,82 @@ final class ContentModule: ModuleBase {
     private var webViewManager: WebViewManager?
     #endif
 
+    /// Keys the server reads off content and feedback widget events to count and
+    /// attribute them, which a global segmentation therefore may not set.
+    static let reservedGlobalSegmentationKeys: Set<String> = [
+        "platform", "app_version", "widget_id", "closed", "shown", "started", "answered", "rating",
+        "comment", "email", "contactMe", "campaign_id", "content_id", "element_id", "dismissed",
+        "journey_id", "journey_definition_id", "journeyId", "journeyDefinitionId", "journeyInstanceId",
+    ]
+
+    /// Prefix of the keys a survey reports its answers under, reserved like the
+    /// keys above.
+    static let reservedSurveyAnswerKeyPrefix = "answ-"
+
+    /// Recorded with every content and feedback widget event. Replaced whole under
+    /// `stateLock`, since the setter runs on any thread while an event reads it.
+    private var globalSegmentation: [String: Any] = [:]
+
+    // MARK: - Global segmentation
+
+    /// Sets the segmentation recorded with every content and feedback widget
+    /// event, on top of the keys those events report themselves. Reserved keys
+    /// and survey answer keys are dropped, then the SDK limits applied. `nil` or
+    /// an empty dictionary clears it. Kept for the life of the run only.
+    func setGlobalContentSegmentation(_ segmentation: [String: Any]?) {
+        guard let segmentation, !segmentation.isEmpty else {
+            logD("setGlobalContentSegmentation", "the global content segmentation is cleared")
+            replaceGlobalSegmentation([:])
+            return
+        }
+
+        var allowed: [String: Any] = [:]
+        for (key, value) in segmentation {
+            if Self.reservedGlobalSegmentationKeys.contains(key) || key.hasPrefix(Self.reservedSurveyAnswerKeyPrefix) {
+                logW("setGlobalContentSegmentation", "a reserved key is dropped from the global content segmentation, key: [\(key)]")
+            } else {
+                allowed[key] = value
+            }
+        }
+
+        // After the reserved keys are gone, so they do not use up the segmentation limit.
+        let sanitized = limits.sanitized(allowed, "Global content segmentation") ?? [:]
+        logD("setGlobalContentSegmentation", "the global content segmentation is set, providedKeyCount: [\(segmentation.count)], keptKeys: [\(sanitized.keys.sorted())]")
+        replaceGlobalSegmentation(sanitized)
+    }
+
+    /// The global segmentation for a widget page to report with its answers.
+    var currentGlobalSegmentation: [String: Any] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return globalSegmentation
+    }
+
+    /// Merges the global segmentation under an event's own, the event's keys
+    /// winning. Global keys are added only while the segmentation limit leaves
+    /// room, so the limit never trims the event's own keys for them.
+    func withGlobalSegmentation(_ eventSegmentation: [String: Any]?) -> [String: Any]? {
+        let global = currentGlobalSegmentation
+        guard !global.isEmpty else { return eventSegmentation }
+
+        let own = eventSegmentation ?? [:]
+        var room = max(0, core.config.sdkInternalLimits.maxSegmentationValues - own.count)
+        var merged = own
+        for key in global.keys.sorted() where merged[key] == nil {
+            guard room > 0 else { break }
+            merged[key] = global[key]
+            room -= 1
+        }
+        return merged
+    }
+
+    /// Swaps in a new global segmentation under the lock.
+    private func replaceGlobalSegmentation(_ segmentation: [String: Any]) {
+        stateLock.lock()
+        globalSegmentation = segmentation
+        stateLock.unlock()
+    }
+
     // MARK: - Zone lifecycle
 
     /// Starts polling for content.

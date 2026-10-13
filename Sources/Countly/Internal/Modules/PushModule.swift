@@ -47,6 +47,12 @@ final class PushModule: ModuleBase {
             return
         }
 
+        // The token and the notification taps belong to the process, so one instance reports them, not every server.
+        guard isDefaultInstance else {
+            logW("applyInitialConfig", "push notifications are handled by the default instance only, this named instance will not register for them")
+            return
+        }
+
         logD("applyInitialConfig", "push module starting, disableAutomaticPushHandling: [\(core.config.disableAutomaticPushHandling)], sendPushTokenAlways: [\(core.config.sendPushTokenAlways)], doNotShowAlertForNotifications: [\(core.config.doNotShowAlertForNotifications)], pushTestMode: [\(core.config.pushTestMode?.wireValue ?? 0)]")
 
         isEnabledOnInitialConfig = true
@@ -91,6 +97,20 @@ final class PushModule: ModuleBase {
         }
         #endif
         #endif
+    }
+
+    /// Whether this is the default instance, the only one that handles push.
+    private var isDefaultInstance: Bool {
+        core.namespace.isDefault
+    }
+
+    /// Sends the token again after a device ID change without merge. The server
+    /// keeps a token on the user that sent it last, so this moves it to the new
+    /// user; without it the previous user's pushes would still reach this device.
+    func deviceIDChangedWithoutMerge() {
+        guard isEnabledOnInitialConfig, isRegistered else { return }
+        logD("deviceIDChangedWithoutMerge", "the device ID changed without merge, the push token is sent again for the new user")
+        sendToken()
     }
 
     /// Whether this instance asked for foreground notifications not to be shown.
@@ -185,6 +205,11 @@ final class PushModule: ModuleBase {
     func sendToken(_ overrideToken: PushDeviceToken? = nil) {
         logI("sendToken", "push token reporting requested, tokenSuppliedByCaller: [\(overrideToken != nil)]")
 
+        guard isDefaultInstance else {
+            logD("sendToken", "push token is not sent, push notifications are handled by the default instance only")
+            return
+        }
+
         guard core.modules.consent.hasConsent(for: .pushNotifications) else {
             logV("sendToken", "no push consent given, push token is not sent")
             return
@@ -240,6 +265,10 @@ final class PushModule: ModuleBase {
 
     /// Tells the server this device has no usable token.
     func clearToken() {
+        guard isDefaultInstance else {
+            logD("clearToken", "push token is not cleared, push notifications are handled by the default instance only")
+            return
+        }
         logD("clearToken", "clearing the push token on the server by sending an empty token")
         send(token: "")
     }
@@ -268,6 +297,11 @@ final class PushModule: ModuleBase {
 
         guard core.modules.consent.hasConsent(for: .pushNotifications) else {
             logV("recordAction", "no push consent given, notification action is not recorded")
+            return
+        }
+
+        guard isDefaultInstance else {
+            logD("recordAction", "notification action is not recorded, push notifications are handled by the default instance only")
             return
         }
 

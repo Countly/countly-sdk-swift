@@ -14,6 +14,7 @@
   * "suspend()" / "resume()"
   * "halt(clearStorage:)", which tears the instance down and, when asked, wipes every persisted key including those an earlier Objective-C SDK wrote, whether the instance is running or not. The instance stays registered and can be started again.
   * Integration-wide operations: "setNewHost", "setNewAppKey", "setNewURLSessionConfiguration", "addCustomNetworkRequestHeaders", "recordMetrics", "addDirectRequest"
+  * "addDirectRequest" encodes every key and value itself, so they are passed as they are, and drops the keys the SDK sets itself, such as "device_id"
 
 * Added the events API on "countly.events":
   * "recordEvent(key, segmentation, count, sum, duration)"
@@ -42,6 +43,7 @@
   * "push(key, value)" / "pushUnique(key, value)" / "pull(key, value)"
   * "save()" / "clear()"
   * Predefined properties: name, username, email, organization, phone, picture, picturePath, gender, byear
+  * "picturePath" uploads a local image on iOS and visionOS. On the other platforms the path is dropped rather than sent as text.
 
 * Added the consent API on "countly.consent":
   * "giveConsent(for:)" for one feature or an array / "giveAllConsents()"
@@ -59,6 +61,7 @@
   * "setID(deviceID)", which picks the merge behavior from how the current ID was obtained
   * "changeWithMerge(deviceID)" / "changeWithoutMerge(deviceID)"
   * "enableTemporaryIDMode()"
+  * "CountlyConfig.resetStoredDeviceID", which drops the stored device ID at start, one the SDK generated included, so a new one is generated when no device ID is configured
 
 * Added the location API on "countly.location":
   * "recordLocation(coordinate, city, isoCountryCode, ipAddress)" / "disableLocationInfo()"
@@ -70,6 +73,8 @@
   * "setCrashSegmentation(segmentation)"
   * Automatic signal and uncaught exception handlers, chaining to any handler already installed, plus a crash filter callback and a regular expression filter via "CountlyConfig.crashes" and "crashFilter". A signal the application ignores, such as SIGPIPE, is left alone, and every other one is passed on after it is reported, so the process ends exactly as it would without the SDK.
   * A detected crash is stored for every instance while the process goes down and sent on the next launch. Nothing is sent from inside the crash handler.
+  * A named instance installs the automatic handlers only when its own "CountlyConfig.features" includes crash reporting. SDK behavior settings can switch automatic crash reporting on for the default instance alone, so one crash is not stored once per instance.
+  * Stopping the SDK gives a signal back only while the SDK's own handler is still the one installed, so a crash reporter installed after it keeps working.
 
 * Added the remote config API on "countly.remoteConfig":
   * "getValue(key)" / "getAllValues()"
@@ -85,10 +90,12 @@
   * "presentNPS(nameIDOrTag, callback:)" / "presentSurvey(...)" / "presentRating(...)"
   * "recordRatingWidget(id:rating:email:comment:userCanBeContacted:)"
   * "widget(from:)", which rebuilds a widget from a description the caller already holds, so presenting or reporting it needs no second fetch
+  * A widget that is not shown because another content or widget is on screen calls back as closed and records nothing
 
 * Added the content API on "countly.content":
-  * "enterContentZone(tags:)" / "exitContentZone()" / "refreshContentZone()"
-  * "changeContent(tags:)" / "previewContent(contentID)"
+  * "enterContentZone()" / "exitContentZone()" / "refreshContentZone()" / "previewContent(contentID)"
+  * "setGlobalContentSegmentation(segmentation)", recorded with every content and feedback widget event and handed to a widget page that records its own answers. It never overrides a key the event reports itself, and the keys the server counts and attributes these events by cannot be set through it.
+  * SDK behavior settings enter or leave the content zone only when they change the zone settings, so a zone the application entered stays open across every other settings refresh
 
 * Added the performance monitoring API on "countly.performance":
   * "recordNetworkTrace(name, requestPayloadSize, responsePayloadSize, responseStatusCode, startTime, endTime)"
@@ -117,9 +124,12 @@
   * "Countly.handleNotificationResponse(response)", for a host or bridge that owns the delegate itself, and for replaying a tap that arrived before the SDK was started
   * "CountlyPushKey", public, so a host reading the payload itself uses the SDK's keys rather than a copy
   * The "CountlyNotificationService" product for notification service extensions, which adds a notification's action buttons and downloads its media attachment while preserving the host's own notification categories
+  * Push is handled by the default instance only, since the token and the notification taps belong to the whole process. A named instance that enables push registers for nothing and reports nothing.
+  * After a device ID change without merge, the token is reported again for the new user, so the previous user's notifications stop reaching the device
 
 * Added automatic view tracking on iOS, tvOS and visionOS:
   * "CountlyConfig.enableAutomaticViewTracking", with an exclusion list ("automaticViewTrackingExclusionList") matching the resolved view name, the class name or a superclass, and a "CountlyAutoViewTrackingName" protocol for naming a screen explicitly
+  * The screen on display is reported again when the application returns from the background, which UIKit does not report as an appearance
   * A SwiftUI hosting controller is reported under the name of the view it hosts, so `UIHostingController<CheckoutView>` reports as "CheckoutView". A hosted view that also reports itself with "countlyView" is reported twice unless its name is on the exclusion list.
   * A host of an erased "AnyView", which SwiftUI uses for its own sheets and navigation destinations, and any other screen known only by a compiler-generated Swift class name, is not reported; give it a title or adopt "CountlyAutoViewTrackingName"
   * "CountlyConfig.disableSwizzling", which stops the "viewDidAppear" and "viewDidDisappear" exchange. That exchange is the only thing automatic view tracking watches, so this leaves it off, even when SDK behavior settings would switch it on; report screens yourself instead. It applies to its own instance only and does not cover push handling, which "disableAutomaticPushHandling" turns off.
@@ -134,15 +144,20 @@
   * Event and request queue size limits, key and value length limits, and the segmentation value cap
   * Event, user property and view segmentation allow and block lists
   * Developer-supplied settings via "CountlyConfig.sdkBehaviorSettings", and "disableSDKBehaviorSettingsUpdates" to pin them
+  * Switching automatic sessions on in a running application begins a session at once. Switching them off ends the session the SDK began, while a session the application began itself is left to it.
 
 * Added the two server requested diagnostics: log gathering, which uploads the SDK's own internal log lines even when logging is disabled, and the connection test, which checks every endpoint the SDK depends on and reports the results.
   * When consent is required, a gathered log line is uploaded only after the consent of the feature that wrote it is given, and a line that belongs to no single feature needs both the events and user details consents.
+  * A value the behavior settings filter out, such as an event, a segmentation key or a user property on a block list, is never written to the log, so no gathered line carries it.
+  * One gathered batch waits in the request queue at a time, and the rest wait in a bounded buffer, so a device that cannot reach the server never fills its queue with log batches. While the application is in the background, nothing is uploaded on the session timer.
+  * When the server stops a gather, its last lines are still uploaded under it.
+  * The connection test report needs no consent. It carries the device ID the test was requested for and is dropped when the device ID changes with merge first, since the merge cancels the test on the server. The test does not run while behavior settings switch networking or tracking off.
 
 * Added networking configuration on "CountlyConfig":
-  * "addCustomNetworkRequestHeaders(headers)" and "customNetworkRequestHeaders"
+  * "customNetworkRequestHeaders", and "addCustomNetworkRequestHeaders(headers)" on the instance to change them while it runs
   * "storedRequestsLimit" / "requestDropAgeHours" / "requestTimeoutDuration" / "alwaysUsePOST"
   * "secretSalt" for parameter tampering protection, "pinnedCertificates" for certificate pinning, and "shouldIgnoreTrustCheck"
-  * "disableBackoffMechanism()" to opt out of the server backoff response
+  * "disableBackoffMechanism" to opt out of the server backoff response
   * "urlSessionConfiguration" to supply a session of the host application's own
 
 * Added a configurable logging system:

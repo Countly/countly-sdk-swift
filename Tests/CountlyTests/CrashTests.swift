@@ -9,6 +9,12 @@
 import XCTest
 @testable import Countly
 
+/// Stand-ins for handlers a host application or another SDK installs around the
+/// SDK's own.
+private let hostExceptionHandler: @convention(c) (NSException) -> Void = { _ in }
+private let laterExceptionHandler: @convention(c) (NSException) -> Void = { _ in }
+private let laterSignalHandler: @convention(c) (Int32) -> Void = { _ in }
+
 /// The `crash` payload: what the server is told about something going wrong.
 ///
 /// A crash report is only useful if it can be symbolicated and attributed, so
@@ -204,6 +210,73 @@ final class CrashTests: CountlyBaseTestCase {
             XCTAssertNotEqual(whileStarted[index], before[index], "signal \(signalCode) should be handled while the SDK runs")
         }
         XCTAssertEqual(afterHalt, before, "every signal should be given back its previous disposition")
+    }
+
+    /// A handler installed after the SDK's chains to it, so stopping the SDK
+    /// leaves that handler live instead of restoring over it and cutting it out.
+    func testAHandlerInstalledAfterTheSDKsStaysLiveWhenTheSDKStops() {
+        var originalAction = Self.action(of: SIGSYS)
+        let originalExceptionHandler = NSGetUncaughtExceptionHandler()
+        defer {
+            sigaction(SIGSYS, &originalAction, nil)
+            NSSetUncaughtExceptionHandler(originalExceptionHandler)
+        }
+
+        let countly = startInstance { $0.features = [.crashReporting] }
+        XCTAssertTrue(CrashHandlerInstaller.isCountlySignalAction(Self.action(of: SIGSYS)))
+        XCTAssertTrue(CrashHandlerInstaller.isCountlyExceptionHandler(NSGetUncaughtExceptionHandler()))
+
+        Self.install(laterSignalHandler, for: SIGSYS)
+        NSSetUncaughtExceptionHandler(laterExceptionHandler)
+        countly.halt()
+
+        XCTAssertEqual(Self.handlerAddress(SIGSYS), unsafeBitCast(laterSignalHandler, to: Int.self))
+        XCTAssertEqual(Self.address(of: NSGetUncaughtExceptionHandler()), Self.address(of: laterExceptionHandler))
+    }
+
+    /// A later handler that gives control back hands the SDK its own handler
+    /// again. Saving that as the predecessor on the next start would make a crash
+    /// chain from the SDK's handler to itself, so the one saved before it stands.
+    func testARestartFindingItsOwnHandlerLiveKeepsThePredecessorSavedBeforeIt() {
+        var originalAction = Self.action(of: SIGSYS)
+        let originalExceptionHandler = NSGetUncaughtExceptionHandler()
+        defer {
+            sigaction(SIGSYS, &originalAction, nil)
+            NSSetUncaughtExceptionHandler(originalExceptionHandler)
+        }
+        NSSetUncaughtExceptionHandler(hostExceptionHandler)
+        let defaultAddress = Self.handlerAddress(SIGSYS)
+
+        let first = startInstance { $0.features = [.crashReporting] }
+        var sdkAction = Self.action(of: SIGSYS)
+        let sdkExceptionHandler = NSGetUncaughtExceptionHandler()
+        Self.install(laterSignalHandler, for: SIGSYS)
+        NSSetUncaughtExceptionHandler(laterExceptionHandler)
+        first.halt()
+        sigaction(SIGSYS, &sdkAction, nil)
+        NSSetUncaughtExceptionHandler(sdkExceptionHandler)
+
+        let second = startInstance { $0.features = [.crashReporting] }
+        XCTAssertTrue(CrashHandlerInstaller.isCountlySignalAction(Self.action(of: SIGSYS)))
+        XCTAssertTrue(CrashHandlerInstaller.isCountlyExceptionHandler(NSGetUncaughtExceptionHandler()))
+        second.halt()
+
+        XCTAssertEqual(Self.handlerAddress(SIGSYS), defaultAddress, "the disposition saved before the SDK's is given back")
+        XCTAssertEqual(Self.address(of: NSGetUncaughtExceptionHandler()), Self.address(of: hostExceptionHandler),
+                       "the host's handler is given back, not the SDK's own")
+    }
+
+    /// Installs `handler` as the disposition of `signalCode`.
+    private static func install(_ handler: @escaping @convention(c) (Int32) -> Void, for signalCode: Int32) {
+        var action = sigaction()
+        action.__sigaction_u.__sa_handler = handler
+        sigemptyset(&action.sa_mask)
+        sigaction(signalCode, &action, nil)
+    }
+
+    /// An uncaught exception handler as an address, 0 for none.
+    private static func address(of handler: (@convention(c) (NSException) -> Void)?) -> Int {
+        handler.map { unsafeBitCast($0, to: Int.self) } ?? 0
     }
 
     private static func action(of signalCode: Int32) -> sigaction {
@@ -444,6 +517,25 @@ final class CrashTests: CountlyBaseTestCase {
 
         XCTAssertNil(lastCrash(of: countly)?["_logs"],
                      "the breadcrumb recorded without consent must not resurface later")
+    }
+
+    /// Every instance would store the same crash, so the server switching
+    /// automatic crash reporting on reaches a named instance only when its own
+    /// config enables crash reporting.
+    func testTheServerTurnsCrashHandlingOnForANamedInstanceOnlyWhenItsConfigEnablesIt() {
+        let settings = ServerConfigBuilder().automaticCrashReporting(true).json()
+        let plain = startInstance { $0.sdkBehaviorSettings = settings }
+        let enabled = startInstance {
+            $0.sdkBehaviorSettings = settings
+            $0.features = [.crashReporting]
+        }
+        XCTAssertTrue(core(of: plain).serverConfig.automaticCrashReportingEnabled)
+
+        CrashHandlerInstaller.shared.dispatch(name: "SIGSEGV", reason: "boom", stackTrace: ["0 MyApp 0x1 boom"])
+        TestUtils.pump(0.3)
+
+        XCTAssertEqual(crashCountOnDisk(of: plain), 0, "a named instance that did not ask for crash reporting recorded the crash")
+        XCTAssertEqual(crashCountOnDisk(of: enabled), 1)
     }
 
     func testTheServerCanSwitchCrashReportingOff() {

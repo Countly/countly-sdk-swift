@@ -36,8 +36,13 @@ final class RequestBuilder {
     /// The timestamp comes from the instance's monotonic clock, so two requests
     /// produced in the same millisecond still order correctly on the server.
     func queryEssentials() -> String {
-        let deviceID = core.modules.deviceID.deviceID
-        let typeValue = core.modules.deviceID.deviceIDType.wireValue
+        queryEssentials(deviceID: core.modules.deviceID.deviceID,
+                        typeValue: core.modules.deviceID.deviceIDType.wireValue)
+    }
+
+    /// The nine parameters, for a request filed under `deviceID` rather than the
+    /// device ID in use now.
+    func queryEssentials(deviceID: String, typeValue: Int) -> String {
         let timestampMs = core.clock.nowMs()
 
         core.logger.d(Self.module, "queryEssentials", "base request parameters are built, deviceIDType: [\(typeValue)], deviceIDLength: [\(deviceID.count)], timestamp: [\(timestampMs)], appKeyLength: [\(core.config.appKey.count)]")

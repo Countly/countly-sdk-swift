@@ -46,8 +46,8 @@ final class ServerConfig {
         static let stored: Set<String> = [timestamp, version, config]
     }
 
-    /// Keys inside the `c` section.
-    private enum Key {
+    /// Keys inside the `c` section, which also name what an apply changed.
+    enum Key {
         static let tracking = "tracking"
         static let networking = "networking"
         static let requestQueueSize = "rqs"
@@ -123,6 +123,40 @@ final class ServerConfig {
         case serverFetch = "server fetch"
     }
 
+    /// The settings one apply changed, in the order they were read.
+    ///
+    /// Only a value that differs from the one in effect counts. The server sends
+    /// every configured key on every answer, and treating an unchanged key as a
+    /// change would rerun every side effect of a change on every refresh.
+    private struct ChangeLog {
+        private(set) var keys: Set<String> = []
+        private(set) var descriptions: [String] = []
+
+        /// Records that `key` now resolves to `value`.
+        mutating func record(_ key: String, _ value: String) {
+            keys.insert(key)
+            descriptions.append("\(key): \(value)")
+        }
+    }
+
+    /// The allow and block lists, replaced whole under `filterLock`.
+    ///
+    /// An answer replaces them on a network thread while events, views and user
+    /// properties read them on whatever thread recorded them, so readers take a
+    /// copy under the lock rather than reading the sets in place.
+    private struct ListingFilters {
+        var events: Set<String> = []
+        var eventsIsWhitelist = false
+        var userProperties: Set<String> = []
+        var userPropertiesIsWhitelist = false
+        var segmentation: Set<String> = []
+        var segmentationIsWhitelist = false
+        var eventSegmentation: [String: Set<String>] = [:]
+        var eventSegmentationIsWhitelist = false
+        var journeyTriggerEvents: Set<String> = []
+        var journeyTriggerViews: Set<String> = []
+    }
+
     // MARK: - Resolved values
 
     private(set) var trackingEnabled = true
@@ -166,16 +200,15 @@ final class ServerConfig {
 
     // MARK: - Listing filters
 
-    private var eventFilterSet: Set<String> = []
-    private var eventFilterIsWhitelist = false
-    private var userPropertyFilterSet: Set<String> = []
-    private var userPropertyFilterIsWhitelist = false
-    private var segmentationFilterSet: Set<String> = []
-    private var segmentationFilterIsWhitelist = false
-    private var eventSegmentationFilterMap: [String: Set<String>] = [:]
-    private var eventSegmentationFilterIsWhitelist = false
-    private var journeyTriggerEvents: Set<String> = []
-    private var journeyTriggerViews: Set<String> = []
+    private let filterLock = NSLock()
+    private var listingFilters = ListingFilters()
+
+    /// A copy of the filters in effect, safe to read on any thread.
+    private var currentFilters: ListingFilters {
+        filterLock.lock()
+        defer { filterLock.unlock() }
+        return listingFilters
+    }
 
     // MARK: - Fetch bookkeeping
 
@@ -186,6 +219,17 @@ final class ServerConfig {
     private var serverConfigUpdateInterval = 0
     private var updatesDisabled = false
     private var refreshTimer: Timer?
+
+    /// Guards `halted`, which a fetch completing on a network thread reads.
+    private let stateLock = NSLock()
+    private var halted = false
+
+    /// Whether `stop()` ended this run. An answer landing afterwards decides nothing.
+    private var isHalted: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return halted
+    }
 
     // MARK: - Collaborators
 
@@ -214,9 +258,13 @@ final class ServerConfig {
 
     // MARK: - Lifecycle
 
-    /// Stops the refresh timer. Called from `halt`.
+    /// Stops the refresh timer and ignores any answer still on its way. Called
+    /// from `halt`.
     func stop() {
         logger?.d(Self.module, "stop", "the behavior settings refresh timer is being stopped, wasScheduled: [\(refreshTimer != nil)]")
+        stateLock.lock()
+        halted = true
+        stateLock.unlock()
         refreshTimer?.invalidate()
         refreshTimer = nil
     }
@@ -329,9 +377,16 @@ final class ServerConfig {
         scheduleRefreshTimerIfNeeded(config: config)
 
         let fetchStart = Date()
-        let requestedDeviceID = transport.deviceID
+        // `lg` and `ct` are armed for the user this request is made for.
+        let requestedIdentity = ArmedIdentity(deviceID: transport.deviceID, typeValue: transport.deviceIDTypeValue)
+        let mergesAtRequest = transport.deviceIDMergeCount
         transport.fetchServerConfig { [weak self] data, statusCode, error in
             guard let self else { return }
+
+            guard !self.isHalted else {
+                self.logger?.d(Self.module, "fetch", "the behavior settings answer arrived after the instance was halted and is ignored, statusCode: [\(statusCode)]")
+                return
+            }
 
             // Wall clock of the whole fetch, reported by the connection test as its
             // `sc` row.
@@ -372,7 +427,8 @@ final class ServerConfig {
 
             // Only a live response decides log gathering, never a stored document. A
             // live response without a usable directive decides against it.
-            if self.transport?.deviceID == requestedDeviceID {
+            let isSameDevice = self.transport?.deviceID == requestedIdentity.deviceID
+            if isSameDevice {
                 self.logGatherer?.apply(LogGatheringDirective.parse(response[DocKey.logGathering], logger: self.logger),
                                         source: "server response")
             } else {
@@ -380,7 +436,20 @@ final class ServerConfig {
             }
 
             if connectionTestArmed {
-                self.connectionTest?.startBattery(serverConfigLatencyMs: fetchLatencyMs)
+                // A merge cancels the armed run on the server; a report under the old ID would only recreate that user.
+                if self.transport?.deviceIDMergeCount == mergesAtRequest {
+                    self.connectionTest?.startBattery(serverConfigLatencyMs: fetchLatencyMs,
+                                                      armedFor: requestedIdentity,
+                                                      mergesAtArming: mergesAtRequest)
+                } else {
+                    self.logger?.d(Self.module, "fetch", "the device ID was changed with merge since the request, the connection test armed for it is skipped")
+                }
+            }
+
+            // Otherwise the current user stays undecided until the next refresh, hours away.
+            if !isSameDevice, self.logGatherer?.currentState == .undecided {
+                self.logger?.d(Self.module, "fetch", "log gathering is still undecided after a device ID change, the behavior settings are fetched again for the current device ID")
+                self.fetch(config: config)
             }
         }
     }
@@ -541,52 +610,58 @@ final class ServerConfig {
             }
         }
 
-        var applied: [String] = []
+        var changes = ChangeLog()
 
-        readBool(&section, Key.tracking, &trackingEnabled, &applied)
-        readBool(&section, Key.networking, &networkingEnabled, &applied)
-        readInt(&section, Key.sessionUpdateInterval, &sessionInterval, min: 1, &applied)
-        readInt(&section, Key.requestQueueSize, &requestQueueSize, min: 1, &applied)
-        readInt(&section, Key.eventQueueSize, &eventQueueSize, min: 1, &applied)
-        readBool(&section, Key.crashReporting, &crashReportingEnabled, &applied)
-        readBool(&section, Key.automaticSessionTracking, &automaticSessionTrackingEnabled, &applied)
-        readBool(&section, Key.automaticViewTracking, &automaticViewTrackingEnabled, &applied)
-        readBool(&section, Key.automaticCrashReporting, &automaticCrashReportingEnabled, &applied)
-        readBool(&section, Key.sessionTracking, &sessionTrackingEnabled, &applied)
-        readBool(&section, Key.logging, &loggingEnabled, &applied)
-        readInt(&section, Key.limitKeyLength, &limitKeyLength, min: 1, &applied)
-        readInt(&section, Key.limitValueSize, &limitValueSize, min: 1, &applied)
-        readInt(&section, Key.limitSegValues, &limitSegValues, min: 1, &applied)
-        readInt(&section, Key.limitBreadcrumb, &limitBreadcrumb, min: 1, &applied)
-        readInt(&section, Key.limitTraceLine, &limitTraceLine, min: 1, &applied)
-        readInt(&section, Key.limitTraceLength, &limitTraceLength, min: 1, &applied)
-        readBool(&section, Key.customEventTracking, &customEventTrackingEnabled, &applied)
-        readBool(&section, Key.viewTracking, &viewTrackingEnabled, &applied)
-        readBool(&section, Key.enterContentZone, &enterContentZone, &applied)
-        readInt(&section, Key.contentZoneInterval, &contentZoneInterval, min: 16, &applied)
-        readBool(&section, Key.consentRequired, &consentRequired, &applied)
-        var dropAge = -1
-        readInt(&section, Key.dropOldRequestTime, &dropAge, min: 0, &applied)
+        readBool(&section, Key.tracking, &trackingEnabled, &changes)
+        readBool(&section, Key.networking, &networkingEnabled, &changes)
+        readInt(&section, Key.sessionUpdateInterval, &sessionInterval, min: 1, &changes)
+        readInt(&section, Key.requestQueueSize, &requestQueueSize, min: 1, &changes)
+        readInt(&section, Key.eventQueueSize, &eventQueueSize, min: 1, &changes)
+        readBool(&section, Key.crashReporting, &crashReportingEnabled, &changes)
+        readBool(&section, Key.automaticSessionTracking, &automaticSessionTrackingEnabled, &changes)
+        readBool(&section, Key.automaticViewTracking, &automaticViewTrackingEnabled, &changes)
+        readBool(&section, Key.automaticCrashReporting, &automaticCrashReportingEnabled, &changes)
+        readBool(&section, Key.sessionTracking, &sessionTrackingEnabled, &changes)
+        readBool(&section, Key.logging, &loggingEnabled, &changes)
+        readInt(&section, Key.limitKeyLength, &limitKeyLength, min: 1, &changes)
+        readInt(&section, Key.limitValueSize, &limitValueSize, min: 1, &changes)
+        readInt(&section, Key.limitSegValues, &limitSegValues, min: 1, &changes)
+        readInt(&section, Key.limitBreadcrumb, &limitBreadcrumb, min: 1, &changes)
+        readInt(&section, Key.limitTraceLine, &limitTraceLine, min: 1, &changes)
+        readInt(&section, Key.limitTraceLength, &limitTraceLength, min: 1, &changes)
+        readBool(&section, Key.customEventTracking, &customEventTrackingEnabled, &changes)
+        readBool(&section, Key.viewTracking, &viewTrackingEnabled, &changes)
+        readBool(&section, Key.enterContentZone, &enterContentZone, &changes)
+        readInt(&section, Key.contentZoneInterval, &contentZoneInterval, min: 16, &changes)
+        readBool(&section, Key.consentRequired, &consentRequired, &changes)
+        var dropAge = dropOldRequestTime ?? -1
+        readInt(&section, Key.dropOldRequestTime, &dropAge, min: 0, &changes)
         dropOldRequestTime = dropAge >= 0 ? dropAge : nil
-        readInt(&section, Key.serverConfigUpdateInterval, &serverConfigUpdateInterval, min: 1, &applied)
-        readBool(&section, Key.locationTracking, &locationTrackingEnabled, &applied)
-        readBool(&section, Key.refreshContentZone, &refreshContentZoneEnabled, &applied)
-        readBool(&section, Key.backoffMechanism, &backoffMechanism, &applied)
-        readInt(&section, Key.bomAcceptedTimeout, &bomAcceptedTimeoutSeconds, min: 1, &applied)
-        readDouble(&section, Key.bomRQPercentage, &bomRQPercentage, &applied)
-        readInt(&section, Key.bomRequestAge, &bomRequestAge, min: 1, &applied)
-        readInt(&section, Key.bomDuration, &bomDuration, min: 1, &applied)
-        readInt(&section, Key.userPropertyCacheLimit, &userPropertyCacheLimit, min: 1, &applied)
+        readInt(&section, Key.serverConfigUpdateInterval, &serverConfigUpdateInterval, min: 1, &changes)
+        readBool(&section, Key.locationTracking, &locationTrackingEnabled, &changes)
+        readBool(&section, Key.refreshContentZone, &refreshContentZoneEnabled, &changes)
+        if config.disableBackoffMechanism {
+            if section[Key.backoffMechanism] != nil {
+                logger?.d(Self.module, "populate", "the backoff mechanism setting is not applied, the developer config disables the mechanism")
+            }
+        } else {
+            readBool(&section, Key.backoffMechanism, &backoffMechanism, &changes)
+        }
+        readInt(&section, Key.bomAcceptedTimeout, &bomAcceptedTimeoutSeconds, min: 1, &changes)
+        readDouble(&section, Key.bomRQPercentage, &bomRQPercentage, &changes)
+        readInt(&section, Key.bomRequestAge, &bomRequestAge, min: 1, &changes)
+        readInt(&section, Key.bomDuration, &bomDuration, min: 1, &changes)
+        readInt(&section, Key.userPropertyCacheLimit, &userPropertyCacheLimit, min: 1, &changes)
 
-        updateListingFilters(&section, applied: &applied)
+        updateListingFilters(&section, changes: &changes)
 
         document[DocKey.config] = section
 
-        if !applied.isEmpty {
-            notifyChange(config: config)
+        if !changes.keys.isEmpty {
+            notifyChange(config: config, changedKeys: changes.keys)
         }
 
-        logger?.d(Self.module, "populate", "behavior settings applied, source: [\(source.rawValue)], version: [\(version)], timestamp: [\(timestamp)], appliedCount: [\(applied.count)], appliedValues: [\(applied.joined(separator: ", "))]")
+        logger?.d(Self.module, "populate", "behavior settings applied, source: [\(source.rawValue)], version: [\(version)], timestamp: [\(timestamp)], changedCount: [\(changes.keys.count)], changedValues: [\(changes.descriptions.joined(separator: ", "))]")
         logEffectiveConfiguration(config: config)
     }
 
@@ -600,7 +675,9 @@ final class ServerConfig {
     }
 
     /// Pushes the resolved values into the rest of the SDK.
-    private func notifyChange(config: CountlyConfig) {
+    ///
+    /// - Parameter changedKeys: the `c` keys whose value this apply changed.
+    private func notifyChange(config: CountlyConfig, changedKeys: Set<String>) {
         // The server may switch logging on for an application that never asked
         // for it, which is how support gets a trace out of a shipped build.
         if loggingEnabled, !config.enableDebug {
@@ -679,13 +756,13 @@ final class ServerConfig {
             installRefreshTimer(config: config)
         }
 
-        delegate?.serverConfigDidChange(self, consentBecameRequired: consentBecameRequired)
+        delegate?.serverConfigDidChange(self, consentBecameRequired: consentBecameRequired, changedKeys: changedKeys)
     }
 
     // MARK: - Value readers
 
     /// Reads a boolean, dropping the key when the value is not one.
-    private func readBool(_ section: inout [String: Any], _ key: String, _ target: inout Bool, _ applied: inout [String]) {
+    private func readBool(_ section: inout [String: Any], _ key: String, _ target: inout Bool, _ changes: inout ChangeLog) {
         guard let value = section[key] else { return }
         guard let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else {
             logger?.w(Self.module, "readBool", "dropping behavior setting, a boolean was expected, key: [\(key)], receivedType: [\(type(of: value))]")
@@ -694,12 +771,14 @@ final class ServerConfig {
         }
         let previous = target
         target = number.boolValue
-        applied.append("\(key): \(target)")
+        if previous != target {
+            changes.record(key, "\(target)")
+        }
         logger?.d(Self.module, "readBool", "a behavior settings switch was resolved, key: [\(key)], previousValue: [\(previous)], newValue: [\(target)], changed: [\(previous != target)]")
     }
 
     /// Reads an integer at or above `min`, dropping the key otherwise.
-    private func readInt(_ section: inout [String: Any], _ key: String, _ target: inout Int, min minimum: Int, _ applied: inout [String]) {
+    private func readInt(_ section: inout [String: Any], _ key: String, _ target: inout Int, min minimum: Int, _ changes: inout ChangeLog) {
         guard let value = section[key] else { return }
         guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else {
             logger?.w(Self.module, "readInt", "dropping behavior setting, an integer was expected, key: [\(key)], receivedType: [\(type(of: value))]")
@@ -714,12 +793,14 @@ final class ServerConfig {
         }
         let previous = target
         target = intValue
-        applied.append("\(key): \(intValue)")
+        if previous != intValue {
+            changes.record(key, "\(intValue)")
+        }
         logger?.d(Self.module, "readInt", "a behavior settings count was resolved, key: [\(key)], previousValue: [\(previous)], newValue: [\(intValue)], changed: [\(previous != intValue)]")
     }
 
     /// Reads a fraction strictly between 0 and 1, dropping the key otherwise.
-    private func readDouble(_ section: inout [String: Any], _ key: String, _ target: inout Double, _ applied: inout [String]) {
+    private func readDouble(_ section: inout [String: Any], _ key: String, _ target: inout Double, _ changes: inout ChangeLog) {
         guard let value = section[key] else { return }
         guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else {
             logger?.w(Self.module, "readDouble", "dropping behavior setting, a double was expected, key: [\(key)], receivedType: [\(type(of: value))]")
@@ -734,7 +815,9 @@ final class ServerConfig {
         }
         let previous = target
         target = doubleValue
-        applied.append("\(key): \(doubleValue.logValue)")
+        if previous != doubleValue {
+            changes.record(key, doubleValue.logValue)
+        }
         logger?.d(Self.module, "readDouble", "a behavior settings fraction was resolved, key: [\(key)], previousValue: [\(previous.logValue)], newValue: [\(doubleValue.logValue)], changed: [\(previous != doubleValue)]")
     }
 
@@ -746,39 +829,45 @@ final class ServerConfig {
 
     /// Resolves the blacklist and whitelist pairs. A blacklist always wins when
     /// both are present, because excluding is the safer of the two.
-    private func updateListingFilters(_ section: inout [String: Any], applied: inout [String]) {
+    private func updateListingFilters(_ section: inout [String: Any], changes: inout ChangeLog) {
+        var filters = currentFilters
+
         resolveListFilter(&section,
                           blacklistKey: Key.eventBlacklist,
                           whitelistKey: Key.eventWhitelist,
-                          set: &eventFilterSet,
-                          isWhitelist: &eventFilterIsWhitelist,
-                          applied: &applied)
+                          set: &filters.events,
+                          isWhitelist: &filters.eventsIsWhitelist,
+                          changes: &changes)
 
         resolveListFilter(&section,
                           blacklistKey: Key.userPropertyBlacklist,
                           whitelistKey: Key.userPropertyWhitelist,
-                          set: &userPropertyFilterSet,
-                          isWhitelist: &userPropertyFilterIsWhitelist,
-                          applied: &applied)
+                          set: &filters.userProperties,
+                          isWhitelist: &filters.userPropertiesIsWhitelist,
+                          changes: &changes)
 
         resolveListFilter(&section,
                           blacklistKey: Key.segmentationBlacklist,
                           whitelistKey: Key.segmentationWhitelist,
-                          set: &segmentationFilterSet,
-                          isWhitelist: &segmentationFilterIsWhitelist,
-                          applied: &applied)
+                          set: &filters.segmentation,
+                          isWhitelist: &filters.segmentationIsWhitelist,
+                          changes: &changes)
 
         resolveMapFilter(&section,
                          blacklistKey: Key.eventSegmentationBlacklist,
                          whitelistKey: Key.eventSegmentationWhitelist,
-                         map: &eventSegmentationFilterMap,
-                         isWhitelist: &eventSegmentationFilterIsWhitelist,
-                         applied: &applied)
+                         map: &filters.eventSegmentation,
+                         isWhitelist: &filters.eventSegmentationIsWhitelist,
+                         changes: &changes)
 
-        resolveNameSet(&section, key: Key.journeyTriggerEvents, set: &journeyTriggerEvents, applied: &applied)
-        resolveNameSet(&section, key: Key.journeyTriggerViews, set: &journeyTriggerViews, applied: &applied)
+        resolveNameSet(&section, key: Key.journeyTriggerEvents, set: &filters.journeyTriggerEvents, changes: &changes)
+        resolveNameSet(&section, key: Key.journeyTriggerViews, set: &filters.journeyTriggerViews, changes: &changes)
 
-        logger?.d(Self.module, "updateListingFilters", "resolved listing filters, eventFilterCount: [\(eventFilterSet.count)], eventFilterIsWhitelist: [\(eventFilterIsWhitelist)], userPropertyFilterCount: [\(userPropertyFilterSet.count)], userPropertyFilterIsWhitelist: [\(userPropertyFilterIsWhitelist)], segmentationFilterCount: [\(segmentationFilterSet.count)], segmentationFilterIsWhitelist: [\(segmentationFilterIsWhitelist)], eventSegmentationFilteredEventCount: [\(eventSegmentationFilterMap.count)], eventSegmentationFilterIsWhitelist: [\(eventSegmentationFilterIsWhitelist)], journeyTriggerEventCount: [\(journeyTriggerEvents.count)], journeyTriggerViewCount: [\(journeyTriggerViews.count)]")
+        filterLock.lock()
+        listingFilters = filters
+        filterLock.unlock()
+
+        logger?.d(Self.module, "updateListingFilters", "resolved listing filters, eventFilterCount: [\(filters.events.count)], eventFilterIsWhitelist: [\(filters.eventsIsWhitelist)], userPropertyFilterCount: [\(filters.userProperties.count)], userPropertyFilterIsWhitelist: [\(filters.userPropertiesIsWhitelist)], segmentationFilterCount: [\(filters.segmentation.count)], segmentationFilterIsWhitelist: [\(filters.segmentationIsWhitelist)], eventSegmentationFilteredEventCount: [\(filters.eventSegmentation.count)], eventSegmentationFilterIsWhitelist: [\(filters.eventSegmentationIsWhitelist)], journeyTriggerEventCount: [\(filters.journeyTriggerEvents.count)], journeyTriggerViewCount: [\(filters.journeyTriggerViews.count)]")
     }
 
     private func resolveListFilter(_ section: inout [String: Any],
@@ -786,16 +875,22 @@ final class ServerConfig {
                                    whitelistKey: String,
                                    set: inout Set<String>,
                                    isWhitelist: inout Bool,
-                                   applied: inout [String]) {
+                                   changes: inout ChangeLog) {
         if let blacklist = section[blacklistKey] as? [String] {
-            set = Set(blacklist)
+            let resolved = Set(blacklist)
+            if resolved != set || isWhitelist {
+                changes.record(blacklistKey, blacklist.joined(separator: ", "))
+            }
+            set = resolved
             isWhitelist = false
-            applied.append("\(blacklistKey): \(blacklist.joined(separator: ", "))")
             section.removeValue(forKey: whitelistKey)
         } else if let whitelist = section[whitelistKey] as? [String] {
-            set = Set(whitelist)
+            let resolved = Set(whitelist)
+            if resolved != set || !isWhitelist {
+                changes.record(whitelistKey, whitelist.joined(separator: ", "))
+            }
+            set = resolved
             isWhitelist = true
-            applied.append("\(whitelistKey): \(whitelist.joined(separator: ", "))")
         } else {
             logUnusableFilter(section, blacklistKey, whitelistKey)
             section.removeValue(forKey: blacklistKey)
@@ -818,7 +913,7 @@ final class ServerConfig {
                                   whitelistKey: String,
                                   map: inout [String: Set<String>],
                                   isWhitelist: inout Bool,
-                                  applied: inout [String]) {
+                                  changes: inout ChangeLog) {
         func build(_ raw: [String: Any]) -> [String: Set<String>] {
             var result: [String: Set<String>] = [:]
             for (key, value) in raw {
@@ -828,14 +923,20 @@ final class ServerConfig {
         }
 
         if let blacklist = section[blacklistKey] as? [String: Any] {
-            map = build(blacklist)
+            let resolved = build(blacklist)
+            if resolved != map || isWhitelist {
+                changes.record(blacklistKey, sortedKeyList(of: blacklist))
+            }
+            map = resolved
             isWhitelist = false
-            applied.append("\(blacklistKey): \(sortedKeyList(of: blacklist))")
             section.removeValue(forKey: whitelistKey)
         } else if let whitelist = section[whitelistKey] as? [String: Any] {
-            map = build(whitelist)
+            let resolved = build(whitelist)
+            if resolved != map || !isWhitelist {
+                changes.record(whitelistKey, sortedKeyList(of: whitelist))
+            }
+            map = resolved
             isWhitelist = true
-            applied.append("\(whitelistKey): \(sortedKeyList(of: whitelist))")
         } else {
             logUnusableFilter(section, blacklistKey, whitelistKey)
             section.removeValue(forKey: blacklistKey)
@@ -843,10 +944,13 @@ final class ServerConfig {
         }
     }
 
-    private func resolveNameSet(_ section: inout [String: Any], key: String, set: inout Set<String>, applied: inout [String]) {
+    private func resolveNameSet(_ section: inout [String: Any], key: String, set: inout Set<String>, changes: inout ChangeLog) {
         if let list = section[key] as? [String] {
-            set = Set(list)
-            applied.append("\(key): \(list.joined(separator: ", "))")
+            let resolved = Set(list)
+            if resolved != set {
+                changes.record(key, list.joined(separator: ", "))
+            }
+            set = resolved
         } else {
             logUnusableFilter(section, key)
             section.removeValue(forKey: key)
@@ -857,33 +961,36 @@ final class ServerConfig {
 
     /// Whether an event key survives the event filter.
     func shouldRecordEvent(_ eventKey: String) -> Bool {
-        guard !eventFilterSet.isEmpty else { return true }
-        return eventFilterIsWhitelist == eventFilterSet.contains(eventKey)
+        let filters = currentFilters
+        guard !filters.events.isEmpty else { return true }
+        return filters.eventsIsWhitelist == filters.events.contains(eventKey)
     }
 
     /// Whether a user property key survives the user property filter.
     func shouldRecordUserProperty(_ propertyKey: String) -> Bool {
-        guard !userPropertyFilterSet.isEmpty else { return true }
-        return userPropertyFilterIsWhitelist == userPropertyFilterSet.contains(propertyKey)
+        let filters = currentFilters
+        guard !filters.userProperties.isEmpty else { return true }
+        return filters.userPropertiesIsWhitelist == filters.userProperties.contains(propertyKey)
     }
 
     /// Drops segmentation keys that the global or per-event filter excludes.
     func filterSegmentation(_ segmentation: [String: Any]?, eventKey: String) -> [String: Any]? {
         guard let segmentation else { return nil }
 
-        let hasGlobalFilter = !segmentationFilterSet.isEmpty
-        let eventFilter = eventSegmentationFilterMap[eventKey]
+        let filters = currentFilters
+        let hasGlobalFilter = !filters.segmentation.isEmpty
+        let eventFilter = filters.eventSegmentation[eventKey]
         let hasEventFilter = !(eventFilter?.isEmpty ?? true)
 
         guard hasGlobalFilter || hasEventFilter else { return segmentation }
 
         var result = segmentation
         for key in segmentation.keys {
-            if hasGlobalFilter, segmentationFilterIsWhitelist != segmentationFilterSet.contains(key) {
-                logger?.d(Self.module, "filterSegmentation", "dropping segmentation key by the global segmentation filter, key: [\(key)], filterIsWhitelist: [\(segmentationFilterIsWhitelist)]")
+            if hasGlobalFilter, filters.segmentationIsWhitelist != filters.segmentation.contains(key) {
+                logger?.d(Self.module, "filterSegmentation", "dropping segmentation key by the global segmentation filter, key: [\(key)], filterIsWhitelist: [\(filters.segmentationIsWhitelist)]")
                 result.removeValue(forKey: key)
             } else if hasEventFilter, let eventFilter,
-                      eventSegmentationFilterIsWhitelist != eventFilter.contains(key) {
+                      filters.eventSegmentationIsWhitelist != eventFilter.contains(key) {
                 logger?.d(Self.module, "filterSegmentation", "dropping segmentation key by the event level segmentation filter, key: [\(key)], eventKey: [\(eventKey)]")
                 result.removeValue(forKey: key)
             }
@@ -894,21 +1001,32 @@ final class ServerConfig {
     /// Whether recording this event should also flush the queue, so a journey can
     /// react to it right away.
     func isJourneyTriggerEvent(_ eventKey: String) -> Bool {
-        journeyTriggerEvents.contains(eventKey)
+        currentFilters.journeyTriggerEvents.contains(eventKey)
     }
 
     /// Whether starting this view should also flush the queue.
     func isJourneyTriggerView(_ viewName: String) -> Bool {
-        journeyTriggerViews.contains(viewName)
+        currentFilters.journeyTriggerViews.contains(viewName)
     }
+}
+
+/// The user a behavior settings request was made for, who owns anything its
+/// answer arms.
+struct ArmedIdentity: Equatable {
+    let deviceID: String
+    /// The `t` value the device ID had when the request was made.
+    let typeValue: Int
 }
 
 /// Applies resolved behavior settings to the rest of the SDK.
 protocol ServerConfigDelegate: AnyObject {
-    /// - Parameter consentBecameRequired: `true` when the server turned consent
-    ///   requirement on for an application that did not require it, which means
-    ///   the consent state has to be resent.
-    func serverConfigDidChange(_ serverConfig: ServerConfig, consentBecameRequired: Bool)
+    /// - Parameters:
+    ///   - consentBecameRequired: `true` when the server turned consent
+    ///     requirement on for an application that did not require it, which means
+    ///     the consent state has to be resent.
+    ///   - changedKeys: the `c` keys, named as in ``ServerConfig/Key``, whose
+    ///     value this apply changed.
+    func serverConfigDidChange(_ serverConfig: ServerConfig, consentBecameRequired: Bool, changedKeys: Set<String>)
 }
 
 /// What the behavior settings fetch needs from the networking layer.
@@ -916,5 +1034,9 @@ protocol ServerConfigTransport: AnyObject {
     var isDeviceIDTemporary: Bool { get }
     /// The device ID requests are built with right now.
     var deviceID: String { get }
+    /// The `t` value of the device ID requests are built with right now.
+    var deviceIDTypeValue: Int { get }
+    /// How many times the device ID was changed with merge in this run.
+    var deviceIDMergeCount: Int { get }
     func fetchServerConfig(completion: @escaping (Data?, Int, Error?) -> Void)
 }

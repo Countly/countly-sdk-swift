@@ -220,7 +220,7 @@ final class ConsentModule: ModuleBase {
             if isGranted {
                 logD("consentDidChange", "consent granted, feature: [\(feature.wireName)], a begin session is requested only with automatic session tracking, automaticSessionTrackingEnabled: [\(core.serverConfig.automaticSessionTrackingEnabled)]")
                 if core.serverConfig.automaticSessionTrackingEnabled {
-                    modules?.sessions.beginSession()
+                    modules?.sessions.beginSession(automatically: true)
                 }
             } else {
                 logD("consentDidChange", "consent cancelled, feature: [\(feature.wireName)], session tracking will no longer be performed")
