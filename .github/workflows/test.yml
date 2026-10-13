@@ -49,8 +49,7 @@ jobs:
     runs-on: macos-15
     steps:
       - name: Checkout SDK code
-        uses: actions/checkout@v4
-
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Set up Xcode
         run: sudo xcode-select -switch /Applications/Xcode_16.4.app
 
@@ -103,7 +102,7 @@ jobs:
 
       - name: Upload the JUnit results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: junit-macOS
           path: test-results/macOS.xml
@@ -111,7 +110,7 @@ jobs:
 
       - name: Upload the runner health assessment
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: runner-health-macOS
           path: runner-health/macOS.json
@@ -119,7 +118,7 @@ jobs:
 
       - name: Upload the coverage summary
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-macOS
           path: |
@@ -130,7 +129,7 @@ jobs:
       # Only on failure: a green run's result bundle is tens of megabytes nobody opens.
       - name: Upload the result bundle
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: test-results-macOS
           path: TestResults.xcresult
@@ -162,8 +161,7 @@ jobs:
         platform: [iOS, tvOS, watchOS, visionOS]
     steps:
       - name: Checkout SDK code
-        uses: actions/checkout@v4
-
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Set up Xcode
         run: sudo xcode-select -switch /Applications/Xcode_16.4.app
 
@@ -268,7 +266,7 @@ jobs:
 
       - name: Upload the JUnit results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: junit-${{ matrix.platform }}
           path: test-results/${{ matrix.platform }}.xml
@@ -276,7 +274,7 @@ jobs:
 
       - name: Upload the runner health assessment
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: runner-health-${{ matrix.platform }}
           path: runner-health/${{ matrix.platform }}.json
@@ -284,7 +282,7 @@ jobs:
 
       - name: Upload the coverage summary
         if: always() && matrix.platform == 'iOS'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-iOS
           path: coverage/iOS.json
@@ -293,7 +291,7 @@ jobs:
       # Only on failure: a green run's result bundle is tens of megabytes nobody opens.
       - name: Upload the test results
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: test-results-${{ matrix.platform }}
           path: TestResults.xcresult
@@ -322,8 +320,7 @@ jobs:
     steps:
       # Only for the scripts under .github/scripts; nothing here builds.
       - name: Checkout SDK code
-        uses: actions/checkout@v4
-
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # `merge-multiple` flattens junit-macOS, junit-iOS, ... into one directory. The files
       # inside are named after their platform, so nothing collides.
       # `continue-on-error` because download-artifact fails outright when the pattern matches
@@ -331,7 +328,7 @@ jobs:
       # to reach the report as empty rows, not as a second red job.
       - name: Download the JUnit results
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: junit-*
           path: junit
@@ -340,7 +337,7 @@ jobs:
       # Advisory only, so it downloads like the rest and is simply absent if no job wrote one.
       - name: Download the runner health assessments
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: runner-health-*
           path: runner-health
@@ -348,7 +345,7 @@ jobs:
 
       - name: Download the coverage summaries
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: coverage-*
           path: coverage
@@ -362,7 +359,7 @@ jobs:
       # would fail. The report still reaches the run summary, which needs no write access.
       - name: Publish the test results as a check
         if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-        uses: EnricoMi/publish-unit-test-result-action@v2
+        uses: EnricoMi/publish-unit-test-result-action@d0a4676d0e0b938bc201470d88276b7c74c712b3 # v2.24.0
         with:
           check_name: "Test Results :rocket:"
           comment_title: "Test Results :rocket:"
@@ -391,7 +388,7 @@ jobs:
       # comment on every push, which nobody reads after the third one.
       - name: Comment the report on the pull request
         if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
           script: |
             const fs = require('fs');
@@ -434,7 +431,7 @@ jobs:
 
       - name: Upload the rendered report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ci-report
           path: ci-report.md

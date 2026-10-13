@@ -107,6 +107,28 @@ final class DeviceIDTests: CountlyBaseTestCase {
         XCTAssertEqual(second.deviceID.current, "second")
     }
 
+    /// Resetting a generated ID with no ID configured has to produce a new one,
+    /// or the reset would hand back the identity it was meant to drop.
+    func testResetStoredDeviceIDGeneratesANewIDInsteadOfTheStoredOne() {
+        let name = uniqueInstanceName()
+
+        let firstConfig = baseConfig(instanceName: name)
+        firstConfig.deviceID = nil
+        let first = start(firstConfig)
+        let generated = first.deviceID.current
+        XCTAssertNotNil(generated)
+        first.halt()
+
+        let secondConfig = baseConfig(instanceName: name)
+        secondConfig.deviceID = nil
+        secondConfig.resetStoredDeviceID = true
+        let second = start(secondConfig)
+
+        XCTAssertNotNil(second.deviceID.current)
+        XCTAssertNotEqual(second.deviceID.current, generated)
+        XCTAssertEqual(second.deviceID.type, .sdkGenerated)
+    }
+
     /// An application that knows who the user is does not want them held as
     /// anonymous, so a provided ID wins over temporary mode at init.
     func testAProvidedIDWinsOverTemporaryModeAtInit() {

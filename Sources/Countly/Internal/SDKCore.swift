@@ -164,6 +164,10 @@ extension SDKCore: LogGatheringTransport {
     func sendSdkLogs(_ payload: String) -> Bool {
         network.sendSdkLogs(payload)
     }
+
+    var hasQueuedSdkLogs: Bool {
+        network.hasQueuedSdkLogs
+    }
 }
 
 /// Strong references to every module of one instance.

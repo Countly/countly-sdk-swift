@@ -350,6 +350,27 @@ final class UserProfileTests: CountlyBaseTestCase {
         XCTAssertEqual(lastUserDetails(of: countly)?["picture"] as? String, url)
     }
 
+    #if !(os(iOS) || os(visionOS))
+    /// Only iOS and visionOS upload a local picture. Anywhere else the path would
+    /// go out as text naming a folder on the device, so it is dropped.
+    func testALocalPicturePathIsDroppedWhereNothingUploadsIt() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("avatar-\(UUID().uuidString).png")
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let countly = startInstance()
+
+        countly.userProfile.setProperty("picturePath", value: file.path)
+        countly.userProfile.setProperty("name", value: "Babe J.")
+        countly.userProfile.save()
+
+        let details = try XCTUnwrap(lastUserDetails(of: countly))
+        XCTAssertEqual(details["name"] as? String, "Babe J.", "the rest of the profile still goes out")
+        XCTAssertNil(details["picturePath"])
+        XCTAssertNil(details["picture"])
+        XCTAssertFalse(requestQueue(of: countly).contains { $0.contains(file.lastPathComponent) }, "the path left the device")
+    }
+    #endif
+
     // MARK: - Server config
 
     func testTheServerUserPropertyBlacklistDropsOnlyTheListedKeys() {

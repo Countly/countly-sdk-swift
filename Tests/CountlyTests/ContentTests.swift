@@ -407,6 +407,37 @@ final class ContentTests: CountlyBaseTestCase {
         XCTAssertEqual(fetches().count, afterHalt)
     }
 
+    // MARK: - Behavior settings
+
+    /// Only the server's own zone settings move a zone the application entered.
+    /// A refresh that changes anything else leaves the zone polling, and one that
+    /// switches the zone on enters it afresh.
+    func testOnlyAnAnswerChangingTheZoneSettingsMovesAZoneTheApplicationEntered() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk/content", json: "{}")
+        let countly = contentInstance()
+        let core = core(of: countly)
+        countly.content.enterContentZone()
+        waitForFetch()
+        let afterEnter = fetches().count
+
+        var answer = ServerConfigBuilder().sessionUpdateInterval(120).json()
+        MockURLProtocol.respond { captured in
+            captured.query.contains("method=sc") ? (200, Data(answer.utf8)) : nil
+        }
+        core.serverConfig.fetch(config: core.config)
+        TestUtils.waitUntil("the unrelated answer is applied") { core.config.updateSessionPeriod == 120 }
+        TestUtils.pump(0.3)
+
+        countly.content.enterContentZone()
+        TestUtils.pump(0.4)
+        XCTAssertEqual(fetches().count, afterEnter, "the answer left the zone, so a second enter was accepted")
+
+        answer = ServerConfigBuilder().sessionUpdateInterval(120).enterContentZone(true).json()
+        core.serverConfig.fetch(config: core.config)
+
+        TestUtils.waitUntil("the server's zone setting enters the zone afresh") { self.fetches().count > afterEnter }
+    }
+
     // MARK: - Closing from another thread
 
     /// Taking content off screen touches the view hierarchy, so it has to happen on

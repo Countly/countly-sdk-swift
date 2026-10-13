@@ -328,13 +328,16 @@ final class WebViewManager: NSObject {
     ///   - frame: Where to place it. Defaults to filling the overlay.
     ///   - appear: Called once the page has loaded and is visible.
     ///   - dismiss: Called once the page has been taken off screen.
+    ///   - refused: Called instead of `dismiss` when another overlay is on screen
+    ///     and the page is not shown at all. Without it `dismiss` is called.
     func present(url: URL?,
                  frame: CGRect? = nil,
                  placement: [String: Any] = [:],
                  widgetType: FeedbackWidgetType? = nil,
                  widgetPosition: String? = nil,
                  appear: (() -> Void)?,
-                 dismiss: (() -> Void)?) {
+                 dismiss: (() -> Void)?,
+                 refused: (() -> Void)? = nil) {
         guard let url else {
             core.logger.e(Self.module, "present", "web view presentation is dropped, the URL could not be built")
             return
@@ -348,7 +351,11 @@ final class WebViewManager: NSObject {
             // callback, and a caller that waited for a dismissal that is not
             // coming would hold its own state open indefinitely.
             isClosed = true
-            dismiss?()
+            if let refused {
+                refused()
+            } else {
+                dismiss?()
+            }
             return
         }
 
@@ -1230,9 +1237,8 @@ final class WebViewManager: NSObject {
                 reportAppearance()
             }
 
-            core.logger.d(Self.module, "recordEvents", "recording a content event, key: [\(key)]")
-            core.logger.d(Self.module, "recordEvents", "content event detail, key: [\(key)], segmentation: [\(segmentation)]")
-            core.modules.events.recordEvent(key, segmentation: segmentation)
+            core.logger.d(Self.module, "recordEvents", "recording a content event, key: [\(key)], segmentationKeys: [\(segmentation.keys.sorted())]")
+            core.modules.events.recordEvent(key, segmentation: core.modules.content.withGlobalSegmentation(segmentation))
         }
 
         if skipped > 0 {

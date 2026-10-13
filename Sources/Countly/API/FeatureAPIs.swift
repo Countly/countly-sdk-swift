@@ -369,6 +369,16 @@ public final class ContentAPI: CountlyAPIBase {
     public func previewContent(_ contentID: String) {
         core()?.modules.content.previewContent(contentID)
     }
+
+    /// Sets a segmentation recorded with every content and feedback widget event,
+    /// on top of the keys those events report themselves.
+    ///
+    /// Keys those events reserve, such as `rating`, `closed`, `dismissed` or the
+    /// `answ-` survey answers, are dropped. It lasts for the run, across sessions,
+    /// and is not restored after a restart. `nil` clears it.
+    public func setGlobalContentSegmentation(_ segmentation: [String: Any]?) {
+        core()?.modules.content.setGlobalContentSegmentation(segmentation)
+    }
 }
 
 // MARK: - Push

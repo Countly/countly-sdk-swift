@@ -186,8 +186,15 @@ final class AutoViewTracker {
         return (base, arguments)
     }
 
+    /// Test hook: supplies the screen on display where no window scene is
+    /// connected, as in a test host without an application.
+    static var topViewControllerOverride: (() -> UIViewController?)?
+
     /// The view controller currently on screen.
     static func topViewController() -> UIViewController? {
+        if let override = topViewControllerOverride {
+            return override()
+        }
         var top = ScreenReader.keyWindow?.rootViewController
 
         while true {

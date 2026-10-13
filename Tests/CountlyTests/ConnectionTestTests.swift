@@ -20,7 +20,14 @@ final class ConnectionTestTests: CountlyBaseTestCase {
 
     private let expectedProbePaths = [
         "/o/ping", "/i", "/o/sdk?method=rc", "/o/sdk?method=ab_fetch_variants", "/o/sdk?method=feedback",
-        "/o/surveys/nps/widget", "/o/surveys/survey/widget", "/o/feedback/widget", "/i/feedback/inputs", "/o/sdk/content",
+        "/o/surveys/nps/widget", "/o/surveys/survey/widget", "/o/feedback/widget", "/o/surveys/rating/widget",
+        "/i/feedback/inputs", "/o/sdk/content",
+        "/feedback/nps", "/feedback/survey", "/feedback/rating",
+        "/surveys/images/ct-probe.png", "/star-rating/images/ct-probe.png", "/_external/content/",
+    ]
+
+    /// The paths a web view loads, probed the way it reaches them.
+    private let webViewProbePaths: Set<String> = [
         "/feedback/nps", "/feedback/survey", "/feedback/rating",
         "/surveys/images/ct-probe.png", "/star-rating/images/ct-probe.png", "/_external/content/",
     ]
@@ -130,6 +137,29 @@ final class ConnectionTestTests: CountlyBaseTestCase {
         rows(report).first { ($0["f"] as? String) == feature }
     }
 
+    /// Holds the answer to the first behavior settings fetch, armed, until the
+    /// returned closure runs, and answers every later fetch unarmed, so a test can
+    /// change the device ID while the arming fetch is in flight.
+    private func holdFirstArmedAnswer() -> () -> Void {
+        let gate = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        var fetchCount = 0
+        let armed = Data(armedResponse().utf8)
+        let unarmed = Data(ServerConfigBuilder().json().utf8)
+        MockURLProtocol.respond { captured in
+            guard captured.path.contains("/o/sdk"), captured.query.contains("method=sc") else { return nil }
+            lock.lock()
+            fetchCount += 1
+            let isFirst = fetchCount == 1
+            lock.unlock()
+            guard isFirst else { return (200, unarmed) }
+            _ = gate.wait(timeout: .now() + 30)
+            return (200, armed)
+        }
+        addTeardownBlock { gate.signal() }
+        return { gate.signal() }
+    }
+
     /// A transport that answers every probe with one status and never touches the
     /// network, for the battery mechanics.
     private final class CannedTransport: ProbeTransport {
@@ -137,6 +167,7 @@ final class ConnectionTestTests: CountlyBaseTestCase {
         let delay: TimeInterval
         private let lock = NSLock()
         private var _urls: [URL] = []
+        private var _webViewURLs: [URL] = []
 
         init(status: Int, delay: TimeInterval = 0) {
             self.status = status
@@ -149,9 +180,17 @@ final class ConnectionTestTests: CountlyBaseTestCase {
             return _urls
         }
 
-        func probe(_ url: URL, timeout: TimeInterval) -> ConnectionTestModule.ProbeOutcome {
+        /// The probes made the way a web view would load them.
+        var webViewURLs: [URL] {
+            lock.lock()
+            defer { lock.unlock() }
+            return _webViewURLs
+        }
+
+        func probe(_ url: URL, timeout: TimeInterval, loadedByWebView: Bool) -> ConnectionTestModule.ProbeOutcome {
             lock.lock()
             _urls.append(url)
+            if loadedByWebView { _webViewURLs.append(url) }
             lock.unlock()
             if delay > 0 { Thread.sleep(forTimeInterval: delay) }
             return ConnectionTestModule.ProbeOutcome(status: status, latencyMs: Int64(delay * 1000), failure: nil)
@@ -176,7 +215,7 @@ final class ConnectionTestTests: CountlyBaseTestCase {
         XCTAssertEqual((report["sdk"] as? [String: Any])?["version"] as? String, SDKIdentity.version)
         XCTAssertGreaterThan(TestUtils.int64(report["ts"]) ?? 0, 1_600_000_000_000)
 
-        // 16 parameterless GETs, marker and cache buster on each, host path joined once.
+        // 17 parameterless GETs, marker and cache buster on each, host path joined once.
         let probes = probes()
         XCTAssertEqual(probes.map(probePath), expectedProbePaths)
         for probe in probes {
@@ -206,7 +245,7 @@ final class ConnectionTestTests: CountlyBaseTestCase {
         XCTAssertGreaterThanOrEqual(TestUtils.int(sc["ms"]) ?? -1, 0)
 
         // Path counts only on the combined rows.
-        XCTAssertEqual(TestUtils.int(row(report, "feedback-widget")?["n"]), 3)
+        XCTAssertEqual(TestUtils.int(row(report, "feedback-widget")?["n"]), 4)
         XCTAssertEqual(TestUtils.int(row(report, "feedback-page")?["n"]), 3)
         XCTAssertEqual(TestUtils.int(row(report, "feedback-assets")?["n"]), 2)
         XCTAssertNil(row(report, "core")?["n"])
@@ -265,7 +304,7 @@ final class ConnectionTestTests: CountlyBaseTestCase {
         XCTAssertEqual(widget["ok"] as? Bool, false)
         XCTAssertEqual(TestUtils.int(widget["st"]), 500)
         XCTAssertEqual(widget["e"] as? String, "HTTP 500")
-        XCTAssertEqual(TestUtils.int(widget["n"]), 3)
+        XCTAssertEqual(TestUtils.int(widget["n"]), 4)
 
         // Strict combined row: anything but 2xx on any path fails it.
         let assets = try XCTUnwrap(row(report, "feedback-assets"))
@@ -345,16 +384,22 @@ final class ConnectionTestTests: CountlyBaseTestCase {
         XCTAssertEqual(probesRun, expectedProbePaths.count)
     }
 
-    func testProbesCarryTheSDKCustomHeaders() throws {
+    /// The SDK's own endpoints are probed with its custom headers, as its requests
+    /// reach them, and what a web view loads without, as the web view reaches it.
+    func testProbesCarryTheCustomHeadersExceptWhereAWebViewLoadsThePage() throws {
         try skipUnlessNetworkIsInterceptable()
         installHandler(scResponse: armedResponse())
         let countly = startInstance { $0.customNetworkRequestHeaders = ["X-Gateway-Token": "abc123"] }
         _ = try XCTUnwrap(waitForReport(of: countly))
 
         let probes = probes()
-        XCTAssertFalse(probes.isEmpty)
+        XCTAssertEqual(probes.count, expectedProbePaths.count)
         for probe in probes {
-            XCTAssertEqual(probe.headers["X-Gateway-Token"], "abc123", "a header checking gateway would report a healthy server as unreachable")
+            if webViewProbePaths.contains(probePath(probe)) {
+                XCTAssertNil(probe.headers["X-Gateway-Token"], "a web view sends none of the SDK's headers: \(probePath(probe))")
+            } else {
+                XCTAssertEqual(probe.headers["X-Gateway-Token"], "abc123", "a header checking gateway would report a healthy server as unreachable: \(probePath(probe))")
+            }
         }
     }
 
@@ -379,9 +424,9 @@ final class ConnectionTestTests: CountlyBaseTestCase {
         waitForBehaviorSettingsFetch()
 
         let module = module(of: countly)
-        // 16 x 1 s minus 15.5 s: a cap of half a second, with probes that take 0.2 s.
+        // 17 x 1 s minus 16.5 s: a cap of half a second, with probes that take 0.2 s.
         module.perRequestTimeout = 1
-        module.batteryCapExtra = -15.5
+        module.batteryCapExtra = -16.5
         module.transport = CannedTransport(status: 200, delay: 0.2)
         module.startBattery(serverConfigLatencyMs: 12)
 
@@ -416,6 +461,89 @@ final class ConnectionTestTests: CountlyBaseTestCase {
         XCTAssertEqual(probes().count, expectedProbePaths.count * 2)
         let secondRequest = try XCTUnwrap(TestUtils.requests(requestQueue(of: second), carrying: "ct_results").first)
         TestUtils.assertBaseParameters(secondRequest, deviceID: "other-device")
+    }
+
+    /// With tracking off the report could never be queued, so the battery is not
+    /// started at all.
+    func testTrackingDisabledByBehaviorSettingsSkipsTheBattery() throws {
+        try skipUnlessNetworkIsInterceptable()
+        installHandler(scResponse: ServerConfigBuilder().tracking(false).armConnectionTest().json())
+        let countly = startInstance()
+
+        TestUtils.waitUntil("the armed response lands") { !core(of: countly).serverConfig.trackingEnabled }
+        TestUtils.pump(0.5)
+
+        XCTAssertTrue(probes().isEmpty, "a report that cannot be queued is not worth the probe traffic")
+        XCTAssertTrue(queuedReports(of: countly).isEmpty)
+        XCTAssertFalse(module(of: countly).isBatteryRunning)
+    }
+
+    // MARK: - Identity
+
+    /// The test is armed for the user the fetch was made for. A change without
+    /// merge while the answer is in flight does not hand that user's report to the
+    /// next one, type included.
+    func testTheReportIsFiledUnderTheUserTheArmingFetchWasMadeFor() throws {
+        try skipUnlessNetworkIsInterceptable()
+        installHandler(scResponse: armedResponse())
+        let release = holdFirstArmedAnswer()
+        let countly = startInstance { $0.deviceID = nil }
+        let generatedID = core(of: countly).modules.deviceID.deviceID
+        waitForBehaviorSettingsFetch()
+
+        countly.deviceID.changeWithoutMerge("next-user")
+        release()
+
+        _ = try XCTUnwrap(waitForReport(of: countly))
+        TestUtils.waitUntil("the battery releases") { !self.module(of: countly).isBatteryRunning }
+        TestUtils.pump(0.3)
+
+        let reports = TestUtils.requests(requestQueue(of: countly), carrying: "ct_results")
+        XCTAssertEqual(reports.count, 1, "the fetch for the next user is not armed")
+        let report = try XCTUnwrap(reports.first)
+        TestUtils.assertBaseParameters(report, deviceID: generatedID, deviceIDType: DeviceIDType.sdkGenerated.rawValue)
+        XCTAssertEqual(probes().count, expectedProbePaths.count)
+    }
+
+    /// A merge cancels the armed run on the server, so an answer arriving after
+    /// one probes nothing: a report under the merged away ID would recreate it.
+    func testAMergeWhileTheArmingFetchIsInFlightSkipsTheBattery() throws {
+        try skipUnlessNetworkIsInterceptable()
+        installHandler(scResponse: armedResponse())
+        let release = holdFirstArmedAnswer()
+        let countly = startInstance()
+        waitForBehaviorSettingsFetch()
+
+        countly.deviceID.changeWithMerge("merged-user")
+        release()
+
+        TestUtils.waitUntil("the behavior settings are fetched again for the merged user") {
+            MockURLProtocol.requests.contains { $0.query.contains("method=sc") && $0.query.contains("device_id=merged-user") }
+        }
+        TestUtils.pump(0.5)
+
+        XCTAssertTrue(probes().isEmpty, "probed for a user the merge cancelled: \(probes().map(probePath))")
+        XCTAssertTrue(queuedReports(of: countly).isEmpty)
+        XCTAssertFalse(module(of: countly).isBatteryRunning)
+    }
+
+    /// A merge landing while the probes run cancels the run on the server just the
+    /// same, so the finished battery queues nothing.
+    func testAMergeDuringTheBatteryDropsTheReport() throws {
+        try skipUnlessNetworkIsInterceptable()
+        installHandler(scResponse: armedResponse(), probeDelay: 0.1)
+        let countly = startInstance()
+        let module = module(of: countly)
+        TestUtils.waitUntil("the battery is running") { module.isBatteryRunning }
+
+        countly.deviceID.changeWithMerge("merged-user")
+
+        TestUtils.waitUntil("the battery finishes", timeout: 120) { !module.isBatteryRunning }
+        TestUtils.pump(0.3)
+
+        XCTAssertTrue(queuedReports(of: countly).isEmpty, "a report under the merged away ID would recreate that user")
+        XCTAssertEqual(TestUtils.requests(requestQueue(of: countly), carrying: "old_device_id").count, 1,
+                       "the merge itself is queued as usual")
     }
 
     // MARK: - Pure pieces
@@ -504,7 +632,7 @@ final class ConnectionTestTests: CountlyBaseTestCase {
         XCTAssertEqual(transport.urls.count, expectedProbePaths.count)
         XCTAssertTrue(transport.urls.allSatisfy { $0.absoluteString.hasPrefix("https://x.com/prefix/") })
         XCTAssertEqual(rows.first { $0.feature == "core" }?.error, "HTTP 400", "the strict row has no legitimate 4xx")
-        XCTAssertEqual(rows.first { $0.feature == "feedback-widget" }?.pathCount, 3)
+        XCTAssertEqual(rows.first { $0.feature == "feedback-widget" }?.pathCount, 4)
         XCTAssertEqual(rows.first { $0.feature == "rc" }?.ok, true)
     }
 }

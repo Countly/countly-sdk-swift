@@ -36,6 +36,16 @@ final class DeviceIDModule: ModuleBase {
     /// while a change replaces it.
     private let stateLock = NSLock()
     private var _deviceID = ""
+    private var _mergeCount = 0
+
+    /// How many times the device ID was changed with merge in this run. The
+    /// connection test reads it to tell whether the user it was armed for still
+    /// exists on the server.
+    var mergeCount: Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _mergeCount
+    }
 
     /// Whether the SDK is holding everything back until a real ID arrives.
     var isTemporary: Bool { deviceID == TemporaryDeviceID.value }
@@ -63,6 +73,12 @@ final class DeviceIDModule: ModuleBase {
         logI("initialize", "resolving the device ID for this launch, storedIDPresent: [\(stored != nil)], configIDProvided: [\(!(config.deviceID ?? "").isEmpty)], temporaryModeRequested: [\(config.temporaryDeviceIDMode)], resetStoredIDRequested: [\(config.resetStoredDeviceID)]")
 
         let provided = (config.deviceID ?? "").isEmpty ? nil : config.deviceID
+
+        // The generated UUID is kept apart from the active ID, so a reset that left it would resolve to the same ID again.
+        if config.resetStoredDeviceID, core.keyValueStore.generatedUUID != nil {
+            logD("initialize", "the stored device ID is reset, the generated ID it may have come from is dropped too")
+            core.keyValueStore.generatedUUID = nil
+        }
 
         if stored == nil || config.resetStoredDeviceID {
             // Temporary mode only applies when no ID was provided: an application
@@ -240,6 +256,9 @@ final class DeviceIDModule: ModuleBase {
         if onServer {
             let oldDeviceID = deviceID
             apply(resolved)
+            stateLock.lock()
+            _mergeCount += 1
+            stateLock.unlock()
             logI("changeDeviceID", "the previous identity will be merged into the new device ID on the server, previousType: [\(previousType)], newType: [\(deviceIDType)]")
             sendOldDeviceID(oldDeviceID)
         } else {
@@ -254,6 +273,7 @@ final class DeviceIDModule: ModuleBase {
             core.modules.consent.cancelAllConsentsWithoutSending()
             core.modules.sessions.resume()
             core.modules.events.clearAllTimedEvents()
+            core.modules.push.deviceIDChangedWithoutMerge()
             logD("changeDeviceID", "the new user is in place after the device ID change, newType: [\(deviceIDType)], isTemporary: [\(isTemporary)]")
         }
 

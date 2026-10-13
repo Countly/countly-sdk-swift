@@ -50,6 +50,13 @@ final class ViewsModule: ModuleBase {
     /// Whether the SDK is starting views from view controller appearances.
     private(set) var isAutoViewTrackingActive = false
 
+    #if os(iOS) || os(tvOS) || os(visionOS)
+    /// Whether going to the background stopped the automatically tracked screen's
+    /// view, which coming back then reopens. A foreground without a background
+    /// before it, such as the one at launch or after Control Center, reopens nothing.
+    private var reopensScreenOnForeground = false
+    #endif
+
     /// Last reported interface orientation, so an unchanged rotation is not
     /// reported twice.
     private var lastInterfaceOrientation: String?
@@ -586,18 +593,30 @@ final class ViewsModule: ModuleBase {
         AutoViewTracker.shared.register(self)
         logD("startAutoViewTracking", "automatic view tracking is enabled and registered for view controller appearances, exclusionEntryCount: [\(automaticViewTrackingExclusionList.count)]")
 
+        startViewForTopViewController(from: "startAutoViewTracking")
+        #endif
+    }
+
+    #if os(iOS) || os(tvOS) || os(visionOS)
+    /// Starts an automatically stopped view for the view controller on screen,
+    /// unless it has no usable name or is excluded.
+    ///
+    /// Used where the screen is already showing and no appearance will report
+    /// it: when tracking starts, and when the application comes back from the
+    /// background, which UIKit does not report as an appearance.
+    private func startViewForTopViewController(from function: String) {
         let topViewController = AutoViewTracker.topViewController()
         guard let topViewController, let title = AutoViewTracker.title(for: topViewController) else {
-            logD("startAutoViewTracking", "no view controller with a resolvable title is on screen, no view will be started until the next appearance")
+            logD(function, "no view controller with a resolvable title is on screen, no view will be started until the next appearance")
             return
         }
 
-        guard !isExcludedFromAutoTracking(topViewController, title: title, from: "startAutoViewTracking") else { return }
+        guard !isExcludedFromAutoTracking(topViewController, title: title, from: function) else { return }
 
-        logD("startAutoViewTracking", "the view already on screen will be started automatically, name: [\(title)]")
+        logD(function, "the view already on screen will be started automatically, name: [\(title)]")
         _ = startViewInternal(title, customSegmentation: nil, isAutoStoppedView: true)
-        #endif
     }
+    #endif
 
     /// Stops reporting view controller appearances.
     func stopAutoViewTracking() {
@@ -781,7 +800,18 @@ final class ViewsModule: ModuleBase {
         recordOrientation()
 
         #if os(iOS) || os(tvOS) || os(visionOS)
-        if !isAutoViewTrackingActive, isManualViewRestartActive {
+        if isAutoViewTrackingActive {
+            guard reopensScreenOnForeground else {
+                logD("applicationWillEnterForeground", "app entered foreground with automatic view tracking active, the background stopped no view, nothing is reopened")
+                return
+            }
+            reopensScreenOnForeground = false
+            logD("applicationWillEnterForeground", "app entered foreground with automatic view tracking active, the screen on display gets its view again")
+            onMainThread { [weak self, core] in
+                guard let self, core.hasStarted, self.isAutoViewTrackingActive else { return }
+                self.startViewForTopViewController(from: "applicationWillEnterForeground")
+            }
+        } else if isManualViewRestartActive {
             logD("applicationWillEnterForeground", "app entered foreground with manual view restart active, stopped views will be started automatically")
             startStoppedViews()
         } else {
@@ -801,6 +831,7 @@ final class ViewsModule: ModuleBase {
         #if os(iOS) || os(tvOS) || os(visionOS)
         if isAutoViewTrackingActive {
             logD("applicationDidEnterBackground", "app entered background while automatic view tracking is active, current view will be stopped automatically")
+            reopensScreenOnForeground = reopensScreenOnForeground || currentView != nil
             stopCurrentView()
         } else if isManualViewRestartActive {
             logD("applicationDidEnterBackground", "app entered background with manual view restart active, running views will be stopped automatically")
@@ -833,6 +864,7 @@ final class ViewsModule: ModuleBase {
         #if os(iOS) || os(tvOS) || os(visionOS)
         AutoViewTracker.shared.deregister(self)
         isAutoViewTrackingActive = false
+        reopensScreenOnForeground = false
         #endif
 
         viewDataDictionary.removeAll()

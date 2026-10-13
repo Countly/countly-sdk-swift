@@ -103,6 +103,20 @@ final class ServerConfigBuilder {
     @discardableResult
     func automaticViewTracking(_ enabled: Bool) -> Self { set("avt", enabled) }
 
+    /// Whether the crash handlers are installed without the developer asking.
+    @discardableResult
+    func automaticCrashReporting(_ enabled: Bool) -> Self { set("acr", enabled) }
+
+    // MARK: - Content zone
+
+    /// Whether the SDK enters the content zone on its own.
+    @discardableResult
+    func enterContentZone(_ enabled: Bool) -> Self { set("ecz", enabled) }
+
+    /// How often the zone the server enters polls, in seconds.
+    @discardableResult
+    func contentZoneInterval(_ seconds: Int) -> Self { set("czi", seconds) }
+
     // MARK: - Backoff
 
     /// How slow an answer has to be before it counts as an overloaded server.

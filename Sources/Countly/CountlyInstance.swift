@@ -297,7 +297,7 @@ public final class CountlyInstance: NSObject {
         // `ViewsModule` is the iOS equivalent. Recording here instead would put an
         // orientation event in the queue before the host has begun its session.
         if core.serverConfig.automaticSessionTrackingEnabled {
-            modules.sessions.beginSession()
+            modules.sessions.beginSession(automatically: true)
         }
 
         modules.push.applyInitialConfig()
@@ -420,7 +420,7 @@ public final class CountlyInstance: NSObject {
         core.modules.events.sendEventsWithSaveIfNeeded()
         // The queue is not drained while terminating, but a queued tail survives to
         // the next launch through the sync save below.
-        core.logGatherer.flushNow()
+        core.logGatherer.flushNow(ignoringQueuedBatch: true)
         core.modules.apm.endBackgroundTrace()
         core.requestQueueStore.saveSync()
     }
@@ -505,7 +505,8 @@ public final class CountlyInstance: NSObject {
     /// Queues a request the SDK does not otherwise produce.
     ///
     /// Keys the SDK owns are stripped, because a request that overrides the device
-    /// ID or the timestamp would be attributed to the wrong user or moment.
+    /// ID or the timestamp would be attributed to the wrong user or moment. Keys and
+    /// values are URL-encoded here, so pass them as they are.
     @objc
     public func addDirectRequest(_ parameters: [String: String]?) {
         guard let core = requireCore() else { return }
@@ -530,7 +531,7 @@ public final class CountlyInstance: NSObject {
         var queryString = core.network.builder.queryEssentials()
         queryString += "&dr=1"
         for (key, value) in filtered {
-            queryString += "&\(key)=\(value)"
+            queryString += "&\(key.urlEscaped)=\(value.urlEscaped)"
         }
 
         core.network.enqueueAndProceed(queryString)
@@ -652,7 +653,7 @@ public final class CountlyInstance: NSObject {
 
 extension CountlyInstance: ServerConfigDelegate {
 
-    func serverConfigDidChange(_ serverConfig: ServerConfig, consentBecameRequired: Bool) {
+    func serverConfigDidChange(_ serverConfig: ServerConfig, consentBecameRequired: Bool, changedKeys: Set<String>) {
         // An answer the halt could not stop any more comes from the halted run's
         // settings, and after a restart `core` is already the next run.
         guard let core, core.serverConfig === serverConfig else { return }
@@ -662,7 +663,7 @@ extension CountlyInstance: ServerConfigDelegate {
             return
         }
 
-        core.logger.d(Self.module, "serverConfigDidChange", "behavior settings are being applied to the running SDK, consentBecameRequired: [\(consentBecameRequired)], trackingEnabled: [\(serverConfig.trackingEnabled)], networkingEnabled: [\(serverConfig.networkingEnabled)], storedRequestsLimit: [\(core.config.storedRequestsLimit)], requestDropAgeHours: [\(core.config.requestDropAgeHours)], requiresConsent: [\(core.config.requiresConsent)], enableDebug: [\(core.config.enableDebug)]")
+        core.logger.d(Self.module, "serverConfigDidChange", "behavior settings are being applied to the running SDK, changedKeys: [\(changedKeys.sorted().joined(separator: ", "))], consentBecameRequired: [\(consentBecameRequired)], trackingEnabled: [\(serverConfig.trackingEnabled)], networkingEnabled: [\(serverConfig.networkingEnabled)], storedRequestsLimit: [\(core.config.storedRequestsLimit)], requestDropAgeHours: [\(core.config.requestDropAgeHours)], requiresConsent: [\(core.config.requiresConsent)], enableDebug: [\(core.config.enableDebug)]")
 
         core.logger.enableDebug = core.config.enableDebug
         core.refreshLimits()
@@ -691,12 +692,15 @@ extension CountlyInstance: ServerConfigDelegate {
             core.modules.location.sendLocationRequest()
         }
 
-        // Content is cleared on every apply rather than exited, because exiting
-        // would pull displayed content off screen on an unrelated settings change.
-        DispatchQueue.main.async {
-            core.modules.content.clearContentState()
-            if serverConfig.enterContentZone {
-                core.modules.content.enterContentZone()
+        // Only the server's own zone settings may move a zone the app entered; cleared, not exited, so displayed content stays.
+        let zoneSettingsChanged = changedKeys.contains(ServerConfig.Key.enterContentZone)
+            || (serverConfig.enterContentZone && changedKeys.contains(ServerConfig.Key.contentZoneInterval))
+        if zoneSettingsChanged, core.hasFinishedInit {
+            DispatchQueue.main.async {
+                core.modules.content.clearContentState()
+                if serverConfig.enterContentZone {
+                    core.modules.content.enterContentZone()
+                }
             }
         }
 
@@ -707,12 +711,14 @@ extension CountlyInstance: ServerConfigDelegate {
         }
     }
 
-    /// Brings automatic view tracking and crash reporting in line with the
-    /// resolved settings. Safe to call repeatedly.
+    /// Brings automatic sessions, view tracking and crash reporting in line with
+    /// the resolved settings. Safe to call repeatedly.
     private func applyAutomaticTrackingState(core: SDKCore) {
         let shouldTrackViews = core.serverConfig.viewTrackingEnabled && core.serverConfig.automaticViewTrackingEnabled
 
         DispatchQueue.main.async {
+            core.modules.sessions.applyAutomaticSessionTracking()
+
             let isActive = core.modules.views.isAutoViewTrackingActive
             if shouldTrackViews, !isActive {
                 core.logger.d(Self.module, "applyAutomaticTrackingState", "behavior settings enable automatic view tracking, it will be started")

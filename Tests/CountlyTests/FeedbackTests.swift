@@ -411,6 +411,32 @@ final class FeedbackTests: CountlyBaseTestCase {
         #endif
     }
 
+    /// A widget refused because another overlay is on screen was never seen, so
+    /// the caller hears it closed while no dismissal is recorded: that would count
+    /// as an answer the user never gave.
+    func testAWidgetRefusedForAnotherOverlayRecordsNoDismissal() throws {
+        try skipUnlessNetworkIsInterceptable()
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("feedback widgets are presented in a web view, which this platform has no overlay for")
+        #else
+        let countly = startInstance { $0.eventSendThreshold = 1 }
+        let widget = try XCTUnwrap(fetchWidgets(countly).first)
+        let overlayOnScreen = WebViewManager(core: core(of: countly))
+        XCTAssertTrue(WebViewManager.gate.claim(overlayOnScreen))
+        defer { WebViewManager.gate.release(overlayOnScreen) }
+
+        let closed = expectation(description: "the caller hears the widget closed")
+        widget.present(callback: { state in
+            if state == .closed { closed.fulfill() }
+        })
+        wait(for: [closed], timeout: TestUtils.asyncTimeout)
+        TestUtils.pump(0.3)
+
+        XCTAssertFalse(events(of: countly).contains { $0["key"] as? String == "[CLY]_survey" },
+                       "a widget nobody saw was recorded as dismissed")
+        #endif
+    }
+
     /// A widget cannot be presented without feedback consent, whatever the host
     /// application asks.
     func testAWidgetIsNotPresentedWithoutConsent() throws {
@@ -461,6 +487,89 @@ final class FeedbackTests: CountlyBaseTestCase {
         XCTAssertEqual(FeedbackWidgetType.survey.wireName, "survey")
         XCTAssertEqual(FeedbackWidgetType.nps.wireName, "nps")
         XCTAssertEqual(FeedbackWidgetType.rating.wireName, "rating")
+    }
+
+    // MARK: - Global content segmentation
+
+    /// The global content segmentation rides on every rating and widget result.
+    /// It can neither overwrite a key the event reports itself nor set a key the
+    /// server reads to count and attribute the result, and clearing it stops it.
+    func testTheGlobalContentSegmentationTravelsWithRatingsAndWidgetResults() throws {
+        let countly = startInstance { $0.eventSendThreshold = 1 }
+        countly.content.setGlobalContentSegmentation([
+            "campaign": "spring", "answer": "global", "widget_id": "hijacked", "answ-q1": "forged", "rating": 1,
+        ])
+
+        countly.feedback.recordRatingWidget(id: "w3", rating: 4, email: nil, comment: nil, userCanBeContacted: false)
+        let survey = try XCTUnwrap(countly.feedback.widget(from: ["_id": "w1", "type": "survey"]))
+        survey.recordResult(["answer": "yes"])
+
+        let rating = try XCTUnwrap(segmentation(of: "[CLY]_star_rating", in: countly))
+        XCTAssertEqual(rating["campaign"] as? String, "spring")
+        XCTAssertEqual(rating["answer"] as? String, "global", "a key the rating does not report itself is the global one")
+        XCTAssertEqual(rating["widget_id"] as? String, "w3", "a reserved key is never taken from the global segmentation")
+        XCTAssertEqual(TestUtils.int(rating["rating"]), 4)
+        XCTAssertNil(rating["answ-q1"])
+
+        let result = try XCTUnwrap(segmentation(of: "[CLY]_survey", in: countly))
+        XCTAssertEqual(result["campaign"] as? String, "spring")
+        XCTAssertEqual(result["answer"] as? String, "yes", "the result's own value wins")
+        XCTAssertEqual(result["widget_id"] as? String, "w1")
+
+        countly.content.setGlobalContentSegmentation(nil)
+        countly.feedback.recordRatingWidget(id: "w3", rating: 2, email: nil, comment: nil, userCanBeContacted: false)
+        let afterClear = events(of: countly).filter { $0["key"] as? String == "[CLY]_star_rating" }.last
+        XCTAssertNil((afterClear?["segmentation"] as? [String: Any])?["campaign"])
+    }
+
+    /// The global segmentation fills only the room the segmentation limit leaves,
+    /// so it never pushes out a key the event reports itself.
+    func testTheGlobalContentSegmentationNeverDisplacesTheEventsOwnKeys() throws {
+        let countly = startInstance {
+            $0.eventSendThreshold = 1
+            $0.sdkInternalLimits.maxSegmentationValues = 6
+        }
+        countly.content.setGlobalContentSegmentation(["g1": 1, "g2": 2, "g3": 3])
+
+        countly.feedback.recordRatingWidget(id: "w3", rating: 5, email: nil, comment: nil, userCanBeContacted: true)
+
+        let rating = try XCTUnwrap(segmentation(of: "[CLY]_star_rating", in: countly))
+        for key in ["platform", "app_version", "widget_id", "rating", "contactMe"] {
+            XCTAssertNotNil(rating[key], "the rating's own [\(key)] was pushed out")
+        }
+        XCTAssertEqual(rating.count, 6)
+        XCTAssertEqual(TestUtils.int(rating["g1"]), 1, "global keys fill the room left in key order")
+    }
+
+    /// The widget page records its answers itself, so the global segmentation
+    /// travels to it as `sg` inside the `custom` parameter, reserved keys dropped.
+    func testTheWidgetPageIsHandedTheGlobalContentSegmentation() throws {
+        let countly = startInstance()
+        let feedback = core(of: countly).modules.feedback
+        let widget = try XCTUnwrap(countly.feedback.widget(from: ["_id": "w2", "type": "nps"]))
+        let surface = CGSize(width: 320, height: 480)
+
+        let plain = try XCTUnwrap(feedback.widgetURL(for: widget, surface: surface))
+        XCTAssertNil(try custom(of: plain)["sg"])
+
+        countly.content.setGlobalContentSegmentation(["campaign": "spring", "closed": true])
+        let url = try XCTUnwrap(feedback.widgetURL(for: widget, surface: surface))
+
+        let sg = try XCTUnwrap(try custom(of: url)["sg"] as? [String: Any])
+        XCTAssertEqual(sg["campaign"] as? String, "spring")
+        XCTAssertNil(sg["closed"], "a reserved key never reaches the page")
+    }
+
+    /// The segmentation of the last recorded event named `key`.
+    private func segmentation(of key: String, in instance: CountlyInstance) -> [String: Any]? {
+        events(of: instance).last { $0["key"] as? String == key }?["segmentation"] as? [String: Any]
+    }
+
+    /// The decoded `custom` object of a widget URL.
+    private func custom(of url: URL) throws -> [String: Any] {
+        let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        let raw = try XCTUnwrap(components.queryItems?.first { $0.name == "custom" }?.value)
+        return try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any])
     }
 
     // MARK: - Rebuilding a widget a caller already holds

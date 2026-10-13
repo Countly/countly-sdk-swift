@@ -28,6 +28,7 @@ final class LogGatheringTests: CountlyBaseTestCase {
     private let maxBufferedLines = 500
     private let maxMessageLength = 4096
     private let charCeiling = 128 * 1024
+    private let deliveryCharThreshold = 96 * 1024
 
     private let harnessPrefix = "harness line"
 
@@ -40,6 +41,8 @@ final class LogGatheringTests: CountlyBaseTestCase {
         private var _trackingReads = 0
         private var _granted = Set(ConsentFeature.allCases)
         private var _refuse = false
+        private var _queued = false
+        private var _queuesEachBatch = false
         private var _payloads: [String] = []
         private var _threads: [Thread] = []
 
@@ -84,6 +87,24 @@ final class LogGatheringTests: CountlyBaseTestCase {
             return _payloads
         }
 
+        /// Whether a batch reads as still waiting in the request queue. Off by
+        /// default, so every batch reads as sent at once.
+        var hasQueuedSdkLogs: Bool {
+            get { lock.lock(); defer { lock.unlock() }; return _queued }
+            set { lock.lock(); _queued = newValue; lock.unlock() }
+        }
+
+        /// When set, every accepted batch reads as waiting in the request queue
+        /// until the test sends it, as on a device that cannot reach the server.
+        var queuesEachBatch: Bool {
+            get { lock.lock(); defer { lock.unlock() }; return _queuesEachBatch }
+            set { lock.lock(); _queuesEachBatch = newValue; lock.unlock() }
+        }
+
+        /// Runs inside every accepted send, the way the request path logs about a
+        /// batch it is handed. Set before the first send.
+        var onSend: (() -> Void)?
+
         var deliveryThreads: [Thread] {
             lock.lock()
             defer { lock.unlock() }
@@ -96,10 +117,15 @@ final class LogGatheringTests: CountlyBaseTestCase {
 
         func sendSdkLogs(_ payload: String) -> Bool {
             lock.lock()
-            defer { lock.unlock() }
-            if _refuse { return false }
+            if _refuse {
+                lock.unlock()
+                return false
+            }
+            if _queuesEachBatch { _queued = true }
             _payloads.append(payload)
             _threads.append(Thread.current)
+            lock.unlock()
+            onSend?()
             return true
         }
     }
@@ -207,6 +233,46 @@ final class LogGatheringTests: CountlyBaseTestCase {
         XCTAssertEqual(gatherer.heldLineCount, 0)
     }
 
+    /// The server still accepts the last lines of a stopped gather under its id,
+    /// so they go out once instead of being dropped with the buffer.
+    func testStoppingAGatherQueuesItsLastLinesOnceUnderItsID() throws {
+        let transport = FakeTransport()
+        let gatherer = makeGatherer(transport)
+        gatherer.apply(directive(id: "gather_stopped", batchSize: minBatchSize), source: "test")
+        capture(gatherer, minBatchSize - 3, message: "last line")
+
+        gatherer.apply(.off, source: "test")
+
+        TestUtils.waitUntil("the tail is uploaded") { transport.payloads.count == 1 }
+        let tail = try XCTUnwrap(transport.batches.first)
+        XCTAssertEqual(tail["i"] as? String, "gather_stopped", "filed under the gather it belongs to")
+        XCTAssertEqual(lines(in: tail).compactMap { $0["m"] as? String },
+                       (0..<(minBatchSize - 3)).map { "last line \($0)" })
+        XCTAssertEqual(gatherer.heldLineCount, 0)
+        XCTAssertFalse(gatherer.isCapturing)
+
+        gatherer.apply(.off, source: "test")
+        capture(gatherer, 4)
+        gatherer.flushNow()
+        TestUtils.pump(0.2)
+        XCTAssertEqual(transport.payloads.count, 1, "the tail goes out once and nothing follows it")
+    }
+
+    /// A new gather deletes the previous one on the server, so the lines of the
+    /// replaced gather are dropped rather than sent after it.
+    func testReplacingAGatherSendsNoTailForThePreviousOne() {
+        let transport = FakeTransport()
+        let gatherer = makeGatherer(transport)
+        gatherer.apply(directive(id: "gather_replaced", batchSize: minBatchSize), source: "test")
+        capture(gatherer, 4)
+
+        gatherer.apply(directive(id: "gather_next", batchSize: minBatchSize), source: "test")
+        TestUtils.pump(0.2)
+
+        XCTAssertTrue(transport.payloads.isEmpty)
+        XCTAssertEqual(gatherer.heldLineCount, 0)
+    }
+
     func testADifferentGatherIDDropsTheHeldLinesAndTheSameOneKeepsThem() {
         let gatherer = makeGatherer()
         gatherer.apply(directive(id: "gather_old"), source: "test")
@@ -303,26 +369,51 @@ final class LogGatheringTests: CountlyBaseTestCase {
     // MARK: - The buffer ceilings
 
     func testTheLineCeilingDropsTheOldestLinesAndCountsThem() {
-        let gatherer = makeGatherer()
+        let transport = FakeTransport()
+        let gatherer = makeGatherer(transport)
         capture(gatherer, maxBufferedLines + 25)
 
         XCTAssertEqual(gatherer.heldLineCount, maxBufferedLines)
-        XCTAssertEqual(gatherer.pendingDroppedCount, 25, "the loss is reported as 'd' instead of disappearing silently")
+        XCTAssertEqual(gatherer.pendingDroppedCount, 0, "until a directive names the wanted levels, no drop is known to be a loss")
         XCTAssertEqual(messages(gatherer).first, "\(harnessPrefix) 25")
         XCTAssertEqual(messages(gatherer).last, "\(harnessPrefix) \(maxBufferedLines + 24)")
+
+        gatherer.apply(directive(id: "gather_ceiling", batchSize: maxBufferedLines), source: "test")
+        TestUtils.waitUntil("the full buffer is uploaded on adoption") { transport.payloads.count == 1 }
+        XCTAssertEqual(TestUtils.int(transport.batches.first?["d"]), 25, "the loss is reported as 'd' instead of disappearing silently")
     }
 
     func testTheCharacterCeilingDropsTheOldestLines() {
-        let gatherer = makeGatherer()
+        let transport = FakeTransport()
+        let gatherer = makeGatherer(transport)
         // Short of the message cap, so the counter suffix survives.
         let long = String(repeating: "c", count: maxMessageLength - 100)
         capture(gatherer, 40, message: long)
 
-        // 40 x 4000 is past 128 KB, so the oldest went and were counted.
+        // 40 x 4000 is past 128 KB, so the oldest went, to be counted once a directive wants their level.
         XCTAssertLessThanOrEqual(gatherer.heldLineCount, 32)
-        XCTAssertGreaterThanOrEqual(gatherer.pendingDroppedCount, 8)
         XCTAssertLessThanOrEqual(messages(gatherer).reduce(0) { $0 + $1.utf16.count }, charCeiling)
         XCTAssertEqual(messages(gatherer).last, "\(long) 39")
+
+        gatherer.apply(directive(id: "gather_chars"), source: "test")
+        gatherer.flushNow()
+        XCTAssertGreaterThanOrEqual(TestUtils.int(transport.batches.first?["d"]) ?? 0, 8)
+    }
+
+    /// While undecided every level is held, so what the ceilings drop then is
+    /// counted toward `d` only for the levels the adopted directive asks for.
+    func testDropsBeforeTheDirectiveCountOnlyForTheLevelsItAsksFor() {
+        let transport = FakeTransport()
+        let gatherer = makeGatherer(transport)
+        capture(gatherer, 30, level: .verbose)
+        capture(gatherer, 20, level: .error)
+        capture(gatherer, maxBufferedLines, level: .info)
+
+        gatherer.apply(directive(id: "gather_levels", levels: "ei", batchSize: maxBufferedLines), source: "test")
+        TestUtils.waitUntil("the full buffer is uploaded on adoption") { transport.payloads.count == 1 }
+
+        XCTAssertEqual(TestUtils.int(transport.batches.first?["d"]), 20, "the 30 verbose lines dropped were never wanted, the 20 error lines were")
+        XCTAssertEqual(lines(in: transport.batches[0]).count, maxBufferedLines)
     }
 
     func testALongMessageIsCutNotDropped() throws {
@@ -470,7 +561,7 @@ final class LogGatheringTests: CountlyBaseTestCase {
         // While gathering every full batch drains, so the buffer only ever
         // overflows before a directive arrives.
         capture(gatherer, maxBufferedLines + 12, level: .error)
-        XCTAssertEqual(gatherer.pendingDroppedCount, 12)
+        XCTAssertEqual(gatherer.pendingDroppedCount, 0, "counted once a directive says the level is wanted")
 
         gatherer.apply(directive(id: "gather_dropped", levels: "e", batchSize: 200), source: "test")
 
@@ -548,6 +639,129 @@ final class LogGatheringTests: CountlyBaseTestCase {
         transport.isTrackingEnabled = true
         gatherer.apply(directive(id: "gather_held", batchSize: minBatchSize), source: "test")
         TestUtils.waitUntil("the refetch drains the held full batches") { transport.payloads.count == 5 }
+        XCTAssertEqual(gatherer.heldLineCount, 0)
+    }
+
+    /// One batch at a time waits in the request queue, so a device that cannot
+    /// send fills the capped buffer rather than the queue, and each sent batch
+    /// lets the next one out, the partial tail last.
+    func testOnlyOneBatchWaitsInTheQueueAndEachSentOneReleasesTheNext() throws {
+        let transport = FakeTransport()
+        transport.queuesEachBatch = true
+        let gatherer = makeGatherer(transport)
+        gatherer.apply(directive(id: "gather_gate", batchSize: minBatchSize), source: "test")
+
+        capture(gatherer, minBatchSize * 3 + 4)
+        gatherer.flushNow()
+        gatherer.scheduleFlush()
+        TestUtils.pump(0.2)
+        XCTAssertEqual(transport.payloads.count, 1, "nothing more is queued while a batch waits in the queue")
+        XCTAssertEqual(gatherer.heldLineCount, minBatchSize * 2 + 4)
+
+        for sent in 1...3 {
+            transport.hasQueuedSdkLogs = false
+            gatherer.queuedBatchWasSent()
+            TestUtils.waitUntil("batch \(sent + 1) follows the sent one") { transport.payloads.count == sent + 1 }
+        }
+        XCTAssertEqual(transport.batches.map { lines(in: $0).count }, [minBatchSize, minBatchSize, minBatchSize, 4])
+        XCTAssertEqual(gatherer.heldLineCount, 0)
+
+        transport.hasQueuedSdkLogs = false
+        gatherer.queuedBatchWasSent()
+        TestUtils.pump(0.2)
+        XCTAssertEqual(transport.payloads.count, 4, "a sent batch with nothing behind it starts nothing")
+    }
+
+    /// Sending a batch logs lines of its own, on threads the transport mark does
+    /// not cover. A flush held back by a queued batch sends what it asked for and
+    /// stops there, or every sent batch would release another one carrying the
+    /// lines its own sending logged.
+    func testLinesLoggedWhileABatchIsSentWaitForTheNextFlush() throws {
+        let transport = FakeTransport()
+        transport.queuesEachBatch = true
+        let gatherer = makeGatherer(transport)
+        transport.onSend = { [weak gatherer] in
+            let logged = DispatchSemaphore(value: 0)
+            Thread {
+                gatherer?.capture("logged while sending", level: .debug, scope: .unattributed)
+                logged.signal()
+            }.start()
+            logged.wait()
+        }
+        gatherer.apply(directive(id: "gather_bounded", batchSize: minBatchSize), source: "test")
+        capture(gatherer, 3, message: "queued")
+        gatherer.flushNow()
+        capture(gatherer, 2, message: "asked")
+        gatherer.flushNow()
+        XCTAssertEqual(transport.payloads.count, 1, "the second flush waits for the queued batch")
+
+        for _ in 0..<4 {
+            transport.hasQueuedSdkLogs = false
+            gatherer.queuedBatchWasSent()
+            TestUtils.pump(0.1)
+        }
+
+        XCTAssertEqual(transport.payloads.count, 2, "only the lines the flush asked for followed the sent batch")
+        XCTAssertEqual(lines(in: try XCTUnwrap(transport.batches.last)).compactMap { $0["m"] as? String },
+                       ["logged while sending", "asked 0", "asked 1"])
+        XCTAssertEqual(messages(gatherer), ["logged while sending"])
+
+        gatherer.flushNow()
+        XCTAssertEqual(transport.payloads.count, 3, "the next flush sends it")
+    }
+
+    /// Termination is the last chance, so it queues everything held even while a
+    /// batch waits in the queue.
+    func testAFlushIgnoringTheQueuedBatchQueuesEverythingHeld() {
+        let transport = FakeTransport()
+        transport.queuesEachBatch = true
+        let gatherer = makeGatherer(transport)
+        gatherer.apply(directive(id: "gather_last", batchSize: minBatchSize), source: "test")
+        capture(gatherer, minBatchSize * 2 + 1)
+        gatherer.flushNow()
+        XCTAssertEqual(transport.payloads.count, 1)
+
+        gatherer.flushNow(ignoringQueuedBatch: true)
+
+        XCTAssertEqual(transport.batches.map { lines(in: $0).count }, [minBatchSize, minBatchSize, 1])
+        XCTAssertEqual(gatherer.heldLineCount, 0)
+    }
+
+    /// A consent withdrawn after its lines were buffered keeps them out of the
+    /// next batch even before the change is reported to the gatherer.
+    func testABatchIsDecidedAgainstTheConsentAsItIsWhenItIsTaken() {
+        let transport = FakeTransport()
+        let gatherer = makeGatherer(transport)
+        gatherer.apply(directive(id: "gather_recheck", batchSize: minBatchSize), source: "test")
+        capture(gatherer, 3, message: "events line", scope: .feature(.events))
+        capture(gatherer, 2, message: "sessions line", scope: .feature(.sessions))
+
+        transport.granted.remove(.events)
+        gatherer.flushNow()
+
+        XCTAssertEqual(uploadedMessages(transport), ["sessions line 0", "sessions line 1"])
+        XCTAssertEqual(awaitingMessages(gatherer), ["events line 0", "events line 1", "events line 2"])
+    }
+
+    /// Long lines reach the character ceiling far short of a batch, so their
+    /// characters ask for a delivery before the ceiling trims any of them.
+    func testLongLinesAskForADeliveryBeforeTheCharacterCeilingTrimsThem() throws {
+        let transport = FakeTransport()
+        let gatherer = makeGatherer(transport)
+        gatherer.apply(directive(id: "gather_long"), source: "test")
+        let long = String(repeating: "l", count: maxMessageLength - 100)
+        let linesToThreshold = deliveryCharThreshold / long.count + 1
+
+        capture(gatherer, linesToThreshold - 1, message: long)
+        TestUtils.pump(0.2)
+        XCTAssertTrue(transport.payloads.isEmpty, "below the threshold the lines wait for a full batch or a flush")
+
+        capture(gatherer, 1, message: "\(long) last")
+
+        TestUtils.waitUntil("the held characters ask for a delivery") { transport.payloads.count == 1 }
+        let batch = try XCTUnwrap(transport.batches.first)
+        XCTAssertEqual(lines(in: batch).count, linesToThreshold, "everything held went out, far short of the batch size")
+        XCTAssertEqual(TestUtils.int(batch["d"]), 0, "nothing was trimmed first")
         XCTAssertEqual(gatherer.heldLineCount, 0)
     }
 
@@ -797,8 +1011,10 @@ final class LogGatheringTests: CountlyBaseTestCase {
         capture(gatherer, 5, scope: .feature(.events))
         capture(gatherer, maxBufferedLines, scope: .feature(.events))
         gatherer.sdkInitFinished()
+        gatherer.apply(directive(id: "gather_init_drops", batchSize: maxBufferedLines), source: "test")
 
-        XCTAssertEqual(gatherer.pendingDroppedCount, 5, "a dropped line that would have waited for its consent is no loss to report")
+        TestUtils.waitUntil("the full buffer is uploaded on adoption") { transport.payloads.count == 1 }
+        XCTAssertEqual(TestUtils.int(transport.batches.first?["d"]), 5, "a dropped line that would have waited for its consent is no loss to report")
     }
 
     /// The waiting lines are bounded like the buffer, by lines and by characters,
@@ -1021,7 +1237,7 @@ final class LogGatheringTests: CountlyBaseTestCase {
             $0.requiresConsent = true
             $0.consents = [.events]
         }
-        let propertyLine = "single user property value detail, key: [email], value: [someone@example.com]"
+        let propertyLine = "predefined user property value detail, key: [email], value: [someone@example.com]"
 
         countly.userProfile.setProperty("email", value: "someone@example.com")
         gatherer(of: countly).flushNow()
@@ -1029,14 +1245,16 @@ final class LogGatheringTests: CountlyBaseTestCase {
         XCTAssertTrue(awaitingMessages(gatherer(of: countly)).contains { $0.contains(propertyLine) })
 
         countly.consent.giveConsent(for: [.userDetails])
-        gatherer(of: countly).flushNow()
+        // The first batch still waits in the failing queue, which holds back an ordinary flush.
+        gatherer(of: countly).flushNow(ignoringQueuedBatch: true)
 
         XCTAssertTrue(uploadedMessages(of: countly).contains { $0.contains(propertyLine) }, "giving the consent releases the line that waited for it")
         XCTAssertFalse(awaitingMessages(gatherer(of: countly)).contains { $0.contains(propertyLine) })
     }
 
     /// Only the uploaded copy waits for consent: the developer log keeps showing
-    /// every call in full.
+    /// what was logged in full. An event refused for consent never logs its
+    /// segmentation, which is logged only once the gates let it through.
     func testWithOnlySessionsConsentNoSecretIsUploadedAndEachWaitsWhileTheLocalLogKeepsIt() throws {
         try skipUnlessNetworkIsInterceptable()
         let sink = LogSink()
@@ -1056,16 +1274,47 @@ final class LogGatheringTests: CountlyBaseTestCase {
         let uploaded = uploadedMessages(of: countly)
         XCTAssertTrue(uploaded.contains { $0.contains("[Sessions]") }, "the sessions consent lets the sessions lines out")
         let awaiting = awaitingMessages(gatherer(of: countly))
-        for secret in ["secret-sku", "secret checkout screen", "secret@example.com"] {
+        XCTAssertFalse((uploaded + awaiting + sink.lines).contains { $0.contains("secret-sku") },
+                       "the refused event's segmentation is never logged")
+        for secret in ["secret checkout screen", "secret@example.com"] {
             XCTAssertFalse(uploaded.contains { $0.contains(secret) }, "[\(secret)] reached the server without the consent it belongs to")
             XCTAssertTrue(awaiting.contains { $0.contains(secret) }, "[\(secret)] waits for its consent instead of being dropped")
             XCTAssertTrue(sink.lines.contains { $0.contains(secret) }, "the local log lost [\(secret)]")
         }
     }
 
-    /// Recording `[CLY]_view` through the events API logs the view name before the
-    /// views consent is checked, so that line answers to the views consent.
-    func testAViewNameRecordedUnderTheReservedViewKeyWaitsForTheViewsConsent() throws {
+    /// A value the behavior settings filter out is never logged, at any level, so
+    /// logging switched on remotely cannot carry out what a filter withholds.
+    func testValuesTheBehaviorSettingsFilterOutAreNeverLogged() {
+        let sink = LogSink()
+        let countly = startInstance {
+            $0.loggerDelegate = sink
+            $0.internalLogLevel = .verbose
+            $0.sdkBehaviorSettings = ServerConfigBuilder()
+                .eventBlacklist(["blocked_event"])
+                .segmentationBlacklist(["blocked_key"])
+                .userPropertyBlacklist(["blocked_property"])
+                .locationTracking(false)
+                .json()
+        }
+
+        countly.events.recordEvent("blocked_event", segmentation: ["note": "blocked-event-value"])
+        countly.events.recordEvent("open_event", segmentation: ["blocked_key": "blocked-segment-value", "plain": "kept-segment-value"])
+        countly.userProfile.setProperty("blocked_property", value: "blocked-property-value")
+        countly.userProfile.setProperty("open_property", value: "kept-property-value")
+        countly.location.recordLocation(city: "blocked-city", isoCountryCode: "TR")
+
+        for secret in ["blocked-event-value", "blocked-segment-value", "blocked-property-value", "blocked-city"] {
+            XCTAssertFalse(sink.lines.contains { $0.contains(secret) }, "[\(secret)] was logged although a filter withheld it")
+        }
+        for kept in ["kept-segment-value", "kept-property-value"] {
+            XCTAssertTrue(sink.lines.contains { $0.contains(kept) }, "[\(kept)] passed the filters, so verbose logging still shows it")
+        }
+    }
+
+    /// Recording `[CLY]_view` through the events API logs the view name only once
+    /// the views consent it answers to lets the event through.
+    func testAViewNameRecordedUnderTheReservedViewKeyIsLoggedOnlyUnderTheViewsConsent() throws {
         try skipUnlessNetworkIsInterceptable()
         let countly = startArmed(id: "gather_reserved") {
             $0.requiresConsent = true
@@ -1074,13 +1323,15 @@ final class LogGatheringTests: CountlyBaseTestCase {
 
         countly.events.recordEvent("[CLY]_view", segmentation: ["name": "secret-view-name"])
         gatherer(of: countly).flushNow()
-        XCTAssertFalse(uploadedMessages(of: countly).contains { $0.contains("secret-view-name") },
-                       "the events module logs a reserved event before it checks the views consent the event answers to")
-        XCTAssertTrue(awaitingMessages(gatherer(of: countly)).contains { $0.contains("secret-view-name") })
+        XCTAssertFalse((uploadedMessages(of: countly) + awaitingMessages(gatherer(of: countly))).contains { $0.contains("secret-view-name") },
+                       "a reserved event refused for the views consent never logs its segmentation")
 
         countly.consent.giveConsent(for: [.viewTracking])
-        gatherer(of: countly).flushNow()
-        XCTAssertTrue(uploadedMessages(of: countly).contains { $0.contains("secret-view-name") })
+        countly.events.recordEvent("[CLY]_view", segmentation: ["name": "secret-view-name"])
+        // The first batch still waits in the failing queue, which holds back an ordinary flush.
+        gatherer(of: countly).flushNow(ignoringQueuedBatch: true)
+        XCTAssertTrue(uploadedMessages(of: countly).contains { $0.contains("secret-view-name") },
+                      "recorded under the views consent, the line answers to it and goes out")
     }
 
     /// Init logs before it reads whether consent is required, and those lines must
@@ -1104,7 +1355,8 @@ final class LogGatheringTests: CountlyBaseTestCase {
         XCTAssertTrue(awaitingMessages(gatherer(of: countly)).contains { $0.contains("waiting-event") })
 
         core(of: countly).modules.consent.requiresConsent = false
-        gatherer(of: countly).flushNow()
+        // The released lines fill a batch that may already wait in the failing queue, which holds back an ordinary flush.
+        gatherer(of: countly).flushNow(ignoringQueuedBatch: true)
 
         XCTAssertTrue(uploadedMessages(of: countly).contains { $0.contains("waiting-event") })
         XCTAssertTrue(awaitingMessages(gatherer(of: countly)).isEmpty)
@@ -1288,6 +1540,33 @@ final class LogGatheringTests: CountlyBaseTestCase {
         XCTAssertEqual(gatherer(of: countly).currentState, .off, "the previous user's directive never arms a gather for the next user")
     }
 
+    /// An answer for the previous device ID decides nothing, so while undecided
+    /// the settings are fetched again for the current one, whose directive then
+    /// applies rather than waiting hours for the next refresh.
+    func testWhileUndecidedTheSettingsAreFetchedAgainForTheCurrentDeviceID() throws {
+        try skipUnlessNetworkIsInterceptable()
+        MockURLProtocol.respond { captured in
+            guard captured.path.contains("/o/sdk"), captured.query.contains("method=sc") else { return nil }
+            if captured.query.contains("device_id=merged_user") {
+                return (200, Data(ServerConfigBuilder().armLogGathering(id: "gather_current_user").json().utf8))
+            }
+            // Slow, so the device ID changes while the fetch is in flight.
+            Thread.sleep(forTimeInterval: 0.5)
+            return (200, Data(ServerConfigBuilder().armLogGathering(id: "gather_previous_user").json().utf8))
+        }
+        let countly = startInstance()
+
+        countly.deviceID.changeWithMerge("merged_user")
+
+        TestUtils.waitUntil("the directive fetched for the current device ID arms the gather") {
+            gatherer(of: countly).currentDirective.gatherID == "gather_current_user"
+        }
+        XCTAssertEqual(gatherer(of: countly).currentState, .gathering)
+        let fetches = MockURLProtocol.requests.filter { $0.query.contains("method=sc") }
+        XCTAssertEqual(fetches.count, 2, "one fetch per device ID")
+        XCTAssertTrue(fetches.last?.query.contains("device_id=merged_user") ?? false)
+    }
+
     /// Temporary mode drops the identity like a change without merge, while a
     /// merge keeps the same user and so the same gather.
     func testEnteringTemporaryIDModeStopsLikeAChangeWithoutMergeAndAMergeKeepsGathering() throws {
@@ -1324,6 +1603,69 @@ final class LogGatheringTests: CountlyBaseTestCase {
 
         XCTAssertFalse(uploadedBatches(of: countly).isEmpty)
         XCTAssertEqual(uploadedBatches(of: countly).first?["i"] as? String, "gather_tracking")
+    }
+
+    /// The messages of every gathered batch the server was sent, oldest first.
+    private func sentMessages() -> [String] {
+        MockURLProtocol.requests.map(\.query).map(TestUtils.parseQuery)
+            .compactMap { $0["sdk_logs"] as? [String: Any] }
+            .flatMap { lines(in: $0) }
+            .compactMap { $0["m"] as? String }
+    }
+
+    /// A device that cannot send keeps one gathered batch in the request queue
+    /// and the rest in the capped buffer. Once the server accepts that batch, the
+    /// held lines follow.
+    func testOneGatheredBatchWaitsInTheQueueAndTheRestFollowsOnceItIsAccepted() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startArmed(id: "gather_gate", batchSize: 10)
+        gatherer(of: countly).flushNow()
+        XCTAssertEqual(uploadedBatches(of: countly).count, 1)
+
+        for index in 0..<30 {
+            countly.events.recordEvent("gate_event_\(index)")
+        }
+        gatherer(of: countly).flushNow()
+        TestUtils.pump(0.3)
+        XCTAssertEqual(uploadedBatches(of: countly).count, 1, "a device that cannot send fills the capped buffer, not the queue")
+        XCTAssertTrue(messages(gatherer(of: countly)).contains { $0.contains("gate_event_29") })
+
+        MockURLProtocol.respondToEverything(json: #"{"result":"Success"}"#)
+        TestUtils.waitUntil("the held lines follow the accepted batch") {
+            core(of: countly).network.proceedOnQueue()
+            return self.sentMessages().contains { $0.contains("gate_event_29") }
+        }
+    }
+
+    /// A tick while the application is suspended uploads nothing, or every tick
+    /// would queue a batch of the SDK's own lines. The first tick after resuming
+    /// sends what was held.
+    func testASessionTickWhileSuspendedUploadsNoGatheredLines() throws {
+        try skipUnlessNetworkIsInterceptable()
+        MockURLProtocol.respondToEverything(json: #"{"result":"Success"}"#)
+        let countly = startArmed(id: "gather_suspended")
+        let sessions = core(of: countly).modules.sessions
+        gatherer(of: countly).flushNow()
+        // Not driven by polling the queue: every poll logs lines of its own, which keep filling new batches.
+        TestUtils.waitUntil("the init lines are sent") {
+            !self.sentMessages().isEmpty && self.uploadedBatches(of: countly).isEmpty
+        }
+
+        countly.suspend()
+        let sentBeforeTicks = sentMessages().count
+        countly.events.recordEvent("while_suspended")
+        sessions.onUpdateTimer()
+        sessions.onUpdateTimer()
+        TestUtils.pump(0.3)
+
+        XCTAssertEqual(sentMessages().count, sentBeforeTicks, "a tick while suspended uploaded gathered lines")
+        XCTAssertTrue(messages(gatherer(of: countly)).contains { $0.contains("while_suspended") })
+
+        countly.resume()
+        sessions.onUpdateTimer()
+        TestUtils.waitUntil("the first tick after resuming sends what was held") {
+            self.sentMessages().contains { $0.contains("while_suspended") }
+        }
     }
 
     // MARK: - Deciding

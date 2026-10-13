@@ -110,6 +110,12 @@ final class CrashModule: ModuleBase {
             return
         }
 
+        // Every instance would record the same crash, so a named one does only when its developer asked for it.
+        guard core.namespace.isDefault || core.config.features.contains(.crashReporting) else {
+            logD("startCrashReporting", "crash handlers are not installed, a named instance reports crashes only when its own config enables crash reporting")
+            return
+        }
+
         guard core.modules.consent.hasConsent(for: .crashReporting) else {
             logV("startCrashReporting", "no crashes consent given, crash handlers are not installed")
             return

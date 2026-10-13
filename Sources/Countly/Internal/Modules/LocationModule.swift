@@ -51,7 +51,6 @@ final class LocationModule: ModuleBase {
                         isoCountryCode: String?,
                         ipAddress: String?) {
         logI("recordLocation", "location recording requested, coordinateProvided: [\(CLLocationCoordinate2DIsValid(coordinate))], cityProvided: [\(!(city ?? "").isEmpty)], countryCodeProvided: [\(!(isoCountryCode ?? "").isEmpty)], IPProvided: [\(!(ipAddress ?? "").isEmpty)]")
-        logV("recordLocation", "location recording detail, latitude: [\(coordinate.latitude.logValue)], longitude: [\(coordinate.longitude.logValue)], city: [\(city ?? "")], countryCode: [\(isoCountryCode ?? "")], IP: [\(ipAddress ?? "")]")
 
         guard core.modules.consent.hasConsent(for: .location) else {
             logV("recordLocation", "no location consent given, location is not recorded")
@@ -62,6 +61,8 @@ final class LocationModule: ModuleBase {
             logD("recordLocation", "location recording is dropped, location tracking is disabled by server config")
             return
         }
+
+        logV("recordLocation", "location recording detail, latitude: [\(coordinate.latitude.logValue)], longitude: [\(coordinate.longitude.logValue)], city: [\(city ?? "")], countryCode: [\(isoCountryCode ?? "")], IP: [\(ipAddress ?? "")]")
 
         updateLocation(coordinate, city: city, isoCountryCode: isoCountryCode, ipAddress: ipAddress)
         sendLocationRequest()
@@ -87,7 +88,9 @@ final class LocationModule: ModuleBase {
         self.ipAddress = Self.nilIfEmpty(ipAddress)
 
         logD("updateLocation", "stored location fields updated, coordinateStored: [\(locationCoordinate != nil)], cityStored: [\(self.city != nil)], countryCodeStored: [\(self.isoCountryCode != nil)], IPStored: [\(self.ipAddress != nil)]")
-        logV("updateLocation", "stored location field detail, location: [\(locationCoordinate ?? "")], city: [\(self.city ?? "")], countryCode: [\(self.isoCountryCode ?? "")], IP: [\(self.ipAddress ?? "")]")
+        if core.serverConfig.locationTrackingEnabled {
+            logV("updateLocation", "stored location field detail, location: [\(locationCoordinate ?? "")], city: [\(self.city ?? "")], countryCode: [\(self.isoCountryCode ?? "")], IP: [\(self.ipAddress ?? "")]")
+        }
 
         // The server resolves a city only together with its country, so one
         // without the other is silently useless.

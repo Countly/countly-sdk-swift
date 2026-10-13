@@ -227,6 +227,33 @@ final class AutoViewTrackingTests: CountlyBaseTestCase {
         XCTAssertEqual(names(of: countly), ["Home"])
     }
 
+    /// UIKit reports no appearance when the application comes back from the
+    /// background, so the SDK starts the view of the screen on display again, or
+    /// the time spent on it after returning would go unreported. An activation
+    /// with no background before it, at launch or after Control Center, leaves
+    /// the running view alone rather than splitting the visit.
+    func testTheScreenOnDisplayGetsItsViewAgainAfterTheBackground() {
+        let home = TitledViewController(named: "Home")
+        AutoViewTracker.topViewControllerOverride = { home }
+        addTeardownBlock { AutoViewTracker.topViewControllerOverride = nil }
+        let countly = trackingInstance()
+        appear(home)
+        countly.resume()
+        TestUtils.pump(0.2)
+        XCTAssertEqual(names(of: countly), ["Home"], "an activation without a background split the visit")
+
+        countly.suspend()
+        XCTAssertEqual(names(of: countly), ["Home", "Home"], "the background closes the screen")
+        countly.resume()
+
+        TestUtils.waitUntil("the screen on display opens again") { self.names(of: countly).count == 3 }
+        XCTAssertEqual(names(of: countly), ["Home", "Home", "Home"])
+
+        countly.resume()
+        TestUtils.pump(0.2)
+        XCTAssertEqual(names(of: countly).count, 3, "one background reopens the screen once")
+    }
+
     // MARK: - The exclusion list
 
     func testAScreenOnTheExclusionListIsIgnoredByName() {
