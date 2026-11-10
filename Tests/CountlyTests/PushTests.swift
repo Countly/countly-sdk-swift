@@ -74,7 +74,8 @@ final class PushTests: CountlyBaseTestCase {
         let segmentation = (recorded[0]["segmentation"] as? [String: Any]) ?? [:]
         XCTAssertEqual(segmentation[CountlyPushKey.notificationID] as? String, "n-1")
         XCTAssertEqual(TestUtils.int(segmentation[CountlyPushKey.actionButtonIndex]), 0)
-        XCTAssertNotNil(segmentation[CountlyPushKey.platform], "the platform tells the dashboard which SDK reported it")
+        XCTAssertEqual(segmentation[CountlyPushKey.platform] as? String, "i",
+                       "the server counts an APNs message from any Apple platform only under \"i\"")
     }
 
     func testTappingAnActionButtonCarriesItsIndex() {

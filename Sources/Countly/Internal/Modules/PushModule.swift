@@ -21,16 +21,9 @@ final class PushModule: ModuleBase {
 
     override class var moduleName: String { "Push" }
 
-    /// Platform value reported with a push action.
-    private static var platformValue: String {
-        #if os(iOS) || os(visionOS)
-        return "i"
-        #elseif os(macOS)
-        return "m"
-        #else
-        return "unknown"
-        #endif
-    }
+    /// Platform value reported with a push action: "i" for APNs on every Apple
+    /// platform, the only key the server counts an Apple message under.
+    private static let platformValue = "i"
 
     /// Whether push was switched on in the config. Without it the module does
     /// nothing, whatever consent says.
