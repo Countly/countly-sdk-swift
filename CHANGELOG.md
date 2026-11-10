@@ -82,6 +82,7 @@
   * A change without merge first stops the views, queues the pending events and profile changes and takes the push token back, all under the leaving user's device ID, then removes consent without a consent request and starts the new user clean.
   * A change with merge fetches the behavior settings and the remote config only once the server has accepted the merge request, so the new user is never created before the merge.
   * Every start replaces the temporary device ID in requests still queued under it, so such a request cannot hold the queue up.
+  * Nothing is sent in temporary device ID mode, also requests queued before the mode began. They go out once it ends.
   * "CountlyConfig.resetStoredDeviceID", which drops the stored device ID at start, one the SDK generated included, so a new one is generated when no device ID is configured. The stored user's pending events and push token are handed back to that user first.
 
 * Added the location API on "countly.location":

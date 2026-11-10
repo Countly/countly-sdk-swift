@@ -471,4 +471,23 @@ final class DeviceIDTests: CountlyBaseTestCase {
         XCTAssertEqual(DeviceIDType.developerSupplied.wireValue, 0)
         XCTAssertEqual(DeviceIDType.sdkGenerated.wireValue, 1)
     }
+
+    /// Offline mode sends nothing, also a request recorded under a real device ID
+    /// before it began; it goes out once the mode ends.
+    func testNothingIsSentInTemporaryIDModeUntilItEnds() throws {
+        try skipUnlessNetworkIsInterceptable()
+        MockURLProtocol.respondToEverything(json: #"{"result": "Success"}"#)
+        let countly = startInstance()
+        countly.deviceID.enableTemporaryIDMode()
+        // Queued under a real device ID, as if it had failed to go out before the mode began.
+        core(of: countly).network.enqueue("\(QS.appKey)=\(Self.appKey)&\(QS.deviceID)=recorded-before-offline&\(QS.timestamp)=1&\(QS.events)=%5B%5D")
+        let wasSent = { MockURLProtocol.requests.contains { $0.query.contains("recorded-before-offline") } }
+
+        countly.requestQueue.attemptToSendStoredRequests()
+        TestUtils.pump(0.5)
+        XCTAssertFalse(wasSent())
+
+        countly.deviceID.disableTemporaryIDMode("after-offline")
+        TestUtils.waitUntil("the held request goes out once offline mode ends") { wasSent() }
+    }
 }
