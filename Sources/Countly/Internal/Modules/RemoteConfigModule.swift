@@ -246,16 +246,32 @@ final class RemoteConfigModule: ModuleBase {
         downloadValues(keys: nil, omitKeys: nil, completion: completion)
     }
 
-    /// Downloads only the named keys.
+    /// Downloads only the named keys, or every key when none of them is usable.
     func downloadSpecificKeys(_ keys: [String], completion: RCDownloadCallback?) {
         logI("downloadSpecificKeys", "a download of specific remote config keys is requested, keyCount: [\(keys.count)], keys: [\(Self.describe(keys))]")
-        downloadValues(keys: keys, omitKeys: nil, completion: completion)
+        downloadValues(keys: usableKeys(keys, "downloadSpecificKeys"), omitKeys: nil, completion: completion)
     }
 
-    /// Downloads everything except the named keys.
+    /// Downloads everything except the named keys, or every key when none of
+    /// them is usable.
     func downloadOmittingKeys(_ omitKeys: [String], completion: RCDownloadCallback?) {
         logI("downloadOmittingKeys", "a download of every remote config key except the named ones is requested, omitKeyCount: [\(omitKeys.count)], omitKeys: [\(Self.describe(omitKeys))]")
-        downloadValues(keys: nil, omitKeys: omitKeys, completion: completion)
+        downloadValues(keys: nil, omitKeys: usableKeys(omitKeys, "downloadOmittingKeys"), completion: completion)
+    }
+
+    /// The non-empty keys of a partial download, or `nil` when none is left, which
+    /// makes it a download of every key.
+    private func usableKeys(_ keys: [String], _ function: String) -> [String]? {
+        let usable = keys.filter { !$0.isEmpty }
+        if usable.count != keys.count {
+            logW(function, "empty keys are ignored, ignoredKeyCount: [\(keys.count - usable.count)]")
+            core.healthTracker.recordLogCode(HealthLogCode.invalidValue)
+        }
+        if usable.isEmpty {
+            logD(function, "no usable key is left, every remote config key will be downloaded")
+            return nil
+        }
+        return usable
     }
 
     private func downloadValues(keys: [String]?, omitKeys: [String]?, completion: RCDownloadCallback?) {
@@ -492,19 +508,25 @@ final class RemoteConfigModule: ModuleBase {
         sendABRequest(method: QS.abOptIn, keys: validKeys, overrideEndpoint: true)
     }
 
-    /// Takes the device out of the A/B tests of the given keys.
+    /// Takes the device out of the A/B tests of the given keys, or out of every
+    /// A/B test when no key is given.
     func exitABTests(forKeys keys: [String]) {
         logI("exitABTests", "an exit from A/B tests is requested, keyCount: [\(keys.count)]")
 
         guard isRemoteConfigCallAllowed("exitABTests", "A/B test exit", requiresNetworking: false) else { return }
 
-        logD("exitABTests", "an exit request will be added to the request queue, keys: [\(Self.describe(keys))]")
-        sendABRequest(method: QS.abOptOut, keys: keys, overrideEndpoint: false)
+        let validKeys = keys.filter { !$0.isEmpty }
+        logD("exitABTests", "an exit request will be added to the request queue, exitsEveryTest: [\(validKeys.isEmpty)], keys: [\(Self.describe(validKeys))]")
+        sendABRequest(method: QS.abOptOut, keys: validKeys, overrideEndpoint: false)
     }
 
+    /// Queues an A/B request. Without keys it concerns every test: the server
+    /// reads an empty list as a list that matches none.
     private func sendABRequest(method: String, keys: [String], overrideEndpoint: Bool) {
         var queryString = "\(core.network.builder.queryEssentials())&\(QS.method)=\(method)"
-        queryString += "&\(QS.rcKeys)=\(CountlyJSON.escapedString(from: keys, logger: log))"
+        if !keys.isEmpty {
+            queryString += "&\(QS.rcKeys)=\(CountlyJSON.escapedString(from: keys, logger: log))"
+        }
 
         if overrideEndpoint {
             queryString = core.network.builder.withEndpointOverride(queryString, endpoint: Endpoint.output + Endpoint.sdk)
