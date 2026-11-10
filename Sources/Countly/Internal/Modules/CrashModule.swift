@@ -234,15 +234,42 @@ final class CrashModule: ModuleBase {
     }
 
     /// Records an error described by a name rather than an exception.
+    ///
+    /// - Parameter typeName: the error's type, sent as the crash type; a plain
+    ///   name has none of its own.
     func recordError(_ errorName: String,
+                     typeName: String = "Swift Error",
                      isFatal: Bool,
                      stackTrace: [String]?,
                      segmentation: [String: Any]?) {
-        logI("recordError", "error recording requested, errorNameLength: [\(errorName.count)], isFatal: [\(isFatal)], stackTraceFrameCount: [\(stackTrace?.count ?? 0)], segmentationKeyCount: [\(segmentation?.count ?? 0)]")
+        logI("recordError", "error recording requested, errorNameLength: [\(errorName.count)], typeName: [\(typeName)], isFatal: [\(isFatal)], stackTraceFrameCount: [\(stackTrace?.count ?? 0)], segmentationKeyCount: [\(segmentation?.count ?? 0)]")
         logV("recordError", "error recording detail, errorName: [\(errorName)], stackTrace: [\(stackTrace ?? [])], segmentation: [\(segmentation ?? [:])]")
 
-        let exception = NSException(name: NSExceptionName("Swift Error"), reason: errorName, userInfo: nil)
+        let exception = NSException(name: NSExceptionName(typeName), reason: errorName, userInfo: nil)
         recordException(exception, isFatal: isFatal, stackTrace: stackTrace, segmentation: segmentation)
+    }
+
+    /// Records a Swift error: its description as the name and its type as the
+    /// crash type.
+    func recordError(_ error: Error, isFatal: Bool, stackTrace: [String]?, segmentation: [String: Any]?) {
+        recordError(String(describing: error),
+                    typeName: Self.typeName(of: error),
+                    isFatal: isFatal,
+                    stackTrace: stackTrace,
+                    segmentation: segmentation)
+    }
+
+    /// The type of `error` as the crash type: the domain of an `NSError`, which
+    /// is what tells its errors apart, otherwise the Swift type's full name.
+    static func typeName(of error: Error) -> String {
+        let errorType = type(of: error)
+        if errorType is NSError.Type {
+            return (error as NSError).domain
+        }
+        let name = String(reflecting: errorType)
+        // A private or local type's name carries its address, which moves with every launch.
+        guard name.contains("(unknown context at $") else { return name }
+        return name.replacingOccurrences(of: #"\(unknown context at \$[0-9a-fA-F]+\)\."#, with: "", options: .regularExpression)
     }
 
     /// Called by the process-wide handler when a crash is detected.

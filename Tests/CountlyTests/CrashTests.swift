@@ -15,6 +15,11 @@ private let hostExceptionHandler: @convention(c) (NSException) -> Void = { _ in 
 private let laterExceptionHandler: @convention(c) (NSException) -> Void = { _ in }
 private let laterSignalHandler: @convention(c) (Int32) -> Void = { _ in }
 
+/// A Swift error of the application's own.
+private enum SampleError: Error {
+    case diskFull
+}
+
 /// The `crash` payload: what the server is told about something going wrong.
 ///
 /// A crash report is only useful if it can be symbolicated and attributed, so
@@ -309,6 +314,21 @@ final class CrashTests: CountlyBaseTestCase {
         // A boolean, not a 1. Every other Countly SDK sends a boolean here and the
         // booleans beside it in this same payload are real booleans.
         XCTAssertEqual(crash["_nonfatal"] as? Bool, true)
+    }
+
+    /// A recorded error reports its own type as the crash type, which is what
+    /// tells one kind of error from another on the dashboard, and its message as
+    /// the crash title.
+    func testARecordedErrorReportsItsTypeAsTheCrashType() {
+        let countly = startInstance()
+
+        countly.crashes.recordError(SampleError.diskFull, stackTrace: ["0 MyApp 0x1 save"])
+        XCTAssertEqual(lastCrash(of: countly)?["_type"] as? String, "CountlyTests.SampleError",
+                       "a private type's name must not carry its address, which changes every launch")
+        XCTAssertEqual(lastCrash(of: countly)?["_name"] as? String, "diskFull")
+
+        countly.crashes.recordError(NSError(domain: "com.example.storage", code: 28), stackTrace: ["0 MyApp 0x1 save"])
+        XCTAssertEqual(lastCrash(of: countly)?["_type"] as? String, "com.example.storage")
     }
 
     /// Every Mac has a shell, so a shell is no jailbreak signal on a Mac or in a

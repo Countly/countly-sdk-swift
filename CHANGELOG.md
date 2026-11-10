@@ -96,7 +96,7 @@
 
 * Added the crashes API on "countly.crashes":
   * "recordException(exception, isFatal, stackTrace, segmentation)"
-  * "recordError(error, ...)" / "recordError(errorName, ...)"
+  * "recordError(error, ...)" / "recordError(errorName, ...)". An error's type is reported as the crash type: the domain of an "NSError", otherwise the Swift type's name.
   * "addCrashBreadcrumb(log)" / "clearCrashBreadcrumbs()"
   * "setCrashSegmentation(segmentation)"
   * Automatic signal and uncaught exception handlers, chaining to any handler already installed, plus a crash filter callback via "CountlyConfig.crashes.crashFilterCallback".
