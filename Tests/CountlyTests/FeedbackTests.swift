@@ -7,6 +7,9 @@
 //
 
 import XCTest
+#if canImport(WebKit)
+import WebKit
+#endif
 @testable import Countly
 
 /// Feedback widgets: what the SDK asks the server for, and what it reports back.
@@ -81,15 +84,16 @@ final class FeedbackTests: CountlyBaseTestCase {
 
         let fetched = expectation(description: "the fetch reports back")
         countly.feedback.getAvailableFeedbackWidgets { widgets, error in
-            XCTAssertNil(widgets)
+            XCTAssertEqual(widgets?.count, 0)
             XCTAssertNotNil(error)
             fetched.fulfill()
         }
         wait(for: [fetched], timeout: 5)
     }
 
-    /// Every refusal reports back. A completion handler that is captured and never
-    /// called leaves the caller waiting for the life of the process.
+    /// Every refusal reports back, with an empty list and the reason. A completion
+    /// handler that is captured and never called leaves the caller waiting for the
+    /// life of the process.
     func testEveryRefusalStillCallsTheCompletionHandler() {
         let cases: [(String, (CountlyConfig) -> Void)] = [
             ("no consent", { $0.requiresConsent = true }),
@@ -102,12 +106,26 @@ final class FeedbackTests: CountlyBaseTestCase {
         for (label, adjust) in cases {
             let countly = startInstance(adjust)
             let reported = expectation(description: "the fetch reports back with \(label)")
-            countly.feedback.getAvailableFeedbackWidgets { widgets, _ in
-                XCTAssertNil(widgets, label)
+            countly.feedback.getAvailableFeedbackWidgets { widgets, error in
+                XCTAssertEqual(widgets?.count, 0, label)
+                XCTAssertNotNil(error, label)
                 reported.fulfill()
             }
             wait(for: [reported], timeout: 5)
         }
+    }
+
+    /// A presentation that cannot happen still answers, so the caller is not left
+    /// waiting for a widget that will never appear.
+    func testAPresentationThatCannotHappenReportsAFailure() {
+        let countly = startInstance { $0.requiresConsent = true }
+
+        let failed = expectation(description: "the presentation reports a failure")
+        countly.feedback.presentNPS(nil) { state in
+            XCTAssertEqual(state, .failed)
+            failed.fulfill()
+        }
+        wait(for: [failed], timeout: 5)
     }
 
     // MARK: - Recording a rating
@@ -148,6 +166,18 @@ final class FeedbackTests: CountlyBaseTestCase {
         XCTAssertTrue(events(of: countly).isEmpty)
     }
 
+    /// The legacy call never moves a rating into the range: an answer outside it is
+    /// not one the user gave.
+    func testARatingOutsideOneToFiveIsDropped() {
+        let countly = startInstance { $0.eventSendThreshold = 1 }
+
+        countly.feedback.recordRatingWidget(id: "w3", rating: 0, email: nil, comment: nil, userCanBeContacted: false)
+        countly.feedback.recordRatingWidget(id: "w3", rating: 6, email: nil, comment: nil, userCanBeContacted: false)
+
+        XCTAssertTrue(events(of: countly).isEmpty)
+        XCTAssertEqual(logCodeCount(HealthLogCode.invalidValue, of: countly), 2)
+    }
+
     func testTheOptionalContactFieldsCanBeOmitted() {
         let countly = startInstance { $0.eventSendThreshold = 1 }
 
@@ -186,6 +216,32 @@ final class FeedbackTests: CountlyBaseTestCase {
         let keys = events(of: countly).compactMap { $0["key"] as? String }
         XCTAssertTrue(keys.contains("[CLY]_survey"))
         XCTAssertTrue(keys.contains("[CLY]_nps"))
+    }
+
+    /// The server adds NPS ratings into its score, so a rating that is missing, not
+    /// a whole number or out of range is not recorded at all.
+    func testAManualResultNeedsARatingInTheRangeOfItsType() throws {
+        let countly = startInstance { $0.eventSendThreshold = 1 }
+        let nps = try XCTUnwrap(countly.feedback.widget(from: ["_id": "w2", "type": "nps"]))
+        let rating = try XCTUnwrap(countly.feedback.widget(from: ["_id": "w3", "type": "rating"]))
+
+        nps.recordResult(["rating": 11])
+        nps.recordResult(["rating": 7.5])
+        nps.recordResult(["rating": "8"])
+        nps.recordResult(["comment": "no rating"])
+        rating.recordResult(["rating": 0])
+        XCTAssertTrue(events(of: countly).isEmpty)
+        XCTAssertEqual(logCodeCount(HealthLogCode.invalidValue, of: countly), 5)
+
+        nps.recordResult(["rating": 0, "": "dropped", "comment": NSNull()])
+        rating.recordResult(["rating": 5])
+
+        let recorded = events(of: countly)
+        XCTAssertEqual(recorded.count, 2)
+        let npsSegmentation = (recorded.first { $0["key"] as? String == "[CLY]_nps" }?["segmentation"] as? [String: Any]) ?? [:]
+        XCTAssertEqual(TestUtils.int(npsSegmentation["rating"]), 0)
+        XCTAssertNil(npsSegmentation[""])
+        XCTAssertNil(npsSegmentation["comment"])
     }
 
     /// A nil result means the widget was closed without being answered, which is
@@ -252,9 +308,24 @@ final class FeedbackTests: CountlyBaseTestCase {
         let countly = startInstance()
         let widgets = fetchWidgets(countly)
 
-        XCTAssertEqual(widgets.first { $0.name == "Onboarding survey" }?.id, "w1")
-        XCTAssertEqual(widgets.first { $0.id == "w2" }?.type, .nps)
-        XCTAssertEqual(widgets.first { $0.tags.contains("cart") }?.id, "w3")
+        XCTAssertEqual(FeedbackModule.widget(in: widgets, matching: "Onboarding survey")?.id, "w1")
+        XCTAssertEqual(FeedbackModule.widget(in: widgets, matching: "w2")?.type, .nps)
+        XCTAssertEqual(FeedbackModule.widget(in: widgets, matching: "cart")?.id, "w3")
+    }
+
+    /// An ID wins over a name, a name over a tag, and a value that matches nothing
+    /// never falls back to another widget.
+    func testAnIDMatchWinsOverANameAndANameOverATag() throws {
+        let countly = startInstance()
+        let byTag = try XCTUnwrap(countly.feedback.widget(from: ["_id": "a", "type": "nps", "name": "x", "tg": ["target"]]))
+        let byName = try XCTUnwrap(countly.feedback.widget(from: ["_id": "b", "type": "nps", "name": "target"]))
+        let byID = try XCTUnwrap(countly.feedback.widget(from: ["_id": "target", "type": "nps", "name": "y"]))
+
+        XCTAssertEqual(FeedbackModule.widget(in: [byTag, byName, byID], matching: "target")?.id, "target")
+        XCTAssertEqual(FeedbackModule.widget(in: [byTag, byName], matching: "target")?.id, "b")
+        XCTAssertEqual(FeedbackModule.widget(in: [byTag], matching: "target")?.id, "a")
+        XCTAssertNil(FeedbackModule.widget(in: [byTag, byName, byID], matching: "nothing-like-it"))
+        XCTAssertEqual(FeedbackModule.widget(in: [byTag, byName], matching: nil)?.id, "a")
     }
 
     /// A list the SDK cannot make sense of yields no widgets rather than a
@@ -340,25 +411,30 @@ final class FeedbackTests: CountlyBaseTestCase {
     /// Presenting a widget builds its URL and puts it in an overlay above the whole
     /// application. The page cannot load without a server, so it comes back down
     /// again, which is the path worth checking: a widget that cannot load must not
-    /// be left covering the application.
+    /// be left covering the application. It was never shown, so the caller hears it
+    /// failed and no "closed" event is recorded, which could hide the widget from
+    /// that user for good.
     func testPresentingAWidgetPutsItOnScreenAndTakesItDownWhenItCannotLoad() throws {
         try skipUnlessNetworkIsInterceptable()
         #if !(os(iOS) || os(visionOS) || os(macOS))
         throw XCTSkip("feedback widgets are presented in a web view, which this platform has no overlay for")
         #else
-        let countly = startInstance()
+        let countly = startInstance { $0.eventSendThreshold = 1 }
         guard let widget = fetchWidgets(countly).first else {
             XCTFail("the widget list should not be empty")
             return
         }
 
-        let closed = expectation(description: "the widget reports it closed")
-        closed.assertForOverFulfill = false
+        let failed = expectation(description: "the widget reports it could not be shown")
+        failed.assertForOverFulfill = false
         widget.present(callback: { state in
-            if state == .closed { closed.fulfill() }
+            if state == .failed { failed.fulfill() }
         })
 
-        wait(for: [closed], timeout: TestUtils.webKitTimeout)
+        wait(for: [failed], timeout: TestUtils.webKitTimeout)
+        TestUtils.pump(0.3)
+        XCTAssertFalse(events(of: countly).contains { $0["key"] as? String == "[CLY]_survey" },
+                       "a widget that never appeared was recorded as closed")
         #endif
     }
 
@@ -383,9 +459,10 @@ final class FeedbackTests: CountlyBaseTestCase {
         #endif
     }
 
-    /// Dismissing a widget without answering it is itself worth reporting: it is
-    /// the difference between a widget nobody saw and one everybody closed.
-    func testDismissingAWidgetRecordsItAsClosed() throws {
+    /// Dismissing a widget the user saw without answering it is itself worth
+    /// reporting: it is the difference between a widget nobody saw and one
+    /// everybody closed.
+    func testDismissingAWidgetThatAppearedRecordsItAsClosed() throws {
         try skipUnlessNetworkIsInterceptable()
         #if !(os(iOS) || os(visionOS) || os(macOS))
         throw XCTSkip("feedback widgets are presented in a web view, which this platform has no overlay for")
@@ -396,11 +473,24 @@ final class FeedbackTests: CountlyBaseTestCase {
             return
         }
 
+        let appeared = expectation(description: "the widget reports it appeared")
+        appeared.assertForOverFulfill = false
         let closed = expectation(description: "the widget reports it closed")
         closed.assertForOverFulfill = false
         widget.present(callback: { state in
+            if state == .appeared { appeared.fulfill() }
             if state == .closed { closed.fulfill() }
         })
+
+        // The server's page cannot load here, so a local one takes its place.
+        let feedback = core(of: countly).modules.feedback
+        TestUtils.waitUntil("the widget is put in an overlay") { !feedback.presentedWidgetManagers.isEmpty }
+        let manager = try XCTUnwrap(feedback.presentedWidgetManagers.first as? WebViewManager)
+        let page: WKWebView? = manager.webView
+        page?.loadHTMLString("<html><body>ok</body></html>", baseURL: URL(string: "https://example.com/"))
+        wait(for: [appeared], timeout: TestUtils.webKitTimeout)
+
+        manager.close()
         wait(for: [closed], timeout: TestUtils.webKitTimeout)
 
         TestUtils.waitUntil("the dismissal is recorded") {
@@ -425,11 +515,11 @@ final class FeedbackTests: CountlyBaseTestCase {
         XCTAssertTrue(WebViewManager.gate.claim(overlayOnScreen))
         defer { WebViewManager.gate.release(overlayOnScreen) }
 
-        let closed = expectation(description: "the caller hears the widget closed")
+        let failed = expectation(description: "the caller hears the widget could not be shown")
         widget.present(callback: { state in
-            if state == .closed { closed.fulfill() }
+            if state == .failed { failed.fulfill() }
         })
-        wait(for: [closed], timeout: TestUtils.asyncTimeout)
+        wait(for: [failed], timeout: TestUtils.asyncTimeout)
         TestUtils.pump(0.3)
 
         XCTAssertFalse(events(of: countly).contains { $0["key"] as? String == "[CLY]_survey" },
@@ -449,8 +539,9 @@ final class FeedbackTests: CountlyBaseTestCase {
 
         // The list itself is refused without consent, so nothing can be presented.
         let reported = expectation(description: "the fetch reports back")
-        countly.feedback.getAvailableFeedbackWidgets { widgets, _ in
-            XCTAssertNil(widgets)
+        countly.feedback.getAvailableFeedbackWidgets { widgets, error in
+            XCTAssertEqual(widgets?.count, 0)
+            XCTAssertNotNil(error)
             reported.fulfill()
         }
         wait(for: [reported], timeout: TestUtils.asyncTimeout)
@@ -459,25 +550,23 @@ final class FeedbackTests: CountlyBaseTestCase {
 
     // MARK: - Consent
 
-    func testNothingIsRecordedWithoutFeedbackConsent() {
+    /// The legacy rating call answers to the "star-rating" consent; the "feedback"
+    /// consent covers the widgets, not this call.
+    func testTheLegacyRatingCallNeedsTheStarRatingConsent() {
         let countly = startInstance {
             $0.eventSendThreshold = 1
             $0.requiresConsent = true
         }
 
-        countly.feedback.recordRatingWidget(id: "w3",
-                                            rating: 4,
-                                            email: nil,
-                                            comment: nil,
-                                            userCanBeContacted: false)
+        countly.feedback.recordRatingWidget(id: "w3", rating: 4, email: nil, comment: nil, userCanBeContacted: false)
         XCTAssertTrue(events(of: countly).isEmpty)
 
         countly.consent.giveConsent(for: .feedback)
-        countly.feedback.recordRatingWidget(id: "w3",
-                                            rating: 4,
-                                            email: nil,
-                                            comment: nil,
-                                            userCanBeContacted: false)
+        countly.feedback.recordRatingWidget(id: "w3", rating: 4, email: nil, comment: nil, userCanBeContacted: false)
+        XCTAssertTrue(events(of: countly).isEmpty, "feedback consent does not cover the legacy call")
+
+        countly.consent.giveConsent(for: .starRating)
+        countly.feedback.recordRatingWidget(id: "w3", rating: 4, email: nil, comment: nil, userCanBeContacted: false)
         XCTAssertEqual(events(of: countly).filter { $0["key"] as? String == "[CLY]_star_rating" }.count, 1)
     }
 

@@ -356,10 +356,14 @@ final class LogGatheringTests: CountlyBaseTestCase {
         XCTAssertEqual(LogGatheringDirective.parse(["e": true, "i": "g", "l": 5], logger: nil).levels, allLevels)
     }
 
-    func testTheBatchSizeIsClampedIntoRange() {
-        XCTAssertEqual(directive(id: "g", batchSize: 1).batchSize, minBatchSize, "a batch of one would upload a request per log line")
-        XCTAssertEqual(directive(id: "g", batchSize: 100_000).batchSize, maxBufferedLines, "a batch bigger than the buffer would never fill")
-        XCTAssertEqual(directive(id: "g", batchSize: 0).batchSize, minBatchSize)
+    /// A batch size outside 10 to 500 is treated as if the server had not sent
+    /// one: the default applies, the value is never moved into the range.
+    func testABatchSizeOutOfRangeFallsBackToTheDefault() {
+        XCTAssertEqual(directive(id: "g", batchSize: 1).batchSize, defaultBatchSize, "a batch of one would upload a request per log line")
+        XCTAssertEqual(directive(id: "g", batchSize: 100_000).batchSize, defaultBatchSize, "a batch bigger than the buffer would never fill")
+        XCTAssertEqual(directive(id: "g", batchSize: 0).batchSize, defaultBatchSize)
+        XCTAssertEqual(directive(id: "g", batchSize: minBatchSize).batchSize, minBatchSize)
+        XCTAssertEqual(directive(id: "g", batchSize: maxBufferedLines).batchSize, maxBufferedLines)
         XCTAssertEqual(directive(id: "g", batchSize: 250).batchSize, 250)
         XCTAssertEqual(directive(id: "g", batchSize: nil).batchSize, defaultBatchSize)
         XCTAssertEqual(LogGatheringDirective.parse(["e": true, "i": "g", "b": "many"], logger: nil).batchSize, defaultBatchSize)
@@ -805,9 +809,9 @@ final class LogGatheringTests: CountlyBaseTestCase {
         let byFeature: [String: ConsentFeature] = [
             "Events": .events, "Views": .viewTracking, "UserProfile": .userDetails,
             "Sessions": .sessions, "Location": .location, "Crash": .crashReporting,
-            "CrashLogStore": .crashReporting, "Push": .pushNotifications,
+            "Push": .pushNotifications,
             "PushRuntime": .pushNotifications, "Attribution": .attribution,
-            "APM": .performanceMonitoring, "Feedback": .feedback,
+            "Feedback": .feedback,
             "RemoteConfig": .remoteConfig, "Content": .content, "DeviceMetrics": .metrics,
         ]
         for (module, feature) in byFeature {
@@ -1112,6 +1116,17 @@ final class LogGatheringTests: CountlyBaseTestCase {
         }
     }
 
+    /// Answers the behavior settings fetches made for `deviceID` with `json`, ahead
+    /// of a broader answer. The server arms a gather for one user, so the fetch a
+    /// device ID change makes for the next user answers without it.
+    private func respondToBehaviorSettings(forDeviceID deviceID: String, with json: String) {
+        MockURLProtocol.respond { captured in
+            guard captured.path.contains("/o/sdk"), captured.query.contains("method=sc"),
+                  TestUtils.parseQuery(captured.query)["device_id"] as? String == deviceID else { return nil }
+            return (200, Data(json.utf8))
+        }
+    }
+
     /// Accepts every gathered log batch, so one queued at init end cannot stay
     /// failing at the head of the queue and hold back the requests behind it.
     private func acceptGatheredBatches() {
@@ -1230,19 +1245,22 @@ final class LogGatheringTests: CountlyBaseTestCase {
     }
 
     /// Giving a consent through the public API releases the lines that waited for
-    /// it, so nothing logged before the consent is lost.
+    /// it, so nothing logged before the consent is lost. The profile call itself is
+    /// ignored without the consent, and logs no value.
     func testAUserPropertyLineWaitsForTheUserDetailsConsentAndIsReleasedOnceItIsGiven() throws {
         try skipUnlessNetworkIsInterceptable()
         let countly = startArmed(id: "gather_users") {
             $0.requiresConsent = true
             $0.consents = [.events]
         }
-        let propertyLine = "predefined user property value detail, key: [email], value: [someone@example.com]"
+        let propertyLine = "user property will be set, key: [email]"
 
         countly.userProfile.setProperty("email", value: "someone@example.com")
         gatherer(of: countly).flushNow()
-        XCTAssertFalse(uploadedMessages(of: countly).contains { $0.contains("someone@example.com") })
+        XCTAssertFalse(uploadedMessages(of: countly).contains { $0.contains(propertyLine) })
         XCTAssertTrue(awaitingMessages(gatherer(of: countly)).contains { $0.contains(propertyLine) })
+        XCTAssertFalse((uploadedMessages(of: countly) + awaitingMessages(gatherer(of: countly))).contains { $0.contains("someone@example.com") },
+                       "a profile call refused for consent logs no value")
 
         countly.consent.giveConsent(for: [.userDetails])
         // The first batch still waits in the failing queue, which holds back an ordinary flush.
@@ -1253,8 +1271,8 @@ final class LogGatheringTests: CountlyBaseTestCase {
     }
 
     /// Only the uploaded copy waits for consent: the developer log keeps showing
-    /// what was logged in full. An event refused for consent never logs its
-    /// segmentation, which is logged only once the gates let it through.
+    /// what was logged in full. An event or a profile call refused for consent
+    /// never logs its values, which are logged only once the gates let them through.
     func testWithOnlySessionsConsentNoSecretIsUploadedAndEachWaitsWhileTheLocalLogKeepsIt() throws {
         try skipUnlessNetworkIsInterceptable()
         let sink = LogSink()
@@ -1274,13 +1292,14 @@ final class LogGatheringTests: CountlyBaseTestCase {
         let uploaded = uploadedMessages(of: countly)
         XCTAssertTrue(uploaded.contains { $0.contains("[Sessions]") }, "the sessions consent lets the sessions lines out")
         let awaiting = awaitingMessages(gatherer(of: countly))
-        XCTAssertFalse((uploaded + awaiting + sink.lines).contains { $0.contains("secret-sku") },
-                       "the refused event's segmentation is never logged")
-        for secret in ["secret checkout screen", "secret@example.com"] {
-            XCTAssertFalse(uploaded.contains { $0.contains(secret) }, "[\(secret)] reached the server without the consent it belongs to")
-            XCTAssertTrue(awaiting.contains { $0.contains(secret) }, "[\(secret)] waits for its consent instead of being dropped")
-            XCTAssertTrue(sink.lines.contains { $0.contains(secret) }, "the local log lost [\(secret)]")
+        for refused in ["secret-sku", "secret@example.com"] {
+            XCTAssertFalse((uploaded + awaiting + sink.lines).contains { $0.contains(refused) },
+                           "the value [\(refused)] of a call refused for consent is never logged")
         }
+        let secret = "secret checkout screen"
+        XCTAssertFalse(uploaded.contains { $0.contains(secret) }, "[\(secret)] reached the server without the consent it belongs to")
+        XCTAssertTrue(awaiting.contains { $0.contains(secret) }, "[\(secret)] waits for its consent instead of being dropped")
+        XCTAssertTrue(sink.lines.contains { $0.contains(secret) }, "the local log lost [\(secret)]")
     }
 
     /// A value the behavior settings filter out is never logged, at any level, so
@@ -1379,23 +1398,24 @@ final class LogGatheringTests: CountlyBaseTestCase {
         XCTAssertTrue(awaitingMessages(gatherer(of: countly)).isEmpty, "nothing waits while consent is not required")
     }
 
-    /// The limits cut a value on behalf of the feature that handed it over, here
-    /// before the crash consent is ever checked, so the line they log about it
-    /// answers to that feature rather than to events and user details.
+    /// The limits cut a value on behalf of the feature that handed it over, so the
+    /// line they log about it answers to that feature's consent alone: with only
+    /// the crash consent given it goes out, where a line no single feature owns
+    /// would wait for the events and user details consents.
     func testALimitsLineAnswersToTheConsentOfTheFeatureWhoseValueItCut() throws {
         try skipUnlessNetworkIsInterceptable()
         let countly = startArmed(id: "gather_limits") {
             $0.requiresConsent = true
-            $0.consents = [.events, .userDetails]
+            $0.consents = [.crashReporting]
         }
 
         countly.crashes.setCrashSegmentation(["note": String(repeating: "x", count: 300) + "SECRET-CRASH-SEGMENTATION"])
-        gatherer(of: countly).flushNow()
+        // A batch queued at the end of init may still wait in the failing queue, which holds back an ordinary flush.
+        gatherer(of: countly).flushNow(ignoringQueuedBatch: true)
 
-        XCTAssertFalse(uploadedMessages(of: countly).contains { $0.contains("SECRET-CRASH-SEGMENTATION") },
-                       "crash data reached the server on the events and user details consent")
-        let cut = try XCTUnwrap(gatherer(of: countly).linesAwaitingConsent.first { $0.message.contains("[Limits]") && $0.message.contains("SECRET-CRASH-SEGMENTATION") })
-        XCTAssertEqual(cut.scope, .feature(.crashReporting))
+        XCTAssertTrue(uploadedMessages(of: countly).contains { $0.contains("[Limits]") && $0.contains("SECRET-CRASH-SEGMENTATION") },
+                      "the crash consent releases the line about the crash value the limits cut")
+        XCTAssertFalse(awaitingMessages(gatherer(of: countly)).contains { $0.contains("SECRET-CRASH-SEGMENTATION") })
     }
 
     /// A request queued for the previous user still goes out after a change
@@ -1474,10 +1494,12 @@ final class LogGatheringTests: CountlyBaseTestCase {
     }
 
     /// A change without merge is a new user: what the old one may upload goes out
-    /// under the old device ID, and the gather does not follow the next user.
+    /// under the old device ID, and the gather does not follow the next user, for
+    /// whom the server armed none.
     func testADeviceIDChangeWithoutMergeUploadsUnderTheOldIDAndThenStops() throws {
         try skipUnlessNetworkIsInterceptable()
         let countly = startArmed(id: "gather_old_user")
+        respondToBehaviorSettings(forDeviceID: "new_user", with: ServerConfigBuilder().json())
         countly.events.recordEvent("old-user-event")
 
         countly.deviceID.changeWithoutMerge("new_user")
@@ -1503,6 +1525,7 @@ final class LogGatheringTests: CountlyBaseTestCase {
             $0.requiresConsent = true
             $0.consents = [.sessions]
         }
+        respondToBehaviorSettings(forDeviceID: "new_user", with: ServerConfigBuilder().json())
         countly.events.recordEvent("old-user-secret")
         XCTAssertTrue(awaitingMessages(gatherer(of: countly)).contains { $0.contains("old-user-secret") })
 

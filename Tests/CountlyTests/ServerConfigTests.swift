@@ -36,7 +36,8 @@ final class ServerConfigTests: CountlyBaseTestCase {
         XCTAssertTrue(config.customEventTrackingEnabled)
         XCTAssertTrue(config.crashReportingEnabled)
         XCTAssertTrue(config.locationTrackingEnabled)
-        XCTAssertFalse(config.consentRequired)
+        XCTAssertNil(config.locationTracking, "without lt the application's own location choice applies")
+        XCTAssertNil(config.consentRequired, "without cr the application's own consent requirement applies")
     }
 
     // MARK: - Parsing
@@ -238,7 +239,7 @@ final class ServerConfigTests: CountlyBaseTestCase {
             $0.sdkBehaviorSettings = ServerConfigBuilder().consentRequired(true).json()
         }
 
-        XCTAssertTrue(serverConfig(of: countly).consentRequired)
+        XCTAssertEqual(serverConfig(of: countly).consentRequired, true)
         XCTAssertFalse(countly.consent.hasConsent(for: .events))
 
         countly.events.recordEvent("should-be-blocked")
@@ -262,9 +263,10 @@ final class ServerConfigTests: CountlyBaseTestCase {
         XCTAssertTrue(requestQueue(of: countly).isEmpty)
     }
 
-    /// The server can switch logging on for an application that never asked for
-    /// it, which is how support gets a trace out of a shipped build.
-    func testTheServerCanSwitchLoggingOn() {
+    /// "log" is no behavior setting: the server gets the SDK's logs through log
+    /// gathering, so the key is ignored like any unknown one and the developer's
+    /// logging stays as configured.
+    func testALogKeyFromTheServerDoesNotChangeTheDevelopersLogging() {
         let settings = #"{"v": 1, "t": 1700000000000, "c": {"log": true}}"#
 
         let countly = startInstance {
@@ -272,7 +274,7 @@ final class ServerConfigTests: CountlyBaseTestCase {
             $0.sdkBehaviorSettings = settings
         }
 
-        XCTAssertTrue(core(of: countly).config.enableDebug)
+        XCTAssertFalse(core(of: countly).config.enableDebug)
     }
 
     // MARK: - Caching
@@ -318,7 +320,7 @@ final class ServerConfigTests: CountlyBaseTestCase {
         private(set) var changedKeys: [Set<String>] = []
 
         /// Keeps the keys this notification reports as changed.
-        func serverConfigDidChange(_ serverConfig: ServerConfig, consentBecameRequired: Bool, changedKeys: Set<String>) {
+        func serverConfigDidChange(_ serverConfig: ServerConfig, changedKeys: Set<String>) {
             self.changedKeys.append(changedKeys)
         }
     }
@@ -378,6 +380,118 @@ final class ServerConfigTests: CountlyBaseTestCase {
                        "an answer repeating what is in effect reports no change at all")
         XCTAssertTrue(serverConfig.enterContentZone)
         XCTAssertEqual(config.content.zoneTimerInterval, 45)
+    }
+
+    /// A behavior settings object of its own, started from `config` and answered
+    /// by `transport`, removed with its storage after the test.
+    private func standaloneServerConfig(_ config: CountlyConfig, transport: CannedTransport = CannedTransport()) -> ServerConfig {
+        let store = KeyValueStore(namespace: StorageNamespace(instanceName: uniqueInstanceName()), logger: nil)
+        let serverConfig = ServerConfig(store: store, logger: nil)
+        addTeardownBlock {
+            serverConfig.stop()
+            store.clearAll()
+        }
+        serverConfig.transport = transport
+        serverConfig.retrieveFromStorage(config: config)
+        return serverConfig
+    }
+
+    /// An answer replaces the stored one whole. A setting the operator removed in
+    /// the dashboard stops applying, and the developer's own value comes back.
+    func testASettingTheAnswerNoLongerCarriesFallsBackToTheDevelopersValue() {
+        let transport = CannedTransport()
+        let config = baseConfig()
+        config.eventSendThreshold = 10
+        config.sdkInternalLimits.maxKeyLength = 50
+        config.sdkBehaviorSettings = ServerConfigBuilder().tracking(false).eventQueueSize(3).maxKeyLength(5)
+            .eventBlacklist(["noise"]).json()
+        let serverConfig = standaloneServerConfig(config, transport: transport)
+        XCTAssertFalse(serverConfig.trackingEnabled)
+        XCTAssertEqual(config.eventSendThreshold, 3)
+        XCTAssertEqual(config.sdkInternalLimits.maxKeyLength, 5)
+        XCTAssertFalse(serverConfig.shouldRecordEvent("noise"))
+
+        transport.answers = [ServerConfigBuilder().json()]
+        serverConfig.fetch(config: config)
+
+        XCTAssertTrue(serverConfig.trackingEnabled)
+        XCTAssertEqual(config.eventSendThreshold, 10)
+        XCTAssertEqual(config.sdkInternalLimits.maxKeyLength, 50)
+        XCTAssertTrue(serverConfig.shouldRecordEvent("noise"), "a filter the answer no longer carries stops filtering")
+    }
+
+    /// An empty list is ignored as if it were missing, so it cannot switch a
+    /// whitelist off by winning over it.
+    func testAnEmptyBlacklistLeavesTheWhitelistInEffect() {
+        let config = baseConfig()
+        config.sdkBehaviorSettings = ServerConfigBuilder().eventBlacklist([]).eventWhitelist(["purchase"]).json()
+
+        let serverConfig = standaloneServerConfig(config)
+
+        XCTAssertTrue(serverConfig.shouldRecordEvent("purchase"))
+        XCTAssertFalse(serverConfig.shouldRecordEvent("anything-else"))
+    }
+
+    func testABlacklistWinsWhenBothListsHaveEntries() {
+        let config = baseConfig()
+        config.sdkBehaviorSettings = ServerConfigBuilder().eventBlacklist(["noise"]).eventWhitelist(["purchase"]).json()
+
+        let serverConfig = standaloneServerConfig(config)
+
+        XCTAssertFalse(serverConfig.shouldRecordEvent("noise"))
+        XCTAssertTrue(serverConfig.shouldRecordEvent("anything-else"))
+    }
+
+    /// A valid answer has a numeric version and timestamp and a config object.
+    /// Anything else leaves the settings in effect alone.
+    func testAnAnswerThatIsNotValidChangesNothing() {
+        let transport = CannedTransport()
+        let config = baseConfig()
+        let serverConfig = standaloneServerConfig(config, transport: transport)
+        transport.answers = [
+            #"{"v": "2", "t": 1700000000000, "c": {"tracking": false}}"#,
+            #"{"v": 2, "t": true, "c": {"tracking": false}}"#,
+            #"{"v": 2, "t": 1700000000000, "c": []}"#,
+        ]
+
+        for _ in transport.answers {
+            serverConfig.fetch(config: config)
+        }
+
+        XCTAssertTrue(serverConfig.trackingEnabled)
+    }
+
+    /// While the settings contain "bom" it wins in both directions; without it the
+    /// developer's choice applies.
+    func testTheServersBackoffSettingWinsInBothDirections() {
+        let developerOff = baseConfig()
+        developerOff.disableBackoffMechanism = true
+        developerOff.sdkBehaviorSettings = ServerConfigBuilder().backoffMechanism(true).json()
+        XCTAssertTrue(standaloneServerConfig(developerOff).backoffMechanism)
+
+        let developerOn = baseConfig()
+        developerOn.sdkBehaviorSettings = ServerConfigBuilder().backoffMechanism(false).json()
+        XCTAssertFalse(standaloneServerConfig(developerOn).backoffMechanism)
+
+        let developerOnly = baseConfig()
+        developerOnly.disableBackoffMechanism = true
+        XCTAssertFalse(standaloneServerConfig(developerOnly).backoffMechanism)
+    }
+
+    /// The edges of the valid ranges: a content zone interval of 15 and a queue
+    /// share of 1 are valid, 14 and 50 are not and leave the defaults in effect.
+    func testTheValueRangesFollowTheSettingsTable() {
+        let edges = baseConfig()
+        edges.sdkBehaviorSettings = ServerConfigBuilder().contentZoneInterval(15).bomRequestQueuePercentage(1).json()
+        let accepted = standaloneServerConfig(edges)
+        XCTAssertEqual(edges.content.zoneTimerInterval, 15)
+        XCTAssertEqual(accepted.bomRQPercentage, 1)
+
+        let outside = baseConfig()
+        outside.sdkBehaviorSettings = ServerConfigBuilder().contentZoneInterval(14).bomRequestQueuePercentage(50).json()
+        let refused = standaloneServerConfig(outside)
+        XCTAssertEqual(outside.content.zoneTimerInterval, CountlyContentConfig.defaultZoneTimerInterval)
+        XCTAssertEqual(refused.bomRQPercentage, 0.5, "50 meant as a percentage would switch the queue check off")
     }
 
     // MARK: - Fetching

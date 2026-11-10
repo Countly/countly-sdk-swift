@@ -32,8 +32,8 @@ final class SessionsModule: ModuleBase {
     /// not lose a fraction of a second each time.
     private var unsentSessionLength: TimeInterval = 0
 
-    /// Whether the SDK is suspended, which happens on background and around a
-    /// device ID change.
+    /// Whether the SDK is suspended, which happens on background and through the
+    /// public `suspend()`.
     private var isSuspended = false
 
     /// Drives the periodic session update.
@@ -110,12 +110,13 @@ final class SessionsModule: ModuleBase {
         core.logGatherer.scheduleFlush()
 
         if core.serverConfig.automaticSessionTrackingEnabled || core.config.enableManualSessionControlHybridMode {
-            updateSession()
+            updateSession(automatically: true)
         } else {
             logD("onUpdateTimer", "sessions are driven manually and hybrid mode is off, this tick will only flush events")
         }
 
         core.modules.events.sendEventsWithSaveIfNeeded()
+        core.healthTracker.saveState()
     }
 
     // MARK: - Session lifecycle
@@ -126,6 +127,9 @@ final class SessionsModule: ModuleBase {
     ///   session tracking does, rather than the host application.
     func beginSession(automatically: Bool = false) {
         logI("beginSession", "session begin requested, isSessionStarted: [\(isSessionStarted)], automaticSessionTracking: [\(core.serverConfig.automaticSessionTrackingEnabled)]")
+        if automatically {
+            core.healthTracker.recordUsage(.sessions, "begin", automatic: true)
+        }
 
         guard core.modules.consent.hasConsent(for: .sessions) else {
             logV("beginSession", "no consent for sessions, no session will be started")
@@ -139,6 +143,7 @@ final class SessionsModule: ModuleBase {
 
         guard !isSessionStarted else {
             logW("beginSession", "a session is already running, this session begin will be ignored")
+            core.healthTracker.recordLogCode(HealthLogCode.sessionOutOfOrder, area: .sessions)
             return
         }
 
@@ -156,20 +161,22 @@ final class SessionsModule: ModuleBase {
 
         isSessionStarted = true
         isSessionStartedAutomatically = automatically
-        lastSessionStartTime = Date().timeIntervalSince1970
+        lastSessionStartTime = core.clock.monotonicSeconds()
         unsentSessionLength = 0
 
         var queryString = core.network.builder.queryEssentials()
         queryString += "&\(QS.sessionBegin)=1"
-        queryString += "&\(QS.metrics)=\(CountlyJSON.escapedString(from: core.metricsDictionary(), logger: log))"
-
-        if !core.serverConfig.locationTrackingEnabled {
-            logD("beginSession", "location tracking is disabled by behavior settings, the begin session request will carry no location")
-        } else if let locationQuery = core.network.builder.locationQueryString() {
-            queryString += locationQuery
-            logD("beginSession", "location information will be sent with the begin session request")
+        if core.modules.consent.hasConsent(for: .metrics) {
+            queryString += "&\(QS.metrics)=\(CountlyJSON.escapedString(from: core.metricsDictionary(), logger: log))"
         } else {
-            logD("beginSession", "no location information is set, the begin session request will carry none")
+            logD("beginSession", "no consent for metrics, the begin session request carries none")
+        }
+
+        if let locationParameters = core.modules.location.beginSessionParameters() {
+            queryString += locationParameters
+            logD("beginSession", "location parameters are sent with the begin session request, locationOn: [\(core.modules.location.isLocationOn)]")
+        } else {
+            logD("beginSession", "no location value is stored, the server places the session from the request's IP address")
         }
 
         logD("beginSession", "session opened, the begin session request will be queued, isForeground: [\(AppState.isForeground)]")
@@ -180,8 +187,14 @@ final class SessionsModule: ModuleBase {
     }
 
     /// Reports the time elapsed since the last update.
-    func updateSession() {
+    ///
+    /// - Parameter automatically: whether the SDK sends the update on its timer,
+    ///   rather than the host application calling for it.
+    func updateSession(automatically: Bool = false) {
         logI("updateSession", "session update requested, isSessionStarted: [\(isSessionStarted)]")
+        if automatically {
+            core.healthTracker.recordUsage(.sessions, "update", automatic: true)
+        }
 
         guard core.modules.consent.hasConsent(for: .sessions) else {
             logV("updateSession", "no consent for sessions, the session duration will not be updated")
@@ -194,7 +207,12 @@ final class SessionsModule: ModuleBase {
         }
 
         guard isSessionStarted else {
-            logD("updateSession", "no session is running, this session update will be ignored")
+            if automatically {
+                logD("updateSession", "no session is running, this session update will be ignored")
+            } else {
+                logW("updateSession", "no session is running, this session update will be ignored")
+                core.healthTracker.recordLogCode(HealthLogCode.sessionOutOfOrder, area: .sessions)
+            }
             return
         }
 
@@ -209,22 +227,29 @@ final class SessionsModule: ModuleBase {
         core.network.enqueueAndProceed("\(core.network.builder.queryEssentials())&\(QS.sessionDuration)=\(duration)")
     }
 
-    /// Closes the session, reporting the remaining duration.
-    func endSession() {
+    /// Closes the session, reporting the remaining duration. A session that is
+    /// running when the server turns session tracking off still ends normally.
+    ///
+    /// - Parameter automatically: whether the SDK ends the session by itself,
+    ///   rather than the host application calling for it.
+    func endSession(automatically: Bool = false) {
         logI("endSession", "session end requested, isSessionStarted: [\(isSessionStarted)]")
+        if automatically {
+            core.healthTracker.recordUsage(.sessions, "end", automatic: true)
+        }
 
         guard core.modules.consent.hasConsent(for: .sessions) else {
             logV("endSession", "no consent for sessions, the session will not be ended")
             return
         }
 
-        guard core.serverConfig.sessionTrackingEnabled else {
-            logD("endSession", "session tracking is disabled by behavior settings, the session will not be ended")
-            return
-        }
-
         guard isSessionStarted else {
-            logD("endSession", "no session is running, this session end will be ignored")
+            if automatically {
+                logD("endSession", "no session is running, this session end will be ignored")
+            } else {
+                logW("endSession", "no session is running, this session end will be ignored")
+                core.healthTracker.recordLogCode(HealthLogCode.sessionOutOfOrder, area: .sessions)
+            }
             return
         }
 
@@ -243,9 +268,11 @@ final class SessionsModule: ModuleBase {
     }
 
     /// Whole seconds since the last read, keeping the remainder for the next one.
+    /// Read from the monotonic clock, so a change of the device's date and time
+    /// cannot stretch or shrink a session.
     private func sessionLengthInSeconds() -> Int {
-        let now = Date().timeIntervalSince1970
-        unsentSessionLength += (now - lastSessionStartTime)
+        let now = core.clock.monotonicSeconds()
+        unsentSessionLength += max(0, now - lastSessionStartTime)
         lastSessionStartTime = now
 
         let whole = Int(unsentSessionLength)
@@ -253,11 +280,45 @@ final class SessionsModule: ModuleBase {
         return whole
     }
 
+    // MARK: - Identity changes
+
+    /// Ends the running session before the identity its requests carry changes,
+    /// so the end goes out under the leaving device ID or app key.
+    ///
+    /// - Parameter includingManual: whether a session the host application began
+    ///   ends too. An app key change ends it; a device ID change without merge
+    ///   ends only the session automatic session tracking runs.
+    /// - Returns: `nil` when no session was ended, otherwise whether the SDK had
+    ///   begun it, for `beginSessionAfterIdentityChange(wasAutomatic:)`.
+    func endSessionForIdentityChange(includingManual: Bool) -> Bool? {
+        guard isSessionStarted else { return nil }
+        guard includingManual || core.serverConfig.automaticSessionTrackingEnabled else {
+            logD("endSessionForIdentityChange", "the running session was begun by the host application and is left to it")
+            return nil
+        }
+        let wasAutomatic = isSessionStartedAutomatically
+        endSession(automatically: true)
+        return isSessionStarted ? nil : wasAutomatic
+    }
+
+    /// Begins a session under the new identity for the one an identity change
+    /// ended, owned as before by the SDK or by the host application. While consent
+    /// is required, a device ID change without merge removed the sessions consent,
+    /// so that session waits until the consent is given again.
+    func beginSessionAfterIdentityChange(wasAutomatic: Bool?) {
+        guard let wasAutomatic else { return }
+        logD("beginSessionAfterIdentityChange", "a session was running for the previous identity, one is begun for the new one, wasAutomatic: [\(wasAutomatic)]")
+        beginSession(automatically: true)
+        if isSessionStarted {
+            isSessionStartedAutomatically = wasAutomatic
+        }
+    }
+
     // MARK: - Suspend and resume
 
     /// Stops tracking and flushes everything to disk.
     ///
-    /// Called on background and around a device ID change. Everything recorded is
+    /// Called on background and by the public `suspend()`. Everything recorded is
     /// pushed out first, because the process may not come back.
     func suspend() {
         logI("suspend", "suspending the SDK, isSuspended: [\(isSuspended)]")
@@ -287,7 +348,7 @@ final class SessionsModule: ModuleBase {
         core.modules.events.sendEventsWithSaveIfNeeded()
 
         if core.serverConfig.automaticSessionTrackingEnabled {
-            endSession()
+            endSession(automatically: true)
         } else {
             logD("suspend", "sessions are driven manually, the running session will be left open across the background")
         }
@@ -347,7 +408,7 @@ final class SessionsModule: ModuleBase {
         } else if isSessionStarted, isSessionStartedAutomatically {
             logD("applyAutomaticSessionTracking", "automatic session tracking is off, the session the SDK started will be ended")
             core.modules.events.sendEventsWithSaveIfNeeded()
-            endSession()
+            endSession(automatically: true)
         }
     }
 

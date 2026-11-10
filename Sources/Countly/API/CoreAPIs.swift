@@ -49,15 +49,19 @@ public final class EventsAPI: CountlyAPIBase {
     ///   - key: Name of the event.
     ///   - segmentation: Extra dimensions to break the event down by. Values may be
     ///     numbers, strings, booleans, or arrays of those.
-    ///   - count: How many times it happened. Values below one are raised to one.
+    ///   - count: How many times it happened. A value below one is ignored with a
+    ///     warning, and 1 is used.
     ///   - sum: A value to total across occurrences, such as a price.
-    ///   - duration: How long it took, in seconds.
+    ///   - duration: How long it took, in seconds. A negative value is ignored with
+    ///     a warning, and 0 is used.
     public func recordEvent(_ key: String,
                             segmentation: [String: Any]? = nil,
                             count: Int = 1,
                             sum: Double = 0,
                             duration: TimeInterval = 0) {
-        core()?.modules.events.recordEvent(key, segmentation: segmentation, count: count, sum: sum, duration: duration)
+        guard let core = core() else { return }
+        core.healthTracker.recordUsage(.events, "record")
+        core.modules.events.recordEvent(key, segmentation: segmentation, count: count, sum: sum, duration: duration)
     }
 
     /// `recordEvent` for Objective-C with only a key, which has no default arguments.
@@ -89,7 +93,9 @@ public final class EventsAPI: CountlyAPIBase {
 
     /// Starts timing an event. End it with `endEvent` to record the elapsed time.
     public func startEvent(_ key: String) {
-        core()?.modules.events.startEvent(key)
+        guard let core = core() else { return }
+        core.healthTracker.recordUsage(.events, "start")
+        core.modules.events.startEvent(key)
     }
 
     /// Ends a timed event and records it.
@@ -97,12 +103,16 @@ public final class EventsAPI: CountlyAPIBase {
                          segmentation: [String: Any]? = nil,
                          count: Int = 1,
                          sum: Double = 0) {
-        core()?.modules.events.endEvent(key, segmentation: segmentation, count: count, sum: sum)
+        guard let core = core() else { return }
+        core.healthTracker.recordUsage(.events, "end")
+        core.modules.events.endEvent(key, segmentation: segmentation, count: count, sum: sum)
     }
 
     /// Discards a timed event without recording it.
     public func cancelEvent(_ key: String) {
-        core()?.modules.events.cancelEvent(key)
+        guard let core = core() else { return }
+        core.healthTracker.recordUsage(.events, "cancel")
+        core.modules.events.cancelEvent(key)
     }
 
     /// Records a reserved event, one of those the SDK normally produces itself.
@@ -180,16 +190,21 @@ public final class SessionsAPI: CountlyAPIBase {
 
     /// Opens a session.
     public func beginSession() {
-        guard let core = core(), allowed(core, "beginSession") else { return }
+        guard let core = core() else { return }
+        core.healthTracker.recordUsage(.sessions, "begin")
+        guard allowed(core, "beginSession") else { return }
         core.logger.i(Self.module, "beginSession", "a session begin was requested through the manual sessions API")
         core.modules.sessions.beginSession()
     }
 
     /// Reports the time elapsed since the last update.
     public func updateSession() {
-        guard let core = core(), allowed(core, "updateSession") else { return }
+        guard let core = core() else { return }
+        core.healthTracker.recordUsage(.sessions, "update")
+        guard allowed(core, "updateSession") else { return }
         guard !core.config.enableManualSessionControlHybridMode else {
             core.logger.w(Self.module, "updateSession", "the call will be ignored since manual session control hybrid mode is enabled, session updates are sent by the timer")
+            core.healthTracker.recordLogCode(HealthLogCode.automaticTrackingActive, area: .sessions)
             return
         }
         core.logger.i(Self.module, "updateSession", "a session update was requested through the manual sessions API")
@@ -198,7 +213,9 @@ public final class SessionsAPI: CountlyAPIBase {
 
     /// Closes the session, sending anything recorded first.
     public func endSession() {
-        guard let core = core(), allowed(core, "endSession") else { return }
+        guard let core = core() else { return }
+        core.healthTracker.recordUsage(.sessions, "end")
+        guard allowed(core, "endSession") else { return }
         core.logger.i(Self.module, "endSession", "a session end was requested through the manual sessions API, recorded events are sent first")
         core.modules.events.sendEventsWithSaveIfNeeded()
         core.modules.sessions.endSession()
@@ -207,6 +224,7 @@ public final class SessionsAPI: CountlyAPIBase {
     private func allowed(_ core: SDKCore, _ function: String) -> Bool {
         guard core.serverConfig.automaticSessionTrackingEnabled else { return true }
         core.logger.w(Self.module, function, "the call will be ignored since automatic session tracking is active")
+        core.healthTracker.recordLogCode(HealthLogCode.automaticTrackingActive, area: .sessions)
         return false
     }
 }
@@ -217,54 +235,61 @@ public final class SessionsAPI: CountlyAPIBase {
 @objcMembers
 public final class ViewsAPI: CountlyAPIBase {
 
+    /// The core, once the call is counted for the health check's method usage.
+    private func core(counting method: String, _ function: String = #function) -> SDKCore? {
+        guard let core = core(function) else { return nil }
+        core.healthTracker.recordUsage(.views, method)
+        return core
+    }
+
     /// Starts a view that stays open until stopped.
     ///
     /// - Returns: The view's ID, for stopping or annotating it later.
     @discardableResult
     public func startView(_ viewName: String, segmentation: [String: Any]? = nil) -> String? {
-        core()?.modules.views.startView(viewName, segmentation: segmentation)
+        core(counting: "start")?.modules.views.startView(viewName, segmentation: segmentation)
     }
 
     /// Starts a view that is stopped as soon as another view starts.
     @discardableResult
     public func startAutoStoppedView(_ viewName: String, segmentation: [String: Any]? = nil) -> String? {
-        core()?.modules.views.startAutoStoppedView(viewName, segmentation: segmentation)
+        core(counting: "startAuto")?.modules.views.startAutoStoppedView(viewName, segmentation: segmentation)
     }
 
     /// Stops the open view with this name.
     public func stopView(name viewName: String, segmentation: [String: Any]? = nil) {
-        core()?.modules.views.stopView(name: viewName, segmentation: segmentation)
+        core(counting: "stop")?.modules.views.stopView(name: viewName, segmentation: segmentation)
     }
 
     /// Stops the view with this ID.
     public func stopView(id viewID: String, segmentation: [String: Any]? = nil) {
-        core()?.modules.views.stopView(id: viewID, segmentation: segmentation)
+        core(counting: "stop")?.modules.views.stopView(id: viewID, segmentation: segmentation)
     }
 
     /// Stops the clock on a view without closing it.
     public func pauseView(id viewID: String) {
-        core()?.modules.views.pauseView(id: viewID)
+        core(counting: "pause")?.modules.views.pauseView(id: viewID)
     }
 
     /// Restarts the clock on a paused view.
     public func resumeView(id viewID: String) {
-        core()?.modules.views.resumeView(id: viewID)
+        core(counting: "resume")?.modules.views.resumeView(id: viewID)
     }
 
     /// Starts the view a SwiftUI screen reports for itself, for
     /// ``CountlyViewModifier``.
     func startReportedView(_ viewName: String, segmentation: [String: Any]?) -> String? {
-        core()?.modules.views.startReportedView(viewName, segmentation: segmentation)
+        core(counting: "start")?.modules.views.startReportedView(viewName, segmentation: segmentation)
     }
 
     /// Stops a view ``startReportedView(_:segmentation:)`` started.
     func stopReportedView(id viewID: String, segmentation: [String: Any]?) {
-        core()?.modules.views.stopReportedView(id: viewID, segmentation: segmentation)
+        core(counting: "stop")?.modules.views.stopReportedView(id: viewID, segmentation: segmentation)
     }
 
     /// Stops every open view.
     public func stopAllViews(segmentation: [String: Any]? = nil) {
-        core()?.modules.views.stopAllViews(segmentation: segmentation)
+        core(counting: "stopAll")?.modules.views.stopAllViews(segmentation: segmentation)
     }
 
     /// Replaces the segmentation merged into every view event.
@@ -400,7 +425,19 @@ public final class ConsentAPI: CountlyAPIBase {
     @available(swift, obsoleted: 1)
     @objc(giveConsentForFeatures:)
     public func objcGiveConsent(for features: [NSNumber]) {
-        giveConsent(for: features.compactMap { ConsentFeature(rawValue: $0.intValue) })
+        giveConsent(for: knownFeatures(features, function: "giveConsent"))
+    }
+
+    /// The features behind Objective-C values, without the values that name no
+    /// feature, which are ignored with a warning.
+    private func knownFeatures(_ values: [NSNumber], function: String) -> [ConsentFeature] {
+        let features = values.compactMap { ConsentFeature(rawValue: $0.intValue) }
+        if features.count != values.count, let core = core(function) {
+            let unknown = values.filter { ConsentFeature(rawValue: $0.intValue) == nil }.map(\.stringValue)
+            core.logger.w(Self.module, function, "values that name no consent feature are ignored, unknownValues: [\(unknown.joined(separator: ", "))]")
+            core.healthTracker.recordLogCode(HealthLogCode.invalidConsentName)
+        }
+        return features
     }
 
     /// Grants consent for every feature.
@@ -424,7 +461,52 @@ public final class ConsentAPI: CountlyAPIBase {
     @available(swift, obsoleted: 1)
     @objc(cancelConsentForFeatures:)
     public func objcCancelConsent(for features: [NSNumber]) {
-        cancelConsent(for: features.compactMap { ConsentFeature(rawValue: $0.intValue) })
+        cancelConsent(for: knownFeatures(features, function: "cancelConsent"))
+    }
+
+    /// Gives consent for the features when `given` is true, removes it otherwise.
+    public func setConsent(for features: [ConsentFeature], given: Bool) {
+        core()?.modules.consent.setConsent(for: features, given: given)
+    }
+
+    /// `setConsent(for:given:)` for Objective-C, with the features as
+    /// `ConsentFeature` values.
+    @available(swift, obsoleted: 1)
+    @objc(setConsentForFeatures:given:)
+    public func objcSetConsent(for features: [NSNumber], given: Bool) {
+        setConsent(for: knownFeatures(features, function: "setConsent"), given: given)
+    }
+
+    /// Stores a named group of features, so consent can be given or removed for
+    /// all of them with one call. Kept for the run only, like consent itself.
+    public func createFeatureGroup(_ groupName: String, features: [ConsentFeature]) {
+        core()?.modules.consent.createFeatureGroup(groupName, features: features)
+    }
+
+    /// `createFeatureGroup(_:features:)` for Objective-C, with the features as
+    /// `ConsentFeature` values.
+    @available(swift, obsoleted: 1)
+    @objc(createFeatureGroup:features:)
+    public func objcCreateFeatureGroup(_ groupName: String, features: [NSNumber]) {
+        createFeatureGroup(groupName, features: knownFeatures(features, function: "createFeatureGroup"))
+    }
+
+    /// Gives or removes consent for every feature of a group made with
+    /// `createFeatureGroup(_:features:)`.
+    public func setConsentFeatureGroup(_ groupName: String, given: Bool) {
+        core()?.modules.consent.setConsentFeatureGroup(groupName, given: given)
+    }
+
+    /// Whether every feature of a group has consent. `false` for a group that was
+    /// never created.
+    public func hasConsent(forGroup groupName: String) -> Bool {
+        core()?.modules.consent.hasConsent(forGroup: groupName) ?? false
+    }
+
+    /// Logs whether consent is required and the consent state of every feature,
+    /// for debugging an integration. Changes nothing.
+    public func checkAllConsent() {
+        core()?.modules.consent.checkAllConsent()
     }
 
     /// Withdraws consent for every feature.
@@ -512,9 +594,21 @@ public final class DeviceIDAPI: CountlyAPIBase {
     /// Holds everything back until a real device ID is set.
     ///
     /// Data recorded meanwhile is rewritten to that ID once it arrives, so nothing
-    /// is lost and nothing is attributed to a placeholder.
+    /// is lost and nothing is attributed to a placeholder. Entering the mode at
+    /// runtime works like `changeWithoutMerge`: what was recorded goes out under
+    /// the current device ID, the session ends and consent is removed.
     public func enableTemporaryIDMode() {
         core()?.modules.deviceID.enableTemporaryDeviceIDMode()
+    }
+
+    /// Leaves temporary device ID mode and sends what was held back.
+    ///
+    /// - Parameter deviceID: The device ID to continue with, as a developer
+    ///   supplied ID. Without one the SDK returns to the device ID, and its type,
+    ///   that was in use when the mode was entered, or generates one when the mode
+    ///   began at init. Ignored with a warning outside temporary device ID mode.
+    public func disableTemporaryIDMode(_ deviceID: String? = nil) {
+        core()?.modules.deviceID.disableTemporaryDeviceIDMode(deviceID)
     }
 }
 

@@ -46,7 +46,9 @@ enum DeviceMetrics {
         return sysctlString(key) ?? ""
     }
 
-    /// Broad device class the dashboard groups by.
+    /// Broad device class the dashboard groups by, one of the form factors every
+    /// Countly SDK reports: mobile, tablet, desktop, smarttv or wearable. A Vision
+    /// Pro is worn, so it reports wearable.
     static var deviceType: String? {
         #if targetEnvironment(macCatalyst)
         return "desktop"
@@ -59,11 +61,14 @@ enum DeviceMetrics {
         #elseif os(macOS)
         return "desktop"
         #elseif os(visionOS)
-        return "vr"
+        return "wearable"
         #else
         return nil
         #endif
     }
+
+    /// Every device this SDK runs on is made by Apple.
+    static let manufacturer = "Apple"
 
     /// CPU architecture of the running process.
     static var architecture: String? {
@@ -214,34 +219,6 @@ enum DeviceMetrics {
 
     /// The separator and omission logic, split out so it is testable without a
     /// running interface style.
-    /// When the process this SDK is running in was started, in milliseconds since
-    /// the epoch.
-    ///
-    /// The app start trace measures how long the application took to become
-    /// usable, so it has to start where the process did. Reading the clock when
-    /// the SDK is constructed measures from `start(with:)` instead, which throws
-    /// away exactly the part the metric exists to report: an application that
-    /// spends most of its launch on its own work before starting Countly would
-    /// report the small remainder as its launch time.
-    ///
-    /// The reference SDK approximates this by stamping the clock in a `+load`
-    /// method. Swift has no equivalent, and the kernel knows the real answer, so
-    /// this asks it directly. If the query fails the current time is returned,
-    /// which yields a zero-ish duration rather than a wrong one.
-    static func processStartTimestampMs() -> Int64 {
-        var info = kinfo_proc()
-        var size = MemoryLayout<kinfo_proc>.stride
-        var name: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
-
-        let result = sysctl(&name, UInt32(name.count), &info, &size, nil, 0)
-        guard result == 0, size > 0 else {
-            return Int64(Date().timeIntervalSince1970 * 1000)
-        }
-
-        let started = info.kp_proc.p_starttime
-        return Int64(started.tv_sec) * 1000 + Int64(started.tv_usec) / 1000
-    }
-
     static func urlString(_ url: String, byAppendingThemeMode theme: String?) -> String {
         guard let theme, !theme.isEmpty else { return url }
         let separator = url.contains("?") ? "&" : "?"
@@ -270,6 +247,7 @@ enum DeviceMetrics {
         var metrics: [String: String] = [:]
         metrics[MetricKey.device] = device
         metrics[MetricKey.deviceType] = deviceType
+        metrics[MetricKey.manufacturer] = manufacturer
         metrics[MetricKey.os] = osName
         metrics[MetricKey.osVersion] = osVersion
         metrics[MetricKey.appVersion] = appVersion

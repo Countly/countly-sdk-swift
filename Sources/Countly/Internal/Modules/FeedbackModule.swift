@@ -51,28 +51,28 @@ final class FeedbackModule: ModuleBase {
 
     // MARK: - Widget list
 
-    /// Fetches the widgets the server offers for this application.
+    /// Fetches the widgets the server offers for this user.
     ///
-    /// Answers with an empty list rather than an error when the SDK is not allowed
-    /// to ask, so a host application can call this unconditionally.
+    /// The completion is called in every case: with the list and no error, or
+    /// with an empty list and the error, also when the SDK is not allowed to ask.
     func getAvailableFeedbackWidgets(completion: @escaping ([CountlyFeedbackWidget]?, Error?) -> Void) {
         logI("getAvailableFeedbackWidgets", "feedback widget list fetch requested")
 
         guard core.serverConfig.networkingEnabled else {
             logD("getAvailableFeedbackWidgets", "feedback widget list fetch is dropped, networking is disabled by server config")
-            completion(nil, nil)
+            completion([], CountlyError.networkingDisabled.asNSError)
             return
         }
 
         guard core.modules.consent.hasConsent(for: .feedback) else {
             logD("getAvailableFeedbackWidgets", "no feedback consent given, feedback widget list is not fetched")
-            completion(nil, nil)
+            completion([], CountlyError.feedbackConsentNotGiven.asNSError)
             return
         }
 
         guard !core.modules.deviceID.isTemporary else {
             logD("getAvailableFeedbackWidgets", "feedback widget list fetch is dropped, device ID is temporary")
-            completion(nil, nil)
+            completion([], CountlyError.feedbackWidgetNotAvailable.asNSError)
             return
         }
 
@@ -82,7 +82,7 @@ final class FeedbackModule: ModuleBase {
         let task = core.network.instantTask(with: request) { [weak self] data, response, error in
             // The caller is answered even once a halt has released the module.
             guard let self else {
-                DispatchQueue.main.async { completion(nil, error ?? CountlyError.feedbacksGeneralAPIError.asNSError) }
+                DispatchQueue.main.async { completion([], error ?? CountlyError.feedbacksGeneralAPIError.asNSError) }
                 return
             }
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -93,15 +93,15 @@ final class FeedbackModule: ModuleBase {
                 let nsError = error as NSError?
                 self.logD("getAvailableFeedbackWidgets", "feedback widget list fetch failed, statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], error: [\(nsError?.localizedDescription ?? "")], domain: [\(nsError?.domain ?? "")], code: [\(nsError?.code ?? 0)]")
                 DispatchQueue.main.async {
-                    completion(nil, error ?? CountlyError.feedbacksGeneralAPIError.asNSError)
+                    completion([], error ?? CountlyError.feedbacksGeneralAPIError.asNSError)
                 }
                 return
             }
 
             guard let rawWidgets = payload["result"] as? [[String: Any]] else {
-                self.logE("getAvailableFeedbackWidgets", "feedback widget list response has no result field, ignoring the response")
+                self.logW("getAvailableFeedbackWidgets", "feedback widget list response has no result field, ignoring the response")
                 self.logD("getAvailableFeedbackWidgets", "widget list response shape detail, responseSize: [\(data?.count ?? 0)], responseFields: [\(payload.keys.sorted().joined(separator: ", "))]")
-                DispatchQueue.main.async { completion(nil, CountlyError.feedbacksGeneralAPIError.asNSError) }
+                DispatchQueue.main.async { completion([], CountlyError.feedbacksGeneralAPIError.asNSError) }
                 return
             }
 
@@ -119,65 +119,49 @@ final class FeedbackModule: ModuleBase {
             DispatchQueue.main.async { completion(widgets, nil) }
         }
         guard let task else {
-            completion(nil, CountlyError.feedbacksGeneralAPIError.asNSError)
+            completion([], CountlyError.feedbacksGeneralAPIError.asNSError)
             return
         }
         task.resume()
     }
 
     private func widgetListRequest() -> URLRequest {
-        var queryString = [
-            "\(QS.method)=\(Key.feedback)",
-            "\(QS.appKey)=\(core.config.appKey.urlEscaped)",
-            "\(QS.deviceID)=\(core.modules.deviceID.deviceID.urlEscaped)",
-            "\(QS.sdkName)=\(core.sdkName)",
-            "\(QS.sdkVersion)=\(core.sdkVersion)",
-        ].joined(separator: "&")
-
-        queryString += "&\(QS.appVersion)=\(DeviceMetrics.appVersion)"
-        queryString = core.network.builder.appendChecksum(queryString)
+        var queryString = core.network.builder.queryEssentials()
+        queryString += "&\(QS.method)=\(Key.feedback)"
+        queryString += "&\(QS.appVersion)=\(core.appVersion.urlEscaped)"
+        queryString = core.network.builder.finishImmediateRequest(queryString)
 
         return core.network.instantRequest(queryString: queryString, path: Endpoint.output + Endpoint.sdk)
     }
 
     // MARK: - Presentation
 
-    /// Presents the first widget of a type, or the one matching a name, ID or tag.
+    /// Presents the first widget of a type, or, when `nameIDOrTag` is given, the
+    /// widget whose ID matches it, else the one whose name does, else the first
+    /// one tagged with it. A given value that matches nothing shows nothing: the
+    /// SDK never falls back to another widget. The callback gets `.failed` when
+    /// nothing is shown.
     func present(type: FeedbackWidgetType, nameIDOrTag: String?, callback: WidgetCallback?) {
         logI("present", "presenting a widget by type is requested, widgetType: [\(type.wireName)], nameIDorTag: [\(nameIDOrTag ?? "")]")
 
         getAvailableFeedbackWidgets { [weak self] widgets, error in
-            guard let self else { return }
+            guard let self else {
+                callback?(.failed)
+                return
+            }
 
             if let error {
                 self.logD("present", "widget list could not be retrieved while resolving a widget to present, widgetType: [\(type.wireName)], error: [\(error.localizedDescription)]")
+                callback?(.failed)
                 return
             }
 
             let candidates = (widgets ?? []).filter { $0.type == type }
             self.logD("present", "widget list filtered by type, widgetType: [\(type.wireName)], matchingWidgetCount: [\(candidates.count)], availableWidgetCount: [\(widgets?.count ?? 0)]")
 
-            var chosen: CountlyFeedbackWidget?
-
-            if let nameIDOrTag, !nameIDOrTag.isEmpty {
-                chosen = candidates.first {
-                    $0.name == nameIDOrTag || $0.id == nameIDOrTag || $0.tags.contains(nameIDOrTag)
-                }
-                if chosen != nil {
-                    self.logD("present", "exact widget match found, nameIDorTag: [\(nameIDOrTag)], widgetType: [\(type.wireName)]")
-                }
-            }
-
-            // Falling back to the first of the type keeps the simple call working
-            // when a host application asks for a kind rather than a specific
-            // widget.
-            if chosen == nil, let first = candidates.first {
-                chosen = first
-                self.logD("present", "no exact widget match, falling back to the first widget of the type, widgetType: [\(type.wireName)], widgetID: [\(first.id)]")
-            }
-
-            guard let widget = chosen else {
-                self.logW("present", "no feedback widget found to present, widgetType: [\(type.wireName)], nameIDorTag: [\(nameIDOrTag ?? "")]")
+            guard let widget = Self.widget(in: candidates, matching: nameIDOrTag) else {
+                self.logW("present", "no feedback widget matches, nothing is shown, widgetType: [\(type.wireName)], nameIDorTag: [\(nameIDOrTag ?? "")]")
+                callback?(.failed)
                 return
             }
 
@@ -185,12 +169,36 @@ final class FeedbackModule: ModuleBase {
         }
     }
 
-    /// Puts one widget on screen.
+    /// The widget `nameIDOrTag` names among `candidates`: the one with that ID,
+    /// else the one with that name, else the first one with that tag. Without a
+    /// value, the first candidate. `nil` when nothing matches.
+    static func widget(in candidates: [CountlyFeedbackWidget], matching nameIDOrTag: String?) -> CountlyFeedbackWidget? {
+        guard let nameIDOrTag, !nameIDOrTag.isEmpty else { return candidates.first }
+        return candidates.first { $0.id == nameIDOrTag }
+            ?? candidates.first { $0.name == nameIDOrTag }
+            ?? candidates.first { $0.tags.contains(nameIDOrTag) }
+    }
+
+    /// Puts one widget on screen. The callback gets `.appeared` once it is shown,
+    /// `.closed` when it is closed and `.failed` when it could not be shown.
     func present(widget: CountlyFeedbackWidget, callback: WidgetCallback?) {
         logI("present", "widget presentation requested, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
 
         guard core.modules.consent.hasConsent(for: .feedback) else {
             logD("present", "no feedback consent given, widget will not be presented")
+            callback?(.failed)
+            return
+        }
+
+        guard !core.config.disableWebView else {
+            logW("present", "the SDK's web views are turned off by disableWebView, the widget will not be presented, widgetID: [\(widget.id)]")
+            callback?(.failed)
+            return
+        }
+
+        guard !core.modules.deviceID.isTemporary else {
+            logD("present", "the widget will not be presented in temporary device ID mode, widgetID: [\(widget.id)]")
+            callback?(.failed)
             return
         }
 
@@ -213,6 +221,11 @@ final class FeedbackModule: ModuleBase {
             let manager = WebViewManager(core: self.core)
             self.presentedWidgetManagers.append(manager)
 
+            // A widget that never appeared, because its page failed to load or
+            // did not load in time, was not closed by the user: a "closed" event
+            // for it could hide the widget from that user for good.
+            var hasAppeared = false
+
             // `self` is captured weakly in both blocks. The module holds the
             // manager, the manager holds the blocks, and a strong `self` there
             // would close the cycle and leak the web view, the overlay window and
@@ -221,19 +234,24 @@ final class FeedbackModule: ModuleBase {
                             widgetType: widget.type,
                             widgetPosition: widget.position,
                             appear: { [weak self] in
+                                hasAppeared = true
                                 self?.logI("present", "widget shown, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
                                 callback?(.appeared)
                             },
                             dismiss: { [weak self, weak manager] in
-                                callback?(.closed)
+                                callback?(hasAppeared ? .closed : .failed)
                                 guard let self else { return }
+                                self.presentedWidgetManagers.removeAll { $0 === manager }
+                                guard hasAppeared else {
+                                    self.logD("present", "the widget is taken down without having been shown, no closed event is recorded, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
+                                    return
+                                }
                                 self.logI("present", "widget dismissed, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
                                 self.recordDismissal(for: widget)
-                                self.presentedWidgetManagers.removeAll { $0 === manager }
                             },
                             refused: { [weak self, weak manager] in
                                 // Never shown, so nothing is recorded: a dismissal would count as an answer the user never gave.
-                                callback?(.closed)
+                                callback?(.failed)
                                 guard let self else { return }
                                 self.logI("present", "widget is not shown, another content or feedback overlay is on screen, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
                                 self.presentedWidgetManagers.removeAll { $0 === manager }
@@ -241,10 +259,27 @@ final class FeedbackModule: ModuleBase {
         }
         #else
         logW("present", "feedback widgets are not available on this platform, the widget will not be presented, widgetID: [\(widget.id)]")
+        callback?(.failed)
         #endif
     }
 
     // MARK: - Lifecycle
+
+    /// Closes the widgets on screen once feedback consent is removed. No "closed"
+    /// event is recorded for them: the consent it needs is already gone, and the
+    /// user did not close the widget. Their callbacks are told it closed.
+    func consentRemoved() {
+        #if os(iOS) || os(visionOS) || os(macOS)
+        let managers = presentedWidgetManagers
+        guard !managers.isEmpty else { return }
+        logD("consentRemoved", "feedback consent was removed, the widgets on screen are closed, widgetCount: [\(managers.count)]")
+        onMainThread {
+            for manager in managers {
+                (manager as? WebViewManager)?.close()
+            }
+        }
+        #endif
+    }
 
     /// Takes any widget still on screen down with the instance.
     ///
@@ -281,15 +316,15 @@ final class FeedbackModule: ModuleBase {
     func widgetURL(for widget: CountlyFeedbackWidget, surface: CGSize) -> URL? {
         var urlString = "\(core.config.normalizedHost)\(Endpoint.feedback)/\(widget.type.wireName)"
 
-        var queryItems = [
+        let queryItems = [
             "\(QS.appKey)=\(core.config.appKey.urlEscaped)",
             "\(QS.deviceID)=\(core.modules.deviceID.deviceID.urlEscaped)",
             "\(QS.sdkName)=\(core.sdkName)",
             "\(QS.sdkVersion)=\(core.sdkVersion)",
-            "\(Key.appVersion)=\(DeviceMetrics.appVersion)",
-            "\(Key.platform)=\(DeviceMetrics.osName ?? "")",
-            "\(Key.widgetID)=\(widget.id)",
-            "\(QS.appVersion)=\(DeviceMetrics.appVersion)",
+            "\(Key.appVersion)=\(core.appVersion.urlEscaped)",
+            "\(Key.platform)=\((DeviceMetrics.osName ?? "").urlEscaped)",
+            "\(Key.widgetID)=\(widget.id.urlEscaped)",
+            "\(QS.appVersion)=\(core.appVersion.urlEscaped)",
             // What the page checks a `resize` message against.
             //
             // The widget's own listener compares `event.origin` to the `origin`
@@ -300,7 +335,7 @@ final class FeedbackModule: ModuleBase {
             "\(Key.origin)=\(core.config.normalizedHost.urlEscaped)",
         ].joined(separator: "&")
 
-        queryItems = core.network.builder.appendChecksum(queryItems)
+        // No checksum: the page sends the answers to endpoints that do not check it.
         urlString += "?\(queryItems)"
 
         // Tells the page it is being shown inside the SDK's own container, and for
@@ -379,17 +414,19 @@ final class FeedbackModule: ModuleBase {
             return
         }
 
-        var queryString = [
-            "\(QS.sdkName)=\(core.sdkName)",
-            "\(QS.sdkVersion)=\(core.sdkVersion)",
-            "\(Key.appVersion)=\(DeviceMetrics.appVersion)",
-            "\(Key.platform)=\(DeviceMetrics.osName ?? "")",
-            "\(Key.shown)=1",
-            "\(Key.widgetID)=\(widget.id)",
-        ].joined(separator: "&")
+        guard !core.modules.deviceID.isTemporary else {
+            logD("fetchWidgetData", "widget data is not fetched in temporary device ID mode, widgetID: [\(widget.id)]")
+            completion(nil, CountlyError.feedbackWidgetNotAvailable.asNSError)
+            return
+        }
 
-        queryString += "&\(QS.appVersion)=\(DeviceMetrics.appVersion)"
-        queryString = core.network.builder.appendChecksum(queryString)
+        var queryString = core.network.builder.queryEssentials()
+        queryString += "&\(Key.appVersion)=\(core.appVersion.urlEscaped)"
+        queryString += "&\(Key.platform)=\((DeviceMetrics.osName ?? "").urlEscaped)"
+        queryString += "&\(Key.shown)=1"
+        queryString += "&\(Key.widgetID)=\(widget.id.urlEscaped)"
+        queryString += "&\(QS.appVersion)=\(core.appVersion.urlEscaped)"
+        queryString = core.network.builder.finishImmediateRequest(queryString)
 
         let path = "\(Endpoint.output)\(Endpoint.surveys)/\(widget.type.wireName)\(Endpoint.widget)"
         let request = core.network.instantRequest(queryString: queryString, path: path)
@@ -427,20 +464,68 @@ final class FeedbackModule: ModuleBase {
     // MARK: - Recording results
 
     /// Records the answers of a widget, or its dismissal when `result` is `nil`.
+    ///
+    /// An NPS result needs a whole number "rating" from 0 to 10, a rating result
+    /// one from 1 to 5; a result without a valid one is not recorded. Entries with
+    /// an empty key or an `NSNull` value are dropped. Each case is a warning.
     func recordResult(_ result: [String: Any]?, for widget: CountlyFeedbackWidget) {
         logI("recordResult", "widget result recording requested, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)], answeredFieldCount: [\(result?.count ?? 0)], isDismissalOnly: [\(result == nil)]")
+
+        guard !core.modules.deviceID.isTemporary else {
+            logW("recordResult", "the widget result is ignored in temporary device ID mode, widgetID: [\(widget.id)]")
+            return
+        }
+
+        warnIfWidgetDataDoesNotMatch(widget)
 
         guard let result else {
             recordDismissal(for: widget)
             return
         }
 
+        let usable = result.filter { !$0.key.isEmpty && !($0.value is NSNull) }
+        if usable.count != result.count {
+            logW("recordResult", "entries with an empty key or a null value are dropped from the widget result, droppedCount: [\(result.count - usable.count)], widgetID: [\(widget.id)]")
+            core.healthTracker.recordLogCode(HealthLogCode.invalidValue)
+        }
+
+        guard Self.isValidRating(usable[Key.rating], for: widget.type) else {
+            logW("recordResult", "the widget result is not recorded, its rating is missing, not a whole number or out of range, widgetID: [\(widget.id)], widgetType: [\(widget.type.wireName)]")
+            core.healthTracker.recordLogCode(HealthLogCode.invalidValue)
+            return
+        }
+
         // Field names describe the widget, the values behind them are what the
         // end user answered.
-        logD("recordResult", "widget result field detail, widgetID: [\(widget.id)], answeredFields: [\(result.keys.sorted().joined(separator: ", "))]")
-        logV("recordResult", "widget result recording detail, widgetID: [\(widget.id)], result: [\(result)]")
+        logD("recordResult", "widget result field detail, widgetID: [\(widget.id)], answeredFields: [\(usable.keys.sorted().joined(separator: ", "))]")
+        logV("recordResult", "widget result recording detail, widgetID: [\(widget.id)], result: [\(usable)]")
 
-        recordWidgetEvent(segmentation: result, for: widget)
+        recordWidgetEvent(segmentation: usable, for: widget)
+    }
+
+    /// Whether `value` is a rating the widget type takes: a whole number from 0
+    /// to 10 for NPS and from 1 to 5 for a rating widget. A survey has none.
+    static func isValidRating(_ value: Any?, for type: FeedbackWidgetType) -> Bool {
+        let range: ClosedRange<Int>
+        switch type {
+        case .nps: range = 0...10
+        case .rating: range = 1...5
+        case .survey: return true
+        }
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue == number.doubleValue.rounded() else { return false }
+        return range.contains(number.intValue)
+    }
+
+    /// Warns when the widget data fetched for `widget` describes another widget.
+    private func warnIfWidgetDataDoesNotMatch(_ widget: CountlyFeedbackWidget) {
+        let data = widget.data
+        guard !data.isEmpty else { return }
+        let dataID = data["_id"] as? String
+        let dataType = data["type"] as? String
+        if (dataID != nil && dataID != widget.id) || (dataType != nil && dataType != widget.type.wireName) {
+            logW("recordResult", "the widget data does not belong to this widget, widgetID: [\(widget.id)], dataID: [\(dataID ?? "")], widgetType: [\(widget.type.wireName)], dataType: [\(dataType ?? "")]")
+        }
     }
 
     private func recordDismissal(for widget: CountlyFeedbackWidget) {
@@ -468,7 +553,7 @@ final class FeedbackModule: ModuleBase {
         // End user text, so the reserved event path's "SDK-built" premise does not hold.
         var payload = truncatedStringValues(segmentation, "recordWidgetEvent")
         payload[Key.platform] = DeviceMetrics.osName
-        payload[Key.appVersion] = DeviceMetrics.appVersion
+        payload[Key.appVersion] = core.appVersion
         payload[Key.widgetID] = widget.id
         payload = core.modules.content.withGlobalSegmentation(payload) ?? payload
 
@@ -482,7 +567,9 @@ final class FeedbackModule: ModuleBase {
         core.modules.events.sendEvents()
     }
 
-    /// Records the result of a rating widget presented by the host application.
+    /// Records the result of a rating widget presented by the host application,
+    /// the legacy call. Needs the "star-rating" consent, a widget ID and a rating
+    /// from 1 to 5; otherwise it is ignored with a warning. Sent right away.
     func recordRatingWidget(id widgetID: String,
                             rating: Int,
                             email: String?,
@@ -490,19 +577,27 @@ final class FeedbackModule: ModuleBase {
                             userCanBeContacted: Bool) {
         logI("recordRatingWidget", "rating widget result recording requested, widgetID: [\(widgetID)], emailProvided: [\(!(email ?? "").isEmpty)], commentProvided: [\(!(comment ?? "").isEmpty)], userCanBeContacted: [\(userCanBeContacted)]")
 
-        guard core.modules.consent.hasConsent(for: .feedback) else {
-            logD("recordRatingWidget", "no feedback consent given, rating widget result is not recorded")
+        guard core.modules.consent.hasConsent(for: .starRating) else {
+            logD("recordRatingWidget", "no star-rating consent given, rating widget result is not recorded")
             return
         }
 
         guard !widgetID.isEmpty else {
-            logE("recordRatingWidget", "rating widget result is dropped, widget ID is empty or nil")
+            logW("recordRatingWidget", "rating widget result is dropped, widget ID is empty")
+            core.healthTracker.recordLogCode(HealthLogCode.invalidValue)
+            return
+        }
+
+        // Never moved into the range: a clamped answer would be one the user did not give.
+        guard (1...5).contains(rating) else {
+            logW("recordRatingWidget", "rating widget result is dropped, the rating must be a whole number from 1 to 5, rating: [\(rating)]")
+            core.healthTracker.recordLogCode(HealthLogCode.invalidValue)
             return
         }
 
         var segmentation: [String: Any] = [:]
         segmentation[Key.platform] = DeviceMetrics.osName
-        segmentation[Key.appVersion] = DeviceMetrics.appVersion
+        segmentation[Key.appVersion] = core.appVersion
         segmentation[Key.rating] = rating
         segmentation[Key.widgetID] = widgetID
         segmentation[Key.email] = email.map { limits.truncatedValue($0, "rating widget email") }

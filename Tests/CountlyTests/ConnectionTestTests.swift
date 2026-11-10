@@ -38,19 +38,23 @@ final class ConnectionTestTests: CountlyBaseTestCase {
         captured.query.contains("ct=1") && !captured.query.contains("app_key=")
     }
 
-    /// Path plus query of a probe, without the marker and cache buster the SDK
-    /// appends. Taken from the raw string: `URL.path` would drop the trailing
-    /// slash of `/_external/content/`.
+    /// Path plus parameters of a probe, without the marker and cache buster the
+    /// SDK appends. An API probe is a POST carrying its parameters in the body and
+    /// a web view probe a GET carrying them in the URL; both come out as
+    /// `path?parameters`. Taken from the raw string: `URL.path` would drop the
+    /// trailing slash of `/_external/content/`.
     private func probePath(_ captured: MockURLProtocol.Captured) -> String {
         let absolute = captured.url.absoluteString
         guard let host = captured.url.host, let hostRange = absolute.range(of: host) else { return "" }
         var path = String(absolute[hostRange.upperBound...])
+        var parameters: [String] = []
         if let queryStart = path.firstIndex(of: "?") {
-            let query = String(path[path.index(after: queryStart)...])
+            parameters += path[path.index(after: queryStart)...].split(separator: "&").map(String.init)
             path = String(path[..<queryStart])
-            let kept = query.split(separator: "&").filter { !$0.hasPrefix("ct=") && !$0.hasPrefix("_=") }
-            if !kept.isEmpty { path += "?" + kept.joined(separator: "&") }
         }
+        parameters += captured.body.split(separator: "&").map(String.init)
+        let kept = parameters.filter { !$0.hasPrefix("ct=") && !$0.hasPrefix("_=") }
+        if !kept.isEmpty { path += "?" + kept.joined(separator: "&") }
         return path
     }
 
@@ -215,19 +219,28 @@ final class ConnectionTestTests: CountlyBaseTestCase {
         XCTAssertEqual((report["sdk"] as? [String: Any])?["version"] as? String, SDKIdentity.version)
         XCTAssertGreaterThan(TestUtils.int64(report["ts"]) ?? 0, 1_600_000_000_000)
 
-        // 17 parameterless GETs, marker and cache buster on each, host path joined once.
+        // 17 parameterless probes, the marker on each, the host path joined once.
+        // An API path goes out as a POST like every SDK request, with its
+        // parameters in the body; what a web view loads stays a GET with the
+        // cache buster.
         let probes = probes()
         XCTAssertEqual(probes.map(probePath), expectedProbePaths)
         for probe in probes {
             let url = probe.url.absoluteString
-            XCTAssertEqual(probe.method, "GET")
-            XCTAssertTrue(probe.body.isEmpty)
-            XCTAssertFalse(url.contains("app_key="), url)
-            XCTAssertFalse(url.contains("device_id="), url)
-            XCTAssertTrue(url.contains("ct=1"), url)
-            XCTAssertTrue(url.contains("&_="), url)
+            XCTAssertFalse(probe.query.contains("app_key="), url)
+            XCTAssertFalse(probe.query.contains("device_id="), url)
+            XCTAssertTrue(probe.query.contains("ct=1"), url)
             XCTAssertTrue(url.hasPrefix("\(Self.host)/"), url)
             XCTAssertFalse(url.contains("ly//"), url)
+            if webViewProbePaths.contains(probePath(probe)) {
+                XCTAssertEqual(probe.method, "GET", url)
+                XCTAssertTrue(probe.body.isEmpty, url)
+                XCTAssertTrue(url.contains("&_="), url)
+            } else {
+                XCTAssertEqual(probe.method, "POST", url)
+                XCTAssertNil(probe.url.query, url)
+                XCTAssertFalse(probe.body.split(separator: "&").contains { $0.hasPrefix("_=") }, probe.body)
+            }
         }
 
         // Healthy grading: 400 is reachable, the two strict rows saw their 200.
@@ -572,6 +585,17 @@ final class ConnectionTestTests: CountlyBaseTestCase {
 
         let noSlash = ConnectionTestModule.probeURL(path: "i", serverURL: "https://x.com/").absoluteString
         XCTAssertTrue(noSlash.hasPrefix("https://x.com/i?ct=1&_="), noSlash)
+    }
+
+    func testAnAPIProbeMovesItsParametersIntoAPOSTBodyWithoutTheCacheBuster() throws {
+        let url = ConnectionTestModule.probeURL(path: "/o/sdk?method=rc", serverURL: "https://x.com/countly")
+        let request = URLSessionProbeTransport.postRequest(from: url)
+
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.url?.absoluteString, "https://x.com/countly/o/sdk")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/x-www-form-urlencoded")
+        let body = String(decoding: try XCTUnwrap(request.httpBody), as: UTF8.self)
+        XCTAssertEqual(body, "method=rc&ct=1")
     }
 
     func testTheConnectionTestFlagIsReadAndStripped() {

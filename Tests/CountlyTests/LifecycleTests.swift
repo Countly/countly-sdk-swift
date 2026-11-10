@@ -254,9 +254,28 @@ final class LifecycleTests: CountlyBaseTestCase {
         core(countly).serverConfig.fetch(config: core(countly).config)
 
         TestUtils.waitUntil("the behaviour settings arrive and consent is resent") {
-            core(countly).serverConfig.consentRequired
+            core(countly).serverConfig.consentRequired == true
                 && TestUtils.requests(self.requestQueue(of: countly), carrying: "consent").count > before
         }
+    }
+
+    /// Lifting the requirement acts like giving every consent, and an answer that
+    /// no longer carries "cr" puts the application's own requirement back.
+    func testTheServerCanLiftTheConsentRequirementUntilItDropsTheSetting() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startInstance {
+            $0.requiresConsent = true
+            $0.sdkBehaviorSettings = ServerConfigBuilder().consentRequired(false).json()
+        }
+        XCTAssertTrue(countly.consent.hasConsent(for: .events), "the server lifted the requirement before init finished")
+
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: ServerConfigBuilder().json())
+        core(countly).serverConfig.fetch(config: core(countly).config)
+
+        TestUtils.waitUntil("the answer without cr restores the application's requirement") {
+            !countly.consent.hasConsent(for: .events)
+        }
+        XCTAssertNil(core(countly).serverConfig.consentRequired)
     }
 
     // MARK: - Termination

@@ -25,6 +25,7 @@ final class CrashModule: ModuleBase {
         static let os = "_os"
         static let osVersion = "_os_version"
         static let device = "_device"
+        static let manufacture = "_manufacture"
         static let architecture = "_architecture"
         static let resolution = "_resolution"
         static let appVersion = "_app_version"
@@ -45,6 +46,8 @@ final class CrashModule: ModuleBase {
         static let root = "_root"
         static let background = "_background"
         static let run = "_run"
+        static let view = "_view"
+        static let currentViewID = "_cvid"
         static let custom = "_custom"
         static let logs = "_logs"
         static let changedFields = "_ob"
@@ -74,12 +77,19 @@ final class CrashModule: ModuleBase {
     // MARK: - Init
 
     func applyInitialConfig() {
-        logD("applyInitialConfig", "crash module starting, crashSegmentationInConfig: [\(core.config.crashSegmentation != nil)], crashFilterRegexSet: [\(core.config.crashFilter != nil)], crashFilterCallbackSet: [\(core.config.crashes.crashFilterCallback != nil)], shouldSendCrashReportCallbackSet: [\(core.config.shouldSendCrashReportCallback != nil)], maxBreadcrumbCount: [\(core.config.sdkInternalLimits.maxBreadcrumbCount)]")
+        logD("applyInitialConfig", "crash module starting, crashSegmentationInConfig: [\(core.config.crashSegmentation != nil)], crashFilterCallbackSet: [\(core.config.crashes.crashFilterCallback != nil)], maxBreadcrumbCount: [\(core.config.sdkInternalLimits.maxBreadcrumbCount)]")
+        applyConfiguredSegmentation()
+    }
 
-        if let segmentation = core.config.crashSegmentation {
-            setCrashSegmentation(segmentation)
+    /// Takes over the segmentation from the config, once crashes consent allows
+    /// keeping it.
+    private func applyConfiguredSegmentation() {
+        guard let segmentation = core.config.crashSegmentation else { return }
+        guard core.modules.consent.hasConsent(for: .crashReporting) else {
+            logV("applyConfiguredSegmentation", "no crashes consent given, the crash segmentation from the config is kept until it is given")
+            return
         }
-        adoptBreadcrumbsFromPreviousRun()
+        storeSegmentation(segmentation)
     }
 
     /// Sets the segmentation merged into every crash report.
@@ -88,13 +98,39 @@ final class CrashModule: ModuleBase {
         logD("setCrashSegmentation", "global crash segmentation keys, keys: [\(segmentation.keys.sorted().joined(separator: ", "))]")
         logV("setCrashSegmentation", "global crash segmentation detail, segmentation: [\(segmentation)]")
 
-        let sanitized = limits.truncatedAndLimited(segmentation, "Crash segmentation")
+        guard core.modules.consent.hasConsent(for: .crashReporting) else {
+            logV("setCrashSegmentation", "no crashes consent given, global crash segmentation is not kept")
+            return
+        }
+        storeSegmentation(segmentation)
+    }
+
+    private func storeSegmentation(_ segmentation: [String: Any]) {
+        let sanitized = limits.sanitized(segmentation, "Crash segmentation") ?? [:]
         if sanitized.count < segmentation.count {
             logD("setCrashSegmentation", "some global crash segmentation keys were dropped by the SDK limits, keptKeyCount: [\(sanitized.count)], requestedKeyCount: [\(segmentation.count)]")
         }
 
         stateLock.lock()
         crashSegmentation = sanitized
+        stateLock.unlock()
+    }
+
+    // MARK: - Consent
+
+    /// Crashes consent was given: the automatic handlers start and the crash
+    /// segmentation from the config is taken over.
+    func consentGiven() {
+        applyConfiguredSegmentation()
+        startCrashReporting()
+    }
+
+    /// Crashes consent was removed: the handlers stop, and the breadcrumbs and the
+    /// global crash segmentation are dropped.
+    func consentRemoved() {
+        stopCrashReporting()
+        stateLock.lock()
+        crashSegmentation.removeAll()
         stateLock.unlock()
     }
 
@@ -130,6 +166,7 @@ final class CrashModule: ModuleBase {
         }
 
         logD("startCrashReporting", "installing the built in uncaught exception handler and signal handlers")
+        core.healthTracker.resumeRecording()
         CrashHandlerInstaller.shared.register(self)
         isHandlerInstalled = true
     }
@@ -160,6 +197,10 @@ final class CrashModule: ModuleBase {
     // MARK: - Recording
 
     /// Records an exception, fatal or handled.
+    ///
+    /// An exception that was never raised has no call stack of its own, so the
+    /// stack of the call that records it is used, and the report always has a
+    /// trace for `_error`.
     func recordException(_ exception: NSException,
                          isFatal: Bool,
                          stackTrace: [String]?,
@@ -175,7 +216,10 @@ final class CrashModule: ModuleBase {
             return
         }
 
-        let frames = stackTrace ?? exception.callStackSymbols
+        var frames = stackTrace ?? exception.callStackSymbols
+        if frames.isEmpty {
+            frames = Thread.callStackSymbols
+        }
         logD("recordException", "stack trace resolved for the exception, suppliedByCaller: [\(stackTrace != nil)], frameCount: [\(frames.count)]")
 
         let overrides = limits.sanitized(segmentation, "Exception segmentation")
@@ -208,6 +252,7 @@ final class CrashModule: ModuleBase {
         // Reached from the signal handler, so nothing here may log at error or
         // warning: those bump the health tracker, whose dispatch primitives are
         // not async signal safe and can deadlock the process mid crash.
+        core.healthTracker.stopRecordingForCrash()
         logD("handleAutoDetectedCrash", "an automatically detected crash arrived, crashName: [\(name)], stackTraceFrameCount: [\(stackTrace.count)]")
 
         guard core.serverConfig.crashReportingEnabled else {
@@ -237,7 +282,9 @@ final class CrashModule: ModuleBase {
     /// Builds the report, gives the filter callback a say, and queues it.
     ///
     /// An automatically detected crash is only stored, for the next launch to
-    /// send; everything else joins the queue and starts a drain.
+    /// send; everything else joins the queue and starts a drain. Either way the
+    /// breadcrumbs are cleared once the crash is processed, sent or filtered, so
+    /// the next report starts with a fresh trail.
     private func handle(name: String,
                         description: String,
                         stackTrace: [String],
@@ -250,22 +297,8 @@ final class CrashModule: ModuleBase {
             return
         }
 
-        // Limited before anything reads it, so the regular expression filter, the
-        // filter callback and the wire report all see the same trace.
+        let limits = isAutoDetected ? self.limits.quietly() : self.limits
         let stackTrace = limits.truncatedStackTrace(stackTrace, "Crash stack trace")
-        let stackTraceJoined = stackTrace.joined(separator: "\n")
-
-        var matchesFilter = false
-        if let filter = core.config.crashFilter {
-            let matchedStackTrace = matches(filter, stackTraceJoined)
-            let matchedDescription = matches(filter, description)
-            let matchedName = matches(filter, name)
-            matchesFilter = matchedStackTrace || matchedDescription || matchedName
-
-            if matchesFilter {
-                logD("handle", "the crash filter regular expression matched, matchedStackTrace: [\(matchedStackTrace)], matchedDescription: [\(matchedDescription)], matchedName: [\(matchedName)]")
-            }
-        }
 
         stateLock.lock()
         var custom = crashSegmentation
@@ -280,7 +313,7 @@ final class CrashModule: ModuleBase {
         let filterCallback = core.config.crashes.crashFilterCallback
 
         let crashData = CountlyCrashData(
-            stackTrace: stackTraceJoined,
+            stackTrace: stackTrace.joined(separator: "\n"),
             name: name,
             crashDescription: description,
             crashSegmentation: limits.sanitized(custom, "Exception segmentation") ?? [:],
@@ -294,21 +327,16 @@ final class CrashModule: ModuleBase {
 
         let filteredByCallback = filterCallback?(crashData) ?? false
 
-        guard !matchesFilter, !filteredByCallback else {
-            logD("handle", "crash report is filtered out and will not be processed, crashName: [\(name)], isFatal: [\(isFatal)], matchesRegexFilter: [\(matchesFilter)], matchesFilterCallback: [\(filteredByCallback)]")
-            if isAutoDetected { stopCrashReporting() }
+        guard !filteredByCallback else {
+            logD("handle", "crash report is dropped by the crash filter callback, crashName: [\(name)], isFatal: [\(isFatal)]")
+            finishProcessing(isAutoDetected: isAutoDetected)
             return
         }
 
         let report = wireReport(for: crashData,
                                 stackTrace: stackTrace,
-                                hadFilterCallback: filterCallback != nil)
-
-        if let shouldSend = core.config.shouldSendCrashReportCallback, !shouldSend(report) {
-            logD("handle", "crash report is dropped by the shouldSendCrashReport callback, crashName: [\(name)], isFatal: [\(isFatal)], reportFieldCount: [\(report.count)]")
-            if isAutoDetected { stopCrashReporting() }
-            return
-        }
+                                hadFilterCallback: filterCallback != nil,
+                                limits: limits)
 
         logI("handle", "crash recorded, crashName: [\(name)], isFatal: [\(crashData.fatal)], isAutoDetected: [\(isAutoDetected)], delivery: [\(isAutoDetected ? "next launch" : "queued")], customSegmentationKeyCount: [\(crashData.crashSegmentation.count)], breadcrumbCount: [\(crashData.breadcrumbs.count)], stackTraceFrameCount: [\(stackTrace.count)]")
         logV("handle", "crash detail, breadcrumbs: [\(crashData.breadcrumbs)], crashSegmentation: [\(crashData.crashSegmentation)], stackTrace: [\(crashData.stackTrace)]")
@@ -322,34 +350,53 @@ final class CrashModule: ModuleBase {
             logD("handle", "the crash report could not be serialized to JSON and will not be sent, crashName: [\(name)], isAutoDetected: [\(isAutoDetected)]")
         }
 
-        guard isAutoDetected else {
+        if isAutoDetected {
+            core.network.storeCrashReport(payload?.urlEscaped)
+        } else {
             core.network.sendCrashReport(payload?.urlEscaped)
-            return
+            // The process usually ends right after an unhandled error.
+            if isFatal {
+                core.requestQueueStore.saveSync()
+            }
         }
 
-        core.network.storeCrashReport(payload?.urlEscaped)
+        finishProcessing(isAutoDetected: isAutoDetected)
+    }
 
-        // The stored report carries the breadcrumbs, which the next launch would
-        // attach again, and a handler left installed would re-enter on the way down.
-        stopCrashReporting()
+    /// Clears the breadcrumbs of a processed crash. An automatically detected
+    /// crash also takes the handlers down, because the stored report carries the
+    /// breadcrumbs and a handler left installed would re-enter on the way down.
+    private func finishProcessing(isAutoDetected: Bool) {
+        if isAutoDetected {
+            stopCrashReporting()
+        } else {
+            clearCrashLogs()
+        }
     }
 
     /// Turns the assembled crash data into the payload the server reads.
     ///
-    /// - Parameter hadFilterCallback: whether the host application was given the
-    ///   report to change, which decides whether the segmentation has to be
-    ///   sanitized again.
+    /// When a filter callback had the report, the limits are applied again to
+    /// what it may have changed: the stack trace, the breadcrumbs, the
+    /// segmentation and the value types of the metrics. `_ob` is computed before,
+    /// so it reflects only what the callback changed.
     private func wireReport(for crashData: CountlyCrashData,
                             stackTrace: [String],
-                            hadFilterCallback: Bool) -> [String: Any] {
-        // The metrics are the SDK's own keys, so only their value types need
-        // checking, and only when a callback had the chance to change them. One
-        // value JSON cannot carry would otherwise make the whole report
-        // serialize to nothing.
+                            hadFilterCallback: Bool,
+                            limits: LimitsEnforcer) -> [String: Any] {
+        crashData.calculateChangedFields()
+        let changed = crashData.changedFieldsBitfield
+        if changed > 0 {
+            logD("wireReport", "the crash filter callback changed the report, the server is told which fields, changedFieldsBitfield: [\(changed)]")
+        }
+
         var report = hadFilterCallback
             ? limits.filterSupportedDataTypes(crashData.crashMetrics)
             : crashData.crashMetrics
-        report[Key.error] = crashData.stackTrace
+
+        report[Key.error] = hadFilterCallback
+            ? limits.truncatedStackTrace(crashData.stackTrace.components(separatedBy: "\n"), "Crash stack trace").joined(separator: "\n")
+            : crashData.stackTrace
         let symbolication = binaryImages(for: stackTrace)
         report[Key.binaryImages] = symbolication.images
         report[Key.buildUUID] = symbolication.buildUUID ?? ""
@@ -358,38 +405,27 @@ final class CrashModule: ModuleBase {
         report[Key.name] = crashData.crashDescription
         report[Key.type] = crashData.name
         report[Key.nonfatal] = !crashData.fatal
-
-        // Tells the server which fields the host application's filter changed, so
-        // a doctored report is not mistaken for a raw one.
-        crashData.calculateChangedFields()
-        let changed = crashData.changedFieldsBitfield
-        if changed > 0 {
-            logD("wireReport", "the crash filter callback changed the report, the server is told which fields, changedFieldsBitfield: [\(changed)]")
-            report[Key.changedFields] = changed
-        }
+        report[Key.changedFields] = changed
 
         if !crashData.crashSegmentation.isEmpty {
-            // Sanitized rather than merely capped when there was a callback that
-            // could have changed the segmentation. `CountlyCrashData` is a class,
-            // so an enriching callback would otherwise ship unbounded keys and
-            // values, and a value JSON cannot represent would make the whole
-            // report serialize to nothing and be lost. Without a callback the
-            // dictionary is still exactly what was sanitized on the way in, and
-            // redoing that is pure rework on every recorded error.
             report[Key.custom] = hadFilterCallback
                 ? (limits.sanitized(crashData.crashSegmentation, "Crash segmentation") ?? [:])
                 : crashData.crashSegmentation
         }
 
-        if !crashData.breadcrumbs.isEmpty {
-            report[Key.logs] = crashData.breadcrumbs.joined(separator: "\n")
+        let breadcrumbs = hadFilterCallback ? limitedBreadcrumbs(crashData.breadcrumbs, limits: limits) : crashData.breadcrumbs
+        if !breadcrumbs.isEmpty {
+            report[Key.logs] = breadcrumbs.joined(separator: "\n")
         }
 
         return report
     }
 
-    private func matches(_ filter: NSRegularExpression, _ text: String) -> Bool {
-        filter.numberOfMatches(in: text, options: [], range: NSRange(location: 0, length: (text as NSString).length)) > 0
+    /// The breadcrumbs within their limits: the latest `maxBreadcrumbCount`, each
+    /// cut to `maxValueSize`.
+    private func limitedBreadcrumbs(_ breadcrumbs: [String], limits: LimitsEnforcer) -> [String] {
+        let maxCount = max(1, core.config.sdkInternalLimits.maxBreadcrumbCount)
+        return breadcrumbs.suffix(maxCount).map { limits.truncatedValue($0, "Crash breadcrumb") }
     }
 
     // MARK: - Breadcrumbs
@@ -413,54 +449,18 @@ final class CrashModule: ModuleBase {
         let limit = core.config.sdkInternalLimits.maxBreadcrumbCount
         if breadcrumbs.count > limit {
             logD("log", "breadcrumb buffer is full, the oldest breadcrumb is dropped, breadcrumbCount: [\(breadcrumbs.count)], limit: [\(limit)]")
-            breadcrumbs.removeFirst()
+            breadcrumbs.removeFirst(breadcrumbs.count - limit)
         } else {
             logD("log", "breadcrumb added to the in memory buffer, breadcrumbCount: [\(breadcrumbs.count)]")
         }
-
-        // Also written to disk, so the run that crashes can still contribute its
-        // breadcrumbs: the in-memory buffer dies with the process.
-        core.crashLogStore.append(truncated)
     }
 
-    /// Drops every breadcrumb, in memory and on disk.
+    /// Drops every breadcrumb.
     func clearCrashLogs() {
         stateLock.lock()
         logD("clearCrashLogs", "breadcrumbs are being cleared, breadcrumbCount: [\(breadcrumbs.count)]")
         breadcrumbs.removeAll()
         stateLock.unlock()
-
-        core.crashLogStore.deleteAll()
-    }
-
-    /// Breadcrumbs left behind by a run that did not get to send them.
-    ///
-    /// Read once at init and cleared, so they are attached to the next report
-    /// rather than to every future one.
-    func adoptBreadcrumbsFromPreviousRun() {
-        guard let stored = core.crashLogStore.readAll(), !stored.isEmpty else {
-            logD("adoptBreadcrumbsFromPreviousRun", "no breadcrumbs were left behind by a previous run")
-            return
-        }
-
-        let recovered = stored.split(separator: "\n").map(String.init)
-        guard !recovered.isEmpty else {
-            logD("adoptBreadcrumbsFromPreviousRun", "the stored breadcrumbs from a previous run held no usable lines, storedLength: [\(stored.count)]")
-            return
-        }
-
-        logD("adoptBreadcrumbsFromPreviousRun", "breadcrumbs from a previous run were found, breadcrumbCount: [\(recovered.count)]")
-
-        let limit = core.config.sdkInternalLimits.maxBreadcrumbCount
-        if recovered.count > limit {
-            logD("adoptBreadcrumbsFromPreviousRun", "the recovered breadcrumbs exceed the buffer limit, the oldest ones are dropped, breadcrumbCount: [\(recovered.count)], limit: [\(limit)]")
-        }
-
-        stateLock.lock()
-        breadcrumbs = Array(recovered.suffix(limit))
-        stateLock.unlock()
-
-        core.crashLogStore.deleteAll()
     }
 
     // MARK: - Context
@@ -471,8 +471,9 @@ final class CrashModule: ModuleBase {
         metrics[Key.os] = DeviceMetrics.osName
         metrics[Key.osVersion] = DeviceMetrics.osVersion
         metrics[Key.device] = DeviceMetrics.device
+        metrics[Key.manufacture] = DeviceMetrics.manufacturer
         metrics[Key.resolution] = DeviceMetrics.resolution
-        metrics[Key.appVersion] = DeviceMetrics.appVersion
+        metrics[Key.appVersion] = core.appVersion
         metrics[Key.appBuild] = DeviceMetrics.appBuild
 
         // Subtracted with a floor: a reading that reports free space without total
@@ -502,6 +503,10 @@ final class CrashModule: ModuleBase {
         metrics[Key.root] = DeviceMetrics.isJailbroken
         metrics[Key.background] = !AppState.isForeground
         metrics[Key.run] = core.clock.timeSinceLaunch()
+
+        let views = core.modules.views
+        metrics[Key.view] = views.currentViewName ?? ""
+        metrics[Key.currentViewID] = views.currentViewID ?? ""
 
         logD("crashMetrics", "device state captured for the crash report, ramUsedMB: [\(usedRAMMB)], ramTotalMB: [\(totalRAMMB)], diskUsedMB: [\(usedDiskMB)], diskTotalMB: [\(totalDiskMB)], batteryReported: [\(battery >= 0)], online: [\(DeviceMetrics.connectionType != 0)], inBackground: [\(!AppState.isForeground)], secondsSinceLaunch: [\(core.clock.timeSinceLaunch())]")
 
@@ -617,6 +622,7 @@ final class CrashModule: ModuleBase {
     override func halt(clearStorage: Bool) {
         logD("halt", "crash module halting, the handlers are uninstalled and the global crash segmentation is dropped")
         stopCrashReporting()
+        core.healthTracker.resumeRecording()
         stateLock.lock()
         crashSegmentation.removeAll()
         stateLock.unlock()

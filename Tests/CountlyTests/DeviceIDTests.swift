@@ -231,6 +231,91 @@ final class DeviceIDTests: CountlyBaseTestCase {
         XCTAssertEqual(countly.deviceID.current, "keep-me")
     }
 
+    /// An empty ID is no ID: neither change may go ahead with a generated one in
+    /// its place, which would merge or split the user without being asked to.
+    func testEmptyIDsAreIgnoredByEveryChange() {
+        let countly = startInstance { $0.deviceID = "keep-me" }
+        let before = requestQueue(of: countly).count
+
+        countly.deviceID.changeWithMerge("")
+        countly.deviceID.changeWithoutMerge("")
+        countly.deviceID.setID("")
+
+        XCTAssertEqual(countly.deviceID.current, "keep-me")
+        XCTAssertEqual(countly.deviceID.type, .developerSupplied)
+        XCTAssertEqual(requestQueue(of: countly).count, before)
+        XCTAssertEqual(logCodeCount(HealthLogCode.invalidDeviceID, of: countly), 3)
+    }
+
+    /// What the leaving user recorded is theirs: the pending events, and the end of
+    /// the view they were on, go out under their device ID.
+    func testAChangeWithoutMergeFilesWhatTheLeavingUserRecordedUnderTheirID() {
+        let countly = startInstance {
+            $0.deviceID = "leaving"
+            $0.eventSendThreshold = 100
+        }
+        countly.views.startView("Inbox")
+        countly.events.recordEvent("pending")
+
+        countly.deviceID.changeWithoutMerge("arriving")
+
+        let keys = TestUtils.requests(requestQueue(of: countly), carrying: "events")
+            .filter { $0["device_id"] as? String == "leaving" }
+            .flatMap { ($0["events"] as? [[String: Any]]) ?? [] }
+            .compactMap { $0["key"] as? String }
+        XCTAssertTrue(keys.contains("pending"))
+        XCTAssertEqual(keys.filter { $0 == ReservedEventKey.view }.count, 2, "the view's start and its end with the time so far")
+    }
+
+    /// A manual view belongs to the user who saw it, so it is not opened again
+    /// for the next user, and the ID the app held for it stops working.
+    func testAChangeWithoutMergeRestartsNoManualViewAndOldViewIDsStopWorking() {
+        let countly = startInstance {
+            $0.deviceID = "leaving"
+            $0.eventSendThreshold = 1
+        }
+        let heldID = countly.views.startView("Inbox") ?? ""
+
+        countly.deviceID.changeWithoutMerge("arriving")
+        countly.views.stopView(id: heldID)
+
+        let viewsOfTheNewUser = TestUtils.requests(requestQueue(of: countly), carrying: "events")
+            .filter { $0["device_id"] as? String == "arriving" }
+            .flatMap { ($0["events"] as? [[String: Any]]) ?? [] }
+            .filter { $0["key"] as? String == ReservedEventKey.view }
+        XCTAssertTrue(viewsOfTheNewUser.isEmpty, "no view is restarted or stopped for the new user")
+        XCTAssertEqual(logCodeCount(HealthLogCode.viewNotFound, of: countly), 1)
+    }
+
+    /// The server must see the merge before anything else for the new ID: a fetch
+    /// arriving first would create the new user, and the merge would then join
+    /// two users instead of moving one.
+    func testAMergeFetchesTheBehaviorSettingsOnlyOnceTheServerAcceptedIt() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let isFetch: (MockURLProtocol.Captured) -> Bool = { $0.query.contains("method=sc") }
+        let countly = startInstance { $0.deviceID = "anonymous" }
+        TestUtils.waitUntil("the start-up behavior settings fetch was attempted") {
+            MockURLProtocol.requests.contains(where: isFetch)
+        }
+        let fetchesBefore = MockURLProtocol.requests.filter(isFetch).count
+
+        countly.deviceID.changeWithMerge("known")
+        TestUtils.pump(0.5)
+        XCTAssertEqual(MockURLProtocol.requests.filter(isFetch).count, fetchesBefore,
+                       "no fetch while the merge request waits in the queue")
+
+        MockURLProtocol.respondToEverything(json: #"{"result": "Success"}"#)
+        core(of: countly).network.proceedOnQueue()
+
+        TestUtils.waitUntil("the behavior settings are fetched for the merged user") {
+            MockURLProtocol.requests.filter(isFetch).count > fetchesBefore
+        }
+        let requests = MockURLProtocol.requests
+        let acceptedMerge = try XCTUnwrap(requests.lastIndex { $0.query.contains("old_device_id=") })
+        let fetch = try XCTUnwrap(requests.lastIndex(where: isFetch))
+        XCTAssertLessThan(acceptedMerge, fetch)
+    }
+
     func testSettingTheSameIDDoesNothing() {
         let countly = startInstance { $0.deviceID = "same" }
         let before = requestQueue(of: countly).count
@@ -302,6 +387,79 @@ final class DeviceIDTests: CountlyBaseTestCase {
 
         XCTAssertTrue(countly.deviceID.isTemporaryIDMode)
         XCTAssertTrue(TestUtils.requests(requestQueue(of: countly), carrying: "old_device_id").isEmpty)
+    }
+
+    /// Leaving the mode without an ID returns to the user the mode was entered
+    /// from, with that ID's origin, and what was held goes out under them.
+    func testLeavingTemporaryModeWithoutAnIDReturnsToTheIDInUseBefore() {
+        let countly = startInstance {
+            $0.deviceID = "returning-user"
+            $0.eventSendThreshold = 1
+        }
+        countly.deviceID.enableTemporaryIDMode()
+        countly.events.recordEvent("held")
+
+        countly.deviceID.disableTemporaryIDMode()
+
+        XCTAssertFalse(countly.deviceID.isTemporaryIDMode)
+        XCTAssertEqual(countly.deviceID.current, "returning-user")
+        XCTAssertEqual(countly.deviceID.type, .developerSupplied)
+        let held = TestUtils.requests(requestQueue(of: countly), carrying: "events")
+            .filter { (($0["events"] as? [[String: Any]]) ?? []).contains { $0["key"] as? String == "held" } }
+        XCTAssertEqual(held.count, 1)
+        XCTAssertEqual(held.first?["device_id"] as? String, "returning-user")
+        XCTAssertEqual(held.first?["t"] as? String, "\(DeviceIDType.developerSupplied.rawValue)")
+    }
+
+    func testLeavingTemporaryModeBegunAtInitWithoutAnIDGeneratesOne() {
+        let countly = startInstance {
+            $0.temporaryDeviceIDMode = true
+            $0.deviceID = nil
+        }
+
+        countly.deviceID.disableTemporaryIDMode()
+
+        XCTAssertFalse(countly.deviceID.isTemporaryIDMode)
+        XCTAssertEqual(countly.deviceID.type, .sdkGenerated)
+        XCTAssertNotEqual(countly.deviceID.current, TemporaryDeviceID.value)
+    }
+
+    func testLeavingTemporaryModeWithAnIDUsesItAsDeveloperSupplied() {
+        let countly = startInstance {
+            $0.temporaryDeviceIDMode = true
+            $0.deviceID = nil
+        }
+
+        countly.deviceID.disableTemporaryIDMode("logged-in")
+
+        XCTAssertEqual(countly.deviceID.current, "logged-in")
+        XCTAssertEqual(countly.deviceID.type, .developerSupplied)
+        XCTAssertTrue(TestUtils.requests(requestQueue(of: countly), carrying: "old_device_id").isEmpty,
+                      "the server never saw the placeholder, so there is nothing to merge")
+    }
+
+    func testLeavingTemporaryModeOutsideItIsIgnored() {
+        let countly = startInstance { $0.deviceID = "keep-me" }
+
+        countly.deviceID.disableTemporaryIDMode("other")
+
+        XCTAssertEqual(countly.deviceID.current, "keep-me")
+    }
+
+    /// A request still carrying the placeholder outside temporary mode would hold
+    /// the whole queue back for good, since the placeholder is never sent.
+    func testAtStartAQueuedRequestStillCarryingThePlaceholderGetsTheCurrentID() {
+        let name = uniqueInstanceName()
+        let first = start(baseConfig(instanceName: name))
+        core(of: first).network.enqueue("\(QS.appKey)=\(Self.appKey)&\(QS.deviceID)=\(TemporaryDeviceID.value)&\(QS.deviceIDType)=2&\(QS.timestamp)=1&\(QS.events)=%5B%5D")
+        first.halt()
+
+        let second = start(baseConfig(instanceName: name))
+
+        let requests = requestQueue(of: second).map(TestUtils.parseQuery)
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?["device_id"] as? String, Self.deviceID)
+        XCTAssertEqual(requests.first?["t"] as? String, "\(DeviceIDType.developerSupplied.rawValue)")
     }
 
     // MARK: - Wire values

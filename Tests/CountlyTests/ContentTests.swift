@@ -89,12 +89,40 @@ final class ContentTests: CountlyBaseTestCase {
         MockURLProtocol.respond(pathContaining: "/o/sdk/content", json: "{}")
         let countly = contentInstance()
 
-        countly.content.previewContent("content-42")
+        countly.content.previewContent("0123456789abcdef01234567")
         waitForFetch()
 
         let parsed = TestUtils.parseQuery(fetches().last?.query ?? "")
-        XCTAssertEqual(parsed["content_id"] as? String, "content-42")
+        XCTAssertEqual(parsed["content_id"] as? String, "0123456789abcdef01234567")
         XCTAssertEqual(parsed["preview"] as? String, "true")
+    }
+
+    /// A content ID is 24 hexadecimal characters. Anything else would be answered
+    /// as an ordinary fetch, so it is not sent at all.
+    func testAPreviewWithAnIDThatIsNotAContentIDIsIgnored() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk/content", json: "{}")
+        let countly = contentInstance()
+
+        countly.content.previewContent("")
+        countly.content.previewContent("content-42")
+        countly.content.previewContent("0123456789abcdef0123456z")
+        TestUtils.pump(0.4)
+
+        XCTAssertTrue(fetches().isEmpty)
+        XCTAssertEqual(logCodeCount(HealthLogCode.invalidValue, of: countly), 3)
+    }
+
+    /// With the SDK's web views turned off nothing is fetched, since nothing could
+    /// be shown.
+    func testWithWebViewsTurnedOffTheZoneIsNotEntered() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk/content", json: "{}")
+        let countly = contentInstance { $0.disableWebView = true }
+
+        countly.content.enterContentZone()
+        countly.content.previewContent("0123456789abcdef01234567")
+        TestUtils.pump(0.4)
+
+        XCTAssertTrue(fetches().isEmpty)
     }
 
     /// The fetch is an instant request on the read endpoint, not a queued report:
@@ -151,7 +179,7 @@ final class ContentTests: CountlyBaseTestCase {
         let countly = contentInstance { $0.requiresConsent = true }
 
         countly.content.enterContentZone()
-        countly.content.previewContent("content-42")
+        countly.content.previewContent("0123456789abcdef01234567")
         TestUtils.pump(0.4)
 
         XCTAssertTrue(fetches().isEmpty)
@@ -293,7 +321,7 @@ final class ContentTests: CountlyBaseTestCase {
         """)
 
         let countly = contentInstance()
-        countly.content.previewContent("content-42")
+        countly.content.previewContent("0123456789abcdef01234567")
         waitForFetch()
         TestUtils.pump(1.0)
         #endif
@@ -375,20 +403,17 @@ final class ContentTests: CountlyBaseTestCase {
     // MARK: - Configuration
 
     /// Polling every second or two is never what an integration means, and the
-    /// cost is paid by the server, so an interval at or below the minimum is
-    /// ignored and the previous one kept.
+    /// cost is paid by the server, so an interval below 15 seconds is ignored with
+    /// a warning at start and the default used. 15 itself is valid.
     func testAZoneTimerIntervalBelowTheMinimumIsIgnored() {
-        let config = CountlyContentConfig()
-        XCTAssertEqual(config.zoneTimerInterval, 30)
+        XCTAssertEqual(CountlyContentConfig().zoneTimerInterval, 30)
 
-        config.zoneTimerInterval = 1
-        XCTAssertEqual(config.zoneTimerInterval, 30, "the previous value is kept")
+        let tooShort = startInstance { $0.content.zoneTimerInterval = 14 }
+        XCTAssertEqual(core(of: tooShort).config.content.zoneTimerInterval, 30)
+        XCTAssertEqual(logCodeCount(HealthLogCode.invalidSetting, of: tooShort), 1)
 
-        config.zoneTimerInterval = 15
-        XCTAssertEqual(config.zoneTimerInterval, 30, "the minimum itself is not enough")
-
-        config.zoneTimerInterval = 60
-        XCTAssertEqual(config.zoneTimerInterval, 60, "a sensible interval is accepted")
+        let minimum = startInstance { $0.content.zoneTimerInterval = 15 }
+        XCTAssertEqual(core(of: minimum).config.content.zoneTimerInterval, 15, "the minimum itself is valid")
     }
 
     /// Halting must take the zone down with it, or a timer keeps polling for an

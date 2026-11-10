@@ -40,9 +40,16 @@ public final class CountlyConfig: NSObject {
 
     // MARK: - Logging
 
-    /// Prints SDK logs to the console in debug builds and enables the logger
-    /// delegate in every build.
+    /// Prints SDK logs to the console, in release builds as well unless
+    /// ``disableSDKLoggingInProduction`` is set. The ``loggerDelegate`` receives
+    /// the lines whether or not this is set.
     public var enableDebug: Bool = false
+
+    /// Keeps console logs off in release builds even when ``enableDebug`` is set,
+    /// because the console of a published application can be read by other
+    /// applications and by anyone holding the device. The logger delegate and log
+    /// gathering are not affected. Off by default.
+    public var disableSDKLoggingInProduction: Bool = false
 
     /// Highest severity that is emitted. Default `.debug`, so verbose stays an
     /// explicit opt-in.
@@ -143,8 +150,10 @@ public final class CountlyConfig: NSObject {
 
     // MARK: - Push notifications
 
-    /// APNs environment the push token belongs to. Leave `nil` to let the SDK
-    /// infer it from the build's provisioning profile.
+    /// APNs environment the push token belongs to. Leave `nil` for App Store
+    /// builds, which are reported as production. Set `.development` for builds
+    /// signed with a development profile, such as debug builds run from Xcode, and
+    /// `.testFlightOrAdHoc` for TestFlight and ad hoc builds.
     public var pushTestMode: PushTestMode?
 
     /// `pushTestMode` for Objective-C, a `PushTestMode` value or `nil`.
@@ -155,8 +164,11 @@ public final class CountlyConfig: NSObject {
         set { pushTestMode = newValue.flatMap { PushTestMode(rawValue: $0.intValue) } }
     }
 
-    /// Sends the push token even when push consent has not been given, so the
-    /// server can hold it until consent arrives.
+    /// Sends the push token even when the user has not allowed the application to
+    /// show notifications, so silent pushes can reach it. Push consent is still
+    /// needed. A device that cannot show notifications still counts as reached in
+    /// a visible campaign, so set this only when the application relies on silent
+    /// pushes.
     public var sendPushTokenAlways: Bool = false
 
     /// Leaves the application delegate and the notification centre delegate alone.
@@ -190,6 +202,24 @@ public final class CountlyConfig: NSObject {
     /// Suppresses the SDK's own alert for notifications received in the
     /// foreground.
     public var doNotShowAlertForNotifications: Bool = false
+
+    /// Lets the application handle the link of a tapped Countly notification
+    /// itself, for example to route its own deep link to the right screen.
+    ///
+    /// Called on the main thread with the link of the tapped part, the body's or
+    /// the button's, or `nil` when it has none or it is not a URL, and the
+    /// notification's `userInfo`. Return `true` when the application took the link
+    /// over and the SDK opens nothing, `false` to let the SDK open it. The push
+    /// action is recorded before the handler runs, whatever it returns.
+    public var pushActionHandler: PushActionHandler?
+
+    /// The URI schemes notification links may open, compared without case, for
+    /// example `["https", "myapp"]`.
+    ///
+    /// Empty by default, which allows every scheme except the dangerous ones:
+    /// file, content, javascript, jar, zip, intent and data. A refused link is not
+    /// opened and is logged as a warning; the push action is still recorded.
+    public var pushAllowedLinkSchemes: [String] = []
 
     // MARK: - Location
 
@@ -245,11 +275,19 @@ public final class CountlyConfig: NSObject {
     /// based dropping.
     public var requestDropAgeHours: Int = 0
 
-    /// Per-request timeout in seconds. Default 30.
+    /// Per-request timeout in seconds, at least 1. Default 30.
     public var requestTimeoutDuration: TimeInterval = 30
 
-    /// Sends every request as POST, whatever its length.
-    public var alwaysUsePOST: Bool = false
+    /// How long the SDK waits after a failed request before it tries the same
+    /// request again, in seconds, at least 1. Default 60. Requests recorded and
+    /// timer ticks in between do not start an earlier attempt.
+    public var failedRequestCooldown: TimeInterval = 60
+
+    /// Trims a request queue that is over ``storedRequestsLimit`` in one step.
+    /// By default the SDK removes at most 100 of the overflow per new request, so a
+    /// queue far over its limit, for example after the server lowered it, shrinks
+    /// step by step instead of losing a large backlog at once.
+    public var disableGradualRequestCleaner: Bool = false
 
     // MARK: - Sessions
 
@@ -281,12 +319,6 @@ public final class CountlyConfig: NSObject {
 
     /// Segmentation merged into every crash report.
     public var crashSegmentation: [String: Any]?
-
-    /// Crash reports whose stack trace matches are dropped.
-    public var crashFilter: NSRegularExpression?
-
-    /// Last word on whether a crash report is sent. Return `false` to drop it.
-    public var shouldSendCrashReportCallback: (([String: Any]) -> Bool)?
 
     // MARK: - Networking
 
@@ -341,8 +373,23 @@ public final class CountlyConfig: NSObject {
     /// Stops the SDK from fetching behavior settings from the server.
     public var disableSDKBehaviorSettingsUpdates: Bool = false
 
-    /// Turns off the request backoff mechanism.
+    /// Turns off the request backoff mechanism. The server's behavior settings
+    /// still turn it on or off while they contain `bom`.
     public var disableBackoffMechanism: Bool = false
+
+    // MARK: - Health check
+
+    /// Stops the health check request the SDK sends once per start. The counters
+    /// still accumulate, but nothing is reported.
+    public var disableHealthCheck: Bool = false
+
+    // MARK: - Web views
+
+    /// Turns off every web view the SDK would show. Content is not fetched or
+    /// shown, and feedback widgets are not presented: their callbacks get an
+    /// error. Getting the widget list and widget data, and reporting a widget
+    /// manually, keep working, so an application can show widgets in its own UI.
+    public var disableWebView: Bool = false
 
     // MARK: - Sub-configurations
 
@@ -351,9 +398,6 @@ public final class CountlyConfig: NSObject {
 
     /// Crash reporting settings.
     public let crashes = CountlyCrashesConfig()
-
-    /// Performance monitoring settings.
-    public let apm = CountlyAPMConfig()
 
     /// Content zone settings.
     public let content = CountlyContentConfig()
@@ -378,6 +422,8 @@ public final class CountlyConfig: NSObject {
     enum ValidationFailure {
         case missingAppKey
         case missingHost
+        case invalidHost
+        case pinningRequiresHTTPS
 
         var message: String {
             switch self {
@@ -385,11 +431,15 @@ public final class CountlyConfig: NSObject {
                 return "the appKey on the config object is missing or still holds the placeholder value, initialization will be aborted"
             case .missingHost:
                 return "the host on the config object is missing or still holds the placeholder value, initialization will be aborted"
+            case .invalidHost:
+                return "the host on the config object is not an absolute URL with an http or https scheme, initialization will be aborted"
+            case .pinningRequiresHTTPS:
+                return "certificate pinning is configured but the host does not use https, initialization will be aborted"
             }
         }
     }
 
-    /// Checks the two values that make the SDK unusable when wrong.
+    /// Checks the values that make the SDK unusable when wrong.
     ///
     /// Returns the failure rather than throwing, so the caller decides whether to
     /// abort loudly or degrade. The SDK never takes down the host application
@@ -397,7 +447,96 @@ public final class CountlyConfig: NSObject {
     func validate() -> ValidationFailure? {
         if appKey.isEmpty || appKey == Placeholder.appKey { return .missingAppKey }
         if host.isEmpty || host == Placeholder.host { return .missingHost }
+        guard Self.isValidServerURL(normalizedHost) else { return .invalidHost }
+        if !pinnedCertificates.isEmpty, !Self.usesHTTPS(normalizedHost) { return .pinningRequiresHTTPS }
         return nil
+    }
+
+    /// Whether `value` is an absolute URL with an http or https scheme and a host.
+    static func isValidServerURL(_ value: String) -> Bool {
+        guard let components = URLComponents(string: value),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = components.host,
+              !host.isEmpty else { return false }
+        return true
+    }
+
+    /// Whether `value` uses the https scheme.
+    static func usesHTTPS(_ value: String) -> Bool {
+        URLComponents(string: value)?.scheme?.lowercased() == "https"
+    }
+
+    /// The default of ``updateSessionPeriod``: 60 seconds, or 20 on watchOS,
+    /// where applications run only briefly.
+    static var defaultUpdateSessionPeriod: TimeInterval {
+        #if os(watchOS)
+        return 20.0
+        #else
+        return 60.0
+        #endif
+    }
+
+    /// The shortest ``failedRequestCooldown`` the SDK accepts, in seconds.
+    static var minimumFailedRequestCooldown: TimeInterval = 1
+
+    /// Puts the default back for every option whose value is outside its valid
+    /// range, with a warning for each. The SDK never raises, lowers or cuts a value
+    /// to make it fit.
+    ///
+    /// - Returns: How many options were reset.
+    @discardableResult
+    func resetInvalidValues(logger: Logger) -> Int {
+        var resetCount = 0
+        func reject(_ option: String, _ value: Any, _ fallback: Any) {
+            resetCount += 1
+            logger.w("Countly", "start", "a config option has an invalid value, the value is ignored and the default is used, option: [\(option)], value: [\(value)], default: [\(fallback)]")
+            logger.healthTracker?.recordLogCode(HealthLogCode.invalidSetting)
+        }
+
+        if updateSessionPeriod < 1 {
+            reject("updateSessionPeriod", updateSessionPeriod, Self.defaultUpdateSessionPeriod)
+            updateSessionPeriod = Self.defaultUpdateSessionPeriod
+        }
+        if eventSendThreshold < 1 {
+            reject("eventSendThreshold", eventSendThreshold, 100)
+            eventSendThreshold = 100
+        }
+        if storedRequestsLimit < 1 {
+            reject("storedRequestsLimit", storedRequestsLimit, 1000)
+            storedRequestsLimit = 1000
+        }
+        if requestDropAgeHours < 0 {
+            reject("requestDropAgeHours", requestDropAgeHours, 0)
+            requestDropAgeHours = 0
+        }
+        if requestTimeoutDuration < 1 {
+            reject("requestTimeoutDuration", requestTimeoutDuration, 30)
+            requestTimeoutDuration = 30
+        }
+        if failedRequestCooldown < Self.minimumFailedRequestCooldown {
+            reject("failedRequestCooldown", failedRequestCooldown, 60)
+            failedRequestCooldown = 60
+        }
+        if content.contentReloadOnStallTimeout < 1 {
+            reject("contentReloadOnStallTimeout", content.contentReloadOnStallTimeout, 1000)
+            content.contentReloadOnStallTimeout = 1000
+        }
+        if content.zoneTimerInterval < CountlyContentConfig.minimumZoneTimerInterval {
+            reject("zoneTimerInterval", content.zoneTimerInterval, CountlyContentConfig.defaultZoneTimerInterval)
+            content.zoneTimerInterval = CountlyContentConfig.defaultZoneTimerInterval
+        }
+        for (key, value) in customMetrics where key.isEmpty || value.isEmpty {
+            resetCount += 1
+            logger.w("Countly", "start", "a metric override with an empty key or value is skipped, key: [\(key)]")
+            logger.healthTracker?.recordLogCode(HealthLogCode.invalidSetting)
+            customMetrics.removeValue(forKey: key)
+        }
+        sdkInternalLimits.resetInvalidValues { name, value, fallback in
+            reject(name, value, fallback)
+        }
+
+        return resetCount
     }
 
     /// Host with any trailing slashes removed, which is how every request URL is
@@ -427,6 +566,7 @@ public final class CountlyConfig: NSObject {
         copy.instanceName = instanceName
 
         copy.enableDebug = enableDebug
+        copy.disableSDKLoggingInProduction = disableSDKLoggingInProduction
         copy.internalLogLevel = internalLogLevel
         copy.loggerDelegate = loggerDelegate
 
@@ -451,6 +591,8 @@ public final class CountlyConfig: NSObject {
         copy.disableAutomaticPushHandling = disableAutomaticPushHandling
         copy.launchNotification = launchNotification
         copy.doNotShowAlertForNotifications = doNotShowAlertForNotifications
+        copy.pushActionHandler = pushActionHandler
+        copy.pushAllowedLinkSchemes = pushAllowedLinkSchemes
 
         copy.location = location
         copy.city = city
@@ -467,7 +609,8 @@ public final class CountlyConfig: NSObject {
         copy.storedRequestsLimit = storedRequestsLimit
         copy.requestDropAgeHours = requestDropAgeHours
         copy.requestTimeoutDuration = requestTimeoutDuration
-        copy.alwaysUsePOST = alwaysUsePOST
+        copy.failedRequestCooldown = failedRequestCooldown
+        copy.disableGradualRequestCleaner = disableGradualRequestCleaner
 
         copy.manualSessionHandling = manualSessionHandling
         copy.enableManualSessionControlHybridMode = enableManualSessionControlHybridMode
@@ -479,8 +622,6 @@ public final class CountlyConfig: NSObject {
         copy.indirectAttribution = indirectAttribution
 
         copy.crashSegmentation = crashSegmentation
-        copy.crashFilter = crashFilter
-        copy.shouldSendCrashReportCallback = shouldSendCrashReportCallback
 
         copy.pinnedCertificates = pinnedCertificates
         copy.secretSalt = secretSalt
@@ -498,10 +639,11 @@ public final class CountlyConfig: NSObject {
         copy.sdkBehaviorSettings = sdkBehaviorSettings
         copy.disableSDKBehaviorSettingsUpdates = disableSDKBehaviorSettingsUpdates
         copy.disableBackoffMechanism = disableBackoffMechanism
+        copy.disableHealthCheck = disableHealthCheck
+        copy.disableWebView = disableWebView
 
         copy.sdkInternalLimits.copyValues(from: sdkInternalLimits)
         copy.crashes.copyValues(from: crashes)
-        copy.apm.copyValues(from: apm)
         copy.content.copyValues(from: content)
         copy.experimental.copyValues(from: experimental)
 

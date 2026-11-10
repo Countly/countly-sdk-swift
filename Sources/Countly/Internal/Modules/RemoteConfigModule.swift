@@ -217,13 +217,27 @@ final class RemoteConfigModule: ModuleBase {
             return
         }
 
-        guard !core.modules.deviceID.isTemporary else {
-            logD("downloadRemoteConfigAutomatically", "device ID is in temporary mode, automatic remote config download will be skipped")
+        guard !core.modules.deviceID.isTemporary, !isQueueHoldingTemporaryRequests else {
+            logD("downloadRemoteConfigAutomatically", "device ID is in temporary mode or requests recorded in it are still queued, automatic remote config download will be skipped")
             return
         }
 
         logD("downloadRemoteConfigAutomatically", "automatic remote config download is starting, fetchType: [full]")
         downloadValues(keys: nil, omitKeys: nil, completion: nil)
+    }
+
+    /// Whether the request queue still holds requests with the temporary device
+    /// ID: values downloaded now would be for a user the server does not know yet.
+    private var isQueueHoldingTemporaryRequests: Bool {
+        let marker = "&\(QS.deviceID)=\(TemporaryDeviceID.value)"
+        return core.requestQueueStore.containsRequest { $0.contains(marker) }
+    }
+
+    /// What a failed request reports: `.networkIssue` when the server could not be
+    /// reached, `.error` for an answer that was refused or unusable.
+    private static func failureResult(for error: Error?) -> RequestResult {
+        guard let error = error as NSError?, error.domain == NSURLErrorDomain else { return .error }
+        return .networkIssue
     }
 
     /// Downloads every key.
@@ -253,8 +267,8 @@ final class RemoteConfigModule: ModuleBase {
             return
         }
 
-        guard !core.modules.deviceID.isTemporary else {
-            logD("downloadValues", "device ID is in temporary mode, remote config value download will be skipped")
+        guard !core.modules.deviceID.isTemporary, !isQueueHoldingTemporaryRequests else {
+            logD("downloadValues", "device ID is in temporary mode or requests recorded in it are still queued, remote config value download will be skipped")
             completion?(.error, CountlyError.remoteConfigGeneralAPIError.asNSError, false, [:])
             return
         }
@@ -268,14 +282,21 @@ final class RemoteConfigModule: ModuleBase {
         let isFullUpdate = keys == nil && omitKeys == nil
         logD("downloadValues", "remote config value download is starting, fetchType: [\(isFullUpdate ? "full" : "partial")], keyCount: [\(keys?.count ?? 0)], omitKeyCount: [\(omitKeys?.count ?? 0)], requestedKeys: [\(Self.describe(keys ?? []))], omittedKeys: [\(Self.describe(omitKeys ?? []))], enrollABOnDownload: [\(enrollABOnRCDownload)], completionHandlerProvided: [\(completion != nil)]")
 
-        fetch(keys: keys, omitKeys: omitKeys, isLegacy: false) { [weak self] remoteConfig, error in
+        let requestedFor = core.modules.deviceID.deviceID
+        fetch(keys: keys, omitKeys: omitKeys, isLegacy: false) { [weak self] remoteConfig, fetchError in
             // The caller is answered even once a halt has released the module.
             guard let self else {
-                completion?(.error, error ?? CountlyError.remoteConfigGeneralAPIError.asNSError, isFullUpdate, [:])
+                completion?(RemoteConfigModule.failureResult(for: fetchError), fetchError ?? CountlyError.remoteConfigGeneralAPIError.asNSError, isFullUpdate, [:])
                 return
             }
 
-            let downloaded = self.buildMeta(from: remoteConfig ?? [:])
+            var error = fetchError
+            if error == nil, self.core.modules.deviceID.deviceID != requestedFor {
+                self.logD("downloadValues", "the device ID changed while the download was running, the values belong to the previous user and are discarded")
+                error = CountlyError.remoteConfigGeneralAPIError.asNSError
+            }
+
+            let downloaded = error == nil ? self.buildMeta(from: remoteConfig ?? [:]) : [:]
             var result = RequestResult.success
 
             if error == nil {
@@ -293,9 +314,9 @@ final class RemoteConfigModule: ModuleBase {
                 self.persistCache()
                 self.lock.unlock()
             } else {
-                result = .error
+                result = Self.failureResult(for: error)
                 let nsError = error as NSError?
-                self.logD("downloadValues", "remote config value download failed, the cached values are left untouched, error: [\(nsError?.localizedDescription ?? "")], domain: [\(nsError?.domain ?? "")], code: [\(nsError?.code ?? 0)]")
+                self.logD("downloadValues", "remote config value download failed, the cached values are left untouched, result: [\(result.rawValue)], error: [\(nsError?.localizedDescription ?? "")], domain: [\(nsError?.domain ?? "")], code: [\(nsError?.code ?? 0)]")
             }
 
             completion?(result, error, isFullUpdate, downloaded)
@@ -414,14 +435,12 @@ final class RemoteConfigModule: ModuleBase {
             queryString += "&\(Key.autoOptIn)=1"
         }
 
-        // Metrics ride along only with session consent, because they describe the
-        // device rather than the config being asked for.
-        if core.modules.consent.hasConsent(for: .sessions) {
+        if core.modules.consent.hasConsent(for: .metrics) {
             queryString += "&\(QS.metrics)=\(CountlyJSON.escapedString(from: core.metricsDictionary(), logger: log))"
         }
 
-        queryString += "&\(QS.appVersion)=\(DeviceMetrics.appVersion)"
-        queryString = core.network.builder.appendChecksum(queryString)
+        queryString += "&\(QS.appVersion)=\(core.appVersion.urlEscaped)"
+        queryString = core.network.builder.finishImmediateRequest(queryString)
 
         return core.network.instantRequest(queryString: queryString, path: Endpoint.output + Endpoint.sdk)
     }
@@ -445,8 +464,8 @@ final class RemoteConfigModule: ModuleBase {
             }
         }
 
-        guard !core.modules.deviceID.isTemporary else {
-            logD(function, "device ID is in temporary mode, the call will be skipped, skippedAction: [\(action)]")
+        guard !core.modules.deviceID.isTemporary, !isQueueHoldingTemporaryRequests else {
+            logD(function, "device ID is in temporary mode or requests recorded in it are still queued, the call will be skipped, skippedAction: [\(action)]")
             return false
         }
 
@@ -455,14 +474,23 @@ final class RemoteConfigModule: ModuleBase {
 
     // MARK: - A/B tests
 
-    /// Puts the device into the A/B tests of the given keys.
+    /// Puts the device into the A/B tests of the given keys. Without a usable key
+    /// the call is omitted with a warning: the server refuses an enrollment with
+    /// no key, and a refused request would hold the queue up.
     func enrollIntoABTests(forKeys keys: [String]) {
         logI("enrollIntoABTests", "enrollment into A/B tests is requested, keyCount: [\(keys.count)]")
 
+        let validKeys = keys.filter { !$0.isEmpty }
+        guard !validKeys.isEmpty else {
+            logW("enrollIntoABTests", "omitting the call, no valid key is given")
+            core.healthTracker.recordLogCode(HealthLogCode.invalidValue)
+            return
+        }
+
         guard isRemoteConfigCallAllowed("enrollIntoABTests", "A/B test enrollment", requiresNetworking: false) else { return }
 
-        logD("enrollIntoABTests", "an enrollment request will be added to the request queue, keys: [\(Self.describe(keys))]")
-        sendABRequest(method: QS.abOptIn, keys: keys, overrideEndpoint: true)
+        logD("enrollIntoABTests", "an enrollment request will be added to the request queue, keys: [\(Self.describe(validKeys))]")
+        sendABRequest(method: QS.abOptIn, keys: validKeys, overrideEndpoint: true)
     }
 
     /// Takes the device out of the A/B tests of the given keys.
@@ -496,8 +524,8 @@ final class RemoteConfigModule: ModuleBase {
     private func testingQueryString(method: String, parameters: String = "") -> String {
         var queryString = "\(core.network.builder.queryEssentials())&\(QS.method)=\(method)"
         queryString += parameters
-        queryString += "&\(QS.appVersion)=\(DeviceMetrics.appVersion)"
-        return core.network.builder.appendChecksum(queryString)
+        queryString += "&\(QS.appVersion)=\(core.appVersion.urlEscaped)"
+        return core.network.builder.finishImmediateRequest(queryString)
     }
 
     /// Reduces the server's variant payload to the variant names per key.
@@ -596,7 +624,7 @@ final class RemoteConfigModule: ModuleBase {
                   let variants = CountlyJSON.object(from: data, logger: self.log) as? [String: Any] else {
                 let nsError = error as NSError?
                 self.logD("testingDownloadVariantInformation", "variants request failed, statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], error: [\(nsError?.localizedDescription ?? "")], domain: [\(nsError?.domain ?? "")], code: [\(nsError?.code ?? 0)]")
-                DispatchQueue.main.async { completion(.error, error ?? CountlyError.remoteConfigGeneralAPIError.asNSError) }
+                DispatchQueue.main.async { completion(Self.failureResult(for: error), error ?? CountlyError.remoteConfigGeneralAPIError.asNSError) }
                 return
             }
 
@@ -640,7 +668,7 @@ final class RemoteConfigModule: ModuleBase {
             guard error == nil, statusCode == 200 else {
                 let nsError = error as NSError?
                 self.logD("testingDownloadExperimentInformation", "experiment request failed, statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], error: [\(nsError?.localizedDescription ?? "")], domain: [\(nsError?.domain ?? "")], code: [\(nsError?.code ?? 0)]")
-                DispatchQueue.main.async { completion(.error, error ?? CountlyError.remoteConfigGeneralAPIError.asNSError) }
+                DispatchQueue.main.async { completion(Self.failureResult(for: error), error ?? CountlyError.remoteConfigGeneralAPIError.asNSError) }
                 return
             }
 
@@ -732,11 +760,13 @@ final class RemoteConfigModule: ModuleBase {
                 return
             }
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let answer = CountlyJSON.object(from: data, logger: nil) as? [String: Any]
 
-            guard error == nil, statusCode == 200 else {
+            // Only {"result": "Success"} means the server enrolled the device.
+            guard error == nil, statusCode == 200, answer?["result"] as? String == "Success" else {
                 let nsError = error as NSError?
-                self.logD("testingEnrollIntoVariant", "variant enrollment request failed, key: [\(key)], variantName: [\(variantName)], statusCode: [\(statusCode)], error: [\(nsError?.localizedDescription ?? "")], domain: [\(nsError?.domain ?? "")], code: [\(nsError?.code ?? 0)]")
-                DispatchQueue.main.async { completion(.error, error ?? CountlyError.remoteConfigGeneralAPIError.asNSError) }
+                self.logD("testingEnrollIntoVariant", "variant enrollment request failed, key: [\(key)], variantName: [\(variantName)], statusCode: [\(statusCode)], result: [\(answer?["result"] as? String ?? "")], error: [\(nsError?.localizedDescription ?? "")], domain: [\(nsError?.domain ?? "")], code: [\(nsError?.code ?? 0)]")
+                DispatchQueue.main.async { completion(Self.failureResult(for: error), error ?? CountlyError.remoteConfigGeneralAPIError.asNSError) }
                 return
             }
 

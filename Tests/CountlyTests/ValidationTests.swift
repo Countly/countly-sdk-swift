@@ -43,10 +43,11 @@ final class ValidationTests: CountlyBaseTestCase {
         XCTAssertFalse(config.networkingEnabled, "the well formed key beside them still applies")
     }
 
-    /// A fraction has to be strictly between zero and one: zero would make every
-    /// queue count as pressured and one would make none of them.
+    /// A fraction has to be above zero and at most one: zero would make every
+    /// queue count as pressured, and a share above one could never be reached.
+    /// One itself is valid, a queue counted as pressured only when it is full.
     func testABackoffFractionOutsideItsRangeIsDropped() {
-        for value in [0.0, 1.0, -0.5, 2.0] {
+        for value in [0.0, -0.5, 1.5, 2.0] {
             let countly = startInstance {
                 $0.sdkBehaviorSettings = ServerConfigBuilder()
                     .bomRequestQueuePercentage(value)
@@ -62,6 +63,13 @@ final class ValidationTests: CountlyBaseTestCase {
                 .json()
         }
         XCTAssertEqual(core(of: accepted).serverConfig.bomRQPercentage, 0.25, accuracy: 0.0001)
+
+        let full = startInstance {
+            $0.sdkBehaviorSettings = ServerConfigBuilder()
+                .bomRequestQueuePercentage(1)
+                .json()
+        }
+        XCTAssertEqual(core(of: full).serverConfig.bomRQPercentage, 1, accuracy: 0.0001)
     }
 
     /// An integer below the minimum its setting allows is dropped rather than

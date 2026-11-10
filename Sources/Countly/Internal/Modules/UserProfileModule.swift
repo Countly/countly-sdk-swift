@@ -28,7 +28,8 @@ enum UserProfileKey {
     ]
 
     /// Marker that carries a local picture path through the request queue, so the
-    /// connection manager knows to turn the request into a multipart upload.
+    /// connection manager knows to turn the request into a multipart upload. It is
+    /// removed before the request is sent.
     static let localPicturePath = "kCountlyLocalPicturePath"
 }
 
@@ -43,12 +44,33 @@ enum UserPropertyModifier: String {
     case addToSet = "$addToSet"
     case pull = "$pull"
 
-    /// Whether repeated calls accumulate into a list rather than replacing.
-    var accumulates: Bool {
+    /// Whether the operand is a list of values collected in call order.
+    var collectsValues: Bool {
         switch self {
         case .push, .addToSet, .pull: return true
         default: return false
         }
+    }
+
+    /// The pending operand and a new one of the same modifier, combined the way
+    /// the server would have applied them one after the other: increments add
+    /// up, multiplications multiply, the highest or lowest value is kept, the
+    /// first setOnce value is kept and list values are collected.
+    func combined(_ pending: Any, with new: Any) -> Any {
+        func number(_ value: Any) -> Double { (value as? NSNumber)?.doubleValue ?? 0 }
+        switch self {
+        case .increment: return number(pending) + number(new)
+        case .multiply: return number(pending) * number(new)
+        case .max: return Swift.max(number(pending), number(new))
+        case .min: return Swift.min(number(pending), number(new))
+        case .setOnce: return pending
+        case .push, .addToSet, .pull: return Self.values(pending) + Self.values(new)
+        }
+    }
+
+    /// An operand as the list a list modifier sends.
+    static func values(_ operand: Any) -> [Any] {
+        (operand as? [Any]) ?? [operand]
     }
 }
 
@@ -57,7 +79,8 @@ enum UserPropertyModifier: String {
 /// Properties are staged rather than sent immediately, so setting five of them in
 /// a row costs one request. Anything pending is flushed before a session or an
 /// event goes out, because the server attributes those to whatever profile it
-/// currently holds.
+/// currently holds. Every call needs the "users" consent; without it the call is
+/// ignored and a save discards what is pending.
 final class UserProfileModule: ModuleBase {
 
     override class var moduleName: String { "UserProfile" }
@@ -65,10 +88,10 @@ final class UserProfileModule: ModuleBase {
     /// Predefined fields. `NSNull` means "clear on the server".
     private var predefinedFields: [String: Any] = [:]
 
-    /// Custom properties set directly.
+    /// Custom properties set directly. `NSNull` means "clear on the server".
     private var customProperties: [String: Any] = [:]
 
-    /// Custom property modifier operations.
+    /// Custom property modifier operations, one modifier per property.
     private var customModifications: [String: [String: Any]] = [:]
 
     /// Local picture path, sent in its own multipart request.
@@ -82,10 +105,21 @@ final class UserProfileModule: ModuleBase {
     var hasUnsyncedChanges: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return !predefinedFields.isEmpty
-            || !customProperties.isEmpty
-            || !customModifications.isEmpty
-            || pictureLocalPath != nil
+        return pendingChangeCount > 0
+    }
+
+    /// How many changes are staged. The caller holds `lock`.
+    private var pendingChangeCount: Int {
+        predefinedFields.count + customProperties.count + customModifications.count + (pictureLocalPath == nil ? 0 : 1)
+    }
+
+    /// Whether profile calls may run, logging when they may not.
+    private func hasConsent(_ function: String) -> Bool {
+        guard core.modules.consent.hasConsent(for: .userDetails) else {
+            logD(function, "no consent for user details, the call is ignored")
+            return false
+        }
+        return true
     }
 
     // MARK: - Setting properties
@@ -108,7 +142,7 @@ final class UserProfileModule: ModuleBase {
         logI("setProperty", "user property will be set, key: [\(key)], valueProvided: [\(value != nil)]")
 
         guard let value else {
-            logW("setProperty", "omitting the call, a nil value can not be set, use the unset call to clear a property, key: [\(key)]")
+            warnIgnored("setProperty", "a nil value is not set, an empty string clears a property, key: [\(key)]")
             return
         }
         setProperties([key: value])
@@ -117,42 +151,36 @@ final class UserProfileModule: ModuleBase {
     /// Sets several properties at once, routing predefined keys to their own
     /// fields.
     ///
-    /// Pass `NSNull()` as a value to clear a field. Passing an empty string clears
-    /// it too: the server treats `""` as a clear and ignores `null` for predefined
-    /// fields, so the empty string is the reliable form.
+    /// An empty string clears the property on the server; a null value is ignored
+    /// with a warning. A new value for a key replaces a pending value, and a key
+    /// with a pending modifier has that saved first.
     func setProperties(_ data: [String: Any]) {
         guard !data.isEmpty else {
-            logW("setProperties", "call will be ignored as no data was provided")
+            warnIgnored("setProperties", "the call is ignored as no data was provided")
             return
         }
+        guard hasConsent("setProperties") else { return }
 
         logI("setProperties", "user properties will be applied, keys: [\(data.keys.sorted())], count: [\(data.count)]")
 
         var appliedCount = 0
         var skippedCount = 0
 
-        lock.lock()
         for (key, rawValue) in data {
-            var value = rawValue
-
-            if value is NSNull {
-                guard UserProfileKey.predefined.contains(key) else {
-                    logD("setProperties", "provided value is null, key: [\(key)], skipping this entry")
-                    skippedCount += 1
-                    continue
-                }
-                if assignPredefined(key, value: NSNull()) {
-                    appliedCount += 1
-                } else {
-                    skippedCount += 1
-                }
+            guard !key.isEmpty, !(rawValue is NSNull) else {
+                warnIgnored("setProperties", "a property with an empty key or a null value is ignored, an empty string clears a property, key: [\(key)]")
+                skippedCount += 1
                 continue
             }
 
-            value = truncatedValue(value, forKey: key, "setProperties")
+            let clears = (rawValue as? String)?.isEmpty == true
+            let value: Any = clears ? NSNull() : truncatedValue(rawValue, forKey: key, "setProperties")
 
             if UserProfileKey.predefined.contains(key) {
-                if assignPredefined(key, value: value) {
+                lock.lock()
+                let accepted = assignPredefined(key, value: value)
+                lock.unlock()
+                if accepted {
                     appliedCount += 1
                 } else {
                     skippedCount += 1
@@ -166,22 +194,22 @@ final class UserProfileModule: ModuleBase {
                 continue
             }
 
-            guard let storable = storableValue(value) else {
-                logD("setProperties", "provided value type is not supported, key: [\(key)], type: [\(type(of: value))], omitting entry")
+            let candidate: Any? = clears ? NSNull() : storableValue(value)
+            guard let storable = candidate else {
+                warnIgnored("setProperties", "the value type is not supported, key: [\(key)], type: [\(type(of: value))]")
                 skippedCount += 1
                 continue
             }
 
-            customProperties[limits.truncatedKey(key, "setProperties")] = storable
-            logV("setProperties", "custom user property value detail as stored, key: [\(key)], value: [\(storable)]")
+            stageCustomValue(storable, forKey: limits.truncatedKey(key, "setProperties"), function: "setProperties")
             appliedCount += 1
         }
-        lock.unlock()
 
         logD("setProperties", "user properties processing finished, appliedCount: [\(appliedCount)], skippedCount: [\(skippedCount)], unsyncedChangesPending: [\(hasUnsyncedChanges)]")
 
         guard appliedCount > 0 else { return }
         userPropertiesChanged()
+        saveIfCacheLimitReached()
     }
 
     /// Sets a custom property without routing predefined keys.
@@ -191,43 +219,58 @@ final class UserProfileModule: ModuleBase {
     func setCustomProperty(_ key: String, value: Any?) {
         logI("setCustomProperty", "custom user property will be set, key: [\(key)], valueProvided: [\(value != nil)]")
 
-        guard let value else {
-            logW("setCustomProperty", "call will be ignored as value is nil, key: [\(key)]")
+        guard let value, !(value is NSNull), !key.isEmpty else {
+            warnIgnored("setCustomProperty", "the call is ignored, the key is empty or the value is null, key: [\(key)]")
             return
         }
+        guard hasConsent("setCustomProperty") else { return }
 
         guard core.serverConfig.shouldRecordUserProperty(key) else {
             logD("setCustomProperty", "custom property key is filtered out by server config user property filter, key: [\(key)], omitting call")
             return
         }
 
-        guard let storable = storableValue(value) else {
-            logW("setCustomProperty", "custom property value type is not supported, key: [\(key)], type: [\(type(of: value))], omitting call")
+        let clears = (value as? String)?.isEmpty == true
+        let candidate: Any? = clears ? NSNull() : storableValue(value)
+        guard let storable = candidate else {
+            warnIgnored("setCustomProperty", "custom property value type is not supported, key: [\(key)], type: [\(type(of: value))]")
             return
         }
 
         let stored = truncatedValue(storable, forKey: key, "setCustomProperty")
         logV("setCustomProperty", "custom user property value detail as stored, key: [\(key)], value: [\(stored)]")
-
-        lock.lock()
-        customProperties[limits.truncatedKey(key, "setCustomProperty")] = stored
-        let total = customProperties.count
-        lock.unlock()
-
-        logD("setCustomProperty", "custom user property stored, key: [\(key)], totalCustomProperties: [\(total)]")
+        stageCustomValue(stored, forKey: limits.truncatedKey(key, "setCustomProperty"), function: "setCustomProperty")
+        saveIfCacheLimitReached()
     }
 
     /// Clears a custom property on the server.
     func unsetCustomProperty(_ key: String) {
         logI("unsetCustomProperty", "custom user property will be unset, key: [\(key)]")
+        guard hasConsent("unsetCustomProperty") else { return }
 
-        lock.lock()
         let truncatedKey = limits.truncatedKey(key, "unsetCustomProperty")
-        customProperties[truncatedKey] = NSNull()
-        let total = customProperties.count
+        stageCustomValue(NSNull(), forKey: truncatedKey, function: "unsetCustomProperty")
+        logD("unsetCustomProperty", "custom user property is staged for clearing on the server, key: [\(truncatedKey)]")
+        saveIfCacheLimitReached()
+    }
+
+    /// Stages a value for a custom property. A pending value of the key is
+    /// replaced; a pending modifier is saved first, since the server cannot apply
+    /// both to one property in one request.
+    private func stageCustomValue(_ value: Any, forKey key: String, function: String) {
+        lock.lock()
+        let hasPendingModifier = customModifications[key] != nil
         lock.unlock()
 
-        logD("unsetCustomProperty", "custom user property is staged for clearing on the server, key: [\(truncatedKey)], totalCustomProperties: [\(total)]")
+        if hasPendingModifier {
+            logD(function, "the key has a pending modifier, it is saved before the new value is staged, key: [\(key)]")
+            save()
+        }
+
+        lock.lock()
+        customProperties[key] = value
+        lock.unlock()
+        logV(function, "custom user property value detail as stored, key: [\(key)], value: [\(value)]")
     }
 
     // MARK: - Modifiers
@@ -261,13 +304,21 @@ final class UserProfileModule: ModuleBase {
 
     /// Stages one modifier operation.
     ///
-    /// Repeated list operations on the same key accumulate into an array instead of
-    /// overwriting, so pushing three values before a save sends all three.
+    /// The same modifier called again on a key is combined with the pending one,
+    /// see `UserPropertyModifier.combined(_:with:)`. A different change pending for
+    /// the key, another modifier or a value, is saved first, since the server
+    /// cannot apply two of them to one property in one request.
     private func modify(_ modifier: UserPropertyModifier, key: String, value: Any) {
         logI("modify", "user property modifier will be applied, modifier: [\(modifier.rawValue)], key: [\(key)]")
 
+        guard !key.isEmpty, !(value is NSNull) else {
+            warnIgnored("modify", "the call is ignored, the key is empty or the value is null, modifier: [\(modifier.rawValue)], key: [\(key)]")
+            return
+        }
+        guard hasConsent("modify") else { return }
+
         guard let storable = storableValue(value) else {
-            logW("modify", "modifier value type is not supported, modifier: [\(modifier.rawValue)], key: [\(key)], type: [\(type(of: value))], omitting call")
+            warnIgnored("modify", "modifier value type is not supported, modifier: [\(modifier.rawValue)], key: [\(key)], type: [\(type(of: value))]")
             return
         }
 
@@ -280,50 +331,48 @@ final class UserProfileModule: ModuleBase {
         if let stringValue = storable as? String {
             stored = limits.truncatedValue(stringValue, "modify")
         }
+        if modifier.collectsValues {
+            stored = UserPropertyModifier.values(stored)
+        }
 
         let truncatedKey = limits.truncatedKey(key, "modify")
         logV("modify", "modifier operand value detail as stored, modifier: [\(modifier.rawValue)], key: [\(truncatedKey)], value: [\(stored)]")
 
         lock.lock()
-        defer { lock.unlock() }
+        let pendingModifier = customModifications[truncatedKey]?.keys.first
+        let hasPendingValue = customProperties[truncatedKey] != nil
+        lock.unlock()
 
-        if modifier.accumulates {
-            // A list operation joins whatever is already staged for the key instead
-            // of replacing it, so a push followed by a pull sends both.
-            var staged = customModifications[truncatedKey] ?? [:]
-            if let existing = staged[modifier.rawValue] {
-                var accumulated = (existing as? [Any]) ?? [existing]
-                if let list = stored as? [Any] {
-                    accumulated.append(contentsOf: list)
-                } else {
-                    accumulated.append(stored)
-                }
-                staged[modifier.rawValue] = accumulated
-                logD("modify", "the operand is merged into the modification already staged for the key, modifier: [\(modifier.rawValue)], key: [\(truncatedKey)], accumulatedOperandCount: [\(accumulated.count)]")
-            } else {
-                staged[modifier.rawValue] = stored
-            }
-            customModifications[truncatedKey] = staged
-        } else {
-            if let replaced = customModifications[truncatedKey], !replaced.isEmpty {
-                logD("modify", "the modification already staged for the key is replaced and will not reach the server, key: [\(truncatedKey)], replacedModifiers: [\(replaced.keys.sorted())], modifier: [\(modifier.rawValue)]")
-            }
-            customModifications[truncatedKey] = [modifier.rawValue: stored]
+        if hasPendingValue || (pendingModifier != nil && pendingModifier != modifier.rawValue) {
+            logD("modify", "the key has a different pending change, it is saved before the modifier is staged, key: [\(truncatedKey)], pendingModifier: [\(pendingModifier ?? "value")], modifier: [\(modifier.rawValue)]")
+            save()
         }
 
-        logD("modify", "modification stored, modifier: [\(modifier.rawValue)], key: [\(truncatedKey)], totalModifications: [\(customModifications.count)]")
+        lock.lock()
+        if let pending = customModifications[truncatedKey]?[modifier.rawValue] {
+            customModifications[truncatedKey] = [modifier.rawValue: modifier.combined(pending, with: stored)]
+            logD("modify", "the operand is combined with the pending one of the same modifier, modifier: [\(modifier.rawValue)], key: [\(truncatedKey)]")
+        } else {
+            customModifications[truncatedKey] = [modifier.rawValue: stored]
+        }
+        let total = customModifications.count
+        lock.unlock()
+
+        logD("modify", "modification stored, modifier: [\(modifier.rawValue)], key: [\(truncatedKey)], totalModifications: [\(total)]")
+        saveIfCacheLimitReached()
     }
 
     // MARK: - Predefined fields
 
-    /// Assigns a predefined field, returning whether the value was accepted.
+    /// Assigns a predefined field, returning whether the value was accepted. The
+    /// caller holds `lock`.
     ///
     /// A rejected value must not count as a change, or the SDK would flush events
     /// and send a user details request carrying nothing.
     private func assignPredefined(_ key: String, value: Any) -> Bool {
         let isNull = value is NSNull
 
-        logD("assignPredefined", "predefined user property will be assigned, key: [\(key)], isNull: [\(isNull)]")
+        logD("assignPredefined", "predefined user property will be assigned, key: [\(key)], clears: [\(isNull)]")
         logV("assignPredefined", "predefined user property value detail, key: [\(key)], value: [\(value)]")
 
         switch key {
@@ -346,7 +395,7 @@ final class UserProfileModule: ModuleBase {
             let path = String(describing: value)
             // An unreadable path would produce a multipart request with no file,
             // which the server rejects, so it is dropped here instead.
-            if !path.isEmpty, !LocalPicturePath.isReadable(path) {
+            if !LocalPicturePath.isReadable(path) {
                 logW("assignPredefined", "provided picture path file can not be opened, pathLength: [\(path.count)], value will be dropped")
                 pictureLocalPath = nil
             } else {
@@ -360,16 +409,13 @@ final class UserProfileModule: ModuleBase {
                 predefinedFields[key] = NSNull()
                 return true
             }
-            if let number = value as? NSNumber {
-                predefinedFields[key] = number
-                return true
+            guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  number.doubleValue == number.doubleValue.rounded(), number.intValue >= 0 else {
+                warnIgnored("assignPredefined", "the birth year is ignored, it has to be a whole number, key: [\(key)], type: [\(type(of: value))]")
+                return false
             }
-            if let text = value as? String, let parsed = NumberFormatter().number(from: text) {
-                predefinedFields[key] = parsed
-                return true
-            }
-            logW("assignPredefined", "provided byear value can not be parsed as a number, key: [\(key)]")
-            return false
+            predefinedFields[key] = number.intValue
+            return true
 
         default:
             return false
@@ -379,6 +425,9 @@ final class UserProfileModule: ModuleBase {
     // MARK: - Sending
 
     /// Sends everything staged and clears it.
+    ///
+    /// Without the "users" consent nothing is sent and the pending changes are
+    /// discarded.
     ///
     /// - Returns: whether the save went ahead. The caller needs to know, because a
     ///   save that declines has not flushed the pending events either, and those
@@ -393,7 +442,10 @@ final class UserProfileModule: ModuleBase {
         }
 
         guard core.modules.consent.hasConsent(for: .userDetails) else {
-            logD("save", "no consent for user details, save will be skipped")
+            if hasUnsyncedChanges {
+                logD("save", "no consent for user details, the pending changes are discarded")
+                clearUserDetails()
+            }
             return false
         }
 
@@ -419,9 +471,9 @@ final class UserProfileModule: ModuleBase {
         lock.lock()
         let localPath = pictureLocalPath
         // A remote picture URL supersedes a local file, but an explicit clear is
-        // not a URL: `setProperties(["picture": NSNull(), "picturePath": path])`
-        // means "drop whatever is on the server and upload this file", and reading
-        // the key's mere presence would suppress the upload and then discard the
+        // not a URL: `setProperties(["picture": "", "picturePath": path])` means
+        // "drop whatever is on the server and upload this file", and reading the
+        // key's mere presence would suppress the upload and then discard the
         // staged path along with everything else.
         let hasPictureURL = !(predefinedFields[UserProfileKey.picture] is NSNull)
             && predefinedFields[UserProfileKey.picture] != nil
@@ -431,7 +483,6 @@ final class UserProfileModule: ModuleBase {
         // picture URL supersedes a local file.
         if let localPath, !hasPictureURL {
             logD("save", "local picture path will be sent in a separate request, pathLength: [\(localPath.count)]")
-            logV("save", "local picture path value detail, picturePath: [\(localPath)]")
             sendUserDetails(CountlyJSON.escapedString(from: [UserProfileKey.localPicturePath: localPath], logger: log))
             queuedRequestCount += 1
         } else if localPath != nil {
@@ -442,6 +493,19 @@ final class UserProfileModule: ModuleBase {
 
         clearUserDetails()
         return true
+    }
+
+    /// Saves automatically once the pending changes reach the server's "upcl"
+    /// limit. Nothing pending is ever dropped because of it.
+    private func saveIfCacheLimitReached() {
+        lock.lock()
+        let count = pendingChangeCount
+        lock.unlock()
+
+        let limit = core.serverConfig.userPropertyCacheLimit
+        guard limit > 0, count >= limit else { return }
+        logD("saveIfCacheLimitReached", "the pending user property changes reached the cache limit and are saved, pendingChangeCount: [\(count)], limit: [\(limit)]")
+        save()
     }
 
     private func sendUserDetails(_ payload: String) {
@@ -460,26 +524,12 @@ final class UserProfileModule: ModuleBase {
         lock.lock()
         defer { lock.unlock() }
 
-        var payload: [String: Any] = [:]
-
-        for (key, value) in predefinedFields where key != UserProfileKey.birthYear {
-            payload[key] = value
-        }
-
-        if let birthYear = predefinedFields[UserProfileKey.birthYear] {
-            // A negative year is meaningless; sending null clears the field
-            // instead of storing nonsense.
-            if let number = birthYear as? NSNumber, number.intValue < 0 {
-                payload[UserProfileKey.birthYear] = NSNull()
-            } else {
-                payload[UserProfileKey.birthYear] = birthYear
-            }
-        }
+        var payload: [String: Any] = predefinedFields
 
         var custom: [String: Any] = [:]
         if !customProperties.isEmpty {
             // Both limits apply here; the modifiers below take neither, on either reference.
-            custom.merge(limits.limited(cappedCustomProperties(), "user details custom properties")) { _, new in new }
+            custom.merge(limits.limited(customProperties, "user details custom properties")) { _, new in new }
         }
         if !customModifications.isEmpty {
             custom.merge(customModifications) { _, new in new }
@@ -510,19 +560,6 @@ final class UserProfileModule: ModuleBase {
         return escaped
     }
 
-    /// Custom properties trimmed to the server's configured cache limit.
-    private func cappedCustomProperties() -> [String: Any] {
-        let limit = core.serverConfig.userPropertyCacheLimit
-        guard limit > 0, customProperties.count > limit else { return customProperties }
-
-        // Sorted so the same overflowing profile trims the same way twice, rather
-        // than dropping whichever keys the dictionary happened to order last.
-        let kept = Set(customProperties.keys.sorted().prefix(limit))
-        let dropped = customProperties.keys.filter { !kept.contains($0) }.sorted()
-        logD("cappedCustomProperties", "custom user properties exceed the server cache limit and will be trimmed, propertyCount: [\(customProperties.count)], limit: [\(limit)], droppedKeys: [\(dropped)]")
-        return customProperties.filter { kept.contains($0.key) }
-    }
-
     /// Drops everything staged without sending it.
     func clearUserDetails() {
         lock.lock()
@@ -550,6 +587,12 @@ final class UserProfileModule: ModuleBase {
         }
         logD("userPropertiesChanged", "user properties changed, the recorded events are flushed first so they keep the previous profile, pendingEventCount: [\(core.modules.events.pendingEventCount)]")
         core.modules.events.sendEvents()
+    }
+
+    /// Logs an ignored call or value as a warning and counts it.
+    private func warnIgnored(_ function: String, _ message: String) {
+        logW(function, message)
+        core.healthTracker.recordLogCode(HealthLogCode.invalidValue)
     }
 
     /// The value as the server stores it, or `nil` when it cannot be stored.

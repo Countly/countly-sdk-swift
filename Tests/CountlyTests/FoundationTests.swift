@@ -164,7 +164,7 @@ final class FoundationTests: XCTestCase {
         XCTAssertEqual(ConsentFeature.userDetails.wireName, "users")
         XCTAssertEqual(ConsentFeature.crashReporting.wireName, "crashes")
         XCTAssertEqual(ConsentFeature.viewTracking.wireName, "views")
-        XCTAssertEqual(ConsentFeature.performanceMonitoring.wireName, "apm")
+        XCTAssertEqual(ConsentFeature.starRating.wireName, "star-rating")
         XCTAssertEqual(ConsentFeature.remoteConfig.wireName, "remote-config")
     }
 
@@ -184,21 +184,69 @@ final class FoundationTests: XCTestCase {
         XCTAssertNil(valid.validate())
     }
 
+    /// A server URL that is not an absolute http or https URL would make every
+    /// request fail, so the SDK refuses to start with one.
+    func testConfigRejectsAServerURLThatIsNotAnAbsoluteHTTPURL() {
+        for host in ["ftp://example.com", "example.com", "my server", "https://", "file:///tmp/countly"] {
+            XCTAssertEqual(CountlyConfig(appKey: "key", host: host).validate(), .invalidHost, "host: \(host)")
+        }
+        XCTAssertNil(CountlyConfig(appKey: "key", host: "http://localhost:8080/").validate())
+        XCTAssertNil(CountlyConfig(appKey: "key", host: "https://example.com/countly").validate())
+    }
+
+    /// Pinning protects nothing on a plain http connection, so the combination is
+    /// refused rather than silently ignored.
+    func testPinningNeedsAnHTTPSServerURL() {
+        let config = CountlyConfig(appKey: "key", host: "http://example.com")
+        config.pinnedCertificates = ["server.cer"]
+        XCTAssertEqual(config.validate(), .pinningRequiresHTTPS)
+
+        config.host = "https://example.com"
+        XCTAssertNil(config.validate())
+    }
+
     func testHostLosesItsTrailingSlashes() {
         let config = CountlyConfig(appKey: "key", host: "https://example.com//")
         XCTAssertEqual(config.normalizedHost, "https://example.com")
     }
 
-    /// A limit below one would silently discard every value, which is worse than
-    /// ignoring the misconfiguration.
+    /// A limit below one would silently discard every value, so it is ignored and
+    /// the default stays; it is never raised to one.
     func testLimitsBelowOneFallBackToTheDefaults() {
         let limits = CountlySDKLimitsConfig()
         limits.maxKeyLength = 0
         limits.maxValueSize = -5
+        limits.maxBreadcrumbCount = 7
 
-        limits.clampToMinimums()
+        var rejected: [String] = []
+        limits.resetInvalidValues { name, _, _ in rejected.append(name) }
+
         XCTAssertEqual(limits.maxKeyLength, DefaultLimits.maxKeyLength)
         XCTAssertEqual(limits.maxValueSize, DefaultLimits.maxValueSize)
+        XCTAssertEqual(limits.maxBreadcrumbCount, 7, "a valid value is left alone")
+        XCTAssertEqual(Set(rejected), ["maxKeyLength", "maxValueSize"])
+    }
+
+    /// An option outside its valid range is ignored with a warning and the
+    /// default is used, never a value raised or lowered to fit.
+    func testConfigValuesOutsideTheirRangeFallBackToTheDefaults() {
+        let config = CountlyConfig(appKey: "key", host: "https://example.com")
+        config.storedRequestsLimit = 0
+        config.eventSendThreshold = -1
+        config.updateSessionPeriod = 0
+        config.requestTimeoutDuration = 0.5
+        config.requestDropAgeHours = -2
+        config.failedRequestCooldown = CountlyConfig.minimumFailedRequestCooldown - 1
+
+        let resetCount = config.resetInvalidValues(logger: Logger(instanceName: nil))
+
+        XCTAssertEqual(resetCount, 6)
+        XCTAssertEqual(config.storedRequestsLimit, 1000)
+        XCTAssertEqual(config.eventSendThreshold, 100)
+        XCTAssertEqual(config.updateSessionPeriod, CountlyConfig.defaultUpdateSessionPeriod)
+        XCTAssertEqual(config.requestTimeoutDuration, 30)
+        XCTAssertEqual(config.requestDropAgeHours, 0)
+        XCTAssertEqual(config.failedRequestCooldown, 60)
     }
 
     // MARK: - Registry

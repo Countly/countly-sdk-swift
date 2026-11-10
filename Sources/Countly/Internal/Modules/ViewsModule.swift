@@ -24,6 +24,9 @@ final class ViewsModule: ModuleBase {
     /// Open views, keyed by view ID.
     private var viewDataDictionary: [String: CountlyViewData] = [:]
 
+    /// The start order the next view gets, see `CountlyViewData.startOrder`.
+    private var nextStartOrder = 0
+
     /// IDs handed out for views that a background and foreground cycle has since
     /// reopened, mapped to the ID the view is open under now.
     ///
@@ -147,13 +150,14 @@ final class ViewsModule: ModuleBase {
         return startViewInternal(viewName, customSegmentation: segmentation, isAutoStoppedView: true)
     }
 
+    /// Stops the view with this name, the last one started when several share it.
     func stopView(name viewName: String, segmentation: [String: Any]? = nil) {
         logI("stopViewWithName", "stop view by name requested, name: [\(viewName)], segmentationKeyCount: [\(segmentation?.count ?? 0)]")
 
         guard manualCallsAllowed("stop view by name", "stopViewWithName") else { return }
 
         guard !viewName.isEmpty else {
-            logE("stopViewWithName", "view name is null or empty, stop view by name will be ignored")
+            warnViewNotFound("stopViewWithName", "view name is null or empty, stop view by name will be ignored")
             return
         }
 
@@ -163,11 +167,11 @@ final class ViewsModule: ModuleBase {
         }
 
         guard let viewID = viewID(forName: viewName) else {
-            logE("stopViewWithName", "no view exists with the given name, it will not be stopped, name: [\(viewName)]")
+            warnViewNotFound("stopViewWithName", "no view exists with the given name, it will not be stopped, name: [\(viewName)]")
             return
         }
 
-        stopViewInternal(viewID: viewID, customSegmentation: segmentation, autoPaused: false)
+        stopViewInternal(viewID: viewID, customSegmentation: segmentation, keepsView: false)
     }
 
     func stopView(id viewID: String, segmentation: [String: Any]? = nil) {
@@ -175,10 +179,11 @@ final class ViewsModule: ModuleBase {
 
         guard manualCallsAllowed("stop view by ID", "stopViewWithID") else { return }
 
-        stopViewInternal(viewID: currentID(for: viewID), customSegmentation: segmentation, autoPaused: false)
+        stopViewInternal(viewID: currentID(for: viewID), customSegmentation: segmentation, keepsView: false)
     }
 
-    /// Stops the clock on a view without closing it.
+    /// Reports the time a view was on screen so far and stops counting it, keeping
+    /// the view open until it is resumed or stopped.
     func pauseView(id heldID: String) {
         logI("pauseView", "pause view requested, viewID: [\(heldID)]")
         let viewID = currentID(for: heldID)
@@ -188,16 +193,22 @@ final class ViewsModule: ModuleBase {
         guard validateViewOperation(viewID: viewID, operation: "pause view") else { return }
 
         guard let viewData = viewDataDictionary[viewID] else {
-            logE("pauseView", "no view exists with the given ID, it will not be paused, viewID: [\(viewID)]")
+            warnViewNotFound("pauseView", "no view exists with the given ID, it will not be paused, viewID: [\(viewID)]")
             return
         }
 
-        logD("pauseView", "view resolved for pausing, viewID: [\(viewID)], name: [\(viewData.viewName)]")
-        stopViewInternal(viewID: viewID, customSegmentation: nil, autoPaused: true)
-        viewData.pause(at: core.clock.now())
+        guard !viewData.isPaused else {
+            logW("pauseView", "the view is already paused, the call will be ignored, viewID: [\(viewID)], name: [\(viewData.viewName)], stoppedForBackground: [\(viewData.willStartAgain)]")
+            core.healthTracker.recordLogCode(HealthLogCode.viewPauseMismatch, area: .views)
+            return
+        }
+
+        logD("pauseView", "view resolved for pausing, its time so far is reported, viewID: [\(viewID)], name: [\(viewData.viewName)]")
+        stopViewInternal(viewID: viewID, customSegmentation: nil, keepsView: true)
+        viewData.pause()
     }
 
-    /// Restarts the clock on a paused view.
+    /// Starts counting a paused view's time again, without a new start event.
     func resumeView(id heldID: String) {
         logI("resumeView", "resume view requested, viewID: [\(heldID)]")
         let viewID = currentID(for: heldID)
@@ -207,7 +218,16 @@ final class ViewsModule: ModuleBase {
         guard validateViewOperation(viewID: viewID, operation: "resume view") else { return }
 
         guard let viewData = viewDataDictionary[viewID] else {
-            logE("resumeView", "no view exists with the given ID, it will not be resumed, viewID: [\(viewID)]")
+            warnViewNotFound("resumeView", "no view exists with the given ID, it will not be resumed, viewID: [\(viewID)]")
+            return
+        }
+
+        guard viewData.isPaused, !viewData.willStartAgain else {
+            let reason = viewData.willStartAgain
+                ? "the view was stopped when the app went to the background and starts again when it returns"
+                : "the view is not paused"
+            logW("resumeView", "\(reason), the call will be ignored, viewID: [\(viewID)], name: [\(viewData.viewName)]")
+            core.healthTracker.recordLogCode(HealthLogCode.viewPauseMismatch, area: .views)
             return
         }
 
@@ -237,7 +257,7 @@ final class ViewsModule: ModuleBase {
             logD("stopReportedView", "the reported view is already closed and nothing is stopped, viewID: [\(viewID)]")
             return
         }
-        stopViewInternal(viewID: viewID, customSegmentation: segmentation, autoPaused: false)
+        stopViewInternal(viewID: viewID, customSegmentation: segmentation, keepsView: false)
     }
 
     /// Closes every open view, not only the automatic ones, because view consent
@@ -263,7 +283,7 @@ final class ViewsModule: ModuleBase {
         let viewID = currentID(for: heldID)
 
         guard !viewID.isEmpty else {
-            logE("addSegmentationToViewWithID", "view ID is null or empty, adding segmentation by view ID will be ignored")
+            warnViewNotFound("addSegmentationToViewWithID", "view ID is null or empty, adding segmentation by view ID will be ignored")
             return
         }
 
@@ -273,7 +293,7 @@ final class ViewsModule: ModuleBase {
         }
 
         guard let viewData = viewDataDictionary[viewID] else {
-            logE("addSegmentationToViewWithID", "no view exists with the given ID, segmentation will not be added, viewID: [\(viewID)]")
+            warnViewNotFound("addSegmentationToViewWithID", "no view exists with the given ID, segmentation will not be added, viewID: [\(viewID)]")
             return
         }
 
@@ -282,17 +302,18 @@ final class ViewsModule: ModuleBase {
         viewData.segmentation.merge(filtered) { _, new in new }
     }
 
-    /// Adds segmentation to the open view with this name.
+    /// Adds segmentation to the open view with this name, the last one started
+    /// when several share it.
     func addSegmentation(toViewWithName viewName: String, segmentation: [String: Any]) {
         logI("addSegmentationToViewWithName", "add segmentation to view by name requested, name: [\(viewName)], segmentationKeyCount: [\(segmentation.count)]")
 
         guard !viewName.isEmpty else {
-            logE("addSegmentationToViewWithName", "view name is null or empty, adding segmentation to view will be ignored")
+            warnViewNotFound("addSegmentationToViewWithName", "view name is null or empty, adding segmentation to view will be ignored")
             return
         }
 
         guard let viewID = viewID(forName: viewName) else {
-            logE("addSegmentationToViewWithName", "no view exists with the given name, segmentation will not be added, name: [\(viewName)]")
+            warnViewNotFound("addSegmentationToViewWithName", "no view exists with the given name, segmentation will not be added, name: [\(viewName)]")
             return
         }
 
@@ -306,16 +327,26 @@ final class ViewsModule: ModuleBase {
     private func manualCallsAllowed(_ operation: String, _ function: String) -> Bool {
         guard isAutoViewTrackingActive else { return true }
         logW(function, "manual view calls are not allowed while automatic view tracking is active, the call will be ignored, operation: [\(operation)]")
+        core.healthTracker.recordLogCode(HealthLogCode.automaticTrackingActive, area: .views)
         return false
+    }
+
+    /// Logs a call naming a view that is not open, and counts it for the health
+    /// check.
+    private func warnViewNotFound(_ function: String, _ message: String) {
+        logW(function, message)
+        core.healthTracker.recordLogCode(HealthLogCode.viewNotFound, area: .views)
     }
 
     // MARK: - Internals
 
     private func startViewInternal(_ viewName: String,
                                    customSegmentation: [String: Any]?,
-                                   isAutoStoppedView: Bool) -> String? {
+                                   isAutoStoppedView: Bool,
+                                   isAutomatic: Bool = false) -> String? {
         guard !viewName.isEmpty else {
-            logE("startViewInternal", "view name is null or empty, start view will be ignored")
+            logW("startViewInternal", "view name is null or empty, start view will be ignored")
+            core.healthTracker.recordLogCode(HealthLogCode.emptyViewName, area: .views)
             return nil
         }
 
@@ -363,28 +394,33 @@ final class ViewsModule: ModuleBase {
         previousViewName = currentViewName
         currentViewName = truncatedName
 
-        let viewData = CountlyViewData(viewID: viewID, viewName: truncatedName, startTime: core.clock.now())
+        let viewData = CountlyViewData(viewID: viewID, viewName: truncatedName, startTime: core.clock.now(), startOrder: nextStartOrder)
+        nextStartOrder += 1
         viewData.startSegmentation = customSegmentation ?? [:]
         viewData.isAutoStoppedView = isAutoStoppedView
+        viewData.isAutomatic = isAutomatic
         viewDataDictionary[viewID] = viewData
 
         core.modules.events.recordReservedEvent(ReservedEventKey.view,
                                                 segmentation: segmentation,
                                                 id: viewID)
 
-        logD("startViewInternal", "view started, name: [\(truncatedName)], viewID: [\(viewID)], previousViewID: [\(previousViewID ?? "")], segmentationKeyCount: [\(segmentation.count)], segmentationKeys: [\(segmentation.keys.sorted())], isAutoStoppedView: [\(isAutoStoppedView)]")
+        logD("startViewInternal", "view started, name: [\(truncatedName)], viewID: [\(viewID)], previousViewID: [\(previousViewID ?? "")], segmentationKeyCount: [\(segmentation.count)], segmentationKeys: [\(segmentation.keys.sorted())], isAutoStoppedView: [\(isAutoStoppedView)], isAutomatic: [\(isAutomatic)]")
         logV("startViewInternal", "started view segmentation value detail, viewID: [\(viewID)], segmentation: [\(segmentation)]")
 
         return viewID
     }
 
-    /// Records the view event and, unless the view is only being paused, forgets
-    /// the view.
-    private func stopViewInternal(viewID: String, customSegmentation: [String: Any]?, autoPaused: Bool) {
+    /// Records the view's end event and, unless the view is kept, forgets it.
+    ///
+    /// - Parameter keepsView: whether the view stays open, as it does when it is
+    ///   paused or stopped for the background. A paused view's end event carries
+    ///   a duration of 0, its time having been reported when it was paused.
+    private func stopViewInternal(viewID: String, customSegmentation: [String: Any]?, keepsView: Bool) {
         guard validateViewOperation(viewID: viewID, operation: "stop view by ID") else { return }
 
         guard let viewData = viewDataDictionary[viewID] else {
-            logE("stopViewInternal", "no view exists with the given ID, it will not be stopped, viewID: [\(viewID)]")
+            warnViewNotFound("stopViewInternal", "no view exists with the given ID, it will not be stopped, viewID: [\(viewID)]")
             return
         }
 
@@ -410,10 +446,10 @@ final class ViewsModule: ModuleBase {
                                                 duration: TimeInterval(duration),
                                                 id: viewData.viewID)
 
-        logD("stopViewInternal", "view stopped, name: [\(viewData.viewName)], viewID: [\(viewData.viewID)], durationSeconds: [\(duration)], segmentationKeyCount: [\(segmentation.count)], segmentationKeys: [\(segmentation.keys.sorted())], autoPaused: [\(autoPaused)]")
+        logD("stopViewInternal", "view stopped, name: [\(viewData.viewName)], viewID: [\(viewData.viewID)], durationSeconds: [\(duration)], wasPaused: [\(viewData.isPaused)], segmentationKeyCount: [\(segmentation.count)], segmentationKeys: [\(segmentation.keys.sorted())], keepsView: [\(keepsView)]")
         logV("stopViewInternal", "stopped view segmentation value detail, viewID: [\(viewData.viewID)], segmentation: [\(segmentation)]")
 
-        if !autoPaused {
+        if !keepsView {
             viewDataDictionary.removeValue(forKey: viewID)
             forgetRestartAliases(of: viewID)
         }
@@ -432,7 +468,7 @@ final class ViewsModule: ModuleBase {
 
     private func validateViewOperation(viewID: String, operation: String) -> Bool {
         guard !viewID.isEmpty else {
-            logE("validateViewOperation", "view ID is null or empty, the view operation will be ignored, operation: [\(operation)]")
+            warnViewNotFound("validateViewOperation", "view ID is null or empty, the view operation will be ignored, operation: [\(operation)]")
             return false
         }
 
@@ -454,8 +490,18 @@ final class ViewsModule: ModuleBase {
         return viewDataDictionary[currentViewID]
     }
 
+    /// The open view with this name that was started last.
     private func viewID(forName viewName: String) -> String? {
-        viewDataDictionary.first { $0.value.viewName == viewName }?.key
+        viewDataDictionary.values
+            .filter { $0.viewName == viewName }
+            .max { $0.startOrder < $1.startOrder }?
+            .viewID
+    }
+
+    /// Open views, oldest first, so what reaches the server keeps the order the
+    /// views were started in.
+    private var viewsOldestFirst: [CountlyViewData] {
+        viewDataDictionary.values.sorted { $0.startOrder < $1.startOrder }
     }
 
     private func stopAutoStoppedView() {
@@ -467,17 +513,7 @@ final class ViewsModule: ModuleBase {
         }
 
         logD("stopAutoStoppedView", "a new view is starting, the current auto stopped view will be stopped, viewID: [\(currentView.viewID)], name: [\(currentView.viewName)]")
-        stopViewInternal(viewID: currentView.viewID, customSegmentation: nil, autoPaused: false)
-    }
-
-    private func stopCurrentView() {
-        guard let currentView else {
-            logD("stopCurrentView", "there is no current view, nothing will be stopped")
-            return
-        }
-
-        logD("stopCurrentView", "the current view will be stopped, viewID: [\(currentView.viewID)], name: [\(currentView.viewName)]")
-        stopViewInternal(viewID: currentView.viewID, customSegmentation: nil, autoPaused: false)
+        stopViewInternal(viewID: currentView.viewID, customSegmentation: nil, keepsView: false)
     }
 
     private func stopAllViewsInternal(segmentation: [String: Any]?) {
@@ -492,30 +528,15 @@ final class ViewsModule: ModuleBase {
         // hold them. The order reaches the server, and an unordered iteration makes
         // two identical runs report the same screens in different sequences, which
         // is noise in the data and noise in any test that compares captures.
-        let ordered = viewDataDictionary
-            .sorted { $0.value.viewStartTime < $1.value.viewStartTime }
-            .map(\.key)
-
-        for viewID in ordered {
-            stopViewInternal(viewID: viewID, customSegmentation: segmentation, autoPaused: false)
-        }
-    }
-
-    /// Closes every open view but remembers them, so foregrounding can reopen them
-    /// with fresh IDs and durations.
-    private func stopRunningViewsForRestart() {
-        logD("stopRunningViewsForRestart", "running views will be stopped automatically and marked for restart, viewCount: [\(viewDataDictionary.count)]")
-        for viewData in viewDataDictionary.values.sorted(by: { $0.viewStartTime < $1.viewStartTime }) {
-            viewData.willStartAgain = true
-            stopViewInternal(viewID: viewData.viewID, customSegmentation: nil, autoPaused: true)
+        for viewData in viewsOldestFirst {
+            stopViewInternal(viewID: viewData.viewID, customSegmentation: segmentation, keepsView: false)
         }
     }
 
     /// Reopens the views that backgrounding closed.
     private func startStoppedViews() {
-        let toRestart = viewDataDictionary.values
-            .filter(\.willStartAgain)
-            .sorted { $0.viewStartTime < $1.viewStartTime }
+        let toRestart = viewsOldestFirst.filter(\.willStartAgain)
+        guard !toRestart.isEmpty else { return }
         logD("startStoppedViews", "previously stopped views will be started automatically, viewCount: [\(toRestart.count)]")
 
         for viewData in toRestart {
@@ -565,6 +586,43 @@ final class ViewsModule: ModuleBase {
         isFirstView = true
     }
 
+    // MARK: - Identity changes
+
+    /// Stops every view before the identity its events carry changes: a device
+    /// ID change without merge or an app key change. Each view, automatic or
+    /// manual, paused or stopped by the background, records its end event under
+    /// the leaving identity, and none starts again: the view IDs the app holds
+    /// stop working.
+    func stopAllViewsForIdentityChange() {
+        logD("stopAllViewsForIdentityChange", "the identity changes, every view is stopped for good, viewCount: [\(viewDataDictionary.count)]")
+        stopAllViewsInternal(segmentation: nil)
+
+        // What consent or the behavior settings kept from being stopped above goes too.
+        viewDataDictionary.removeAll()
+        restartedViewIDs.removeAll()
+        currentViewID = nil
+        previousViewID = nil
+        currentViewName = nil
+        previousViewName = nil
+    }
+
+    /// Starts a view for the screen on display after an identity change, with
+    /// automatic view tracking. In the background the screen gets its view when
+    /// the application returns. Manual views are left to the application.
+    func startViewForCurrentScreenAfterIdentityChange() {
+        #if os(iOS) || os(tvOS) || os(visionOS)
+        guard isAutoViewTrackingActive else { return }
+        guard AppState.isForeground else {
+            reopensScreenOnForeground = true
+            return
+        }
+        onMainThread { [weak self, core] in
+            guard let self, core.hasStarted, self.isAutoViewTrackingActive else { return }
+            self.startViewForTopViewController(from: "startViewForCurrentScreenAfterIdentityChange")
+        }
+        #endif
+    }
+
     // MARK: - Automatic view tracking
 
     /// Starts reporting a view for every view controller that appears.
@@ -602,8 +660,9 @@ final class ViewsModule: ModuleBase {
     /// unless it has no usable name or is excluded.
     ///
     /// Used where the screen is already showing and no appearance will report
-    /// it: when tracking starts, and when the application comes back from the
-    /// background, which UIKit does not report as an appearance.
+    /// it: when tracking starts, when the application comes back from the
+    /// background, which UIKit does not report as an appearance, and after an
+    /// identity change.
     private func startViewForTopViewController(from function: String) {
         let topViewController = AutoViewTracker.topViewController()
         guard let topViewController, let title = AutoViewTracker.title(for: topViewController) else {
@@ -614,7 +673,8 @@ final class ViewsModule: ModuleBase {
         guard !isExcludedFromAutoTracking(topViewController, title: title, from: function) else { return }
 
         logD(function, "the view already on screen will be started automatically, name: [\(title)]")
-        _ = startViewInternal(title, customSegmentation: nil, isAutoStoppedView: true)
+        core.healthTracker.recordUsage(.views, "start", automatic: true)
+        _ = startViewInternal(title, customSegmentation: nil, isAutoStoppedView: true, isAutomatic: true)
     }
     #endif
 
@@ -703,7 +763,8 @@ final class ViewsModule: ModuleBase {
         // Android and one here. Android is the reference when the SDKs disagree,
         // and a screen time feature that reports one screen out of three is not
         // worth being bug-compatible about.
-        _ = startViewInternal(title, customSegmentation: nil, isAutoStoppedView: true)
+        core.healthTracker.recordUsage(.views, "start", automatic: true)
+        _ = startViewInternal(title, customSegmentation: nil, isAutoStoppedView: true, isAutomatic: true)
     }
 
     /// Whether the exclusion list covers this screen.
@@ -737,12 +798,11 @@ final class ViewsModule: ModuleBase {
 
     // MARK: - Orientation
 
-    /// Reports the interface orientation when it changes.
+    /// Records the interface orientation when it changed, or whenever `force` is
+    /// set, which a session start uses so every `begin_session` carries one.
     ///
     /// Deduplicated: rotation notifications fire more often than the orientation
     /// actually changes, and a repeated event would inflate the numbers.
-    /// Records the interface orientation when it changed, or whenever `force` is set,
-    /// which a session start uses so every `begin_session` carries one.
     func recordOrientation(force: Bool = false) {
         #if os(iOS)
         guard core.config.enableOrientationTracking else {
@@ -792,6 +852,9 @@ final class ViewsModule: ModuleBase {
 
     // MARK: - Lifecycle
 
+    /// Starts again what the background stopped: the manual views marked for a
+    /// restart, as new views, and with automatic view tracking a view for the
+    /// screen on display.
     func applicationWillEnterForeground() {
         // Android re-reads the orientation on every activity start, not only at
         // launch, so a device rotated while the app was away is reported on the way
@@ -799,54 +862,47 @@ final class ViewsModule: ModuleBase {
         // nothing changed.
         recordOrientation()
 
+        startStoppedViews()
+
         #if os(iOS) || os(tvOS) || os(visionOS)
-        if isAutoViewTrackingActive {
-            guard reopensScreenOnForeground else {
-                logD("applicationWillEnterForeground", "app entered foreground with automatic view tracking active, the background stopped no view, nothing is reopened")
-                return
-            }
-            reopensScreenOnForeground = false
-            logD("applicationWillEnterForeground", "app entered foreground with automatic view tracking active, the screen on display gets its view again")
-            onMainThread { [weak self, core] in
-                guard let self, core.hasStarted, self.isAutoViewTrackingActive else { return }
-                self.startViewForTopViewController(from: "applicationWillEnterForeground")
-            }
-        } else if isManualViewRestartActive {
-            logD("applicationWillEnterForeground", "app entered foreground with manual view restart active, stopped views will be started automatically")
-            startStoppedViews()
-        } else {
-            logD("applicationWillEnterForeground", "app entered foreground, no views will be restarted, isAutoViewTrackingActive: [\(isAutoViewTrackingActive)], isManualViewRestartActive: [\(isManualViewRestartActive)]")
+        guard isAutoViewTrackingActive else { return }
+        guard reopensScreenOnForeground else {
+            logD("applicationWillEnterForeground", "app entered foreground with automatic view tracking active, the background stopped no view, nothing is reopened")
+            return
         }
-        #else
-        if isManualViewRestartActive {
-            logD("applicationWillEnterForeground", "app entered foreground on a non UIKit platform, stopped views will be started automatically")
-            startStoppedViews()
-        } else {
-            logD("applicationWillEnterForeground", "app entered foreground on a non UIKit platform with manual view restart off, no views will be restarted")
+        reopensScreenOnForeground = false
+        logD("applicationWillEnterForeground", "app entered foreground with automatic view tracking active, the screen on display gets its view again")
+        onMainThread { [weak self, core] in
+            guard let self, core.hasStarted, self.isAutoViewTrackingActive else { return }
+            self.startViewForTopViewController(from: "applicationWillEnterForeground")
         }
         #endif
     }
 
+    /// Stops every running view with the time it was on screen, so no view counts
+    /// time the application spends in the background. Manual views are kept for a
+    /// restart on foreground unless `disableViewRestartForManualRecording` is set;
+    /// an automatic view is not kept, the screen on display gets a new one. A
+    /// paused view stays paused.
     func applicationDidEnterBackground() {
+        let running = viewsOldestFirst.filter { !$0.isPaused }
+        logD("applicationDidEnterBackground", "app entered background, running views will be stopped, runningViewCount: [\(running.count)], manualViewRestart: [\(isManualViewRestartActive)], automaticViewTracking: [\(isAutoViewTrackingActive)]")
+
         #if os(iOS) || os(tvOS) || os(visionOS)
-        if isAutoViewTrackingActive {
-            logD("applicationDidEnterBackground", "app entered background while automatic view tracking is active, current view will be stopped automatically")
-            reopensScreenOnForeground = reopensScreenOnForeground || currentView != nil
-            stopCurrentView()
-        } else if isManualViewRestartActive {
-            logD("applicationDidEnterBackground", "app entered background with manual view restart active, running views will be stopped automatically")
-            stopRunningViewsForRestart()
-        } else {
-            logD("applicationDidEnterBackground", "app entered background with automatic view tracking and manual view restart both off, running views will be left open, viewCount: [\(viewDataDictionary.count)]")
-        }
-        #else
-        if isManualViewRestartActive {
-            logD("applicationDidEnterBackground", "app entered background on a non UIKit platform, running views will be stopped automatically")
-            stopRunningViewsForRestart()
-        } else {
-            logD("applicationDidEnterBackground", "app entered background on a non UIKit platform with manual view restart off, running views will be left open, viewCount: [\(viewDataDictionary.count)]")
+        if running.contains(where: \.isAutomatic) {
+            reopensScreenOnForeground = true
         }
         #endif
+
+        for viewData in running {
+            if !viewData.isAutomatic, isManualViewRestartActive {
+                stopViewInternal(viewID: viewData.viewID, customSegmentation: nil, keepsView: true)
+                viewData.pause()
+                viewData.willStartAgain = true
+            } else {
+                stopViewInternal(viewID: viewData.viewID, customSegmentation: nil, keepsView: false)
+            }
+        }
     }
 
     func applicationWillTerminate() {
@@ -876,5 +932,6 @@ final class ViewsModule: ModuleBase {
         previousViewName = nil
         lastInterfaceOrientation = nil
         isFirstView = true
+        nextStartOrder = 0
     }
 }

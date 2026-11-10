@@ -325,6 +325,28 @@ final class PushRuntime: NSObject {
         }
     }
 
+    private func logWarning(_ function: String, _ message: String) {
+        for module in subscribers.current() {
+            module.core.logger.w(Self.module, function, message)
+        }
+    }
+
+    // MARK: - Taps before start
+
+    /// Keeps a tap that arrived while no instance was running, with the time it
+    /// happened, so the default instance records it once it starts. Every such
+    /// tap is kept, in storage, until it is recorded.
+    private func storePendingTap(notificationID: String, buttonIndex: Int) {
+        let defaults = UserDefaults.standard
+        var taps = defaults.array(forKey: PersistencyKey.pendingPushActions) as? [[String: Any]] ?? []
+        taps.append([
+            PendingPushActionKey.notificationID: notificationID,
+            PendingPushActionKey.buttonIndex: buttonIndex,
+            PendingPushActionKey.time: Date().timeIntervalSince1970,
+        ])
+        defaults.set(taps, forKey: PersistencyKey.pendingPushActions)
+    }
+
     /// One line describing a notification, for the log.
     private func describe(_ request: UNNotificationRequest) -> String {
         let content = request.content
@@ -337,14 +359,19 @@ final class PushRuntime: NSObject {
 
     // MARK: - Opening a URL
 
-    /// Opens the URL a notification action carries.
-    func openURL(_ urlString: String?) {
+    /// Opens the URL a notification action carries, unless its scheme is a
+    /// dangerous one or not among `allowedSchemes` when those are set.
+    func openURL(_ urlString: String?, allowedSchemes: [String] = []) {
         guard let urlString, !urlString.isEmpty else {
             log("openURL", "no URL to open, the notification action carries none")
             return
         }
         guard let url = URL(string: urlString) else {
             log("openURL", "the URL carried by the notification is not a valid URL, it is not opened, url: [\(urlString)]")
+            return
+        }
+        guard LinkSchemePolicy.isAllowed(scheme: url.scheme, allowedSchemes: allowedSchemes) else {
+            logWarning("openURL", "the link of the notification is not opened, its scheme is not allowed, scheme: [\(url.scheme ?? "")], allowedSchemeCount: [\(allowedSchemes.count)]")
             return
         }
 
@@ -509,6 +536,16 @@ extension PushRuntime: UNUserNotificationCenterDelegate {
         }
 
         let modules = subscribers.current()
+
+        // A tap that started the application before the SDK did is recorded once
+        // the default instance starts, with the time it happened.
+        guard !modules.isEmpty else {
+            if let notificationID = payload[CountlyPushKey.notificationID] as? String {
+                storePendingTap(notificationID: notificationID, buttonIndex: buttonIndex)
+            }
+            return
+        }
+
         logInfo("handle", "notification action resolved, countlyID: [\(payload[CountlyPushKey.notificationID] as? String ?? "")], actionIdentifier: [\(response.actionIdentifier)], buttonIndex: [\(buttonIndex)], tappedBody: [\(buttonIndex == 0)], url: [\(url ?? "none")], instanceCount: [\(modules.count)]")
 
         for module in modules {
@@ -523,7 +560,16 @@ extension PushRuntime: UNUserNotificationCenterDelegate {
             return
         }
 
-        openURL(url)
+        // The application's handler gets the link first, on the main thread.
+        let handler = modules.lazy.compactMap(\.actionHandler).first
+        let allowedSchemes = modules.first?.allowedLinkSchemes ?? []
+        onMainThread { [weak self] in
+            if let handler, handler(url.flatMap { URL(string: $0) }, userInfo) {
+                self?.log("handle", "the application's action handler took the link over, the SDK opens nothing")
+                return
+            }
+            self?.openURL(url, allowedSchemes: allowedSchemes)
+        }
     }
 
     private func countlyPayload(in userInfo: [AnyHashable: Any]) -> [String: Any]? {

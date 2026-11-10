@@ -78,31 +78,38 @@ final class UserProfileTests: CountlyBaseTestCase {
         XCTAssertEqual(TestUtils.int(custom["seats"]), 12)
     }
 
-    /// `NSNull` clears a predefined field on the server. It is meaningless for a
-    /// custom key, which is unset through its own call, so it is dropped there.
-    func testNullClearsAPredefinedFieldAndIsIgnoredForACustomOne() {
+    /// A null value is ignored with a warning; an empty string is how a property is
+    /// cleared, and goes out as a JSON null, which the server removes.
+    func testANullValueIsIgnoredAndAnEmptyStringClears() {
         let countly = startInstance()
 
         countly.userProfile.setProperties(["name": NSNull(), "plan": NSNull()])
         countly.userProfile.save()
+        XCTAssertNil(lastUserDetails(of: countly), "nothing was staged")
+        XCTAssertEqual(logCodeCount(HealthLogCode.invalidValue, of: countly), 2)
 
-        guard let details = lastUserDetails(of: countly) else {
-            XCTFail("clearing a predefined field is a change worth sending")
-            return
-        }
-        XCTAssertTrue(details["name"] is NSNull)
-        XCTAssertNil(lastCustom(of: countly)["plan"])
+        countly.userProfile.setProperties(["name": "", "plan": ""])
+        countly.userProfile.save()
+
+        XCTAssertTrue(lastUserDetails(of: countly)?["name"] is NSNull)
+        XCTAssertTrue(lastCustom(of: countly)["plan"] is NSNull)
     }
 
-    /// A negative birth year is not a year. Sending null clears the field rather
-    /// than storing nonsense the dashboard would then plot.
-    func testANegativeBirthYearClearsTheFieldInsteadOfBeingStored() {
+    /// A birth year is a whole number. Anything else is ignored with a warning
+    /// rather than stored as nonsense the dashboard would then plot.
+    func testABirthYearHasToBeAWholeNumber() {
         let countly = startInstance()
 
         countly.userProfile.setProperty("byear", value: -50)
+        countly.userProfile.setProperty("byear", value: "1990")
+        countly.userProfile.setProperty("byear", value: 1990.5)
         countly.userProfile.save()
+        XCTAssertNil(lastUserDetails(of: countly))
+        XCTAssertEqual(logCodeCount(HealthLogCode.invalidValue, of: countly), 3)
 
-        XCTAssertTrue(lastUserDetails(of: countly)?["byear"] is NSNull)
+        countly.userProfile.setProperty("byear", value: 1990)
+        countly.userProfile.save()
+        XCTAssertEqual(TestUtils.int(lastUserDetails(of: countly)?["byear"]), 1990)
     }
 
     // MARK: - Custom properties
@@ -160,9 +167,16 @@ final class UserProfileTests: CountlyBaseTestCase {
         XCTAssertNotNil((custom["removed_tags"] as? [String: Any])?["$pull"])
     }
 
-    /// A pull on a key that already carries pushes must not throw the pushes away:
-    /// the server applies both, and that is what every other Countly SDK sends.
-    func testAPullKeepsThePushesStagedForTheSameKey() {
+    /// The `custom` objects of every profile request, oldest first.
+    private func customs(of instance: CountlyInstance) -> [[String: Any]] {
+        TestUtils.requests(requestQueue(of: instance), carrying: "user_details")
+            .compactMap { ($0["user_details"] as? [String: Any])?["custom"] as? [String: Any] }
+    }
+
+    /// The server cannot apply two different modifiers to one property in one
+    /// request, so a pull on a key with pending pushes saves the pushes first, and
+    /// both reach the server in call order.
+    func testADifferentModifierForAKeySavesThePendingOneFirst() {
         let countly = startInstance()
 
         countly.userProfile.push("tags", value: "alpha")
@@ -170,9 +184,52 @@ final class UserProfileTests: CountlyBaseTestCase {
         countly.userProfile.pull("tags", value: "alpha")
         countly.userProfile.save()
 
-        let tags = lastCustom(of: countly)["tags"] as? [String: Any]
-        XCTAssertEqual((tags?["$push"] as? [Any])?.count, 2, "both pushes survive the pull")
-        XCTAssertEqual(tags?["$pull"] as? String, "alpha")
+        let sent = customs(of: countly).compactMap { $0["tags"] as? [String: Any] }
+        XCTAssertEqual(sent.count, 2)
+        XCTAssertEqual((sent.first?["$push"] as? [Any])?.map { "\($0)" }, ["alpha", "beta"])
+        XCTAssertEqual((sent.last?["$pull"] as? [Any])?.map { "\($0)" }, ["alpha"])
+    }
+
+    /// A value and a modifier for one key go out in call order too.
+    func testAValueAndAModifierForOneKeyGoOutInCallOrder() {
+        let countly = startInstance()
+
+        countly.userProfile.setCustomProperty("level", value: 5)
+        countly.userProfile.increment("level")
+        countly.userProfile.save()
+
+        let sent = customs(of: countly).compactMap { $0["level"] }
+        XCTAssertEqual(sent.count, 2)
+        XCTAssertEqual(TestUtils.int(sent.first), 5)
+        XCTAssertEqual(TestUtils.int((sent.last as? [String: Any])?["$inc"]), 1)
+    }
+
+    /// The same modifier called again on a key is combined the way the server
+    /// would have applied the calls one after the other.
+    func testRepeatedModifiersAreCombined() {
+        let countly = startInstance()
+
+        countly.userProfile.incrementBy("credits", value: 5)
+        countly.userProfile.incrementBy("credits", value: 5)
+        countly.userProfile.multiply("factor", value: 2)
+        countly.userProfile.multiply("factor", value: 3)
+        countly.userProfile.max("best", value: 5)
+        countly.userProfile.max("best", value: 9)
+        countly.userProfile.max("best", value: 7)
+        countly.userProfile.min("worst", value: 5)
+        countly.userProfile.min("worst", value: 2)
+        countly.userProfile.min("worst", value: 7)
+        countly.userProfile.setOnce("first", value: "a")
+        countly.userProfile.setOnce("first", value: "b")
+        countly.userProfile.save()
+
+        XCTAssertEqual(customs(of: countly).count, 1, "one request carries all of them")
+        let custom = lastCustom(of: countly)
+        XCTAssertEqual(TestUtils.int((custom["credits"] as? [String: Any])?["$inc"]), 10)
+        XCTAssertEqual(TestUtils.int((custom["factor"] as? [String: Any])?["$mul"]), 6)
+        XCTAssertEqual(TestUtils.int((custom["best"] as? [String: Any])?["$max"]), 9)
+        XCTAssertEqual(TestUtils.int((custom["worst"] as? [String: Any])?["$min"]), 2)
+        XCTAssertEqual((custom["first"] as? [String: Any])?["$setOnce"] as? String, "a")
     }
 
     /// Pushing three values before a save has to send all three. Overwriting would
@@ -307,6 +364,8 @@ final class UserProfileTests: CountlyBaseTestCase {
 
     // MARK: - Consent
 
+    /// Without the "users" consent a profile call is ignored, not kept for later:
+    /// consent given afterwards does not send what was set before it.
     func testNothingIsSentWithoutUserDetailsConsent() {
         let countly = startInstance { $0.requiresConsent = true }
 
@@ -316,8 +375,12 @@ final class UserProfileTests: CountlyBaseTestCase {
 
         countly.consent.giveConsent(for: .userDetails)
         countly.userProfile.save()
-        XCTAssertEqual(TestUtils.requests(requestQueue(of: countly), carrying: "user_details").count, 1,
-                       "the properties were staged all along, and consent releases them")
+        XCTAssertTrue(TestUtils.requests(requestQueue(of: countly), carrying: "user_details").isEmpty,
+                      "a call made without consent was ignored")
+
+        countly.userProfile.setProperty("name", value: "Ada")
+        countly.userProfile.save()
+        XCTAssertEqual(TestUtils.requests(requestQueue(of: countly), carrying: "user_details").count, 1)
     }
 
     // MARK: - Limits
@@ -402,38 +465,35 @@ final class UserProfileTests: CountlyBaseTestCase {
 
     // MARK: - The server's cache limit
 
-    /// The server can cap how many custom properties the SDK holds. Past the cap
-    /// the extras are dropped rather than sent, because a profile with thousands of
-    /// one-off keys is a bug in the integration and forwarding it makes it the
-    /// server's problem too.
-    func testCustomPropertiesAreTrimmedToTheServersCacheLimit() {
+    /// The server's cache limit is when the SDK saves by itself. Nothing pending is
+    /// ever dropped because of it.
+    func testReachingTheServersCacheLimitSavesAutomaticallyAndDropsNothing() {
         let countly = startInstance {
             $0.sdkBehaviorSettings = ServerConfigBuilder().userPropertyCacheLimit(3).json()
         }
 
-        // Deliberately set in an order unrelated to the sort order, so a trim that
-        // happened to keep insertion order would not pass by luck.
-        countly.userProfile.setProperties([
-            "zeta": 1, "alpha": 2, "mike": 3, "bravo": 4, "yankee": 5,
-        ])
+        countly.userProfile.setCustomProperty("zeta", value: 1)
+        countly.userProfile.setCustomProperty("alpha", value: 2)
+        XCTAssertTrue(customs(of: countly).isEmpty, "below the limit nothing is saved by itself")
+        countly.userProfile.setCustomProperty("mike", value: 3)
+        XCTAssertEqual(customs(of: countly).count, 1, "reaching the limit saves")
+
+        countly.userProfile.setCustomProperty("bravo", value: 4)
+        countly.userProfile.setCustomProperty("yankee", value: 5)
         countly.userProfile.save()
 
-        let custom = lastCustom(of: countly)
-
-        XCTAssertEqual(custom.count, 3, "the limit was not applied")
-        // Sorted rather than arbitrary: the same overflowing profile has to trim the
-        // same way twice, or two devices with identical data disagree on the server.
-        XCTAssertEqual(Set(custom.keys), ["alpha", "bravo", "mike"])
+        let sentKeys = customs(of: countly).flatMap(\.keys)
+        XCTAssertEqual(Set(sentKeys), ["zeta", "alpha", "mike", "bravo", "yankee"])
     }
 
-    /// At or below the limit nothing is touched. The trim allocates and sorts, so
-    /// it must not run for the ordinary profile that is nowhere near the cap.
+    /// Below the limit a save is the application's call.
     func testCustomPropertiesAreLeftAloneBelowTheLimit() {
         let countly = startInstance {
             $0.sdkBehaviorSettings = ServerConfigBuilder().userPropertyCacheLimit(5).json()
         }
 
         countly.userProfile.setProperties(["a": 1, "b": 2, "c": 3])
+        XCTAssertTrue(customs(of: countly).isEmpty)
         countly.userProfile.save()
 
         XCTAssertEqual(Set(lastCustom(of: countly).keys), ["a", "b", "c"])

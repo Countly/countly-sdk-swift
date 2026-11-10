@@ -116,6 +116,20 @@ final class ConnectionTestModule: ModuleBase {
     private var batteryRunning = false
     private var halted = false
 
+    /// An armed run that waits for the application to be in the foreground,
+    /// because network requests stall in the background.
+    private struct PendingRun {
+        let serverConfigLatencyMs: Int64
+        let identity: ArmedIdentity?
+        let mergesAtArming: Int
+    }
+
+    private var pendingRun: PendingRun?
+
+    /// Set when the application goes to the background during a battery, whose
+    /// results are then dropped and which runs again in the foreground.
+    private var interrupted = false
+
     /// Test hooks: the deadlines can be shrunk and the network swapped out.
     var perRequestTimeout: TimeInterval = ConnectionTestModule.defaultPerRequestTimeout
     var batteryCapExtra: TimeInterval = ConnectionTestModule.defaultBatteryCapExtra
@@ -136,7 +150,62 @@ final class ConnectionTestModule: ModuleBase {
     override func halt(clearStorage: Bool) {
         stateLock.lock()
         halted = true
+        pendingRun = nil
         stateLock.unlock()
+    }
+
+    override func didEnterBackground() {
+        guard Self.waitsForTheForeground else { return }
+        stateLock.lock()
+        if batteryRunning {
+            interrupted = true
+        }
+        stateLock.unlock()
+    }
+
+    override func didEnterForeground() {
+        startPendingRun(assumingForeground: true)
+    }
+
+    /// Whether the probes wait for the foreground. iOS, tvOS, visionOS and watchOS
+    /// suspend an application in the background, which stalls them; a macOS
+    /// application keeps its network when it is not frontmost.
+    private static var waitsForTheForeground: Bool {
+        #if os(macOS)
+        return false
+        #else
+        return true
+        #endif
+    }
+
+    /// Whether the probes may run now.
+    ///
+    /// - Parameter assumingForeground: whether the caller knows the application
+    ///   is in the foreground, as the foreground hook does before the cached state
+    ///   is updated.
+    private func mayProbeNow(assumingForeground: Bool) -> Bool {
+        assumingForeground || !Self.waitsForTheForeground || AppState.isForeground
+    }
+
+    /// Starts the armed run that waited for the foreground, if there is one.
+    ///
+    /// - Parameter assumingForeground: whether the caller knows the application
+    ///   is in the foreground, as the foreground hook does before the cached state
+    ///   is updated.
+    private func startPendingRun(assumingForeground: Bool) {
+        guard mayProbeNow(assumingForeground: assumingForeground) else { return }
+
+        stateLock.lock()
+        let pending = pendingRun
+        pendingRun = nil
+        stateLock.unlock()
+
+        guard let pending else { return }
+        logD("startPendingRun", "the application is in the foreground, the waiting connection test runs now")
+        startBattery(serverConfigLatencyMs: pending.serverConfigLatencyMs,
+                     armedFor: pending.identity,
+                     mergesAtArming: pending.mergesAtArming,
+                     assumingForeground: true)
     }
 
     /// Takes the single battery slot, checked and claimed in one critical section
@@ -171,7 +240,13 @@ final class ConnectionTestModule: ModuleBase {
     ///   - mergesAtArming: the device ID merges counted when the arming fetch was
     ///     made. A merge since then cancels the run on the server, so the report is
     ///     dropped.
-    func startBattery(serverConfigLatencyMs: Int64, armedFor identity: ArmedIdentity? = nil, mergesAtArming: Int? = nil) {
+    ///   - assumingForeground: whether the caller knows the application is in the
+    ///     foreground. Otherwise a run armed while it is in the background waits,
+    ///     except on macOS.
+    func startBattery(serverConfigLatencyMs: Int64,
+                      armedFor identity: ArmedIdentity? = nil,
+                      mergesAtArming: Int? = nil,
+                      assumingForeground: Bool = false) {
         // The spec does not cover it: honouring the operator's own kill switch was
         // judged safer than probe traffic.
         guard core.serverConfig.networkingEnabled else {
@@ -184,12 +259,21 @@ final class ConnectionTestModule: ModuleBase {
             return
         }
 
+        let mergesAtArming = mergesAtArming ?? core.modules.deviceID.mergeCount
+
+        guard mayProbeNow(assumingForeground: assumingForeground) else {
+            stateLock.lock()
+            pendingRun = PendingRun(serverConfigLatencyMs: serverConfigLatencyMs, identity: identity, mergesAtArming: mergesAtArming)
+            stateLock.unlock()
+            logD("startBattery", "the application is in the background, the armed connection test runs once it is in the foreground")
+            return
+        }
+
         if let refusal = claimBattery() {
             logD("startBattery", refusal)
             return
         }
 
-        let mergesAtArming = mergesAtArming ?? core.modules.deviceID.mergeCount
         logI("startBattery", "connection test armed by the server, running the probe battery, serverConfigLatencyMs: [\(serverConfigLatencyMs)]")
 
         // The core is captured strongly for the life of the battery: the module
@@ -202,6 +286,7 @@ final class ConnectionTestModule: ModuleBase {
                                      mergesAtArming: mergesAtArming,
                                      serverURL: core.config.normalizedHost)
             self.releaseBattery()
+            self.startPendingRun(assumingForeground: false)
         }
     }
 
@@ -216,6 +301,19 @@ final class ConnectionTestModule: ModuleBase {
 
         guard !isHalted else {
             logD("runBatteryAndReport", "the module was halted during the battery, the report is dropped")
+            return
+        }
+
+        stateLock.lock()
+        let wasInterrupted = interrupted
+        interrupted = false
+        if wasInterrupted {
+            pendingRun = PendingRun(serverConfigLatencyMs: serverConfigLatencyMs, identity: identity, mergesAtArming: mergesAtArming)
+        }
+        stateLock.unlock()
+
+        guard !wasInterrupted else {
+            logD("runBatteryAndReport", "the application went to the background during the battery, its results are dropped and it runs again in the foreground")
             return
         }
 
@@ -380,10 +478,11 @@ final class ConnectionTestModule: ModuleBase {
 
 /// Issues one probe. A protocol so tests can swap the network out.
 protocol ProbeTransport: AnyObject {
-    /// One bare GET, waited for synchronously.
+    /// One probe, waited for synchronously: a GET for what a web view loads, a
+    /// POST like the SDK's own requests for an API path.
     ///
     /// - Parameter loadedByWebView: whether a web view loads this path, which then
-    ///   goes out without the SDK's custom headers and certificate pinning.
+    ///   goes out as a GET without the SDK's custom headers and certificate pinning.
     func probe(_ url: URL, timeout: TimeInterval, loadedByWebView: Bool) -> ConnectionTestModule.ProbeOutcome
     /// Called once the battery is over, so a transport can release what it built.
     func batteryFinished()
@@ -409,8 +508,10 @@ final class URLSessionProbeTransport: NSObject, ProbeTransport {
     }
 
     func probe(_ url: URL, timeout: TimeInterval, loadedByWebView: Bool) -> ConnectionTestModule.ProbeOutcome {
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
+        var request = loadedByWebView ? URLRequest(url: url) : Self.postRequest(from: url)
+        if loadedByWebView {
+            request.httpMethod = "GET"
+        }
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         request.timeoutInterval = timeout
 
@@ -452,6 +553,21 @@ final class URLSessionProbeTransport: NSObject, ProbeTransport {
         return ConnectionTestModule.ProbeOutcome(status: status,
                                                  latencyMs: Int64(-start.timeIntervalSinceNow * 1000),
                                                  failure: failure)
+    }
+
+    /// The POST form of an API path's probe: the path alone in the URL, and the
+    /// method parameter and the `ct` marker in the body, the way the SDK sends its
+    /// own requests. The cache buster is left out, since a POST is not cached.
+    static func postRequest(from url: URL) -> URLRequest {
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let items = (components?.queryItems ?? []).filter { $0.name != "_" }
+        components?.query = nil
+
+        var request = URLRequest(url: components?.url ?? url)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data(items.map { "\($0.name)=\(($0.value ?? "").urlEscaped)" }.joined(separator: "&").utf8)
+        return request
     }
 
     func batteryFinished() {

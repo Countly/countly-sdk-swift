@@ -82,23 +82,51 @@ final class NetworkingTests: CountlyBaseTestCase {
 
     // MARK: - Judging a response
 
-    /// Only the ingest endpoint promises a `result` field. The read endpoints
-    /// answer with application payload of their own shape, so demanding `result`
-    /// there marks a perfectly good response as a failure and leaves the request
-    /// at the head of the queue to be re-sent on every later drain.
-    func testAcceptanceIsJudgedPerEndpoint() {
+    /// Every queued request is accepted only with a JSON object carrying
+    /// `result`, also the A/B enrollment the queue sends to `/o/sdk`: that
+    /// endpoint answers with `result` as well.
+    func testAQueuedRequestToAnotherEndpointNeedsAResultField() {
         MockURLProtocol.respond { captured in
-            captured.path == "/i" ? (200, Data(#"{"result": "Success"}"#.utf8)) : nil
-        }
-        MockURLProtocol.respond { captured in
-            // A read endpoint answering with its own shape and no `result` field.
             captured.path.hasPrefix("/o") ? (200, Data(#"{"colour": "blue"}"#.utf8)) : nil
         }
+        let countly = startInstance()
 
-        let countly = startInstance { $0.eventSendThreshold = 1 }
-        countly.events.recordEvent("ingested")
+        countly.remoteConfig.enrollIntoABTests(forKeys: ["button_colour"])
+        TestUtils.pump(0.4)
+        XCTAssertEqual(TestUtils.requests(requestQueue(of: countly), carrying: "keys").count, 1,
+                       "a 2xx without result is not an acceptance")
 
-        TestUtils.waitUntil("the ingest request is accepted") {
+        MockURLProtocol.reset()
+        MockURLProtocol.respond { captured in
+            captured.path.hasPrefix("/o") ? (200, Data(#"{"result": "Successfully enrolled in ab tests"}"#.utf8)) : nil
+        }
+        countly.requestQueue.attemptToSendStoredRequests()
+
+        TestUtils.waitUntil("the enrollment is accepted") {
+            TestUtils.requests(self.requestQueue(of: countly), carrying: "keys").isEmpty
+        }
+    }
+
+    /// After a failure the queue waits for the cool-down: requests recorded in
+    /// the meantime do not start an earlier attempt, so a server that is down is
+    /// not hit by every event the application records.
+    func testAFailedRequestWaitsForTheCooldownBeforeItIsTriedAgain() {
+        let countly = startInstance {
+            $0.eventSendThreshold = 1
+            $0.failedRequestCooldown = 1
+        }
+        let eventAttempts = { MockURLProtocol.requests.filter { $0.query.contains("events=") }.count }
+
+        countly.events.recordEvent("first")
+        TestUtils.waitUntil("the first attempt fails") { eventAttempts() == 1 }
+
+        countly.events.recordEvent("second")
+        countly.events.recordEvent("third")
+        TestUtils.pump(0.3)
+        XCTAssertEqual(eventAttempts(), 1, "nothing is sent while the cool-down runs")
+
+        MockURLProtocol.respondToEverything(json: #"{"result": "Success"}"#)
+        TestUtils.waitUntil("the queue drains once the cool-down is over", timeout: 5) {
             self.requestQueue(of: countly).isEmpty
         }
     }
@@ -127,13 +155,35 @@ final class NetworkingTests: CountlyBaseTestCase {
 
     // MARK: - Request shape
 
-    func testAShortRequestGoesOutAsAGET() {
+    /// Every request, queued or immediate, is a form POST with its data in the
+    /// body and only the path in the URL, which keeps personal data out of server
+    /// and proxy access logs.
+    func testEveryRequestIsAPOSTWithItsDataInTheBody() {
         MockURLProtocol.respondToEverything(json: #"{"result": "Success"}"#)
         let countly = startInstance { $0.eventSendThreshold = 1 }
 
         countly.events.recordEvent("short")
+        _ = eventRequest("short")
 
-        XCTAssertEqual(eventRequest("short")?.method, "GET")
+        XCTAssertGreaterThan(MockURLProtocol.requests.count, 1, "the start-up requests are checked as well")
+        for request in MockURLProtocol.requests {
+            XCTAssertEqual(request.method, "POST", "path: \(request.path)")
+            XCTAssertNil(request.url.query, "nothing but the path goes into the URL, path: \(request.path)")
+            XCTAssertEqual(request.headers["Content-Type"], "application/x-www-form-urlencoded", "path: \(request.path)")
+        }
+    }
+
+    /// A request that skips the queue still tells the server how many requests
+    /// wait on the device: the number queued at that moment.
+    func testImmediateRequestsCarryTheQueuedRequestCount() {
+        MockURLProtocol.respondToEverything(json: #"{"result": "Success"}"#)
+        _ = startInstance()
+
+        TestUtils.waitUntil("the behavior settings fetch is sent") {
+            MockURLProtocol.requests.contains { $0.query.contains("method=sc") }
+        }
+        let fetch = MockURLProtocol.requests.first { $0.query.contains("method=sc") }
+        XCTAssertNotNil(TestUtils.parseQuery(fetch?.query ?? "")["rr"])
     }
 
     /// A URL has a length past which servers and proxies start refusing it, so a
@@ -150,18 +200,6 @@ final class NetworkingTests: CountlyBaseTestCase {
         let sent = eventRequest("long")
         XCTAssertEqual(sent?.method, "POST")
         XCTAssertTrue(sent?.query.contains("blob") == true)
-    }
-
-    func testEveryRequestCanBeForcedIntoAPOST() {
-        MockURLProtocol.respondToEverything(json: #"{"result": "Success"}"#)
-        let countly = startInstance {
-            $0.eventSendThreshold = 1
-            $0.alwaysUsePOST = true
-        }
-
-        countly.events.recordEvent("short-but-posted")
-
-        XCTAssertEqual(eventRequest("short-but-posted")?.method, "POST")
     }
 
     // MARK: - The checksum

@@ -60,6 +60,20 @@ final class KeyValueStore {
         set { set(newValue, PersistencyKey.isCustomDeviceID) }
     }
 
+    /// The device ID in use before temporary device ID mode was entered at
+    /// runtime, which leaving the mode without a new ID returns to. `nil` when the
+    /// mode started at init with no earlier ID.
+    var preTemporaryDeviceID: String? {
+        get { defaults.string(forKey: namespace.key(PersistencyKey.preTemporaryDeviceID)) }
+        set { set(newValue, PersistencyKey.preTemporaryDeviceID) }
+    }
+
+    /// Whether ``preTemporaryDeviceID`` was supplied by the host application.
+    var preTemporaryIsCustomDeviceID: Bool {
+        get { defaults.bool(forKey: namespace.key(PersistencyKey.preTemporaryIsCustomDeviceID)) }
+        set { set(newValue, PersistencyKey.preTemporaryIsCustomDeviceID) }
+    }
+
     // MARK: - Push
 
     /// Whether the user has granted notification permission, so the SDK can tell
@@ -67,6 +81,20 @@ final class KeyValueStore {
     var notificationPermission: Bool {
         get { defaults.bool(forKey: namespace.key(PersistencyKey.notificationPermission)) }
         set { set(newValue, PersistencyKey.notificationPermission) }
+    }
+
+    /// The device ID the last push token was sent for, so the token can be taken
+    /// back from that user when they leave. `nil` once it was cleared.
+    var pushTokenDeviceID: String? {
+        get { defaults.string(forKey: namespace.key(PersistencyKey.pushTokenDeviceID)) }
+        set { set(newValue, PersistencyKey.pushTokenDeviceID) }
+    }
+
+    /// Notification taps that arrived before the SDK started, each with its
+    /// notification ID, tapped button and time, until they are recorded.
+    var pendingPushActions: [[String: Any]] {
+        get { defaults.array(forKey: namespace.key(PersistencyKey.pendingPushActions)) as? [[String: Any]] ?? [] }
+        set { set(newValue.isEmpty ? nil : newValue, PersistencyKey.pendingPushActions) }
     }
 
     // MARK: - Remote config
@@ -82,6 +110,16 @@ final class KeyValueStore {
     var serverConfig: [String: Any]? {
         get { defaults.dictionary(forKey: namespace.key(PersistencyKey.serverConfig)) }
         set { set(newValue, PersistencyKey.serverConfig) }
+    }
+
+    // MARK: - Events
+
+    /// The event queue: the events recorded and not yet moved into a request,
+    /// each as the JSON it is sent as. Written on every change, so recorded events
+    /// survive the application being closed or killed before they are sent.
+    var recordedEvents: [String] {
+        get { defaults.stringArray(forKey: namespace.key(PersistencyKey.recordedEvents)) ?? [] }
+        set { _ = write(newValue.isEmpty ? nil : newValue, PersistencyKey.recordedEvents, function: "recordedEvents") }
     }
 
     // MARK: - Health check
@@ -130,6 +168,11 @@ final class KeyValueStore {
             PersistencyKey.remoteConfig,
             PersistencyKey.serverConfig,
             PersistencyKey.healthCheckState,
+            PersistencyKey.recordedEvents,
+            PersistencyKey.preTemporaryDeviceID,
+            PersistencyKey.preTemporaryIsCustomDeviceID,
+            PersistencyKey.pushTokenDeviceID,
+            PersistencyKey.pendingPushActions,
         ] + Self.legacyKeys
 
         // Closed before the removal: a write already past its check takes itself

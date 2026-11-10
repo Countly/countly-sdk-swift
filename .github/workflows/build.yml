@@ -31,7 +31,7 @@ concurrency:
 jobs:
   # The package has no external dependencies and builds from the manifest alone, so this is
   # the fastest signal that the sources are well formed. It runs first and everything else
-  # waits on it: a syntax error should not cost fifteen matrix cells.
+  # waits on it: a syntax error should not cost ten matrix cells.
   package:
     name: Resolve and build the package
     runs-on: macos-15
@@ -52,8 +52,9 @@ jobs:
       - name: Build the notification service target
         run: swift build --target CountlyNotificationService
 
-  # Every supported Apple platform, on every Xcode the SDK claims to support. `xcodebuild` is
+  # Every supported Apple platform, on each Xcode a hosted runner still provides. `xcodebuild` is
   # used rather than `swift build` because only it can target the device SDKs.
+  # Xcode 15.4 is not built: it needs macOS 14, whose hosted runners GitHub retired.
   build:
     name: ${{ matrix.env.platform }} (Xcode ${{ matrix.env.xcode }})
     needs: package
@@ -63,11 +64,6 @@ jobs:
       matrix:
         env:
           [
-            { os_version: 14, platform: "macOS",    sdk: "macosx14.5",    xcode: "15.4" },
-            { os_version: 14, platform: "iOS",      sdk: "iphoneos17.5",  xcode: "15.4" },
-            { os_version: 14, platform: "tvOS",     sdk: "appletvos17.5", xcode: "15.4" },
-            { os_version: 14, platform: "watchOS",  sdk: "watchos10.5",   xcode: "15.4" },
-            { os_version: 14, platform: "visionOS", sdk: "xros1.2",       xcode: "15.4" },
             { os_version: 15, platform: "macOS",    sdk: "macosx15.5",    xcode: "16.4" },
             { os_version: 15, platform: "iOS",      sdk: "iphoneos18.5",  xcode: "16.4" },
             { os_version: 15, platform: "tvOS",     sdk: "appletvos18.5", xcode: "16.4" },

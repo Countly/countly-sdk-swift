@@ -66,8 +66,6 @@ final class CrashTests: CountlyBaseTestCase {
                        "the report should be on disk by the time the handler returns")
         let logs = lastCrash(of: countly)?["_logs"] as? String ?? ""
         XCTAssertTrue(logs.contains("opened cart"), "the stored report should carry the breadcrumbs, logs were: [\(logs)]")
-        XCTAssertEqual(core(of: countly).crashLogStore.readAll() ?? "", "",
-                       "the breadcrumb file should be empty once the report holding them is stored")
     }
 
     /// The next launch sends what the crashed run stored, through the ordinary
@@ -456,22 +454,36 @@ final class CrashTests: CountlyBaseTestCase {
         XCTAssertNil(lastCrash(of: countly)?["_logs"])
     }
 
-    // MARK: - Filters
+    /// A processed crash takes its breadcrumbs with it, so the next report starts
+    /// with a fresh trail instead of repeating this one.
+    func testBreadcrumbsAreClearedOnceAHandledErrorIsRecorded() {
+        let countly = startInstance()
 
-    /// The regular expression filter is matched against the stack trace, the
-    /// description and the name, so an application can suppress a known noisy
-    /// crash without shipping a new build of the SDK.
-    func testTheRegularExpressionFilterSuppressesAMatchingReport() throws {
-        let countly = startInstance {
-            $0.crashFilter = try? NSRegularExpression(pattern: "SecretError")
-        }
+        countly.crashes.addCrashBreadcrumb("opened the cart")
+        countly.crashes.recordError("First", isFatal: false, stackTrace: ["0 MyApp 0x1 first"])
+        countly.crashes.recordError("Second", isFatal: false, stackTrace: ["0 MyApp 0x1 second"])
 
-        countly.crashes.recordError("SecretError leaked", isFatal: false, stackTrace: [])
-        XCTAssertEqual(crashCount(of: countly), 0)
-
-        countly.crashes.recordError("An ordinary error", isFatal: false, stackTrace: [])
-        XCTAssertEqual(crashCount(of: countly), 1)
+        let reports = TestUtils.requests(requestQueue(of: countly), carrying: "crash")
+            .compactMap { $0["crash"] as? [String: Any] }
+        XCTAssertEqual(reports.count, 2)
+        XCTAssertTrue((reports.first?["_logs"] as? String ?? "").contains("opened the cart"))
+        XCTAssertNil(reports.last?["_logs"], "the second report must not repeat the first one's trail")
     }
+
+    /// A crash the filter drops is processed too: its breadcrumbs go with it.
+    func testBreadcrumbsAreClearedWhenTheFilterDropsACrash() {
+        let countly = startInstance()
+        core(of: countly).config.crashes.crashFilterCallback = { $0.crashDescription == "Dropped" }
+
+        countly.crashes.addCrashBreadcrumb("before the dropped crash")
+        countly.crashes.recordError("Dropped", isFatal: false, stackTrace: ["0 MyApp 0x1 dropped"])
+        countly.crashes.recordError("Kept", isFatal: false, stackTrace: ["0 MyApp 0x1 kept"])
+
+        XCTAssertEqual(crashCount(of: countly), 1)
+        XCTAssertNil(lastCrash(of: countly)?["_logs"])
+    }
+
+    // MARK: - Filters
 
     /// The callback filter gets the assembled report and can either drop it or
     /// edit it in place, which is how an application redacts a stack trace that
@@ -500,6 +512,53 @@ final class CrashTests: CountlyBaseTestCase {
 
         let custom = lastCrash(of: countly)?["_custom"] as? [String: Any]
         XCTAssertEqual(TestUtils.describe(custom?["redacted"] ?? ""), "1")
+    }
+
+    /// `_ob` names the fields the filter changed, one bit each: the description,
+    /// which is the crash title, is 64 and the name, which is the error type, is
+    /// 32. A report the filter left alone carries 0.
+    func testTheChangedFieldBitsFollowTheFieldsTheFilterEdited() {
+        let countly = startInstance()
+        let crashes = core(of: countly).config.crashes
+
+        crashes.crashFilterCallback = { crashData in
+            crashData.crashDescription = "redacted title"
+            return false
+        }
+        countly.crashes.recordError("Title", isFatal: false, stackTrace: ["0 MyApp 0x1 title"])
+        XCTAssertEqual(TestUtils.int(lastCrash(of: countly)?["_ob"]), 64)
+
+        crashes.crashFilterCallback = { crashData in
+            crashData.name = "RedactedType"
+            crashData.fatal = !crashData.fatal
+            return false
+        }
+        countly.crashes.recordError("Type", isFatal: false, stackTrace: ["0 MyApp 0x1 type"])
+        XCTAssertEqual(TestUtils.int(lastCrash(of: countly)?["_ob"]), 33)
+
+        crashes.crashFilterCallback = { _ in false }
+        countly.crashes.recordError("Untouched", isFatal: false, stackTrace: ["0 MyApp 0x1 untouched"])
+        XCTAssertEqual(TestUtils.int(lastCrash(of: countly)?["_ob"]), 0)
+    }
+
+    /// What a filter adds is held to the limits again: a breadcrumb list or a
+    /// stack trace it grew goes out within them.
+    func testWhatTheFilterAddsIsHeldToTheLimits() {
+        let countly = startInstance {
+            $0.sdkInternalLimits.maxBreadcrumbCount = 2
+            $0.sdkInternalLimits.maxStackTraceLinesPerThread = 3
+        }
+        core(of: countly).config.crashes.crashFilterCallback = { crashData in
+            crashData.breadcrumbs = ["one", "two", "three", "four"]
+            crashData.stackTrace = (0..<10).map { "frame-\($0)" }.joined(separator: "\n")
+            return false
+        }
+
+        countly.crashes.recordError("Grown", isFatal: false, stackTrace: ["0 MyApp 0x1 grown"])
+
+        let crash = lastCrash(of: countly)
+        XCTAssertEqual((crash?["_logs"] as? String)?.split(separator: "\n").map(String.init), ["three", "four"])
+        XCTAssertEqual((crash?["_error"] as? String)?.split(separator: "\n").count, 3)
     }
 
     // MARK: - Consent and server config
@@ -550,10 +609,9 @@ final class CrashTests: CountlyBaseTestCase {
 
     // MARK: - Limits
 
-    /// Every frame is shortened to the configured length, and the trace keeps all
-    /// of its frames: `maxStackTraceLinesPerThread` is accepted but not applied to
-    /// the exception's own trace, which is what the crash filters read.
-    func testStackTraceLinesAreTruncatedToTheConfiguredLengthButNoFramesAreDropped() {
+    /// Every frame is shortened to the configured length, and the trace keeps at
+    /// most `maxStackTraceLinesPerThread` frames, the first ones.
+    func testStackTraceLinesAreHeldToTheConfiguredLengthAndCount() {
         let countly = startInstance {
             $0.sdkInternalLimits.maxStackTraceLineLength = 10
             $0.sdkInternalLimits.maxStackTraceLinesPerThread = 2
@@ -562,16 +620,70 @@ final class CrashTests: CountlyBaseTestCase {
         countly.crashes.recordError("Long trace", isFatal: false, stackTrace: [
             "a line that is considerably longer than ten characters",
             "another long line here",
-            "a third one that is kept",
-            "deepest frame a filter might match",
+            "a third one that is dropped",
+            "a fourth one that is dropped",
         ])
 
         let trace = lastCrash(of: countly)?["_error"] as? String ?? ""
         let lines = trace.split(separator: "\n").map(String.init)
-        XCTAssertEqual(lines.count, 4, "no frame is dropped")
-        for line in lines {
-            XCTAssertLessThanOrEqual(line.count, 10, "line was: \(line)")
+        XCTAssertEqual(lines, ["a line tha", "another lo"])
+    }
+
+    /// However the lines add up, the whole trace stays within 20,000 characters.
+    func testTheWholeStackTraceIsCappedAtTwentyThousandCharacters() {
+        let countly = startInstance {
+            $0.sdkInternalLimits.maxStackTraceLineLength = 1_000
+            $0.sdkInternalLimits.maxStackTraceLinesPerThread = 100
         }
+
+        countly.crashes.recordError("Huge trace",
+                                    isFatal: false,
+                                    stackTrace: (0..<60).map { _ in String(repeating: "x", count: 1_000) })
+
+        let trace = lastCrash(of: countly)?["_error"] as? String ?? ""
+        XCTAssertEqual(trace.count, 20_000)
+    }
+
+    /// An error recorded without a stack trace of its own still gets one, the
+    /// stack of the call that recorded it: `_error` is the field the server cannot
+    /// do without.
+    func testAHandledErrorWithoutAStackTraceStillCarriesOne() {
+        let countly = startInstance()
+
+        countly.crashes.recordError("No trace given")
+
+        XCTAssertFalse((lastCrash(of: countly)?["_error"] as? String ?? "").isEmpty)
+    }
+
+    /// A report says which view was on screen, by name and by the ID the view's
+    /// events carry, so the crash can be linked to it.
+    func testAReportCarriesTheCurrentView() {
+        let countly = startInstance()
+        let viewID = countly.views.startView("Checkout")
+
+        countly.crashes.recordError("In a view", isFatal: false, stackTrace: ["0 MyApp 0x1 view"])
+
+        let crash = lastCrash(of: countly)
+        XCTAssertEqual(crash?["_view"] as? String, "Checkout")
+        XCTAssertEqual(crash?["_cvid"] as? String, viewID)
+        XCTAssertEqual(crash?["_manufacture"] as? String, "Apple")
+    }
+
+    /// Without crashes consent the SDK keeps no global crash segmentation; the one
+    /// from the config is taken over once the consent is given.
+    func testGlobalCrashSegmentationWaitsForCrashesConsent() {
+        let countly = startInstance {
+            $0.requiresConsent = true
+            $0.crashSegmentation = ["from": "config"]
+        }
+
+        countly.crashes.setCrashSegmentation(["from": "runtime"])
+        countly.consent.giveConsent(for: .crashReporting)
+        countly.crashes.recordError("After consent", isFatal: false, stackTrace: ["0 MyApp 0x1 consent"])
+
+        let custom = lastCrash(of: countly)?["_custom"] as? [String: Any]
+        XCTAssertEqual(custom?["from"] as? String, "config",
+                       "the segmentation set without consent must not have been kept")
     }
 
     func testCrashSegmentationRespectsTheValueCountLimit() {

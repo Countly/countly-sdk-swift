@@ -264,10 +264,11 @@ final class PushTests: CountlyBaseTestCase {
         #endif
     }
 
-    /// The server keeps a token on the user that sent it last, so after a device ID
-    /// change without merge the token goes out again, under the new user, or the
+    /// The server keeps a token on the user that sent it last. Before a device ID
+    /// change without merge the token is taken back from the leaving user, under
+    /// their device ID, and after it the token goes out for the new user, or the
     /// previous user's pushes would keep reaching this device.
-    func testAChangeWithoutMergeSendsTheTokenAgainForTheNewUser() throws {
+    func testAChangeWithoutMergeMovesTheTokenFromTheLeavingUserToTheNewOne() throws {
         #if !(os(iOS) || os(visionOS) || os(macOS))
         throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
         #else
@@ -285,15 +286,18 @@ final class PushTests: CountlyBaseTestCase {
 
         countly.deviceID.changeWithoutMerge("next-user")
 
-        let resent = try XCTUnwrap(tokenRequests(of: countly).last)
-        XCTAssertEqual(tokenRequests(of: countly).count, afterMerge + 1)
-        XCTAssertEqual(resent["device_id"] as? String, "next-user")
-        XCTAssertEqual(resent["ios_token"] as? String, "0c0d")
+        let sent = Array(tokenRequests(of: countly).dropFirst(afterMerge))
+        XCTAssertEqual(sent.count, 2)
+        XCTAssertEqual(sent.first?["device_id"] as? String, "merged-user", "the merge moved the token to the merged user")
+        XCTAssertEqual(sent.first?["ios_token"] as? String, "")
+        XCTAssertEqual(sent.last?["device_id"] as? String, "next-user")
+        XCTAssertEqual(sent.last?["ios_token"] as? String, "0c0d")
         #endif
     }
 
     /// With consent required, a change without merge withdraws every consent, so
-    /// the token waits until push consent is given for the new user.
+    /// the token waits until push consent is given for the new user. The silent
+    /// consent removal does not clear the token a second time.
     func testAChangeWithoutMergeUnderRequiredConsentWaitsForThePushConsent() throws {
         #if !(os(iOS) || os(visionOS) || os(macOS))
         throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
@@ -309,11 +313,59 @@ final class PushTests: CountlyBaseTestCase {
         let before = tokenRequests(of: countly).count
 
         countly.deviceID.changeWithoutMerge("consent-user")
-        XCTAssertEqual(tokenRequests(of: countly).count, before, "no push consent for the new user yet")
+        let cleared = Array(tokenRequests(of: countly).dropFirst(before))
+        XCTAssertEqual(cleared.count, 1, "only the empty token for the leaving user, no push consent for the new user yet")
+        XCTAssertEqual(cleared.first?["device_id"] as? String, Self.deviceID)
+        XCTAssertEqual(cleared.first?["ios_token"] as? String, "")
 
         countly.consent.giveConsent(for: .pushNotifications)
         XCTAssertEqual(tokenRequests(of: countly).last?["device_id"] as? String, "consent-user")
         XCTAssertEqual(tokenRequests(of: countly).last?["ios_token"] as? String, "0e0f")
+        #endif
+    }
+
+    /// Servers from 26.01 on keep the token through a consent change, so the SDK
+    /// clears it itself, or an opted out user keeps getting campaign pushes.
+    func testRemovingPushConsentClearsTheTokenOnTheServer() throws {
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
+        #else
+        let countly = startPushInstance {
+            $0.sendPushTokenAlways = true
+            $0.features = [.pushNotifications]
+            $0.disableAutomaticPushHandling = true
+            $0.requiresConsent = true
+            $0.consents = [.pushNotifications]
+        }
+        Countly.didRegisterForRemoteNotifications(deviceToken: Data([0x01, 0x0F]))
+
+        countly.consent.cancelConsent(for: .pushNotifications)
+
+        XCTAssertEqual(tokenRequests(of: countly).last?["ios_token"] as? String, "")
+        XCTAssertEqual(tokenRequests(of: countly).last?["device_id"] as? String, Self.deviceID)
+        #endif
+    }
+
+    /// A reset of the stored device ID at start is a user change too: the token
+    /// sent for the previous user is taken back under their device ID.
+    func testResettingTheStoredDeviceIDTakesTheTokenBackFromThePreviousUser() throws {
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
+        #else
+        let first = startPushInstance {
+            $0.deviceID = "previous-user"
+            $0.features = [.pushNotifications]
+            $0.disableAutomaticPushHandling = true
+        }
+        Countly.didRegisterForRemoteNotifications(deviceToken: Data([0x02, 0x0F]))
+        XCTAssertEqual(tokenRequests(of: first).last?["device_id"] as? String, "previous-user")
+        first.halt()
+
+        let second = startPushInstance { $0.deviceID = "next-user" }
+
+        let cleared = tokenRequests(of: second).filter { $0["ios_token"] as? String == "" }
+        XCTAssertEqual(cleared.count, 1)
+        XCTAssertEqual(cleared.first?["device_id"] as? String, "previous-user")
         #endif
     }
 
@@ -563,7 +615,89 @@ final class PushTests: CountlyBaseTestCase {
         #endif
     }
 
+    // MARK: - Taps before the start
+
+    /// A tap that started the application before the SDK did is kept and recorded
+    /// once the default instance starts, with the time it happened.
+    func testATapBeforeTheStartIsRecordedAtTheStartWithItsTime() throws {
+        #if !(canImport(UserNotifications) && (os(iOS) || os(visionOS) || os(macOS)))
+        throw XCTSkip("the push runtime only exists on iOS, visionOS and macOS")
+        #else
+        Countly.handleNotificationResponse(try response(id: "n-early",
+                                                        buttons: [["t": "Open", "l": "https://count.ly/one"]],
+                                                        actionIdentifier: CountlyPushKey.actionIdentifierPrefix + "1"))
+        let tappedAt = Date().timeIntervalSince1970
+        TestUtils.pump(1.5)
+
+        let countly = startPushInstance { $0.eventSendThreshold = 1 }
+
+        let recorded = events(of: countly).filter { $0["key"] as? String == "[CLY]_push_action" }
+        XCTAssertEqual(recorded.count, 1)
+        let segmentation = (recorded.first?["segmentation"] as? [String: Any]) ?? [:]
+        XCTAssertEqual(segmentation[CountlyPushKey.notificationID] as? String, "n-early")
+        XCTAssertEqual(TestUtils.int(segmentation[CountlyPushKey.actionButtonIndex]), 1)
+        let recordedAt = (TestUtils.double(recorded.first?["timestamp"]) ?? 0) / 1000
+        XCTAssertLessThan(abs(recordedAt - tappedAt), 1, "the event carries the time of the tap, not of the start")
+        XCTAssertTrue(core(of: countly).keyValueStore.pendingPushActions.isEmpty)
+        #endif
+    }
+
+    func testATapBeforeTheStartIsDroppedWithoutPushConsent() throws {
+        #if !(canImport(UserNotifications) && (os(iOS) || os(visionOS) || os(macOS)))
+        throw XCTSkip("the push runtime only exists on iOS, visionOS and macOS")
+        #else
+        Countly.handleNotificationResponse(try response(id: "n-early"))
+
+        let countly = startPushInstance {
+            $0.eventSendThreshold = 1
+            $0.requiresConsent = true
+        }
+
+        XCTAssertTrue(events(of: countly).filter { $0["key"] as? String == "[CLY]_push_action" }.isEmpty)
+        XCTAssertTrue(core(of: countly).keyValueStore.pendingPushActions.isEmpty)
+        #endif
+    }
+
     // MARK: - Opening a URL
+
+    /// The application's handler gets the link first and can take it over. The
+    /// action is recorded before, whatever the handler returns.
+    func testTheApplicationsActionHandlerCanTakeTheLinkOver() throws {
+        #if !(canImport(UserNotifications) && (os(iOS) || os(visionOS) || os(macOS)))
+        throw XCTSkip("the push runtime only exists on iOS, visionOS and macOS")
+        #else
+        var handled: URL?
+        let countly = startPushInstance {
+            $0.eventSendThreshold = 1
+            $0.features = [.pushNotifications]
+            $0.disableAutomaticPushHandling = true
+            $0.pushActionHandler = { link, _ in
+                handled = link
+                return true
+            }
+        }
+
+        Countly.handleNotificationResponse(try response(id: "n-20", url: "myapp://inbox"))
+
+        TestUtils.waitUntil("the action handler is called") { handled != nil }
+        XCTAssertEqual(handled?.absoluteString, "myapp://inbox")
+        XCTAssertEqual(events(of: countly).filter { $0["key"] as? String == "[CLY]_push_action" }.count, 1)
+        #endif
+    }
+
+    /// A notification link is remote input: a dangerous scheme is never opened,
+    /// and an allow list narrows the rest.
+    func testDangerousLinkSchemesAreNeverOpenedAndAnAllowListNarrowsTheRest() {
+        XCTAssertTrue(LinkSchemePolicy.isAllowed(scheme: "https", allowedSchemes: []))
+        XCTAssertTrue(LinkSchemePolicy.isAllowed(scheme: "myapp", allowedSchemes: []))
+        for scheme in ["file", "content", "javascript", "jar", "zip", "intent", "data", "JavaScript"] {
+            XCTAssertFalse(LinkSchemePolicy.isAllowed(scheme: scheme, allowedSchemes: []), scheme)
+        }
+        XCTAssertTrue(LinkSchemePolicy.isAllowed(scheme: "MyApp", allowedSchemes: ["myapp"]))
+        XCTAssertFalse(LinkSchemePolicy.isAllowed(scheme: "https", allowedSchemes: ["myapp"]))
+        XCTAssertFalse(LinkSchemePolicy.isAllowed(scheme: "javascript", allowedSchemes: ["javascript"]))
+        XCTAssertFalse(LinkSchemePolicy.isAllowed(scheme: nil, allowedSchemes: []))
+    }
 
     /// A URL that is missing, empty or not a URL at all is not opened, and must not
     /// trap on the way to deciding that.

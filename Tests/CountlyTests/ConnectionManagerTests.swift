@@ -122,13 +122,15 @@ final class ConnectionManagerTests: CountlyBaseTestCase {
         }
         TestUtils.waitUntil("the start-up queue drains") { self.requestQueue(of: countly).isEmpty }
 
+        // The fetch and the health check of the start skip the queue and can reach the transport late, so only queued reports are counted.
+        let queuedSends = { MockURLProtocol.requests.filter { $0.query.contains("crash=") || $0.query.contains("events=") }.count }
         reportAutoDetectedCrash(on: countly)
-        let sentBeforeTheCrash = MockURLProtocol.requests.count
+        let sentBeforeTheCrash = queuedSends()
         countly.events.recordEvent("after the crash")
         TestUtils.pump(0.5)
 
-        XCTAssertEqual(MockURLProtocol.requests.count, sentBeforeTheCrash,
-                       "no request may start once the crash is stored")
+        XCTAssertEqual(queuedSends(), sentBeforeTheCrash,
+                       "no queued request may start once the crash is stored")
         let queued = requestQueue(of: countly)
         XCTAssertEqual(TestUtils.requests(queued, carrying: "crash").count, 1,
                        "the crash report should wait in the queue")
@@ -155,8 +157,8 @@ final class ConnectionManagerTests: CountlyBaseTestCase {
         }
         XCTAssertTrue(MockURLProtocol.requests
             .filter { $0.query.contains("crash=") }
-            .allSatisfy { $0.method == "GET" },
-            "a queued report is an ordinary request")
+            .allSatisfy { $0.method == "POST" },
+            "a queued report is an ordinary request, a POST like every other")
     }
 
     // MARK: - Picture upload

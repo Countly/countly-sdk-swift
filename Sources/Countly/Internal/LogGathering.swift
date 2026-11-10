@@ -99,13 +99,16 @@ struct LogGatheringDirective: Equatable {
         return filtered
     }
 
-    /// Clamps the batch size into the accepted range, falling back to the default
-    /// when the value is missing or not a number.
+    /// The batch size the directive names, or the default when the value is
+    /// missing, not a whole number or outside 10 to 500: a value out of range is
+    /// treated as if the server had not sent it, never moved into the range.
     static func clampBatchSize(_ raw: Any?) -> Int {
-        guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else {
+        guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue == number.doubleValue.rounded(),
+              (minBatchSize...maxBufferedLines).contains(number.intValue) else {
             return defaultBatchSize
         }
-        return min(maxBufferedLines, max(minBatchSize, number.intValue))
+        return number.intValue
     }
 }
 
@@ -153,11 +156,9 @@ enum LogGatheringScope: Hashable {
         case UserProfileModule.moduleName: return .feature(.userDetails)
         case SessionsModule.moduleName: return .feature(.sessions)
         case LocationModule.moduleName: return .feature(.location)
-        // The crash log store writes the breadcrumbs it was handed.
-        case CrashModule.moduleName, "CrashLogStore": return .feature(.crashReporting)
+        case CrashModule.moduleName: return .feature(.crashReporting)
         case PushModule.moduleName, "PushRuntime": return .feature(.pushNotifications)
         case AttributionModule.moduleName: return .feature(.attribution)
-        case APMModule.moduleName: return .feature(.performanceMonitoring)
         case FeedbackModule.moduleName: return .feature(.feedback)
         case RemoteConfigModule.moduleName: return .feature(.remoteConfig)
         case ContentModule.moduleName: return .feature(.content)

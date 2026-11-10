@@ -84,11 +84,13 @@ public final class CountlyCrashData: NSObject {
         return result
     }
 
-    /// Order matters: it defines the bit positions of the changed-field bitfield.
+    /// Order matters: it defines the bit positions of the changed-field bitfield,
+    /// description 64, name 32, stack trace 16, segmentation 8, breadcrumbs 4,
+    /// metrics 2 and fatal 1.
     private func currentChecksums() -> [String] {
         [
-            name.sha256Hex,
             crashDescription.sha256Hex,
+            name.sha256Hex,
             stackTrace.sha256Hex,
             Self.stableDescription(crashSegmentation).sha256Hex,
             Self.stableDescription(breadcrumbs).sha256Hex,

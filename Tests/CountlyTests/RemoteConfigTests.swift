@@ -173,7 +173,9 @@ final class RemoteConfigTests: CountlyBaseTestCase {
         XCTAssertEqual(TestUtils.int(all["c"]?.value), 30)
     }
 
-    func testAFailedDownloadReportsAnErrorAndLeavesTheCacheAlone() {
+    /// A server that cannot be reached is a network issue, which the application
+    /// can tell from a server that answered with a refusal.
+    func testADownloadThatCannotReachTheServerReportsANetworkIssueAndLeavesTheCacheAlone() {
         MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"a": 1}"#)
         let countly = startInstance()
 
@@ -185,7 +187,7 @@ final class RemoteConfigTests: CountlyBaseTestCase {
 
         expectCompletion("the failed download still reports back") { done in
             countly.remoteConfig.downloadKeys { result, error, _, _ in
-                XCTAssertEqual(result, .error)
+                XCTAssertEqual(result, .networkIssue)
                 XCTAssertNotNil(error)
                 done()
             }
@@ -193,6 +195,36 @@ final class RemoteConfigTests: CountlyBaseTestCase {
 
         XCTAssertEqual(TestUtils.int(countly.remoteConfig.getValue("a").value), 1,
                        "a failed refresh must not empty the cache")
+    }
+
+    func testADownloadTheServerRefusesReportsAnError() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"result": "Missing parameter"}"#, status: 400)
+        let countly = startInstance()
+
+        expectCompletion("the refused download reports back") { done in
+            countly.remoteConfig.downloadKeys { result, _, _, _ in
+                XCTAssertEqual(result, .error)
+                done()
+            }
+        }
+    }
+
+    /// The values of an answer that arrives after the device ID changed belong to
+    /// the previous user, so they are not stored for the new one.
+    func testAnAnswerThatArrivesAfterADeviceIDChangeIsDiscarded() {
+        MockURLProtocol.respondSlowly(after: 0.5, json: #"{"a": 1}"#)
+        let countly = startInstance { $0.deviceID = "first-user" }
+
+        expectCompletion("the download reports back", timeout: 10) { done in
+            countly.remoteConfig.downloadKeys { result, _, _, values in
+                XCTAssertEqual(result, .error)
+                XCTAssertTrue(values.isEmpty)
+                done()
+            }
+            countly.deviceID.changeWithoutMerge("second-user")
+        }
+
+        XCTAssertNil(countly.remoteConfig.getValue("a").value)
     }
 
     // MARK: - Reading values
@@ -403,6 +435,31 @@ final class RemoteConfigTests: CountlyBaseTestCase {
         let queued = requestQueue(of: countly).map(TestUtils.parseQuery)
         XCTAssertTrue(queued.contains { $0["method"] as? String == "ab" })
         XCTAssertTrue(queued.contains { $0["method"] as? String == "ab_opt_out" })
+    }
+
+    /// The server refuses an enrollment without a key, and a refused request would
+    /// hold up everything queued behind it.
+    func testEnrollingWithoutAUsableKeyIsOmitted() {
+        let countly = startInstance()
+
+        countly.remoteConfig.enrollIntoABTests(forKeys: [])
+        countly.remoteConfig.enrollIntoABTests(forKeys: [""])
+
+        XCTAssertTrue(requestQueue(of: countly).map(TestUtils.parseQuery).filter { $0["method"] as? String == "ab" }.isEmpty)
+        XCTAssertEqual(logCodeCount(HealthLogCode.invalidValue, of: countly), 2)
+    }
+
+    /// Only {"result": "Success"} confirms an enrollment.
+    func testAVariantEnrollmentTheServerDidNotConfirmIsAnError() {
+        MockURLProtocol.respond(pathContaining: "/i", json: #"{"result": "No such variant"}"#)
+        let countly = startInstance()
+
+        expectCompletion("the enrolment reports back") { done in
+            countly.remoteConfig.testingEnrollIntoVariant(key: "colour", variantName: "purple") { result, _ in
+                XCTAssertEqual(result, .error)
+                done()
+            }
+        }
     }
 
     /// The response shape is an object carrying `jsonArray`, not a bare array. Any

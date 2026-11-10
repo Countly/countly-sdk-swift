@@ -29,6 +29,10 @@ final class ConnectionManager: NSObject {
     private var isProcessingQueue = false
     private var isBackingOff = false
 
+    /// When the cool-down after a failed request ends, on the uptime clock, or nil
+    /// when none is running. Guarded by `stateLock`.
+    private var failedRequestCooldownEnd: TimeInterval?
+
     /// Whether the drain is paused by the backoff mechanism.
     ///
     /// For the suite: the pause starts inside the response handling that also
@@ -94,7 +98,7 @@ final class ConnectionManager: NSObject {
     @discardableResult
     func enqueue(_ queryString: String) -> String? {
         core.requestQueueStore.enqueue(queryString,
-                                       appVersion: DeviceMetrics.appVersion,
+                                       appVersion: core.appVersion.urlEscaped,
                                        trackingEnabled: core.serverConfig.trackingEnabled)
     }
 
@@ -173,9 +177,15 @@ final class ConnectionManager: NSObject {
 
         stateLock.lock()
         let backingOff = isBackingOff
+        let cooldownEnd = failedRequestCooldownEnd
         stateLock.unlock()
         if backingOff {
             abortProcessing("backoff is currently active")
+            return
+        }
+
+        if let cooldownEnd, ProcessInfo.processInfo.systemUptime < cooldownEnd {
+            abortProcessing("the cool-down after a failed request is running, remainingSeconds: [\((cooldownEnd - ProcessInfo.processInfo.systemUptime).logSeconds)]")
             return
         }
 
@@ -197,6 +207,7 @@ final class ConnectionManager: NSObject {
         var next = core.requestQueueStore.headEntry
         while let expired = next, core.requestQueueStore.isOldRequest(expired.request) {
             core.logger.w(Self.module, "proceedOnQueue", "dropping the request at the head of the queue, reason: request age exceeded the configured drop age, requestDropAgeHours: [\(core.requestQueueStore.requestDropAgeHours)], requestSize: [\(expired.request.count)], queuedRequestCount: [\(core.requestQueueStore.count)]")
+            core.healthTracker.recordLogCode(HealthLogCode.requestTooOld)
             core.requestQueueStore.removeHead(expired)
             droppedForAge += 1
             next = core.requestQueueStore.headEntry
@@ -286,6 +297,8 @@ final class ConnectionManager: NSObject {
             endpoint = override
         }
 
+        let isAutomaticCrash = extractAndRemoveParameter(&queryString, parameter: QS.automaticCrash) != nil
+
         var callback: RequestCallback?
         let callbackID = extractAndRemoveParameter(&queryString, parameter: QS.callbackID)
         if let callbackID {
@@ -301,6 +314,7 @@ final class ConnectionManager: NSObject {
         // query, and only a profile picture save ever carries one. The key is
         // matched as a parameter, because a gathered log batch can quote its name.
         let pictureUpload = queryString.contains("&\(QS.userDetails)=") ? pictureUploadData(for: queryString) : nil
+        queryString = withoutLocalPicturePath(queryString)
         if pictureUpload == nil {
             queryString = builder.appendChecksum(queryString)
         }
@@ -335,6 +349,9 @@ final class ConnectionManager: NSObject {
                 }
 
                 if self.isRequestSuccessful(response: response, data: data, endpoint: endpoint) {
+                    if isAutomaticCrash {
+                        self.core.healthTracker.addAutomaticCrashes(1)
+                    }
                     self.handleSuccess(head: head,
                                        queryString: queryString,
                                        elapsed: elapsed,
@@ -395,6 +412,11 @@ final class ConnectionManager: NSObject {
             core.logGatherer.queuedBatchWasSent()
         }
 
+        // Matched as a parameter, because a gathered log batch can quote its name.
+        if queryString.split(separator: "&").contains(where: { $0.hasPrefix("\(QS.deviceIDOld)=") }) {
+            core.modules.deviceID.mergeRequestWasAccepted()
+        }
+
         if core.serverConfig.backoffMechanism, shouldBackOff(responseTimeSeconds: Int(elapsed), queryString: queryString) {
             core.logger.d(Self.module, "proceedOnQueue", "stopping queue processing, reason: backoff is triggered, responseTimeSeconds: [\(Int(elapsed))], queuedRequestCount: [\(core.requestQueueStore.count)]")
             drainStartTime = nil
@@ -421,9 +443,10 @@ final class ConnectionManager: NSObject {
         core.healthTracker.logFailedNetworkRequest(statusCode: statusCode, errorResponse: body)
         core.healthTracker.saveState()
 
-        core.logger.d(Self.module, "proceedOnQueue", "queue processing is stopped after a rejected request, the request stays at the head of the queue and is sent again on the next drain, queuedRequestCount: [\(core.requestQueueStore.count)]")
+        core.logger.d(Self.module, "proceedOnQueue", "queue processing is stopped after a rejected request, the request stays at the head of the queue and is sent again after the cool-down, queuedRequestCount: [\(core.requestQueueStore.count)]")
 
         drainStartTime = nil
+        startFailedRequestCooldown()
         releaseProcessing()
     }
 
@@ -443,10 +466,37 @@ final class ConnectionManager: NSObject {
         core.requestQueueStore.save()
         #endif
 
-        core.logger.d(Self.module, "proceedOnQueue", "queue processing is stopped after a network error, the request stays at the head of the queue and is sent again on the next drain, queuedRequestCount: [\(core.requestQueueStore.count)]")
+        core.logger.d(Self.module, "proceedOnQueue", "queue processing is stopped after a network error, the request stays at the head of the queue and is sent again after the cool-down, queuedRequestCount: [\(core.requestQueueStore.count)]")
 
         drainStartTime = nil
+        startFailedRequestCooldown()
         releaseProcessing()
+    }
+
+    /// Holds the queue back for `CountlyConfig.failedRequestCooldown` seconds
+    /// after a failed request, then tries the same request again. New requests and
+    /// timer ticks in between do not start an earlier attempt, so a server that is
+    /// down is not hit by every event the application records.
+    private func startFailedRequestCooldown() {
+        let cooldown = core.config.failedRequestCooldown
+        guard cooldown > 0 else { return }
+
+        stateLock.lock()
+        failedRequestCooldownEnd = ProcessInfo.processInfo.systemUptime + cooldown
+        stateLock.unlock()
+
+        core.logger.d(Self.module, "startFailedRequestCooldown", "the queue waits before the failed request is tried again, cooldownSeconds: [\(cooldown.logSeconds)]")
+
+        DispatchQueue.global(qos: .default).asyncAfter(deadline: .now() + cooldown) { [weak self, core] in
+            guard let self else { return }
+            _ = core
+            self.stateLock.lock()
+            if let end = self.failedRequestCooldownEnd, ProcessInfo.processInfo.systemUptime >= end {
+                self.failedRequestCooldownEnd = nil
+            }
+            self.stateLock.unlock()
+            self.proceedOnQueue()
+        }
     }
 
     /// The response is autoclosed because most requests carry no callback, and
@@ -601,7 +651,7 @@ final class ConnectionManager: NSObject {
         // sees it and starts no send the dying process could not finish.
         core.isCrashing = true
 
-        guard enqueue(builder.queryEssentials() + "&\(QS.crash)=\(report)") != nil else {
+        guard enqueue(builder.queryEssentials() + "&\(QS.crash)=\(report)&\(QS.automaticCrash)=1") != nil else {
             core.logger.d(Self.module, "storeCrashReport", "crash report is not stored, reason: the request queue refused it, crashReportLength: [\(report.count)]")
             return
         }
@@ -645,22 +695,47 @@ final class ConnectionManager: NSObject {
             request.httpMethod = "POST"
             request.httpBody = body
             core.logger.d(Self.module, "buildRequest", "request will be sent as a multipart POST with picture data, endpoint: [\(endpoint)], uploadDataSize: [\(body.count)]")
-        } else if queryString.count > kGETRequestMaxLength || core.config.alwaysUsePOST {
-            request.httpMethod = "POST"
-            request.httpBody = Data(queryString.utf8)
-            core.logger.d(Self.module, "buildRequest", "request will be sent as a POST, endpoint: [\(endpoint)], queryStringLength: [\(queryString.count)], getRequestMaxLength: [\(kGETRequestMaxLength)], alwaysUsePOST: [\(core.config.alwaysUsePOST)]")
         } else {
-            request = URLRequest(url: Self.requestURL("\(urlString)?\(queryString)"))
+            Self.setFormBody(queryString, on: &request)
+            core.logger.d(Self.module, "buildRequest", "request will be sent as a POST, endpoint: [\(endpoint)], bodyLength: [\(queryString.count)]")
         }
 
         request.cachePolicy = .reloadIgnoringLocalCacheData
         return request
     }
 
+    /// Makes `request` a form POST carrying `queryString` as its body.
+    ///
+    /// Every request is a POST with its data in the body: nothing but the
+    /// endpoint path goes into the URL, which keeps personal data out of server
+    /// and proxy access logs and away from URL length limits.
+    private static func setFormBody(_ queryString: String, on request: inout URLRequest) {
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data(queryString.utf8)
+    }
+
     private func appendMultipart(_ data: inout Data, key: String, value: String) {
         data.append(Data("\r\n--\(kUploadBoundary)\r\n".utf8))
         data.append(Data("Content-Disposition: form-data; name=\"\(key)\";\r\n\r\n".utf8))
         data.append(Data(value.utf8))
+    }
+
+    /// The query string without the local picture marker. The path only tells the
+    /// SDK which file to upload, and would otherwise reach the server as text,
+    /// naming folders of the device. A `user_details` left empty is removed.
+    private func withoutLocalPicturePath(_ queryString: String) -> String {
+        guard let userDetails = queryString.valueForQueryStringKey(QS.userDetails),
+              var parsed = CountlyJSON.object(from: Data((userDetails.removingPercentEncoding ?? userDetails).utf8), logger: nil) as? [String: Any],
+              parsed.removeValue(forKey: UserProfileKey.localPicturePath) != nil else { return queryString }
+
+        var stripped = queryString.components(separatedBy: "&")
+            .filter { !$0.hasPrefix("\(QS.userDetails)=") }
+            .joined(separator: "&")
+        if !parsed.isEmpty {
+            stripped += "&\(QS.userDetails)=\(CountlyJSON.escapedString(from: parsed, logger: core.logger))"
+        }
+        return stripped
     }
 
     /// Builds the leading multipart section when the queued request carries a
@@ -728,41 +803,25 @@ final class ConnectionManager: NSObject {
         return value
     }
 
-    /// Decides whether a completed response counts as the request having landed.
+    /// Decides whether a completed response counts as the request having landed:
+    /// a 2xx status and a JSON object with a `result` field, whatever endpoint the
+    /// request went to. The `/o/sdk` endpoints a queued request can reach answer
+    /// with `result` as well.
     ///
-    /// Only the ingest endpoint promises a `result` field, so only the ingest
-    /// endpoint is judged by it. Every other endpoint answers with application
-    /// payload of its own shape (remote config values, behavior settings, the
-    /// widget list, A/B enrolment), and demanding `result` there marks a perfectly
-    /// good response as a failure, leaving the request at the head of the queue to
-    /// be retried on every later drain.
+    /// A rejection is logged at debug: a failed request is part of normal work,
+    /// and the health check reports it in `sc` and `em` rather than as an error.
     ///
     /// - Parameters:
-    ///   - endpoint: The path the request was sent to. Passed in rather than read
-    ///     back off the response: a server hosted under a sub-path answers from
-    ///     `/countly/i`, and a redirect can change the path outright, either of
-    ///     which would make a path comparison conclude "not the ingest endpoint"
-    ///     and wave through a 2xx that says `{"result": "Error"}`. That would
-    ///     delete the request from the queue.
-    ///   - quiet: Logs a rejection at debug rather than error. Used by the health
-    ///     check, whose whole purpose is to report the error count, and which must
-    ///     not add to it by being rejected.
+    ///   - endpoint: The path the request was sent to, for the log.
+    ///   - quiet: Whether the request skipped the queue, which only changes the
+    ///     wording of the log line.
     private func isRequestSuccessful(response: URLResponse?,
                                      data: Data?,
                                      endpoint: String,
                                      quiet: Bool = false) -> Bool {
-        // Rejections are logged at debug for the health check and at error for
-        // everything else, which is the only thing `quiet` changes. The two
-        // wordings differ because a log message has to name one line of code.
         func logRejection(_ reason: String) {
-            // Composed outside the literal so the message keeps the house shape,
-            // where everything after the prose is a `key: [value]` pair.
             let line = (quiet ? "an unqueued request is judged as failed, " : "a queued request is judged as failed, ") + reason
-            if quiet {
-                core.logger.d(Self.module, "isRequestSuccessful", line)
-            } else {
-                core.logger.e(Self.module, "isRequestSuccessful", line)
-            }
+            core.logger.d(Self.module, "isRequestSuccessful", line)
         }
 
         guard let http = response as? HTTPURLResponse else {
@@ -773,11 +832,6 @@ final class ConnectionManager: NSObject {
         guard (200..<300).contains(http.statusCode) else {
             core.logger.d(Self.module, "isRequestSuccessful", "the request is judged as failed, reason: the HTTP status code is not in the 2XX series, endpoint: [\(endpoint)], statusCode: [\(http.statusCode)], responseSize: [\(data?.count ?? 0)]")
             return false
-        }
-
-        guard endpoint == Endpoint.input else {
-            core.logger.d(Self.module, "isRequestSuccessful", "2XX on a non ingest endpoint is a success, the reply body is application payload and is not validated, endpoint: [\(endpoint)], statusCode: [\(http.statusCode)], responseSize: [\(data?.count ?? 0)]")
-            return true
         }
 
         guard let reply = CountlyJSON.object(from: data, logger: nil) as? [String: Any] else {
@@ -986,6 +1040,7 @@ final class ConnectionManager: NSObject {
         currentTask = nil
         isProcessingQueue = false
         isBackingOff = false
+        failedRequestCooldownEnd = nil
         stateLock.unlock()
         hasAnyRequestFailed = false
         drainStartTime = nil
@@ -1124,8 +1179,10 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
     func sendHealthCheck(payload: [String: Any], completion: @escaping (Bool, Error?) -> Void) {
         var queryString = builder.queryEssentials()
         queryString += "&hc=\(CountlyJSON.escapedString(from: payload, logger: core.logger))"
-        queryString += "&\(QS.metrics)=\(CountlyJSON.escapedString(from: [MetricKey.appVersion: DeviceMetrics.appVersion], logger: core.logger))"
-        queryString = builder.appendChecksum(queryString)
+        if core.modules.consent.hasConsent(for: .metrics) {
+            queryString += "&\(QS.metrics)=\(CountlyJSON.escapedString(from: [MetricKey.appVersion: core.appVersion], logger: core.logger))"
+        }
+        queryString = builder.finishImmediateRequest(queryString)
 
         let request = instantRequest(queryString: queryString, path: Endpoint.input)
         core.logger.d(Self.module, "sendHealthCheck", "health check request is prepared, method: [\(request.httpMethod ?? "GET")], queryLength: [\(queryString.count)]")
@@ -1144,8 +1201,8 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
     func fetchServerConfig(completion: @escaping (Data?, Int, Error?) -> Void) {
         var queryString = builder.queryEssentials()
         queryString += "&\(QS.method)=\(ServerConfig.fetchMethod)"
-        queryString += "&\(QS.appVersion)=\(DeviceMetrics.appVersion)"
-        queryString = builder.appendChecksum(queryString)
+        queryString += "&\(QS.appVersion)=\(core.appVersion.urlEscaped)"
+        queryString = builder.finishImmediateRequest(queryString)
 
         let request = instantRequest(queryString: queryString, path: Endpoint.output + Endpoint.sdk)
         core.logger.d(Self.module, "fetchServerConfig", "behavior settings request is prepared, method: [\(request.httpMethod ?? "GET")], queryLength: [\(queryString.count)]")
@@ -1158,18 +1215,11 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
         }?.resume()
     }
 
-    /// Builds a GET or POST request depending on length, the same rule the queued
-    /// path uses.
+    /// Builds the POST request of a request that skips the queue.
     func instantRequest(queryString: String, path: String) -> URLRequest {
-        let base = core.config.normalizedHost + path
-
-        if queryString.count > kGETRequestMaxLength || core.config.alwaysUsePOST {
-            var request = URLRequest(url: Self.requestURL(base))
-            request.httpMethod = "POST"
-            request.httpBody = Data(queryString.utf8)
-            return request
-        }
-
-        return URLRequest(url: Self.requestURL("\(base)?\(queryString)"))
+        var request = URLRequest(url: Self.requestURL(core.config.normalizedHost + path))
+        Self.setFormBody(queryString, on: &request)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        return request
     }
 }

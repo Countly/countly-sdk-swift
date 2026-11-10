@@ -1276,6 +1276,12 @@ final class WebViewManager: NSObject {
             return
         }
 
+        let allowedSchemes = core.config.content.allowedLinkSchemes
+        guard LinkSchemePolicy.isAllowed(scheme: url.scheme, allowedSchemes: allowedSchemes, alsoRefused: Self.refusedSchemes) else {
+            core.logger.w(Self.module, "openExternalLink", "the link is not opened, its scheme is not allowed, scheme: [\(url.scheme ?? "")], allowedSchemeCount: [\(allowedSchemes.count)]")
+            return
+        }
+
         #if os(macOS)
         // AppKit answers synchronously and has no completion handler.
         let opened = NSWorkspace.shared.open(url)

@@ -14,72 +14,11 @@ import CoreLocation
 /// one.
 ///
 /// Everything here is about state that outlives the moment it was written: a
-/// breadcrumb file that must not grow without bound, a session configuration
-/// swapped at runtime, a location half-specified. Each is cheap to get wrong and
+/// session configuration swapped at runtime, a location half-specified. Each is cheap to get wrong and
 /// expensive to notice, because the symptom appears a launch or a week later.
 final class StorageAndConfigTests: CountlyBaseTestCase {
 
     private static let accepted = #"{"result": "Success"}"#
-
-    // MARK: - The breadcrumb file
-
-    /// Only the newest breadcrumbs are ever read back, so without a cap the file
-    /// grows for the life of the installation while all but its tail is dead
-    /// weight. It is trimmed once it reaches twice the limit, so the rewrite is
-    /// paid once per limit's worth rather than on every append.
-    func testTheBreadcrumbFileIsTrimmedOnceItOutgrowsTwiceTheLimit() {
-        let namespace = StorageNamespace(instanceName: "trim-\(UUID().uuidString.prefix(8))")
-        let store = CrashLogStore(namespace: namespace, logger: nil)
-        defer { store.deleteAll() }
-
-        store.maxBreadcrumbCount = 3
-        for index in 0..<12 {
-            store.append("step-\(index)")
-        }
-
-        TestUtils.waitUntil("every breadcrumb has been written") {
-            (store.readAll() ?? "").contains("step-11")
-        }
-
-        // The guarantee is a bound, not an exact count: the file is trimmed back to
-        // the limit once it reaches twice it, and then grows again until the next
-        // trim. What must hold is that it never runs away, and that the breadcrumbs
-        // nearest a crash are the ones kept.
-        let lines = (store.readAll() ?? "").split(separator: "\n").filter { !$0.isEmpty }
-        XCTAssertLessThanOrEqual(lines.count, 6, "the file grew past twice the limit")
-        XCTAssertTrue(lines.last?.contains("step-11") == true,
-                      "the newest breadcrumbs are the ones nearest a crash, so those are kept")
-        XCTAssertFalse(lines.contains { $0.contains("step-0") }, "the oldest were dropped")
-    }
-
-    /// Below the trim point the file is left alone, because rewriting it on every
-    /// append would turn a cheap log line into a whole-file read and write.
-    func testTheBreadcrumbFileIsNotRewrittenBelowTheTrimPoint() {
-        let namespace = StorageNamespace(instanceName: "no-trim-\(UUID().uuidString.prefix(8))")
-        let store = CrashLogStore(namespace: namespace, logger: nil)
-        defer { store.deleteAll() }
-
-        store.maxBreadcrumbCount = 10
-        for index in 0..<4 { store.append("step-\(index)") }
-
-        TestUtils.waitUntil("the breadcrumbs land") {
-            (store.readAll() ?? "").contains("step-3")
-        }
-        let lines = (store.readAll() ?? "").split(separator: "\n").filter { !$0.isEmpty }
-        XCTAssertEqual(lines.count, 4)
-    }
-
-    /// Reading a file that was never written is not an error: it is the ordinary
-    /// case on a first launch.
-    func testReadingAnEmptyBreadcrumbStoreYieldsNothing() {
-        let namespace = StorageNamespace(instanceName: "empty-\(UUID().uuidString.prefix(8))")
-        let store = CrashLogStore(namespace: namespace, logger: nil)
-
-        XCTAssertNil(store.readAll())
-        // Deleting one that does not exist is equally ordinary.
-        store.deleteAll()
-        XCTAssertNil(store.readAll())
-    }
 
     // MARK: - Swapping the session configuration
 
@@ -124,6 +63,7 @@ final class StorageAndConfigTests: CountlyBaseTestCase {
     /// data the caller meant, but it is worth warning about.
     func testACityWithoutACountryIsStillSent() {
         let countly = startInstance()
+        countly.sessions.beginSession()
 
         countly.location.recordLocation(kCLLocationCoordinate2DInvalid,
                                         city: "Istanbul",
@@ -140,6 +80,7 @@ final class StorageAndConfigTests: CountlyBaseTestCase {
 
     func testACountryWithoutACityIsStillSent() {
         let countly = startInstance()
+        countly.sessions.beginSession()
 
         countly.location.recordLocation(kCLLocationCoordinate2DInvalid,
                                         city: nil,
@@ -153,41 +94,31 @@ final class StorageAndConfigTests: CountlyBaseTestCase {
         XCTAssertEqual(request["country_code"] as? String, "TR")
     }
 
-    /// Sending the stored location again is how a feature that arrives later, such
-    /// as consent, gets the location the application supplied at init.
-    func testTheStoredLocationCanBeSentAgain() {
+    /// The location the application supplied at init waits for location consent:
+    /// without it nothing of it is ever sent.
+    func testTheConfiguredLocationWaitsForConsent() {
         let countly = startInstance {
+            $0.requiresConsent = true
             $0.city = "Istanbul"
             $0.isoCountryCode = "TR"
         }
-        let before = TestUtils.requests(requestQueue(of: countly), carrying: "city").count
 
-        core(of: countly).modules.location.sendLocationInfo()
-
-        XCTAssertGreaterThan(TestUtils.requests(requestQueue(of: countly), carrying: "city").count,
-                             before)
+        XCTAssertTrue(TestUtils.requests(requestQueue(of: countly), carrying: "city").isEmpty)
     }
 
-    func testSendingTheStoredLocationNeedsConsent() {
-        let countly = startInstance { $0.requiresConsent = true }
-        let before = requestQueue(of: countly).count
-
-        core(of: countly).modules.location.sendLocationInfo()
-
-        XCTAssertEqual(requestQueue(of: countly).count, before)
-    }
-
-    func testSendingTheStoredLocationIsDroppedWhenTheServerDisablesLocation() {
+    /// While the server turns location tracking off, consent does not release the
+    /// configured location either.
+    func testTheConfiguredLocationIsNotSentWhileTheServerDisablesLocation() {
         let countly = startInstance {
+            $0.requiresConsent = true
             $0.city = "Istanbul"
             $0.isoCountryCode = "TR"
             $0.sdkBehaviorSettings = ServerConfigBuilder().locationTracking(false).json()
         }
-        let before = requestQueue(of: countly).count
 
-        core(of: countly).modules.location.sendLocationInfo()
+        countly.consent.giveConsent(for: .location)
 
-        XCTAssertEqual(requestQueue(of: countly).count, before)
+        XCTAssertTrue(TestUtils.requests(requestQueue(of: countly), carrying: "city").isEmpty)
     }
 
     // MARK: - Foreground and background reaching every module
@@ -357,6 +288,8 @@ final class StorageAndConfigTests: CountlyBaseTestCase {
         original.disableAutomaticPushHandling = true
         original.launchNotification = ["launch": 1]
         original.doNotShowAlertForNotifications = true
+        original.pushActionHandler = { _, _ in true }
+        original.pushAllowedLinkSchemes = ["myapp"]
         original.location = CLLocationCoordinate2D(latitude: 1, longitude: 2)
         original.city = "City"
         original.isoCountryCode = "TR"
@@ -370,7 +303,11 @@ final class StorageAndConfigTests: CountlyBaseTestCase {
         original.storedRequestsLimit = 7
         original.requestDropAgeHours = 7
         original.requestTimeoutDuration = 7
-        original.alwaysUsePOST = true
+        original.failedRequestCooldown = 7
+        original.disableGradualRequestCleaner = true
+        original.disableHealthCheck = true
+        original.disableWebView = true
+        original.disableSDKLoggingInProduction = true
         original.manualSessionHandling = true
         original.enableManualSessionControlHybridMode = true
         original.providedUserProperties = ["property": 1]
@@ -378,8 +315,6 @@ final class StorageAndConfigTests: CountlyBaseTestCase {
         original.campaignData = "campaign-data"
         original.indirectAttribution = ["idfa": "value"]
         original.crashSegmentation = ["crash": 1]
-        original.crashFilter = try NSRegularExpression(pattern: "filtered")
-        original.shouldSendCrashReportCallback = { _ in false }
         original.pinnedCertificates = ["certificate"]
         original.secretSalt = "salt"
         original.urlSessionConfiguration.timeoutIntervalForRequest = 7
@@ -402,10 +337,6 @@ final class StorageAndConfigTests: CountlyBaseTestCase {
         original.sdkInternalLimits.maxStackTraceLineLength = 7
         original.sdkInternalLimits.maxStackTraceLinesPerThread = 7
         original.crashes.crashFilterCallback = { _ in false }
-        original.apm.enableForegroundBackgroundTracking = true
-        original.apm.enableAppStartTimeTracking = true
-        original.apm.enableManualAppLoadedTrigger = true
-        original.apm.appStartTimestampOverride = 7
         original.content.globalContentCallback = { _, _ in }
         original.content.zoneTimerInterval = 77
         original.content.overlayCornerRadius = 7
@@ -415,17 +346,17 @@ final class StorageAndConfigTests: CountlyBaseTestCase {
         original.content.disableZoom = true
         original.content.disableRotation = true
         original.content.contentURLHandler = { _ in true }
+        original.content.allowedLinkSchemes = ["myapp"]
         original.content.showWidgetsWithinApp = true
         original.experimental.enablePreviousNameRecording = true
         original.experimental.enableVisibilityTracking = true
 
         let copy = original.snapshot()
 
-        XCTAssertEqual(Mirror(reflecting: original).children.count, 64)
+        XCTAssertEqual(Mirror(reflecting: original).children.count, 67)
         XCTAssertEqual(Mirror(reflecting: original.sdkInternalLimits).children.count, 7)
         XCTAssertEqual(Mirror(reflecting: original.crashes).children.count, 1)
-        XCTAssertEqual(Mirror(reflecting: original.apm).children.count, 4)
-        XCTAssertEqual(Mirror(reflecting: original.content).children.count, 10)
+        XCTAssertEqual(Mirror(reflecting: original.content).children.count, 11)
         XCTAssertEqual(Mirror(reflecting: original.experimental).children.count, 2)
 
         assertSameValues(original, copy)
