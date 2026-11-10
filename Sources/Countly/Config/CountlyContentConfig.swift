@@ -44,22 +44,19 @@ public final class CountlyContentConfig: NSObject {
     public var globalContentCallback: ContentCallback?
 
     /// How often the SDK asks the server for content while a content zone is
-    /// entered, in seconds. Default 30.
+    /// entered, in seconds. Default 30, at least 15.
     ///
-    /// Anything at or below the minimum is ignored and the previous value kept,
-    /// which is what the other Countly SDKs do. Polling every second or two is
-    /// never what an integration means, and the cost of taking it literally is
-    /// paid by the server rather than by whoever set it.
-    public var zoneTimerInterval: Int = 30 {
-        didSet {
-            if zoneTimerInterval <= Self.minimumZoneTimerInterval {
-                zoneTimerInterval = oldValue
-            }
-        }
-    }
+    /// A value below 15 is ignored with a warning at start and the default used.
+    /// Polling every second or two is never what an integration means, and the
+    /// cost of taking it literally is paid by the server rather than by whoever
+    /// set it.
+    public var zoneTimerInterval: Int = CountlyContentConfig.defaultZoneTimerInterval
 
     /// The shortest polling interval the SDK accepts, in seconds.
     static let minimumZoneTimerInterval = 15
+
+    /// The polling interval when none is configured, in seconds.
+    static let defaultZoneTimerInterval = 30
 
     /// Corner radius of the overlay, in points, or `nil` to take the window's own.
     ///
@@ -123,6 +120,15 @@ public final class CountlyContentConfig: NSObject {
     /// view, which is how an app routes its own deep links.
     public var contentURLHandler: ContentURLHandler?
 
+    /// The URI schemes links from content and feedback widgets may open, compared
+    /// without case, for example `["https", "myapp"]`. Checked after
+    /// `contentURLHandler` declined the link.
+    ///
+    /// Empty by default, which allows every scheme except the dangerous ones:
+    /// file, content, javascript, jar, zip, intent and data. Those are never
+    /// opened. A refused link is logged as a warning.
+    public var allowedLinkSchemes: [String] = []
+
     /// Shows content and feedback widgets inside the application's own window
     /// rather than over the whole screen.
     ///
@@ -149,6 +155,7 @@ public final class CountlyContentConfig: NSObject {
         disableZoom = other.disableZoom
         disableRotation = other.disableRotation
         contentURLHandler = other.contentURLHandler
+        allowedLinkSchemes = other.allowedLinkSchemes
         showWidgetsWithinApp = other.showWidgetsWithinApp
     }
 }

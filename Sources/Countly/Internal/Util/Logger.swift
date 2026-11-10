@@ -15,8 +15,9 @@ import Foundation
 /// produced it.
 ///
 /// Format follows the cross-SDK spec:
-/// `[Countly] [<Level>] [<Module>] <function>, <message>`, with a
-/// `[<instanceName>]` segment inserted for non-default instances.
+/// `[<Level>] [Countly] [<Module>] <function>, <message>` on the console, with a
+/// `[<instanceName>]` segment inserted for non-default instances. The listener
+/// gets the same line without the level, which it receives on its own.
 ///
 /// Messages are passed as autoclosures, so an argument that serializes JSON or
 /// builds a description costs nothing when its level is inactive. That holds at
@@ -29,9 +30,27 @@ final class Logger {
     /// Prefix every line carries, so host applications can filter SDK output.
     static let prefix = "[Countly] "
 
-    /// Mirrors `CountlyConfig.enableDebug`. Server behavior settings may turn
-    /// this on for an app that did not ask for it.
+    /// Mirrors `CountlyConfig.enableDebug`.
     var enableDebug: Bool = false
+
+    /// Mirrors `CountlyConfig.disableSDKLoggingInProduction`: console lines are
+    /// left out of release builds even with `enableDebug` set.
+    var disableInProduction: Bool = false
+
+    /// Whether this build is a release build. The SDK is compiled with the
+    /// application's configuration, so `DEBUG` is set exactly in debug builds.
+    static let isProductionBuild: Bool = {
+        #if DEBUG
+        return false
+        #else
+        return true
+        #endif
+    }()
+
+    /// Whether console lines are printed at all.
+    var printsToConsole: Bool {
+        enableDebug && !(disableInProduction && Self.isProductionBuild)
+    }
 
     /// Lines above this level are dropped.
     var level: CountlyLogLevel = .debug
@@ -64,7 +83,7 @@ final class Logger {
     /// Whether a line at `level` reaches the console or the delegate. Capture is
     /// not part of this, so it keeps its developer facing meaning.
     func isEnabled(_ requested: CountlyLogLevel) -> Bool {
-        guard enableDebug || delegate != nil else { return false }
+        guard printsToConsole || delegate != nil else { return false }
         return requested.rawValue <= level.rawValue
     }
 
@@ -125,23 +144,17 @@ final class Logger {
 
         guard wantsConsole else { return }
 
-        let line = "[\(requested.label)] " + body
-
-        // Runtime gated only. A `#if DEBUG` here would compile the console sink out
-        // of every release build of the SDK, so a developer who set `enableDebug`
-        // in a TestFlight build to chase a problem would get silence, and the flag
-        // would quietly mean something different depending on how the SDK was
-        // built. The reference gates this at runtime too.
-        if enableDebug {
-            Logger.print(line)
+        if printsToConsole {
+            Logger.print("[\(requested.label)] " + Logger.prefix + body)
         }
 
-        delegate?.internalLog(Logger.prefix + line, level: requested)
+        delegate?.internalLog(Logger.prefix + body, level: requested)
     }
 
-    /// Console sink. Kept separate so tests and the crash path can reach it
-    /// without going through level resolution.
+    /// Console sink, for lines that already carry their level and the `[Countly]`
+    /// tag. Kept separate so tests and the crash path can reach it without going
+    /// through level resolution.
     static func print(_ text: String) {
-        NSLog("%@%@", prefix, text)
+        NSLog("%@", text)
     }
 }

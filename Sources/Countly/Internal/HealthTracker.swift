@@ -8,6 +8,58 @@
 
 import Foundation
 
+/// The feature areas whose method calls the health check counts.
+enum HealthArea: String, CaseIterable {
+    case sessions
+    case events
+    case views
+    case crashes
+
+    /// The consent the counts of this area follow.
+    var consent: ConsentFeature {
+        switch self {
+        case .sessions: return .sessions
+        case .events: return .events
+        case .views: return .viewTracking
+        case .crashes: return .crashReporting
+        }
+    }
+}
+
+/// The log codes the health check reports, with the meaning every Countly SDK
+/// gives them.
+enum HealthLogCode {
+    static let calledBeforeInit = "w101"
+    static let invalidServerURL = "e102"
+    static let invalidAppKey = "e103"
+    static let startedAgain = "w110"
+    static let invalidSetting = "w121"
+    static let keyCut = "w201"
+    static let valueCut = "w202"
+    static let entriesDropped = "w203"
+    static let stackTraceCut = "w205"
+    static let unsupportedValueRemoved = "w206"
+    static let queueFull = "w310"
+    static let backoffStarted = "w320"
+    static let backoffContinued = "w321"
+    static let requestTooOld = "w330"
+    static let invalidConsentName = "w402"
+    static let storedStateReset = "e503"
+    static let trackingDisabled = "w505"
+    static let invalidDeviceID = "w601"
+    static let invalidValue = "w700"
+    static let emptyEventKey = "w701"
+    static let emptyViewName = "w710"
+    static let eventNotRunning = "w720"
+    static let cancelledEventNotRunning = "w721"
+    static let eventAlreadyRunning = "w722"
+    static let viewNotFound = "w730"
+    static let viewPauseMismatch = "w731"
+    static let automaticTrackingActive = "w740"
+    static let eventValueIgnored = "w750"
+    static let sessionOutOfOrder = "w760"
+}
+
 /// Counts how badly the SDK is behaving and reports it once per launch.
 ///
 /// The counters are wire data, not diagnostics: they become the `hc` payload of
@@ -31,6 +83,8 @@ final class HealthTracker {
         static let errorMessage = "REMsg"
         static let backoffRequest = "BReq"
         static let consecutiveBackoffRequest = "CBReq"
+        static let methodUsage = "MU"
+        static let logCodes = "LC"
     }
 
     /// Keys of the `hc` request payload.
@@ -41,11 +95,16 @@ final class HealthTracker {
         static let requestError = "em"
         static let backoffRequest = "bom"
         static let consecutiveBackoffRequest = "cbom"
+        static let methodUsage = "fu"
+        static let logCodes = "lc"
     }
 
     /// Longest error message retained, so one huge server error cannot bloat
     /// every subsequent health check.
     private static let maxErrorMessageLength = 1000
+
+    /// A method usage or log code count stops growing here until it is reported.
+    static let maxCount = 65535
 
     /// Serial queue owning every counter. All mutation hops onto it.
     private let queue = DispatchQueue(label: "ly.count.healthtracker.queue")
@@ -57,6 +116,10 @@ final class HealthTracker {
     /// instance alive.
     weak var transport: HealthCheckTransport?
 
+    /// Answers whether a feature has consent, so method usage and the log codes of
+    /// a feature area follow that consent. Set once the modules exist.
+    var consentChecker: ((ConsentFeature) -> Bool)?
+
     private var countLogWarning: Int = 0
     private var countLogError: Int = 0
     private var countBackoffRequest: Int = 0
@@ -64,8 +127,15 @@ final class HealthTracker {
     private var consecutiveBackoffRequest: Int = 0
     private var statusCode: Int = -1
     private var errorMessage: String = ""
+    private var methodUsage: [String: [String: Int]] = [:]
+    private var logCodes: [String: Int] = [:]
 
-    /// Turned off by behavior settings.
+    /// Set while an automatically detected crash is being reported, when calling
+    /// into this class could deadlock the dying process.
+    private var isRecordingStopped = false
+
+    /// Turned off by `CountlyConfig.disableHealthCheck`. The counters still
+    /// accumulate, but no report is sent.
     var healthCheckEnabled: Bool = true
 
     /// One health check per launch. Set once the server accepts it.
@@ -90,67 +160,146 @@ final class HealthTracker {
     /// Records the last failed network response. Only sensible status codes are
     /// kept, so a transport level failure does not overwrite a real server error.
     func logFailedNetworkRequest(statusCode: Int, errorResponse: String?) {
-        guard statusCode > 0, statusCode < 1000, let errorResponse else {
-            // Says why a health check can report no failure at all while the
-            // requests were failing the whole time.
-            logger?.d(Self.module, "logFailedNetworkRequest", "the failed network request is not recorded, it carries no server status or no response body, statusCode: [\(statusCode)], hasErrorResponse: [\(errorResponse != nil)]")
+        guard statusCode > 0, statusCode < 1000 else {
+            logger?.d(Self.module, "logFailedNetworkRequest", "the failed network request is not recorded, it carries no server status, statusCode: [\(statusCode)]")
             return
         }
 
+        let message = String((errorResponse ?? "").prefix(Self.maxErrorMessageLength))
         queue.async {
             self.statusCode = statusCode
-            self.errorMessage = String(errorResponse.prefix(Self.maxErrorMessageLength))
-            self.logger?.d(Self.module, "logFailedNetworkRequest", "recorded failed network request, statusCode: [\(statusCode)], errorResponseLength: [\(errorResponse.count)], storedErrorMessageLength: [\(self.errorMessage.count)]")
+            self.errorMessage = message
+            self.logger?.d(Self.module, "logFailedNetworkRequest", "recorded failed network request, statusCode: [\(statusCode)], storedErrorMessageLength: [\(message.count)]")
         }
     }
 
-    /// Records that a request was held back by the backoff mechanism.
+    /// Records one backoff pause. The run of backoffs it belongs to grows, and
+    /// `cbom` is raised to it at once, so nothing has to end the run to keep the
+    /// longest one up to date.
     func logBackoffRequest() {
         queue.async {
+            let runBefore = self.countConsecutiveBackoffRequest
             self.countBackoffRequest += 1
             self.countConsecutiveBackoffRequest += 1
-            self.logger?.d(Self.module, "logBackoffRequest", "recorded a backed off request, backoffRequestCount: [\(self.countBackoffRequest)], currentConsecutiveBackoffRequestCount: [\(self.countConsecutiveBackoffRequest)]")
+            self.consecutiveBackoffRequest = max(self.consecutiveBackoffRequest, self.countConsecutiveBackoffRequest)
+            self.incrementLogCodeLocked(HealthLogCode.backoffStarted)
+            if runBefore > 0 {
+                self.incrementLogCodeLocked(HealthLogCode.backoffContinued)
+            }
+            self.logger?.d(Self.module, "logBackoffRequest", "recorded a backoff, backoffCount: [\(self.countBackoffRequest)], currentRun: [\(self.countConsecutiveBackoffRequest)], longestRun: [\(self.consecutiveBackoffRequest)]")
         }
     }
 
-    /// Closes the current backoff streak, keeping the longest one seen.
+    /// Ends the current run of backoffs, after a request was answered in time.
     func logConsecutiveBackoffRequest() {
-        queue.async { self.closeBackoffStreak() }
+        queue.async { self.countConsecutiveBackoffRequest = 0 }
+    }
+
+    /// Counts one call of a method of a feature area.
+    ///
+    /// - Parameters:
+    ///   - automatic: whether the SDK made the call by itself, which the server
+    ///     reads from the ":a" modifier.
+    func recordUsage(_ area: HealthArea, _ method: String, automatic: Bool = false) {
+        guard !isRecordingStopped, !method.isEmpty else { return }
+        guard consentChecker?(area.consent) ?? true else { return }
+
+        let name = automatic ? method + ":a" : method
+        queue.async {
+            var methods = self.methodUsage[area.rawValue] ?? [:]
+            methods[name] = min(Self.maxCount, (methods[name] ?? 0) + 1)
+            self.methodUsage[area.rawValue] = methods
+        }
+    }
+
+    /// Counts occurrences of a known problem.
+    ///
+    /// - Parameters:
+    ///   - area: the feature area of the public method that ran into it, whose
+    ///     consent the count then follows.
+    ///   - count: how many times it occurred, for example the number of requests
+    ///     one trim of the queue dropped.
+    func recordLogCode(_ code: String, area: HealthArea? = nil, count: Int = 1) {
+        guard !isRecordingStopped, !code.isEmpty, count > 0 else { return }
+        if let area, !(consentChecker?(area.consent) ?? true) { return }
+
+        queue.async { self.incrementLogCodeLocked(code, by: count) }
     }
 
     /// Must be called on `queue`.
-    private func closeBackoffStreak() {
-        consecutiveBackoffRequest = max(consecutiveBackoffRequest, countConsecutiveBackoffRequest)
-        countConsecutiveBackoffRequest = 0
-        logger?.d(Self.module, "closeBackoffStreak", "consecutive backoff streak closed, peakConsecutiveBackoffRequestCount: [\(consecutiveBackoffRequest)]")
+    private func incrementLogCodeLocked(_ code: String, by count: Int = 1) {
+        logCodes[code] = min(Self.maxCount, (logCodes[code] ?? 0) + count)
+    }
+
+    /// The method usage and log code counts not reported yet, read after every
+    /// count queued before this call. Must not be called on `queue`.
+    var pendingCounts: (methodUsage: [String: [String: Int]], logCodes: [String: Int]) {
+        queue.sync { (methodUsage, logCodes) }
+    }
+
+    /// Adds counts made before this tracker existed, such as calls to an instance
+    /// that was not started yet.
+    func absorb(_ pending: PendingHealthCounts.Counts) {
+        guard pending.warnings > 0 || pending.errors > 0 || !pending.logCodes.isEmpty else { return }
+        queue.async {
+            self.countLogWarning += pending.warnings
+            self.countLogError += pending.errors
+            for (code, count) in pending.logCodes {
+                self.logCodes[code] = min(Self.maxCount, (self.logCodes[code] ?? 0) + count)
+            }
+        }
+    }
+
+    /// Adds automatically detected crashes the previous run reported, which were
+    /// counted outside this class because they happen inside a crash handler.
+    func addAutomaticCrashes(_ count: Int) {
+        guard count > 0 else { return }
+        queue.async {
+            var methods = self.methodUsage[HealthArea.crashes.rawValue] ?? [:]
+            methods["record:a"] = min(Self.maxCount, (methods["record:a"] ?? 0) + count)
+            self.methodUsage[HealthArea.crashes.rawValue] = methods
+        }
+    }
+
+    /// Stops method usage and log codes while an automatically detected crash is
+    /// reported, since the crash handler must not reach this class.
+    func stopRecordingForCrash() {
+        isRecordingStopped = true
+    }
+
+    /// Lifts ``stopRecordingForCrash()`` when crash reporting starts again or the
+    /// instance is halted.
+    func resumeRecording() {
+        isRecordingStopped = false
     }
 
     // MARK: - Persistence
 
     /// Persists the counters so a launch that never got to send a health check
-    /// still contributes its numbers to the next one.
+    /// still contributes its numbers to the next one. The current backoff run
+    /// keeps going: `cbom` already holds the longest one.
     func saveState() {
         queue.async {
-            // Closed inline, before the snapshot is built. Enqueueing the close
-            // instead would run it after the dictionary below was assembled and
-            // persist the peak as of the previous close.
-            self.closeBackoffStreak()
-
-            let state: [String: Any] = [
-                StateKey.logWarning: self.countLogWarning,
-                StateKey.logError: self.countLogError,
-                StateKey.statusCode: self.statusCode,
-                StateKey.errorMessage: self.errorMessage,
-                StateKey.backoffRequest: self.countBackoffRequest,
-                StateKey.consecutiveBackoffRequest: self.consecutiveBackoffRequest,
-            ]
-            self.store.healthCheckState = state
-            self.logger?.d(Self.module, "saveState", "counters persisted, errorCount: [\(self.countLogError)], warningCount: [\(self.countLogWarning)], statusCode: [\(self.statusCode)], errorMessageLength: [\(self.errorMessage.count)], backoffRequestCount: [\(self.countBackoffRequest)], peakConsecutiveBackoffRequestCount: [\(self.consecutiveBackoffRequest)]")
+            self.store.healthCheckState = self.stateLocked()
+            self.logger?.d(Self.module, "saveState", "counters persisted, errorCount: [\(self.countLogError)], warningCount: [\(self.countLogWarning)], statusCode: [\(self.statusCode)], backoffCount: [\(self.countBackoffRequest)], longestBackoffRun: [\(self.consecutiveBackoffRequest)], methodUsageAreaCount: [\(self.methodUsage.count)], logCodeCount: [\(self.logCodes.count)]")
         }
     }
 
-    /// Zeroes the counters and persists the empty state, after the server has
-    /// accepted them.
+    /// Must be called on `queue`.
+    private func stateLocked() -> [String: Any] {
+        [
+            StateKey.logWarning: countLogWarning,
+            StateKey.logError: countLogError,
+            StateKey.statusCode: statusCode,
+            StateKey.errorMessage: errorMessage,
+            StateKey.backoffRequest: countBackoffRequest,
+            StateKey.consecutiveBackoffRequest: consecutiveBackoffRequest,
+            StateKey.methodUsage: methodUsage,
+            StateKey.logCodes: logCodes,
+        ]
+    }
+
+    /// Zeroes the counters and persists the empty state.
     func clearAndSave() {
         queue.async {
             self.clearValuesLocked()
@@ -171,7 +320,7 @@ final class HealthTracker {
     }
 
     private func clearValuesLocked() {
-        logger?.d(Self.module, "clearValues", "clearing counters, discardedErrorCount: [\(countLogError)], discardedWarningCount: [\(countLogWarning)], discardedBackoffRequestCount: [\(countBackoffRequest)]")
+        logger?.d(Self.module, "clearValues", "clearing counters, discardedErrorCount: [\(countLogError)], discardedWarningCount: [\(countLogWarning)], discardedBackoffCount: [\(countBackoffRequest)]")
 
         countLogWarning = 0
         countLogError = 0
@@ -180,6 +329,42 @@ final class HealthTracker {
         countBackoffRequest = 0
         consecutiveBackoffRequest = 0
         countConsecutiveBackoffRequest = 0
+        methodUsage = [:]
+        logCodes = [:]
+    }
+
+    /// Takes the reported amounts away once the server accepted a health check.
+    /// What was counted while the request was on its way stays for the next one.
+    private func clearSentValues(_ sent: Snapshot) {
+        queue.async {
+            self.countLogError = max(0, self.countLogError - sent.errors)
+            self.countLogWarning = max(0, self.countLogWarning - sent.warnings)
+            self.countBackoffRequest = max(0, self.countBackoffRequest - sent.backoffs)
+
+            if self.statusCode == sent.statusCode, self.errorMessage == sent.errorMessage {
+                self.statusCode = -1
+                self.errorMessage = ""
+            }
+            if self.consecutiveBackoffRequest == sent.longestBackoffRun {
+                self.consecutiveBackoffRequest = 0
+            }
+
+            for (area, methods) in sent.methodUsage {
+                var remaining = self.methodUsage[area] ?? [:]
+                for (method, count) in methods {
+                    let left = (remaining[method] ?? 0) - count
+                    remaining[method] = left > 0 ? left : nil
+                }
+                self.methodUsage[area] = remaining.isEmpty ? nil : remaining
+            }
+            for (code, count) in sent.logCodes {
+                let left = (self.logCodes[code] ?? 0) - count
+                self.logCodes[code] = left > 0 ? left : nil
+            }
+
+            self.store.healthCheckState = self.stateLocked()
+            self.logger?.d(Self.module, "clearSentValues", "the reported amounts are taken off the counters, remainingErrorCount: [\(self.countLogError)], remainingWarningCount: [\(self.countLogWarning)], remainingBackoffCount: [\(self.countBackoffRequest)]")
+        }
     }
 
     private func restore() {
@@ -195,10 +380,55 @@ final class HealthTracker {
         countBackoffRequest = (state[StateKey.backoffRequest] as? Int) ?? 0
         consecutiveBackoffRequest = (state[StateKey.consecutiveBackoffRequest] as? Int) ?? 0
 
-        logger?.d(Self.module, "restore", "restored persisted counters, errorCount: [\(countLogError)], warningCount: [\(countLogWarning)], statusCode: [\(statusCode)], errorMessageLength: [\(errorMessage.count)], backoffRequestCount: [\(countBackoffRequest)], consecutiveBackoffRequestCount: [\(consecutiveBackoffRequest)]")
+        if let storedUsage = state[StateKey.methodUsage] as? [String: Any] {
+            for (area, value) in storedUsage {
+                guard let methods = value as? [String: Any] else { continue }
+                var counts: [String: Int] = [:]
+                for (method, count) in methods {
+                    guard let count = count as? Int, count > 0 else { continue }
+                    counts[method] = min(Self.maxCount, count)
+                }
+                if !counts.isEmpty {
+                    methodUsage[area] = counts
+                }
+            }
+        }
+        if let storedCodes = state[StateKey.logCodes] as? [String: Any] {
+            for (code, count) in storedCodes {
+                guard let count = count as? Int, count > 0 else { continue }
+                logCodes[code] = min(Self.maxCount, count)
+            }
+        }
+
+        logger?.d(Self.module, "restore", "restored persisted counters, errorCount: [\(countLogError)], warningCount: [\(countLogWarning)], statusCode: [\(statusCode)], errorMessageLength: [\(errorMessage.count)], backoffCount: [\(countBackoffRequest)], longestBackoffRun: [\(consecutiveBackoffRequest)], methodUsageAreaCount: [\(methodUsage.count)], logCodeCount: [\(logCodes.count)]")
     }
 
     // MARK: - Sending
+
+    /// The counters a health check reported, kept until the server answers.
+    private struct Snapshot {
+        let errors: Int
+        let warnings: Int
+        let statusCode: Int
+        let errorMessage: String
+        let backoffs: Int
+        let longestBackoffRun: Int
+        let methodUsage: [String: [String: Int]]
+        let logCodes: [String: Int]
+
+        var payload: [String: Any] {
+            [
+                RequestKey.errorCount: errors,
+                RequestKey.warningCount: warnings,
+                RequestKey.statusCode: statusCode,
+                RequestKey.requestError: errorMessage,
+                RequestKey.backoffRequest: backoffs,
+                RequestKey.consecutiveBackoffRequest: longestBackoffRun,
+                RequestKey.methodUsage: methodUsage,
+                RequestKey.logCodes: logCodes,
+            ]
+        }
+    }
 
     /// Sends the health check as an instant request, outside the request queue.
     ///
@@ -237,17 +467,16 @@ final class HealthTracker {
             return
         }
 
-        let payload = snapshotPayload()
-        let requestError = (payload[RequestKey.requestError] as? String) ?? ""
-        logger?.i(Self.module, "sendHealthCheck", "sending health check request, errorCount: [\(payload[RequestKey.errorCount] ?? 0)], warningCount: [\(payload[RequestKey.warningCount] ?? 0)], statusCode: [\(payload[RequestKey.statusCode] ?? -1)], backoffRequestCount: [\(payload[RequestKey.backoffRequest] ?? 0)], consecutiveBackoffRequestCount: [\(payload[RequestKey.consecutiveBackoffRequest] ?? 0)], requestErrorLength: [\(requestError.count)]")
+        let snapshot = takeSnapshot()
+        logger?.i(Self.module, "sendHealthCheck", "sending health check request, errorCount: [\(snapshot.errors)], warningCount: [\(snapshot.warnings)], statusCode: [\(snapshot.statusCode)], backoffCount: [\(snapshot.backoffs)], longestBackoffRun: [\(snapshot.longestBackoffRun)], methodUsageAreaCount: [\(snapshot.methodUsage.count)], logCodeCount: [\(snapshot.logCodes.count)], requestErrorLength: [\(snapshot.errorMessage.count)]")
 
         // The body the server sent back on the last failed request is repeated
         // verbatim on the wire, and nobody knows what a deployment puts in it.
-        if !requestError.isEmpty {
-            logger?.v(Self.module, "sendHealthCheck", "health check request error detail, requestError: [\(requestError)]")
+        if !snapshot.errorMessage.isEmpty {
+            logger?.v(Self.module, "sendHealthCheck", "health check request error detail, requestError: [\(snapshot.errorMessage)]")
         }
 
-        transport.sendHealthCheck(payload: payload) { [weak self] wasAccepted, error in
+        transport.sendHealthCheck(payload: snapshot.payload) { [weak self] wasAccepted, error in
             guard let self else { return }
 
             if let error {
@@ -264,22 +493,22 @@ final class HealthTracker {
                 return
             }
 
-            self.logger?.d(Self.module, "sendHealthCheck", "health check accepted by the server, counters will be cleared")
-            self.clearAndSave()
+            self.logger?.d(Self.module, "sendHealthCheck", "health check accepted by the server, the reported amounts will be cleared")
+            self.clearSentValues(snapshot)
         }
     }
 
     /// Reads the counters synchronously for the outgoing request.
-    private func snapshotPayload() -> [String: Any] {
+    private func takeSnapshot() -> Snapshot {
         queue.sync {
-            [
-                RequestKey.errorCount: countLogError,
-                RequestKey.warningCount: countLogWarning,
-                RequestKey.statusCode: statusCode,
-                RequestKey.requestError: errorMessage,
-                RequestKey.backoffRequest: countBackoffRequest,
-                RequestKey.consecutiveBackoffRequest: consecutiveBackoffRequest,
-            ]
+            Snapshot(errors: countLogError,
+                     warnings: countLogWarning,
+                     statusCode: statusCode,
+                     errorMessage: errorMessage,
+                     backoffs: countBackoffRequest,
+                     longestBackoffRun: consecutiveBackoffRequest,
+                     methodUsage: methodUsage,
+                     logCodes: logCodes)
         }
     }
 }
@@ -292,4 +521,48 @@ final class HealthTracker {
 /// the same rule every other request is judged by.
 protocol HealthCheckTransport: AnyObject {
     func sendHealthCheck(payload: [String: Any], completion: @escaping (Bool, Error?) -> Void)
+}
+
+/// Warnings, errors and log codes counted for an instance before it has a
+/// health tracker, for example calls made before `start(with:)`. The tracker
+/// takes them over when the instance starts.
+enum PendingHealthCounts {
+
+    /// What was counted for one instance.
+    struct Counts {
+        var warnings = 0
+        var errors = 0
+        var logCodes: [String: Int] = [:]
+    }
+
+    private static let lock = NSLock()
+    private static var byInstance: [String: Counts] = [:]
+
+    /// Counts a warning, with its log code when it has one.
+    static func recordWarning(instanceName: String, code: String? = nil) {
+        lock.lock()
+        defer { lock.unlock() }
+        var counts = byInstance[instanceName] ?? Counts()
+        counts.warnings += 1
+        if let code {
+            counts.logCodes[code] = min(HealthTracker.maxCount, (counts.logCodes[code] ?? 0) + 1)
+        }
+        byInstance[instanceName] = counts
+    }
+
+    /// Counts an error.
+    static func recordError(instanceName: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        var counts = byInstance[instanceName] ?? Counts()
+        counts.errors += 1
+        byInstance[instanceName] = counts
+    }
+
+    /// Hands over and forgets what was counted for an instance.
+    static func take(instanceName: String) -> Counts {
+        lock.lock()
+        defer { lock.unlock() }
+        return byInstance.removeValue(forKey: instanceName) ?? Counts()
+    }
 }

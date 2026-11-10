@@ -39,7 +39,6 @@ final class SDKCore {
 
     let keyValueStore: KeyValueStore
     let requestQueueStore: RequestQueueStore
-    let crashLogStore: CrashLogStore
     let healthTracker: HealthTracker
     let serverConfig: ServerConfig
 
@@ -97,6 +96,7 @@ final class SDKCore {
         let isDefault = namespace.isDefault
         self.logger = Logger(instanceName: isDefault ? nil : instanceName)
         logger.enableDebug = config.enableDebug
+        logger.disableInProduction = config.disableSDKLoggingInProduction
         logger.level = config.internalLogLevel
         logger.delegate = config.loggerDelegate
 
@@ -108,8 +108,6 @@ final class SDKCore {
 
         self.keyValueStore = KeyValueStore(namespace: namespace, logger: logger)
         self.requestQueueStore = RequestQueueStore(namespace: namespace, logger: logger)
-        self.crashLogStore = CrashLogStore(namespace: namespace, logger: logger)
-        crashLogStore.maxBreadcrumbCount = config.sdkInternalLimits.maxBreadcrumbCount
         self.healthTracker = HealthTracker(store: keyValueStore, logger: logger)
         self.serverConfig = ServerConfig(store: keyValueStore, logger: logger)
 
@@ -126,14 +124,21 @@ final class SDKCore {
     /// Rebuilds the limit enforcer after behavior settings changed the limits.
     func refreshLimits() {
         limits = LimitsEnforcer(limits: config.sdkInternalLimits, logger: logger)
-        // The breadcrumb file caps itself, so it has to hear about a limit the
-        // server lowered as well.
-        crashLogStore.maxBreadcrumbCount = config.sdkInternalLimits.maxBreadcrumbCount
     }
 
     /// The metrics dictionary for this instance, including its custom metrics.
     func metricsDictionary() -> [String: String] {
         DeviceMetrics.metricsDictionary(customMetrics: sanitizedCustomMetrics(), logger: logger)
+    }
+
+    /// The application version reported as `av`, `_app_version` and
+    /// `app_version`: the developer's `_app_version` metric override when there is
+    /// one, the bundle's version otherwise.
+    var appVersion: String {
+        if let override = config.customMetrics[MetricKey.appVersion], !override.isEmpty {
+            return override
+        }
+        return DeviceMetrics.appVersion
     }
 
     /// Custom metrics with the SDK limits applied, computed once per read because
@@ -186,7 +191,6 @@ final class ModuleRegistry {
     let crashes: CrashModule
     let remoteConfig: RemoteConfigModule
     let attribution: AttributionModule
-    let apm: APMModule
     let feedback: FeedbackModule
     let content: ContentModule
     let push: PushModule
@@ -202,7 +206,6 @@ final class ModuleRegistry {
          crashes: CrashModule,
          remoteConfig: RemoteConfigModule,
          attribution: AttributionModule,
-         apm: APMModule,
          feedback: FeedbackModule,
          content: ContentModule,
          push: PushModule,
@@ -217,7 +220,6 @@ final class ModuleRegistry {
         self.crashes = crashes
         self.remoteConfig = remoteConfig
         self.attribution = attribution
-        self.apm = apm
         self.feedback = feedback
         self.content = content
         self.push = push
@@ -227,7 +229,7 @@ final class ModuleRegistry {
     /// Every module, for operations that fan out over all of them.
     var all: [ModuleBase] {
         [consent, deviceID, events, sessions, views, userProfile, location,
-         crashes, remoteConfig, attribution, apm, feedback, content, push, connectionTest]
+         crashes, remoteConfig, attribution, feedback, content, push, connectionTest]
     }
 }
 

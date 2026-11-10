@@ -42,13 +42,20 @@ import Foundation
     }
 }
 
-/// Whether a widget just appeared or was dismissed.
+/// What happened to a widget the SDK was asked to present.
 @objc public enum WidgetState: Int, Sendable {
+    /// The widget is on screen.
     case appeared
+    /// The widget was on screen and is closed.
     case closed
+    /// The widget could not be shown, and nothing was recorded for it: the widget
+    /// list could not be fetched, no widget matched, feedback consent is missing,
+    /// the SDK is in temporary device ID mode, web views are disabled, another
+    /// overlay is on screen, or the page did not load.
+    case failed
 }
 
-/// Called when a widget appears or is dismissed.
+/// Called when a widget appears, is closed, or could not be shown.
 public typealias WidgetCallback = (_ state: WidgetState) -> Void
 
 /// One feedback widget the server offers for this application.
@@ -102,11 +109,13 @@ public final class CountlyFeedbackWidget: NSObject {
     }
 
     /// Presents the widget and reports when it appears and when it is dismissed.
+    /// `dismissBlock` is also called when the widget could not be shown, so a
+    /// caller waiting for the widget to go away is not left waiting.
     public func present(appearBlock: (() -> Void)?, dismissBlock: (() -> Void)?) {
         present { state in
             switch state {
             case .appeared: appearBlock?()
-            case .closed: dismissBlock?()
+            case .closed, .failed: dismissBlock?()
             }
         }
     }
@@ -130,10 +139,12 @@ public final class CountlyFeedbackWidget: NSObject {
         }
     }
 
-    /// Records the answers of a manually presented widget.
+    /// Records the answers of a manually presented widget, sent right away.
     ///
     /// Pass `nil` when the user dismissed it without answering, which records the
-    /// dismissal rather than nothing.
+    /// dismissal rather than nothing. An NPS result needs a whole number "rating"
+    /// from 0 to 10, a rating result one from 1 to 5; a result without one is not
+    /// recorded. Entries with an empty key or an `NSNull` value are dropped.
     public func recordResult(_ result: [String: Any]?) {
         module?.recordResult(result, for: self)
     }

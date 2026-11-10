@@ -102,6 +102,10 @@ final class RequestQueueStore: @unchecked Sendable {
         }
     }
 
+    /// Whether an overfull queue is trimmed by at most `removalLoopLimit` of its
+    /// overflow per new request, rather than all at once.
+    var isGradualCleanerEnabled = true
+
     /// Runs every database operation, one at a time.
     private let writeQueue = DispatchQueue(label: "ly.count.requestqueue.write", qos: .utility)
 
@@ -189,7 +193,8 @@ final class RequestQueueStore: @unchecked Sendable {
     @discardableResult
     func enqueue(_ queryString: String, appVersion: String, trackingEnabled: Bool) -> String? {
         guard trackingEnabled else {
-            logger?.d(Self.module, "enqueue", "request is not stored in the queue, reason: tracking is disabled by behavior settings, queryStringLength: [\(queryString.count)]")
+            logger?.w(Self.module, "enqueue", "request is not stored in the queue, reason: tracking is disabled by behavior settings, queryStringLength: [\(queryString.count)]")
+            logger?.healthTracker?.recordLogCode(HealthLogCode.trackingDisabled)
             return nil
         }
 
@@ -218,8 +223,10 @@ final class RequestQueueStore: @unchecked Sendable {
         guard entries.count >= storedRequestsLimit else { return }
 
         let exceeded = entries.count - storedRequestsLimit
-        let removeCount = min(min(exceeded, Self.removalLoopLimit) + 1, entries.count)
-        logger?.d(Self.module, "trimToLimitLocked", "the oldest queued requests are dropped because the queue is over its limit, queuedRequestCount: [\(entries.count)], storedRequestsLimit: [\(storedRequestsLimit)], droppedRequestCount: [\(removeCount)], exceededBy: [\(exceeded)]")
+        let overflow = isGradualCleanerEnabled ? min(exceeded, Self.removalLoopLimit) : exceeded
+        let removeCount = min(overflow + 1, entries.count)
+        logger?.w(Self.module, "trimToLimitLocked", "the oldest queued requests are dropped because the queue is over its limit, queuedRequestCount: [\(entries.count)], storedRequestsLimit: [\(storedRequestsLimit)], droppedRequestCount: [\(removeCount)], exceededBy: [\(exceeded)], gradualCleaner: [\(isGradualCleanerEnabled)]")
+        logger?.healthTracker?.recordLogCode(HealthLogCode.queueFull, count: removeCount)
         entries.removeFirst(removeCount)
         scheduleSyncLocked()
     }
@@ -320,15 +327,18 @@ final class RequestQueueStore: @unchecked Sendable {
 
         let temporaryID = "&\(QS.deviceID)=\(TemporaryDeviceID.value)"
         let realID = "&\(QS.deviceID)=\(deviceID.urlEscaped)"
-        let temporaryType = "&\(QS.deviceIDType)=\(DeviceIDType.temporary.wireValue)"
-        let realType = "&\(QS.deviceIDType)=\(typeValue)"
+
+        // Runs at every start, so a queue with nothing to rewrite is not written.
+        guard isDetached || entries.contains(where: { $0.request.contains(temporaryID) }) else {
+            logger?.d(Self.module, "replaceTemporaryDeviceIDs", "no queued request carries the temporary device ID, nothing is rewritten, queuedRequestCount: [\(entries.count)]")
+            return
+        }
 
         let replacedCount = changeWholeQueueLocked { queue -> Int in
             var replacedCount = 0
             for index in queue.indices where queue[index].request.contains(temporaryID) {
-                queue[index].request = queue[index].request
-                    .replacingOccurrences(of: temporaryID, with: realID)
-                    .replacingOccurrences(of: temporaryType, with: realType)
+                let withRealID = queue[index].request.replacingOccurrences(of: temporaryID, with: realID)
+                queue[index].request = Self.replacingTemporaryType(in: withRealID, with: typeValue)
                 replacedCount += 1
             }
             return replacedCount
@@ -408,8 +418,23 @@ final class RequestQueueStore: @unchecked Sendable {
 
         if before > entries.count {
             scheduleSyncLocked()
-            logger?.d(Self.module, "removeOldAgeRequests", "queued requests past the configured drop age are dropped, droppedRequestCount: [\(before - entries.count)], requestDropAgeHours: [\(requestDropAgeHours)], remainingRequestCount: [\(entries.count)]")
+            logger?.w(Self.module, "removeOldAgeRequests", "queued requests past the configured drop age are dropped, droppedRequestCount: [\(before - entries.count)], requestDropAgeHours: [\(requestDropAgeHours)], remainingRequestCount: [\(entries.count)]")
+            logger?.healthTracker?.recordLogCode(HealthLogCode.requestTooOld, count: before - entries.count)
         }
+    }
+
+    /// `request` with its `t` parameter set to `typeValue` when it carries the
+    /// offline mode type: 2, or 9 in requests an earlier Countly SDK queued.
+    private static func replacingTemporaryType(in request: String, with typeValue: Int) -> String {
+        let legacyTemporaryTypeValue = 9
+        let temporaryParts: Set<String> = [
+            "\(QS.deviceIDType)=\(DeviceIDType.temporary.wireValue)",
+            "\(QS.deviceIDType)=\(legacyTemporaryTypeValue)",
+        ]
+        return request
+            .split(separator: "&", omittingEmptySubsequences: false)
+            .map { temporaryParts.contains(String($0)) ? "\(QS.deviceIDType)=\(typeValue)" : String($0) }
+            .joined(separator: "&")
     }
 
     /// Makes a change meant for the whole queue, and keeps it for the database's
@@ -449,9 +474,11 @@ final class RequestQueueStore: @unchecked Sendable {
         return String(value.prefix(while: { $0 != "&" }))
     }
 
-    /// Whether a request is at least `dropAgeHours` old.
+    /// Whether a request is at least `dropAgeHours` old. A request without a
+    /// readable timestamp is kept: its age is unknown, not infinite.
     private static func isOld(_ request: String, dropAgeHours: Int) -> Bool {
-        request.requestAgeSeconds / 3600.0 >= Double(dropAgeHours)
+        guard request.hasRequestTimestamp else { return false }
+        return request.requestAgeSeconds / 3600.0 >= Double(dropAgeHours)
     }
 
     // MARK: - Persistence

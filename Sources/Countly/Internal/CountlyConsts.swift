@@ -59,8 +59,8 @@ enum QS {
     static let crash = "crash"
     static let checksum256 = "checksum256"
     static let consent = "consent"
-    static let apm = "apm"
     static let remainingRequest = "rr"
+    static let directRequest = "dr"
 
     static let method = "method"
     static let theme = "th"
@@ -80,6 +80,10 @@ enum QS {
     static let newEndPoint = "new_end_point"
     static let endPointOverrideTag = "&new_end_point="
     static let callbackID = "callback_id"
+    /// Internal tag of a crash report the crash handler stored, removed before
+    /// the request is sent. It lets the health check count automatically detected
+    /// crashes without being called from inside the crash handler.
+    static let automaticCrash = "cly_automatic_crash"
 }
 
 /// Server endpoints the SDK talks to.
@@ -106,9 +110,14 @@ enum ReservedEventKey {
     static let nps = "[CLY]_nps"
     static let survey = "[CLY]_survey"
     static let pushAction = "[CLY]_push_action"
+    /// Recorded by a content page when its content is shown.
+    static let contentShown = "[CLY]_content_shown"
+    /// Recorded by a content page when the user interacts with its content.
+    static let contentInteracted = "[CLY]_content_interacted"
 
     /// The feature each reserved event belongs to. The event answers to that
-    /// feature's consent, and so does a gathered log line quoting its key.
+    /// feature's consent, and so does a gathered log line quoting its key. A
+    /// rating result answers to the "star-rating" consent as well.
     static let owningFeature: [String: ConsentFeature] = [
         orientation: .userDetails,
         view: .viewTracking,
@@ -116,9 +125,16 @@ enum ReservedEventKey {
         nps: .feedback,
         survey: .feedback,
         pushAction: .pushNotifications,
+        contentShown: .content,
+        contentInteracted: .content,
     ]
 
     static let all = Set(owningFeature.keys)
+
+    /// Reserved events sent right away rather than with the next batch: a widget
+    /// answer lets the server stop offering the widget, and a notification tap is
+    /// often followed by the application closing.
+    static let sentImmediately: Set<String> = [nps, survey, ratingWidget, pushAction]
 }
 
 /// Keys of the Countly payload carried inside a push notification.
@@ -181,9 +197,6 @@ enum SegKey {
     static let duration = "dur"
 }
 
-/// Requests larger than this are sent as POST even when `alwaysUsePOST` is off.
-let kGETRequestMaxLength = 2048
-
 /// Boundary used when the SDK uploads a user profile picture.
 let kUploadBoundary = "0cae04a8b698d63ff6ea55d168993f21"
 
@@ -212,6 +225,21 @@ enum PersistencyKey {
     static let isCustomDeviceID = "kCountlyIsCustomDeviceIDKey"
     static let remoteConfig = "kCountlyRemoteConfigKey"
     static let serverConfig = "kCountlyServerConfigPersistencyKey"
+    static let recordedEvents = "kCountlyRecordedEventsPersistencyKey"
+    static let preTemporaryDeviceID = "kCountlyPreTemporaryDeviceIDKey"
+    static let preTemporaryIsCustomDeviceID = "kCountlyPreTemporaryIsCustomDeviceIDKey"
+    static let pushTokenDeviceID = "kCountlyPushTokenDeviceIDKey"
+    /// Notification taps that arrived before the SDK started. Process wide, read
+    /// by the default instance, the only one that handles push.
+    static let pendingPushActions = "kCountlyPendingPushActionsKey"
+}
+
+/// Keys of one stored notification tap, see `PersistencyKey.pendingPushActions`.
+enum PendingPushActionKey {
+    static let notificationID = "i"
+    static let buttonIndex = "b"
+    /// Seconds since 1970 when the tap happened.
+    static let time = "t"
 }
 
 /// The sentinel device ID that means "hold everything until a real ID arrives".

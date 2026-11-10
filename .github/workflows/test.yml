@@ -317,6 +317,8 @@ jobs:
       contents: read
       checks: write
       pull-requests: write
+      # Lists the base branch's runs and reads its coverage artifact for the coverage gate.
+      actions: read
     steps:
       # Only for the scripts under .github/scripts; nothing here builds.
       - name: Checkout SDK code
@@ -436,3 +438,33 @@ jobs:
           name: ci-report
           path: ci-report.md
           if-no-files-found: warn
+
+      # A pull request that lowers the coverage fails. The base branch's figure is the macOS
+      # coverage summary of its last green push, which the macOS job uploads on every run.
+      - name: Find the base branch's last green push
+        id: base
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_id=$(gh run list -R "${{ github.repository }}" --workflow test.yml --branch "${{ github.base_ref }}" --event push --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+
+      - name: Download the base branch's coverage
+        if: github.event_name == 'pull_request' && steps.base.outputs.run_id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: coverage-macOS
+          path: coverage-baseline
+          run-id: ${{ steps.base.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Fail a pull request that lowers the coverage
+        if: github.event_name == 'pull_request'
+        run: |
+          python3 .github/scripts/coverage_gate.py \
+            --platform macOS \
+            --current-dir coverage \
+            --baseline-dir coverage-baseline

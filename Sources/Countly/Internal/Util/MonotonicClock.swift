@@ -67,6 +67,13 @@ final class MonotonicClock {
         Int(ProcessInfo.processInfo.systemUptime - startUptime)
     }
 
+    /// Seconds on a clock that only moves forward, also while the device sleeps,
+    /// whatever the user does to the device's date and time. For measuring
+    /// durations, such as a session's.
+    func monotonicSeconds() -> TimeInterval {
+        TimeInterval(clock_gettime_nsec_np(CLOCK_MONOTONIC)) / 1_000_000_000
+    }
+
     // MARK: - Calendar fields sent as base parameters
 
     /// Autoupdating so that a device changing region mid-session does not leave

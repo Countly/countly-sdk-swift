@@ -75,10 +75,6 @@ public final class CountlyInstance: NSObject {
     @objc
     public private(set) lazy var attribution = AttributionAPI(instance: self)
 
-    /// Performance monitoring.
-    @objc
-    public private(set) lazy var performance = APMAPI(instance: self)
-
     /// Feedback widgets.
     @objc
     public private(set) lazy var feedback = FeedbackAPI(instance: self)
@@ -127,6 +123,7 @@ public final class CountlyInstance: NSObject {
             // logger, and a call before init is exactly the mistake worth seeing.
             let reason = Countly.isRegistered(self) ? "the SDK has not been started yet" : notRegisteredReason
             Logger.print("[Warning] [\(Self.module)] \(function), \(reason), the call is ignored")
+            PendingHealthCounts.recordWarning(instanceName: name, code: HealthLogCode.calledBeforeInit)
             return nil
         }
         return current
@@ -154,6 +151,7 @@ public final class CountlyInstance: NSObject {
 
         if let core, core.hasStarted {
             core.logger.w(Self.module, "start", "omitting the call, the SDK has already been started")
+            core.healthTracker.recordLogCode(HealthLogCode.startedAgain)
             return
         }
 
@@ -170,6 +168,7 @@ public final class CountlyInstance: NSObject {
         // half-initialized state behind.
         if let failure = config.validate() {
             Logger.print("[Error] [\(Self.module)] start, \(failure.message)")
+            PendingHealthCounts.recordError(instanceName: name)
             return
         }
 
@@ -185,7 +184,6 @@ public final class CountlyInstance: NSObject {
         // run as it was given, and a config shared by two instances cannot carry
         // one's changes into the other.
         let config = config.snapshot()
-        config.sdkInternalLimits.clampToMinimums()
 
         // Taken before anything is opened. A previous holder still halting is
         // waited for, so its last write lands before this instance reads.
@@ -215,7 +213,6 @@ public final class CountlyInstance: NSObject {
             crashes: CrashModule(core: core),
             remoteConfig: RemoteConfigModule(core: core),
             attribution: AttributionModule(core: core),
-            apm: APMModule(core: core),
             feedback: FeedbackModule(core: core),
             content: ContentModule(core: core),
             push: PushModule(core: core),
@@ -224,6 +221,9 @@ public final class CountlyInstance: NSObject {
         core.attach(network: network, modules: modules)
 
         core.healthTracker.transport = network
+        core.healthTracker.consentChecker = { [weak core] feature in
+            core?.modules.consent.hasConsent(for: feature) ?? true
+        }
         core.serverConfig.transport = network
         core.serverConfig.delegate = self
         core.serverConfig.logGatherer = core.logGatherer
@@ -234,6 +234,15 @@ public final class CountlyInstance: NSObject {
     private func configure(core: SDKCore, with config: CountlyConfig) {
         let modules = core.modules!
         let logger = core.logger
+
+        core.healthTracker.absorb(PendingHealthCounts.take(instanceName: name))
+        core.healthTracker.healthCheckEnabled = !config.disableHealthCheck
+
+        // Checked before the behavior settings read the developer's values.
+        config.resetInvalidValues(logger: logger)
+        if config.host.hasSuffix("/") {
+            logger.w(Self.module, "start", "the trailing slashes of the server URL are removed, so endpoint paths can be appended to it, serverUrl: [\(config.normalizedHost)]")
+        }
 
         // Behavior settings first: they can change limits, queue sizes and whether
         // features are allowed at all, and everything below reads those.
@@ -253,25 +262,20 @@ public final class CountlyInstance: NSObject {
         // integration does not behave the way its config reads.
         logger.i(Self.module, "start", "tracking configuration in effect, requiresConsent: [\(config.requiresConsent)], enableAllConsents: [\(config.enableAllConsents)], initialConsentCount: [\(config.consents.count)], manualSessionHandling: [\(config.manualSessionHandling)], hybridSessionMode: [\(config.enableManualSessionControlHybridMode)], automaticViewTracking: [\(config.enableAutomaticViewTracking)], viewTrackingExclusionCount: [\(config.automaticViewTrackingExclusionList.count)], orientationTracking: [\(config.enableOrientationTracking)], updateSessionPeriod: [\(config.updateSessionPeriod.logSeconds)], eventSendThreshold: [\(config.eventSendThreshold)], enableDebug: [\(config.enableDebug)], internalLogLevel: [\(config.internalLogLevel.label)]")
 
-        logger.i(Self.module, "start", "networking configuration in effect, storedRequestsLimit: [\(config.storedRequestsLimit)], requestDropAgeHours: [\(config.requestDropAgeHours)], requestTimeoutDuration: [\(config.requestTimeoutDuration.logSeconds)], alwaysUsePOST: [\(config.alwaysUsePOST)], customNetworkRequestHeaderCount: [\(config.customNetworkRequestHeaders?.count ?? 0)], pinnedCertificateCount: [\(config.pinnedCertificates.count)], secretSaltConfigured: [\(config.secretSalt?.isEmpty == false)], customMetricCount: [\(config.customMetrics.count)], temporaryDeviceIDMode: [\(config.temporaryDeviceIDMode)], deviceIDProvided: [\(config.deviceID != nil)], resetStoredDeviceID: [\(config.resetStoredDeviceID)], behaviorSettingsUpdatesDisabled: [\(config.disableSDKBehaviorSettingsUpdates)], backoffMechanismDisabled: [\(config.disableBackoffMechanism)], features: [\(config.features.map { "\($0)" }.joined(separator: ", "))]")
+        logger.i(Self.module, "start", "networking configuration in effect, storedRequestsLimit: [\(config.storedRequestsLimit)], requestDropAgeHours: [\(config.requestDropAgeHours)], requestTimeoutDuration: [\(config.requestTimeoutDuration.logSeconds)], failedRequestCooldown: [\(config.failedRequestCooldown.logSeconds)], gradualRequestCleaner: [\(!config.disableGradualRequestCleaner)], healthCheckDisabled: [\(config.disableHealthCheck)], webViewDisabled: [\(config.disableWebView)],customNetworkRequestHeaderCount: [\(config.customNetworkRequestHeaders?.count ?? 0)], pinnedCertificateCount: [\(config.pinnedCertificates.count)], secretSaltConfigured: [\(config.secretSalt?.isEmpty == false)], customMetricCount: [\(config.customMetrics.count)], temporaryDeviceIDMode: [\(config.temporaryDeviceIDMode)], deviceIDProvided: [\(config.deviceID != nil)], resetStoredDeviceID: [\(config.resetStoredDeviceID)], behaviorSettingsUpdatesDisabled: [\(config.disableSDKBehaviorSettingsUpdates)], backoffMechanismDisabled: [\(config.disableBackoffMechanism)], features: [\(config.features.map { "\($0)" }.joined(separator: ", "))]")
 
-        logger.d(Self.module, "start", "behavior settings in effect, trackingEnabled: [\(core.serverConfig.trackingEnabled)], networkingEnabled: [\(core.serverConfig.networkingEnabled)], sessionTracking: [\(core.serverConfig.sessionTrackingEnabled)], automaticSessionTracking: [\(core.serverConfig.automaticSessionTrackingEnabled)], viewTracking: [\(core.serverConfig.viewTrackingEnabled)], automaticViewTracking: [\(core.serverConfig.automaticViewTrackingEnabled)], crashReporting: [\(core.serverConfig.crashReportingEnabled)], automaticCrashReporting: [\(core.serverConfig.automaticCrashReportingEnabled)], locationTracking: [\(core.serverConfig.locationTrackingEnabled)], customEventTracking: [\(core.serverConfig.customEventTrackingEnabled)], backoffMechanism: [\(core.serverConfig.backoffMechanism)], consentRequired: [\(core.serverConfig.consentRequired)]")
+        logger.d(Self.module, "start", "behavior settings in effect, trackingEnabled: [\(core.serverConfig.trackingEnabled)], networkingEnabled: [\(core.serverConfig.networkingEnabled)], sessionTracking: [\(core.serverConfig.sessionTrackingEnabled)], automaticSessionTracking: [\(core.serverConfig.automaticSessionTrackingEnabled)], viewTracking: [\(core.serverConfig.viewTrackingEnabled)], automaticViewTracking: [\(core.serverConfig.automaticViewTrackingEnabled)], crashReporting: [\(core.serverConfig.crashReportingEnabled)], automaticCrashReporting: [\(core.serverConfig.automaticCrashReportingEnabled)], locationTracking: [\(core.serverConfig.locationTracking.map { "\($0)" } ?? "not set")], customEventTracking: [\(core.serverConfig.customEventTrackingEnabled)], backoffMechanism: [\(core.serverConfig.backoffMechanism)], consentRequired: [\(core.serverConfig.consentRequired.map { "\($0)" } ?? "not set")]")
 
         logger.d(Self.module, "start", "SDK internal limits in effect, maxKeyLength: [\(config.sdkInternalLimits.maxKeyLength)], maxValueSize: [\(config.sdkInternalLimits.maxValueSize)], maxValueSizePicture: [\(config.sdkInternalLimits.maxValueSizePicture)], maxSegmentationValues: [\(config.sdkInternalLimits.maxSegmentationValues)], maxBreadcrumbCount: [\(config.sdkInternalLimits.maxBreadcrumbCount)], maxStackTraceLineLength: [\(config.sdkInternalLimits.maxStackTraceLineLength)], maxStackTraceLinesPerThread: [\(config.sdkInternalLimits.maxStackTraceLinesPerThread)]")
 
         // The device ID must exist before any request is built.
         modules.deviceID.initialize(with: config)
 
-        core.requestQueueStore.storedRequestsLimit = Swift.max(1, config.storedRequestsLimit)
+        core.requestQueueStore.storedRequestsLimit = config.storedRequestsLimit
         core.requestQueueStore.requestDropAgeHours = config.requestDropAgeHours
+        core.requestQueueStore.isGradualCleanerEnabled = !config.disableGradualRequestCleaner
 
         core.network.addCustomNetworkRequestHeaders(config.customNetworkRequestHeaders)
-
-        if let provided = config.providedUserProperties, !provided.isEmpty {
-            logger.i(Self.module, "start", "applying the user properties provided at init, count: [\(provided.count)]")
-            modules.userProfile.setProperties(provided)
-        }
-        modules.userProfile.save()
 
         core.serverConfig.fetch(config: config)
 
@@ -326,7 +330,6 @@ public final class CountlyInstance: NSObject {
         modules.sessions.startUpdateTimer()
         modules.remoteConfig.applyInitialConfig()
         modules.remoteConfig.downloadRemoteConfigAutomatically()
-        modules.apm.applyInitialConfig()
 
         installLifecycleObserver(core: core)
 
@@ -342,14 +345,18 @@ public final class CountlyInstance: NSObject {
             modules.consent.sendConsents()
         }
 
-        // Without session consent nothing carried location or attribution along,
-        // so they are sent on their own.
+        // After the consent, which the profile calls need.
+        if let provided = config.providedUserProperties, !provided.isEmpty {
+            logger.i(Self.module, "start", "applying the user properties provided at init, count: [\(provided.count)]")
+            modules.userProfile.setProperties(provided)
+            modules.userProfile.save()
+        }
+
+        // When no session request will carry the location, it goes on its own.
+        modules.location.sendAtEndOfInit()
+
+        // Without session consent nothing carried attribution along either.
         if !modules.consent.hasConsent(for: .sessions) {
-            if !modules.consent.hasConsent(for: .location) || modules.location.isLocationInfoDisabled {
-                modules.location.sendLocationRequest()
-            } else {
-                modules.location.sendLocationInfo()
-            }
             modules.attribution.sendIndirectAttributionIfAvailable()
         }
 
@@ -421,45 +428,98 @@ public final class CountlyInstance: NSObject {
         // The queue is not drained while terminating, but a queued tail survives to
         // the next launch through the sync save below.
         core.logGatherer.flushNow(ignoringQueuedBatch: true)
-        core.modules.apm.endBackgroundTrace()
         core.requestQueueStore.saveSync()
     }
 
     // MARK: - Integration-wide operations
 
-    /// Points the SDK at a different server.
+    /// Points the SDK at a different server, for this run: the next start uses
+    /// the server URL of the config again.
     ///
-    /// Requests already queued keep going to their original destination only if
-    /// they have already been sent; anything still queued goes to the new host.
+    /// Everything still queued goes to the new server; a request already on its
+    /// way finishes at the old one. The new server is then caught up: the push
+    /// token and, while consent is required, the consent state are sent again,
+    /// and its behavior settings and, with automatic triggers, its remote config
+    /// are fetched. A URL that is not an absolute http or https URL, or an http URL
+    /// while certificates are pinned, is ignored with an error.
     @objc
     public func setNewHost(_ host: String) {
         guard let core = requireCore() else { return }
-        guard !host.isEmpty else {
-            core.logger.w(Self.module, "setNewHost", "omitting the call, the provided host is empty")
+
+        var normalized = host
+        while normalized.hasSuffix("/") {
+            normalized.removeLast()
+        }
+
+        guard normalized != Placeholder.host, CountlyConfig.isValidServerURL(normalized) else {
+            core.logger.e(Self.module, "setNewHost", "omitting the call, the server URL is not a valid absolute http or https URL, host: [\(host)]")
+            core.healthTracker.recordLogCode(HealthLogCode.invalidServerURL)
             return
         }
-        core.logger.i(Self.module, "setNewHost", "the server host is being changed, host: [\(host)], previousHost: [\(core.config.host)], queuedRequestCount: [\(core.requestQueueStore.count)]")
-        core.config.host = host
+
+        guard core.config.pinnedCertificates.isEmpty || CountlyConfig.usesHTTPS(normalized) else {
+            core.logger.e(Self.module, "setNewHost", "omitting the call, certificate pinning is configured and the server URL does not use https, host: [\(host)]")
+            core.healthTracker.recordLogCode(HealthLogCode.invalidServerURL)
+            return
+        }
+
+        core.logger.i(Self.module, "setNewHost", "the server host is being changed, host: [\(normalized)], previousHost: [\(core.config.normalizedHost)], queuedRequestCount: [\(core.requestQueueStore.count)]")
+        core.config.host = normalized
+        catchUpAfterConnectionChange(core: core)
     }
 
-    /// Points the SDK at a different app key.
+    /// Points the SDK at a different app key, for this run: the next start uses
+    /// the app key of the config again.
     ///
-    /// Queued requests keep the app key they were recorded under, so data already
-    /// collected still lands where it belongs. Use the request queue API to rewrite
-    /// or drop them.
+    /// What belongs to the old app is closed first under the old key: the running
+    /// views stop, pending events and profile changes are queued and the running
+    /// session ends. Then a session begins for the new app if one was running,
+    /// and automatic view tracking starts a view for the screen on display. The
+    /// stored remote config values belong to the old app and are cleared, and the
+    /// new app is caught up like a new server. Requests already queued keep the
+    /// app key they were recorded under; the request queue API rewrites or drops
+    /// them. An empty or placeholder key is ignored with an error, the key in use
+    /// is ignored.
     @objc
     public func setNewAppKey(_ appKey: String) {
         guard let core = requireCore() else { return }
-        guard !appKey.isEmpty else {
-            core.logger.w(Self.module, "setNewAppKey", "omitting the call, the provided app key is empty")
+
+        guard !appKey.isEmpty, appKey != Placeholder.appKey else {
+            core.logger.e(Self.module, "setNewAppKey", "omitting the call, the app key is empty or still the placeholder value")
+            core.healthTracker.recordLogCode(HealthLogCode.invalidAppKey)
+            return
+        }
+
+        guard appKey != core.config.appKey else {
+            core.logger.d(Self.module, "setNewAppKey", "omitting the call, the app key is the one in use")
             return
         }
 
         core.logger.i(Self.module, "setNewAppKey", "the app key is being changed, appKey: [\(appKey)], previousAppKey: [\(core.config.appKey)], queuedRequestCount: [\(core.requestQueueStore.count)]")
-        core.modules.events.sendEventsWithSaveIfNeeded()
-        core.modules.sessions.suspend()
+
+        let modules = core.modules!
+        modules.views.stopAllViewsForIdentityChange()
+        modules.events.sendEventsWithSaveIfNeeded()
+        let endedSession = modules.sessions.endSessionForIdentityChange(includingManual: true)
+
         core.config.appKey = appKey
-        core.modules.sessions.resume()
+
+        modules.sessions.beginSessionAfterIdentityChange(wasAutomatic: endedSession)
+        modules.views.startViewForCurrentScreenAfterIdentityChange()
+        modules.remoteConfig.clearCachedRemoteConfig()
+        catchUpAfterConnectionChange(core: core)
+    }
+
+    /// Catches a new server or app up after `setNewHost` or `setNewAppKey`,
+    /// since it knows nothing that was sent before. In temporary device ID mode
+    /// the fetches skip themselves as usual.
+    private func catchUpAfterConnectionChange(core: SDKCore) {
+        core.modules.push.connectionChanged()
+        if core.modules.consent.requiresConsent {
+            core.modules.consent.sendConsents()
+        }
+        core.serverConfig.fetch(config: core.config)
+        core.modules.remoteConfig.downloadRemoteConfigAutomatically()
     }
 
     /// Replaces the session configuration used for every request.
@@ -493,7 +553,12 @@ public final class CountlyInstance: NSObject {
 
         var metrics = core.metricsDictionary()
         if let metricsOverride, !metricsOverride.isEmpty {
-            metrics.merge(metricsOverride) { _, override in override }
+            let usable = metricsOverride.filter { !$0.key.isEmpty && !$0.value.isEmpty }
+            if usable.count != metricsOverride.count {
+                core.logger.w(Self.module, "recordMetrics", "metric overrides with an empty key or value are skipped, skippedCount: [\(metricsOverride.count - usable.count)]")
+                core.healthTracker.recordLogCode(HealthLogCode.invalidValue)
+            }
+            metrics.merge(usable) { _, override in override }
         }
 
         core.logger.d(Self.module, "recordMetrics", "metrics request is being prepared, finalMetricCount: [\(metrics.count)]")
@@ -526,10 +591,16 @@ public final class CountlyInstance: NSObject {
             filtered.removeValue(forKey: key)
         }
 
+        guard !filtered.isEmpty else {
+            core.logger.w(Self.module, "addDirectRequest", "omitting the call, no parameter is left once the reserved keys are removed")
+            core.healthTracker.recordLogCode(HealthLogCode.invalidValue)
+            return
+        }
+
         core.logger.i(Self.module, "addDirectRequest", "direct request is being queued, parameterCount: [\(filtered.count + 1)]")
 
         var queryString = core.network.builder.queryEssentials()
-        queryString += "&dr=1"
+        queryString += "&\(QS.directRequest)=1"
         for (key, value) in filtered {
             queryString += "&\(key.urlEscaped)=\(value.urlEscaped)"
         }
@@ -600,18 +671,15 @@ public final class CountlyInstance: NSObject {
         core.serverConfig.stop()
         core.logGatherer.halt()
 
-        // Every store is closed, not only erased ones: a send that completes, a
-        // download or a breadcrumb that lands after this point belongs to the run
-        // being halted and must not write over what the next start reads.
+        // Every store is closed, not only erased ones: a send or a download that
+        // completes after this point belongs to the run being halted and must not
+        // write over what the next start reads.
         if clearStorage {
             core.requestQueueStore.flush()
             core.requestQueueStore.deleteFile()
-            core.crashLogStore.close()
-            core.crashLogStore.deleteAll()
             core.keyValueStore.clearAll()
         } else {
             core.requestQueueStore.close()
-            core.crashLogStore.close()
             core.keyValueStore.close()
         }
 
@@ -642,7 +710,6 @@ public final class CountlyInstance: NSObject {
         defer { StorageClaims.release(namespace, by: self) }
 
         RequestQueueDatabase(namespace: namespace, logger: nil).deleteEverything()
-        CrashLogStore(namespace: namespace, logger: nil).deleteAll()
         KeyValueStore(namespace: namespace, logger: nil).clearAll()
 
         Logger.print("[Info] [\(Self.module)] halt, the SDK is not running, its stored data is erased, name: [\(name)]")
@@ -653,7 +720,7 @@ public final class CountlyInstance: NSObject {
 
 extension CountlyInstance: ServerConfigDelegate {
 
-    func serverConfigDidChange(_ serverConfig: ServerConfig, consentBecameRequired: Bool, changedKeys: Set<String>) {
+    func serverConfigDidChange(_ serverConfig: ServerConfig, changedKeys: Set<String>) {
         // An answer the halt could not stop any more comes from the halted run's
         // settings, and after a restart `core` is already the next run.
         guard let core, core.serverConfig === serverConfig else { return }
@@ -663,33 +730,29 @@ extension CountlyInstance: ServerConfigDelegate {
             return
         }
 
-        core.logger.d(Self.module, "serverConfigDidChange", "behavior settings are being applied to the running SDK, changedKeys: [\(changedKeys.sorted().joined(separator: ", "))], consentBecameRequired: [\(consentBecameRequired)], trackingEnabled: [\(serverConfig.trackingEnabled)], networkingEnabled: [\(serverConfig.networkingEnabled)], storedRequestsLimit: [\(core.config.storedRequestsLimit)], requestDropAgeHours: [\(core.config.requestDropAgeHours)], requiresConsent: [\(core.config.requiresConsent)], enableDebug: [\(core.config.enableDebug)]")
+        core.logger.d(Self.module, "serverConfigDidChange", "behavior settings are being applied to the running SDK, changedKeys: [\(changedKeys.sorted().joined(separator: ", "))], trackingEnabled: [\(serverConfig.trackingEnabled)], networkingEnabled: [\(serverConfig.networkingEnabled)], storedRequestsLimit: [\(core.config.storedRequestsLimit)], requestDropAgeHours: [\(core.config.requestDropAgeHours)], requiresConsent: [\(core.config.requiresConsent)]")
 
-        core.logger.enableDebug = core.config.enableDebug
         core.refreshLimits()
 
-        core.requestQueueStore.storedRequestsLimit = Swift.max(1, core.config.storedRequestsLimit)
+        core.requestQueueStore.storedRequestsLimit = core.config.storedRequestsLimit
         core.requestQueueStore.requestDropAgeHours = core.config.requestDropAgeHours
 
-        core.modules.consent.requiresConsent = core.config.requiresConsent
+        // During init the requirement is only recorded: nothing runs yet that a
+        // change would have to start or stop, and init sends the consent state itself.
+        if core.hasFinishedInit {
+            let required = core.config.requiresConsent
+            // The change starts and stops views, push and content, which belong to the main thread.
+            onMainThread {
+                guard core.hasStarted else { return }
+                core.modules.consent.applyRequirementChange(to: required)
+            }
+        } else {
+            core.modules.consent.requiresConsent = core.config.requiresConsent
+        }
         core.modules.sessions.applyUpdatePeriodIfChanged()
 
-        // Consent turning on mid-session means the server's view of what it may
-        // keep just changed, so the state is resent.
-        if consentBecameRequired, core.hasFinishedInit {
-            core.logger.d(Self.module, "serverConfigDidChange", "consent requirement was turned on by behavior settings, consents will be resent")
-            core.modules.consent.sendConsents()
-            if !core.modules.consent.hasConsent(for: .location) {
-                core.modules.location.sendLocationRequest()
-            }
-        }
-
-        // Location switched off by the server clears what is stored and tells the
-        // server to stop inferring it.
-        if !serverConfig.locationTrackingEnabled, !core.modules.location.isLocationInfoDisabled {
-            core.logger.d(Self.module, "serverConfigDidChange", "location tracking is disabled by behavior settings, location info will be cleared")
-            core.modules.location.disableLocation()
-            core.modules.location.sendLocationRequest()
+        if changedKeys.contains(ServerConfig.Key.locationTracking) {
+            core.modules.location.serverSettingChanged()
         }
 
         // Only the server's own zone settings may move a zone the app entered; cleared, not exited, so displayed content stays.

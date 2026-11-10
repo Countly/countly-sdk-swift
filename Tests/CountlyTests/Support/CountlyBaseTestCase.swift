@@ -36,6 +36,9 @@ class CountlyBaseTestCase: XCTestCase {
     override func setUp() {
         super.setUp()
         MockURLProtocol.reset()
+        // Most suites install an answer after a first attempt failed and expect the
+        // next drain to send at once, so the cool-down is off unless a test sets one.
+        CountlyConfig.minimumFailedRequestCooldown = 0
     }
 
     override func tearDown() {
@@ -48,6 +51,7 @@ class CountlyBaseTestCase: XCTestCase {
         }
         openedStores.removeAll()
         MockURLProtocol.reset()
+        CountlyConfig.minimumFailedRequestCooldown = 1
         super.tearDown()
     }
 
@@ -65,6 +69,7 @@ class CountlyBaseTestCase: XCTestCase {
         config.enableDebug = true
         config.internalLogLevel = .error
         config.urlSessionConfiguration = MockURLProtocol.sessionConfiguration()
+        config.failedRequestCooldown = 0
         // Automatic sessions would put a `begin_session` at the head of every
         // queue and shift every index a test asserts on. Suites that are about
         // sessions turn this back off.
@@ -147,6 +152,17 @@ class CountlyBaseTestCase: XCTestCase {
     /// Every request this instance has queued but not yet had accepted.
     func requestQueue(of instance: CountlyInstance) -> [String] {
         core(of: instance).requestQueueStore.snapshot
+    }
+
+    /// How often a health check log code was counted and not reported yet.
+    func logCodeCount(_ code: String, of instance: CountlyInstance) -> Int {
+        core(of: instance).healthTracker.pendingCounts.logCodes[code] ?? 0
+    }
+
+    /// How often a method of a health check feature area was counted and not
+    /// reported yet, `method` including any ":a" modifier.
+    func usageCount(_ area: HealthArea, _ method: String, of instance: CountlyInstance) -> Int {
+        core(of: instance).healthTracker.pendingCounts.methodUsage[area.rawValue]?[method] ?? 0
     }
 
     // MARK: - Request queue files

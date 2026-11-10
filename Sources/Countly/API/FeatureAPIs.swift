@@ -18,15 +18,19 @@ public final class CrashesAPI: CountlyAPIBase {
     ///
     /// - Parameters:
     ///   - exception: The exception to report.
-    ///   - isFatal: Whether the application cannot continue. A fatal report is sent
-    ///     immediately rather than queued.
-    ///   - stackTrace: Frames to report instead of the exception's own.
+    ///   - isFatal: Whether the application cannot continue. A fatal report is
+    ///     written to storage at once, because the process usually ends right
+    ///     after, and is sent through the queue like any other.
+    ///   - stackTrace: Frames to report instead of the exception's own. Without
+    ///     either, the stack of this call is reported.
     ///   - segmentation: Extra context for this one report.
     public func recordException(_ exception: NSException,
                                 isFatal: Bool = false,
                                 stackTrace: [String]? = nil,
                                 segmentation: [String: Any]? = nil) {
-        core()?.modules.crashes.recordException(exception, isFatal: isFatal, stackTrace: stackTrace, segmentation: segmentation)
+        guard let core = core() else { return }
+        core.healthTracker.recordUsage(.crashes, "record")
+        core.modules.crashes.recordException(exception, isFatal: isFatal, stackTrace: stackTrace, segmentation: segmentation)
     }
 
     /// Records a Swift error.
@@ -35,7 +39,9 @@ public final class CrashesAPI: CountlyAPIBase {
                             isFatal: Bool = false,
                             stackTrace: [String]? = nil,
                             segmentation: [String: Any]? = nil) {
-        core()?.modules.crashes.recordError(String(describing: error), isFatal: isFatal, stackTrace: stackTrace, segmentation: segmentation)
+        guard let core = core() else { return }
+        core.healthTracker.recordUsage(.crashes, "record")
+        core.modules.crashes.recordError(String(describing: error), isFatal: isFatal, stackTrace: stackTrace, segmentation: segmentation)
     }
 
     /// Records an error described by a name.
@@ -43,17 +49,23 @@ public final class CrashesAPI: CountlyAPIBase {
                             isFatal: Bool = false,
                             stackTrace: [String]? = nil,
                             segmentation: [String: Any]? = nil) {
-        core()?.modules.crashes.recordError(errorName, isFatal: isFatal, stackTrace: stackTrace, segmentation: segmentation)
+        guard let core = core() else { return }
+        core.healthTracker.recordUsage(.crashes, "record")
+        core.modules.crashes.recordError(errorName, isFatal: isFatal, stackTrace: stackTrace, segmentation: segmentation)
     }
 
     /// Records a breadcrumb, reported with the next crash.
     public func addCrashBreadcrumb(_ log: String) {
-        core()?.modules.crashes.log(log)
+        guard let core = core() else { return }
+        core.healthTracker.recordUsage(.crashes, "log")
+        core.modules.crashes.log(log)
     }
 
     /// Drops every recorded breadcrumb.
     public func clearCrashBreadcrumbs() {
-        core()?.modules.crashes.clearCrashLogs()
+        guard let core = core() else { return }
+        core.healthTracker.recordUsage(.crashes, "clear")
+        core.modules.crashes.clearCrashLogs()
     }
 
     /// Replaces the segmentation merged into every crash report.
@@ -226,56 +238,6 @@ public final class AttributionAPI: CountlyAPIBase {
     /// `AttributionKey` for the keys.
     public func recordIndirectAttribution(_ attribution: [String: String]) {
         core()?.modules.attribution.recordIndirectAttribution(attribution)
-    }
-}
-
-// MARK: - Performance monitoring
-
-/// Times network calls, application launch, and whatever the host application
-/// chooses.
-@objcMembers
-public final class APMAPI: CountlyAPIBase {
-
-    /// Reports one network call.
-    ///
-    /// Timestamps are milliseconds since the epoch.
-    public func recordNetworkTrace(_ traceName: String,
-                                   requestPayloadSize: Int,
-                                   responsePayloadSize: Int,
-                                   responseStatusCode: Int,
-                                   startTime: Int64,
-                                   endTime: Int64) {
-        core()?.modules.apm.recordNetworkTrace(traceName,
-                                               requestPayloadSize: requestPayloadSize,
-                                               responsePayloadSize: responsePayloadSize,
-                                               responseStatusCode: responseStatusCode,
-                                               startTime: startTime,
-                                               endTime: endTime)
-    }
-
-    /// Starts timing something the host application names.
-    public func startCustomTrace(_ traceName: String) {
-        core()?.modules.apm.startCustomTrace(traceName)
-    }
-
-    /// Ends a custom trace and reports its duration plus any metrics.
-    public func endCustomTrace(_ traceName: String, metrics: [String: Any]? = nil) {
-        core()?.modules.apm.endCustomTrace(traceName, metrics: metrics)
-    }
-
-    /// Discards a running trace without reporting it.
-    public func cancelCustomTrace(_ traceName: String) {
-        core()?.modules.apm.cancelCustomTrace(traceName)
-    }
-
-    /// Discards every running trace.
-    public func clearAllCustomTraces() {
-        core()?.modules.apm.clearAllCustomTraces()
-    }
-
-    /// Marks the application as fully loaded, closing the app start trace.
-    public func appLoadingFinished() {
-        core()?.modules.apm.appLoadingFinished()
     }
 }
 

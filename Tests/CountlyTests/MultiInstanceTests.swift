@@ -358,18 +358,6 @@ final class MultiInstanceTests: CountlyBaseTestCase {
         XCTAssertTrue(countly.isStarted)
     }
 
-    /// A breadcrumb that reaches a halted instance's store after the erasure must
-    /// not bring the crash log back for the next start to attach to a report.
-    func testABreadcrumbLeftInFlightByAHaltedInstanceCannotUndoClearStorage() {
-        let countly = startInstance()
-        let haltedStore = core(of: countly).crashLogStore
-
-        countly.halt(clearStorage: true)
-        haltedStore.append("written after the erasure")
-
-        XCTAssertNil(haltedStore.readAll(), "the halted store must not write the crash log again")
-    }
-
     /// A send that completes after an ordinary halt belongs to the halted run. Its
     /// removal must not reach the files the next start reads, where an emptied
     /// queue would erase what that start is still sending.
@@ -406,7 +394,7 @@ final class MultiInstanceTests: CountlyBaseTestCase {
         first.halt()
 
         let second = start(baseConfig(instanceName: name))
-        second.serverConfigDidChange(haltedSettings, consentBecameRequired: true, changedKeys: [ServerConfig.Key.consentRequired])
+        second.serverConfigDidChange(haltedSettings, changedKeys: [ServerConfig.Key.consentRequired])
 
         XCTAssertFalse(requestQueue(of: second).contains { $0.contains("consent=") },
                        "the halted run's settings resent consent on the next run")
@@ -542,5 +530,68 @@ final class MultiInstanceTests: CountlyBaseTestCase {
 
         XCTAssertEqual(core(of: countly).config.normalizedHost, Self.host)
         XCTAssertEqual(core(of: countly).config.appKey, Self.appKey)
+    }
+
+    /// A host the requests cannot be sent to would strand everything queued, so
+    /// the URL in use stays. Pinned certificates need https.
+    func testAHostThatIsNotAnAbsoluteHTTPURLIsRefused() {
+        let countly = startInstance { $0.pinnedCertificates = ["pinned.cer"] }
+
+        countly.setNewHost("not a url")
+        countly.setNewHost("ftp://files.example")
+        countly.setNewHost("http://plain.example")
+        countly.setNewHost(Placeholder.host)
+
+        XCTAssertEqual(core(of: countly).config.normalizedHost, Self.host)
+        XCTAssertEqual(logCodeCount(HealthLogCode.invalidServerURL, of: countly), 4)
+
+        countly.setNewHost("https://moved.example//")
+        XCTAssertEqual(core(of: countly).config.normalizedHost, "https://moved.example")
+    }
+
+    func testThePlaceholderOrTheCurrentAppKeyIsIgnored() {
+        let countly = startInstance { $0.eventSendThreshold = 1 }
+        countly.sessions.beginSession()
+        let before = requestQueue(of: countly).count
+
+        countly.setNewAppKey(Placeholder.appKey)
+        countly.setNewAppKey(Self.appKey)
+
+        XCTAssertEqual(core(of: countly).config.appKey, Self.appKey)
+        XCTAssertEqual(requestQueue(of: countly).count, before, "the session is not ended and begun again for the same app")
+        XCTAssertEqual(logCodeCount(HealthLogCode.invalidAppKey, of: countly), 1)
+    }
+
+    /// What belongs to the old app is closed under the old key, and a session that
+    /// ran goes on under the new key.
+    func testChangingTheAppKeyEndsTheSessionUnderTheOldKeyAndBeginsOneUnderTheNew() {
+        let countly = startInstance { $0.eventSendThreshold = 100 }
+        countly.sessions.beginSession()
+        countly.events.recordEvent("before the switch")
+
+        countly.setNewAppKey("next-app")
+
+        let requests = requestQueue(of: countly).map(TestUtils.parseQuery)
+        let end = requests.first { $0["end_session"] != nil }
+        let events = requests.first { $0["events"] != nil }
+        let begins = requests.filter { $0["begin_session"] != nil }
+        XCTAssertEqual(end?["app_key"] as? String, Self.appKey)
+        XCTAssertEqual(events?["app_key"] as? String, Self.appKey)
+        XCTAssertEqual(begins.last?["app_key"] as? String, "next-app")
+        XCTAssertEqual(begins.count, 2)
+    }
+
+    /// The new server knows nothing that was sent before, so the consent state
+    /// goes out again while consent is required.
+    func testChangingTheHostSendsTheConsentStateAgain() {
+        let countly = startInstance {
+            $0.requiresConsent = true
+            $0.consents = [.events]
+        }
+        let before = TestUtils.requests(requestQueue(of: countly), carrying: "consent").count
+
+        countly.setNewHost("https://moved.example")
+
+        XCTAssertEqual(TestUtils.requests(requestQueue(of: countly), carrying: "consent").count, before + 1)
     }
 }

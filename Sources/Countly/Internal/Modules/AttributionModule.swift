@@ -58,12 +58,12 @@ final class AttributionModule: ModuleBase {
         }
 
         guard !campaignType.isEmpty else {
-            logE("recordDirectAttribution", "omitting the call, campaignType must be a non zero length string")
+            warnIgnored("recordDirectAttribution", "omitting the call, campaignType must be a non zero length string")
             return
         }
 
         guard !campaignData.isEmpty else {
-            logE("recordDirectAttribution", "omitting the call, campaignData must be a non zero length string, campaignType: [\(campaignType)]")
+            warnIgnored("recordDirectAttribution", "omitting the call, campaignData must be a non zero length string, campaignType: [\(campaignType)]")
             return
         }
 
@@ -79,12 +79,12 @@ final class AttributionModule: ModuleBase {
         }
 
         guard let parsed = CountlyJSON.object(from: Data(campaignData.utf8), logger: log) as? [String: Any] else {
-            logE("recordDirectAttribution", "omitting the call, the campaign data is not valid JSON")
+            warnIgnored("recordDirectAttribution", "omitting the call, the campaign data is not valid JSON")
             return
         }
 
         guard let campaignID = parsed["cid"] as? String, !campaignID.isEmpty else {
-            logE("recordDirectAttribution", "omitting the call, the campaign ID in the campaign data is missing or empty")
+            warnIgnored("recordDirectAttribution", "omitting the call, the campaign ID in the campaign data is missing or empty")
             return
         }
 
@@ -110,15 +110,26 @@ final class AttributionModule: ModuleBase {
 
         // An empty identifier is worse than a missing one: it would overwrite a
         // value the server already has.
-        let nonEmpty = attribution.filter { !$0.value.isEmpty }
+        let nonEmpty = attribution.filter { !$0.key.isEmpty && !$0.value.isEmpty }
         if nonEmpty.count < attribution.count {
-            logD("recordIndirectAttribution", "indirect attribution keys with an empty value are dropped rather than overwriting what the server already holds, droppedKeyCount: [\(attribution.count - nonEmpty.count)]")
+            warnIgnored("recordIndirectAttribution", "indirect attribution entries with an empty key or value are dropped rather than overwriting what the server already holds, droppedCount: [\(attribution.count - nonEmpty.count)]")
+        }
+
+        guard !nonEmpty.isEmpty else {
+            logW("recordIndirectAttribution", "omitting the call, no usable key and value pair is left")
+            return
         }
 
         let sanitized = limits.truncatedAndLimited(nonEmpty, "Indirect attribution")
 
         indirectAttribution = sanitized.compactMapValues { $0 as? String }
         sendIndirectAttribution()
+    }
+
+    /// Logs an ignored call or value as a warning and counts it.
+    private func warnIgnored(_ function: String, _ message: String) {
+        logW(function, message)
+        core.healthTracker.recordLogCode(HealthLogCode.invalidValue)
     }
 
     /// Resends the stored identifiers, used when attribution consent arrives after

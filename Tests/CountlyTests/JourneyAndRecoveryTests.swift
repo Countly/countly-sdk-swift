@@ -152,113 +152,23 @@ final class JourneyAndRecoveryTests: CountlyBaseTestCase {
 
     // MARK: - Breadcrumbs across launches
 
-    /// Writes breadcrumbs into the store an instance of this name will read, which
-    /// is what a run that died without a teardown leaves behind.
-    ///
-    /// A crash is not a halt: the process stops, nothing runs, and the file is
-    /// simply still there on the next launch. Halting the SDK deliberately clears
-    /// the breadcrumbs, so it cannot stand in for one.
-    private func leaveBreadcrumbsBehind(_ crumbs: [String], forInstanceNamed name: String) {
-        let store = CrashLogStore(namespace: StorageNamespace(instanceName: name), logger: nil)
-        for crumb in crumbs { store.append(crumb) }
-        // The store writes on its own queue; reading it back is what guarantees the
-        // writes have landed before the instance starts. Compared against the
-        // escaped form, because the store replaces the line separator on the way in.
-        let expected = (crumbs.last ?? "").replacingOccurrences(of: "\n", with: "\\n")
-        TestUtils.waitUntil("the breadcrumbs reach disk") {
-            (store.readAll() ?? "").contains(expected)
-        }
-    }
-
-    /// The crash report of a run that ended is the point of writing breadcrumbs to
-    /// disk at all: the next launch picks them up and attaches them to the first
-    /// report it makes.
-    func testBreadcrumbsFromARunThatCrashedAreAttachedToTheNextReport() {
-        let name = uniqueInstanceName()
-        leaveBreadcrumbsBehind(["opened the cart", "tapped checkout"], forInstanceNamed: name)
-
-        let countly = start(baseConfig(instanceName: name))
-        countly.crashes.recordError("crashed last time", isFatal: false, stackTrace: [])
-
-        guard let crash = TestUtils.requests(requestQueue(of: countly), carrying: "crash")
-            .last?["crash"] as? [String: Any] else {
-            XCTFail("the new launch should have reported a crash")
-            return
-        }
-        let logs = crash["_logs"] as? String ?? ""
-        XCTAssertTrue(logs.contains("opened the cart"), "logs were: \(logs)")
-        XCTAssertTrue(logs.contains("tapped checkout"), "logs were: \(logs)")
-    }
-
-    /// They are attached once and then cleared, so they do not follow the user
-    /// through every report for the rest of the installation.
-    func testRecoveredBreadcrumbsAreAttachedOnlyOnce() {
-        let name = uniqueInstanceName()
-        leaveBreadcrumbsBehind(["from the previous run"], forInstanceNamed: name)
-
-        let countly = start(baseConfig(instanceName: name))
-        countly.crashes.recordError("first", isFatal: false, stackTrace: [])
-        countly.crashes.clearCrashBreadcrumbs()
-        countly.crashes.recordError("second", isFatal: false, stackTrace: [])
-
-        let reports = TestUtils.requests(requestQueue(of: countly), carrying: "crash")
-            .compactMap { $0["crash"] as? [String: Any] }
-        XCTAssertEqual(reports.count, 2)
-        XCTAssertTrue((reports[0]["_logs"] as? String ?? "").contains("from the previous run"))
-        XCTAssertNil(reports[1]["_logs"], "the second report should carry no breadcrumbs")
-    }
-
-    /// The recovered set is held to the same limit as a live one, so a run that
-    /// logged thousands of breadcrumbs does not produce an enormous first report.
-    /// The newest are the ones nearest the crash, so those are what is kept.
-    func testRecoveredBreadcrumbsAreHeldToTheBreadcrumbLimit() {
-        let name = uniqueInstanceName()
-        leaveBreadcrumbsBehind((0..<20).map { "step-\($0)" }, forInstanceNamed: name)
-
-        let config = baseConfig(instanceName: name)
-        config.sdkInternalLimits.maxBreadcrumbCount = 3
-        let countly = start(config)
-        countly.crashes.recordError("after recovery", isFatal: false, stackTrace: [])
-
-        guard let crash = TestUtils.requests(requestQueue(of: countly), carrying: "crash")
-            .last?["crash"] as? [String: Any] else {
-            XCTFail("the new launch should have reported a crash")
-            return
-        }
-        let lines = (crash["_logs"] as? String ?? "").split(separator: "\n")
-        XCTAssertLessThanOrEqual(lines.count, 3)
-        XCTAssertTrue(lines.last?.contains("step-19") == true,
-                      "the newest breadcrumb is kept, lines were: \(lines)")
-    }
-
-    /// Halting the SDK deliberately is not a crash, and it clears the breadcrumbs
-    /// rather than leaving them for a launch that has nothing to do with them.
-    func testAnOrdinaryHaltLeavesNoBreadcrumbsToRecover() {
+    /// Breadcrumbs belong to the run that recorded them. A run that ends without a
+    /// crash report leaves nothing behind for the next run's first crash.
+    func testBreadcrumbsDoNotOutliveTheirRun() {
         let name = uniqueInstanceName()
 
         let first = start(baseConfig(instanceName: name))
-        first.crashes.addCrashBreadcrumb("should not survive a teardown")
+        first.crashes.addCrashBreadcrumb("from the previous run")
         first.halt()
 
-        let store = CrashLogStore(namespace: StorageNamespace(instanceName: name), logger: nil)
-        XCTAssertNil(store.readAll())
-    }
-
-    /// A breadcrumb carrying a newline would read back as several, so the
-    /// separator is escaped rather than carried through.
-    func testABreadcrumbWithANewlineStaysOneBreadcrumb() {
-        let name = uniqueInstanceName()
-        leaveBreadcrumbsBehind(["line one\nline two"], forInstanceNamed: name)
-
         let countly = start(baseConfig(instanceName: name))
-        countly.crashes.recordError("after recovery", isFatal: false, stackTrace: [])
+        countly.crashes.recordError("in the new run", isFatal: false, stackTrace: ["0 MyApp 0x1 boom"])
 
         guard let crash = TestUtils.requests(requestQueue(of: countly), carrying: "crash")
             .last?["crash"] as? [String: Any] else {
-            XCTFail("the new launch should have reported a crash")
+            XCTFail("the new run should have reported a crash")
             return
         }
-        let lines = (crash["_logs"] as? String ?? "").split(separator: "\n")
-        XCTAssertEqual(lines.count, 1, "one breadcrumb should read back as one line")
+        XCTAssertNil(crash["_logs"], "the previous run's breadcrumbs must not reach this report")
     }
 }

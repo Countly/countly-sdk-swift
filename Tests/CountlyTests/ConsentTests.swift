@@ -166,7 +166,7 @@ final class ConsentTests: CountlyBaseTestCase {
 
     /// Granting the same feature twice must not queue a second identical request:
     /// the state did not change, and the queue is a scarce resource.
-    func testGrantingAnAlreadyGrantedFeatureStillReportsTheState() {
+    func testGrantingAnAlreadyGrantedFeatureQueuesNoSecondRequest() {
         let countly = startInstance { $0.requiresConsent = true }
 
         countly.consent.giveConsent(for: .events)
@@ -175,8 +175,17 @@ final class ConsentTests: CountlyBaseTestCase {
         countly.consent.giveConsent(for: .events)
         let afterSecond = TestUtils.requests(requestQueue(of: countly), carrying: "consent").count
 
-        XCTAssertGreaterThan(afterSecond, afterFirst - 1)
+        XCTAssertEqual(afterSecond, afterFirst)
         XCTAssertTrue(countly.consent.hasConsent(for: .events))
+    }
+
+    func testRemovingConsentThatWasNeverGivenQueuesNothing() {
+        let countly = startInstance { $0.requiresConsent = true }
+        let before = TestUtils.requests(requestQueue(of: countly), carrying: "consent").count
+
+        countly.consent.cancelConsent(for: [.events, .crashReporting])
+
+        XCTAssertEqual(TestUtils.requests(requestQueue(of: countly), carrying: "consent").count, before)
     }
 
     func testAnEmptyFeatureListGrantsNothing() {
@@ -191,6 +200,59 @@ final class ConsentTests: CountlyBaseTestCase {
         for feature in ConsentFeature.allCases {
             XCTAssertFalse(countly.consent.hasConsent(for: feature), feature.wireName)
         }
+        XCTAssertEqual(logCodeCount(HealthLogCode.invalidConsentName, of: countly), 1)
+    }
+
+    func testSetConsentGivesOrRemoves() {
+        let countly = startInstance { $0.requiresConsent = true }
+
+        countly.consent.setConsent(for: [.events, .crashReporting], given: true)
+        XCTAssertTrue(countly.consent.hasConsent(for: .events))
+        XCTAssertTrue(countly.consent.hasConsent(for: .crashReporting))
+
+        countly.consent.setConsent(for: [.events], given: false)
+        XCTAssertFalse(countly.consent.hasConsent(for: .events))
+        XCTAssertTrue(countly.consent.hasConsent(for: .crashReporting))
+    }
+
+    func testAFeatureGroupGivesAndRemovesConsentForAllItsFeatures() {
+        let countly = startInstance { $0.requiresConsent = true }
+        countly.consent.createFeatureGroup("activity", features: [.sessions, .events, .viewTracking])
+
+        countly.consent.setConsentFeatureGroup("activity", given: true)
+        XCTAssertTrue(countly.consent.hasConsent(forGroup: "activity"))
+        XCTAssertTrue(countly.consent.hasConsent(for: .viewTracking))
+        XCTAssertFalse(countly.consent.hasConsent(for: .crashReporting), "only the group's features")
+
+        countly.consent.cancelConsent(for: .events)
+        XCTAssertFalse(countly.consent.hasConsent(forGroup: "activity"), "a group has consent only when all its features do")
+
+        countly.consent.setConsentFeatureGroup("activity", given: false)
+        XCTAssertFalse(countly.consent.hasConsent(for: .sessions))
+
+        countly.consent.setConsentFeatureGroup("never-created", given: true)
+        XCTAssertFalse(countly.consent.hasConsent(forGroup: "never-created"))
+        XCTAssertEqual(logCodeCount(HealthLogCode.invalidConsentName, of: countly), 2)
+    }
+
+    /// A device ID change without merge removes every consent for the new user,
+    /// but tells the server nothing: the removal would be filed under a user who
+    /// never gave the consent. The location erase request is skipped for the same
+    /// reason.
+    func testAChangeWithoutMergeRemovesConsentWithoutSendingAnything() {
+        let countly = startInstance {
+            $0.requiresConsent = true
+            $0.consents = [.location, .events]
+        }
+        let before = requestQueue(of: countly).count
+
+        countly.deviceID.changeWithoutMerge("next-user")
+
+        let after = requestQueue(of: countly).dropFirst(before).map(TestUtils.parseQuery)
+        XCTAssertTrue(after.filter { $0["consent"] != nil }.isEmpty, "no consent request for the silent removal")
+        XCTAssertTrue(after.filter { $0["location"] != nil }.isEmpty, "no location erase request")
+        XCTAssertFalse(countly.consent.hasConsent(for: .location))
+        XCTAssertFalse(countly.consent.hasConsent(for: .events))
     }
 
     // MARK: - Consent given at init
@@ -278,11 +340,11 @@ final class ConsentTests: CountlyBaseTestCase {
             .location: "location",
             .viewTracking: "views",
             .attribution: "attribution",
-            .performanceMonitoring: "apm",
             .feedback: "feedback",
             .remoteConfig: "remote-config",
             .content: "content",
             .metrics: "metrics",
+            .starRating: "star-rating",
         ]
 
         XCTAssertEqual(expected.count, ConsentFeature.allCases.count,

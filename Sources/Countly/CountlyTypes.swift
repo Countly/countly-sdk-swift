@@ -36,11 +36,13 @@ import Foundation
     }
 }
 
-/// Receives every internal SDK log line the configured level allows.
+/// Receives every internal SDK log line the configured level allows, whether or
+/// not `CountlyConfig.enableDebug` is set.
 ///
-/// Lines arrive already prefixed with `[Countly] [<Level>] `. The delegate is
-/// called on whichever thread produced the log, so implementations must be
-/// thread safe and must not block.
+/// Lines arrive prefixed with `[Countly] `; the level comes as its own argument.
+/// The delegate is called on whichever thread produced the log, sometimes while
+/// the SDK holds an internal lock, so implementations must be thread safe, return
+/// quickly and never call back into the SDK.
 @objc public protocol CountlyLoggerDelegate: AnyObject {
     func internalLog(_ log: String, level: CountlyLogLevel)
 }
@@ -59,11 +61,12 @@ import Foundation
     case location
     case viewTracking
     case attribution
-    case performanceMonitoring
     case feedback
     case remoteConfig
     case content
     case metrics
+    /// The legacy rating call `recordRatingWidget(id:rating:email:comment:userCanBeContacted:)`.
+    case starRating
 
     /// The name this feature carries on the wire.
     public var wireName: String {
@@ -76,11 +79,11 @@ import Foundation
         case .location: return "location"
         case .viewTracking: return "views"
         case .attribution: return "attribution"
-        case .performanceMonitoring: return "apm"
         case .feedback: return "feedback"
         case .remoteConfig: return "remote-config"
         case .content: return "content"
         case .metrics: return "metrics"
+        case .starRating: return "star-rating"
         }
     }
 
@@ -115,8 +118,9 @@ import Foundation
     case developerSupplied = 0
     /// A UUID this SDK generated and stored.
     case sdkGenerated = 1
-    /// Temporary device ID mode: nothing is sent until a real ID is set.
-    case temporary = 9
+    /// Temporary device ID mode (offline mode): nothing is sent until a real ID
+    /// is set.
+    case temporary = 2
 
     /// The numeric value sent as the `t` query parameter.
     public var wireValue: Int { rawValue }
@@ -152,6 +156,17 @@ import Foundation
     }
 }
 
+/// Handles the link of a tapped Countly notification, see
+/// `CountlyConfig.pushActionHandler`.
+///
+/// - Parameters:
+///   - link: The link of the tapped part, the body's or the button's, or `nil`
+///     when it has none or it is not a URL.
+///   - userInfo: The notification's `userInfo`.
+/// - Returns: `true` when the application took the link over and the SDK opens
+///   nothing, `false` to let the SDK open it.
+public typealias PushActionHandler = (_ link: URL?, _ userInfo: [AnyHashable: Any]) -> Bool
+
 // MARK: - Metrics
 
 /// Keys of the device metrics dictionary sent with `begin_session` and metric overrides.
@@ -162,6 +177,7 @@ import Foundation
 public final class MetricKey: NSObject {
     public static let device = "_device"
     public static let deviceType = "_device_type"
+    public static let manufacturer = "_manufacturer"
     public static let os = "_os"
     public static let osVersion = "_os_version"
     public static let appVersion = "_app_version"

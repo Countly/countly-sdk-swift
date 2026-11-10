@@ -356,10 +356,14 @@ final class LogGatheringTests: CountlyBaseTestCase {
         XCTAssertEqual(LogGatheringDirective.parse(["e": true, "i": "g", "l": 5], logger: nil).levels, allLevels)
     }
 
-    func testTheBatchSizeIsClampedIntoRange() {
-        XCTAssertEqual(directive(id: "g", batchSize: 1).batchSize, minBatchSize, "a batch of one would upload a request per log line")
-        XCTAssertEqual(directive(id: "g", batchSize: 100_000).batchSize, maxBufferedLines, "a batch bigger than the buffer would never fill")
-        XCTAssertEqual(directive(id: "g", batchSize: 0).batchSize, minBatchSize)
+    /// A batch size outside 10 to 500 is treated as if the server had not sent
+    /// one: the default applies, the value is never moved into the range.
+    func testABatchSizeOutOfRangeFallsBackToTheDefault() {
+        XCTAssertEqual(directive(id: "g", batchSize: 1).batchSize, defaultBatchSize, "a batch of one would upload a request per log line")
+        XCTAssertEqual(directive(id: "g", batchSize: 100_000).batchSize, defaultBatchSize, "a batch bigger than the buffer would never fill")
+        XCTAssertEqual(directive(id: "g", batchSize: 0).batchSize, defaultBatchSize)
+        XCTAssertEqual(directive(id: "g", batchSize: minBatchSize).batchSize, minBatchSize)
+        XCTAssertEqual(directive(id: "g", batchSize: maxBufferedLines).batchSize, maxBufferedLines)
         XCTAssertEqual(directive(id: "g", batchSize: 250).batchSize, 250)
         XCTAssertEqual(directive(id: "g", batchSize: nil).batchSize, defaultBatchSize)
         XCTAssertEqual(LogGatheringDirective.parse(["e": true, "i": "g", "b": "many"], logger: nil).batchSize, defaultBatchSize)
@@ -805,9 +809,9 @@ final class LogGatheringTests: CountlyBaseTestCase {
         let byFeature: [String: ConsentFeature] = [
             "Events": .events, "Views": .viewTracking, "UserProfile": .userDetails,
             "Sessions": .sessions, "Location": .location, "Crash": .crashReporting,
-            "CrashLogStore": .crashReporting, "Push": .pushNotifications,
+            "Push": .pushNotifications,
             "PushRuntime": .pushNotifications, "Attribution": .attribution,
-            "APM": .performanceMonitoring, "Feedback": .feedback,
+            "Feedback": .feedback,
             "RemoteConfig": .remoteConfig, "Content": .content, "DeviceMetrics": .metrics,
         ]
         for (module, feature) in byFeature {

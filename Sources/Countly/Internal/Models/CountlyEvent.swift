@@ -57,6 +57,24 @@ final class CountlyEvent {
         self.key = key
     }
 
+    /// Rebuilds an event from the form ``dictionaryRepresentation`` produces, as
+    /// the stored event queue holds it. Nil for an entry without a key.
+    convenience init?(dictionary: [String: Any]) {
+        guard let key = dictionary[Field.key] as? String, !key.isEmpty else { return nil }
+        self.init(key: key)
+        id = dictionary[Field.id] as? String ?? ""
+        currentViewID = dictionary[Field.currentViewID] as? String
+        previousViewID = dictionary[Field.previousViewID] as? String
+        previousEventID = dictionary[Field.previousEventID] as? String
+        segmentation = dictionary[Field.segmentation] as? [String: Any]
+        count = (dictionary[Field.count] as? NSNumber)?.intValue ?? 1
+        sum = (dictionary[Field.sum] as? NSNumber)?.doubleValue ?? 0
+        duration = (dictionary[Field.duration] as? NSNumber)?.doubleValue ?? 0
+        timestamp = ((dictionary[Field.timestamp] as? NSNumber)?.doubleValue ?? 0) / 1000
+        hourOfDay = (dictionary[Field.hourOfDay] as? NSNumber)?.intValue ?? 0
+        dayOfWeek = (dictionary[Field.dayOfWeek] as? NSNumber)?.intValue ?? 0
+    }
+
     /// The form that goes into the `events=` array.
     var dictionaryRepresentation: [String: Any] {
         var result: [String: Any] = [:]
@@ -70,7 +88,7 @@ final class CountlyEvent {
         result[Field.previousEventID] = previousEventID
         result[Field.count] = count
         result[Field.sum] = sum
-        result[Field.timestamp] = Int64(timestamp * 1000)
+        result[Field.timestamp] = Int64((timestamp * 1000).rounded())
         result[Field.hourOfDay] = hourOfDay
         result[Field.dayOfWeek] = dayOfWeek
         result[Field.duration] = duration

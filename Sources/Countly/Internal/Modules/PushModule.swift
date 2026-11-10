@@ -113,9 +113,83 @@ final class PushModule: ModuleBase {
         sendToken()
     }
 
+    /// Sends the token again after the server URL or the app key changed: the
+    /// new server or app does not have it.
+    func connectionChanged() {
+        guard isEnabledOnInitialConfig, isRegistered else { return }
+        logD("connectionChanged", "the server URL or the app key changed, the push token is sent again")
+        sendToken()
+    }
+
+    /// Takes the token back from the user whose device ID is in use now, before a
+    /// device ID change without merge replaces it, so the leaving user's pushes stop
+    /// reaching this device. Sent only when a token was sent for that device ID.
+    func clearTokenForLeavingUser() {
+        let deviceID = core.modules.deviceID.deviceID
+        clearTokenForLeavingUser(deviceID: deviceID, typeValue: core.modules.deviceID.deviceIDType.wireValue)
+    }
+
+    /// Takes the token back from the user with `deviceID`, the stored device ID a
+    /// reset at init is about to clear, when a token was sent for that device ID.
+    func clearTokenForLeavingUser(deviceID: String, typeValue: Int) {
+        guard isDefaultInstance, !deviceID.isEmpty, core.keyValueStore.pushTokenDeviceID == deviceID else {
+            logD("clearTokenForLeavingUser", "no push token was sent for the leaving device ID, nothing is cleared")
+            return
+        }
+        logD("clearTokenForLeavingUser", "the push token sent for the leaving device ID is cleared under that device ID")
+        send(token: "", essentials: core.network.builder.queryEssentials(deviceID: deviceID, typeValue: typeValue))
+        core.keyValueStore.pushTokenDeviceID = nil
+    }
+
+    /// Follows a device ID change with merge: the server moves the token to the
+    /// new device ID with the rest of the profile, so nothing is sent and the
+    /// record of whom it was sent for moves along.
+    func deviceIDMerged(from oldDeviceID: String, into newDeviceID: String) {
+        guard core.keyValueStore.pushTokenDeviceID == oldDeviceID else { return }
+        core.keyValueStore.pushTokenDeviceID = newDeviceID
+    }
+
+    /// Follows the end of temporary device ID mode: a token queued under the
+    /// placeholder was rewritten to the real device ID like every queued request,
+    /// and the token is sent for the device ID now in use.
+    func temporaryDeviceIDReplaced(by deviceID: String) {
+        if core.keyValueStore.pushTokenDeviceID == TemporaryDeviceID.value {
+            core.keyValueStore.pushTokenDeviceID = deviceID
+        }
+        guard isEnabledOnInitialConfig, isRegistered else { return }
+        logD("temporaryDeviceIDReplaced", "temporary device ID mode ended, the push token is sent for the device ID now in use")
+        sendToken()
+    }
+
+    /// Reacts to the removal of push consent: Countly notifications stop being
+    /// handled and, unless the removal is the silent one of a device ID change
+    /// without merge, an empty token takes the token away from the user on the
+    /// server, which since 26.01 keeps it through a consent change.
+    ///
+    /// - Parameter silently: whether the removal comes from a device ID change
+    ///   without merge, which already cleared the token under the old device ID.
+    func consentRemoved(silently: Bool) {
+        let hadToken = core.keyValueStore.pushTokenDeviceID != nil
+        stopPushNotifications()
+        guard !silently, isDefaultInstance, isEnabledOnInitialConfig || hadToken else { return }
+        logD("consentRemoved", "push consent was removed, the push token is cleared on the server")
+        clearToken()
+    }
+
     /// Whether this instance asked for foreground notifications not to be shown.
     var suppressesForegroundAlert: Bool {
         core.config.doNotShowAlertForNotifications
+    }
+
+    /// The application's handler for the link of a tapped notification.
+    var actionHandler: PushActionHandler? {
+        core.config.pushActionHandler
+    }
+
+    /// The schemes notification links may open, empty for every scheme but the
+    /// dangerous ones.
+    var allowedLinkSchemes: [String] {
+        core.config.pushAllowedLinkSchemes
     }
 
     /// Whether this instance may act on a notification at all.
@@ -273,12 +347,20 @@ final class PushModule: ModuleBase {
         send(token: "")
     }
 
+    /// Queues a token request for the device ID in use and records whom the token
+    /// went to, so it can be taken back when that user leaves.
     private func send(token: String) {
+        send(token: token, essentials: core.network.builder.queryEssentials())
+        core.keyValueStore.pushTokenDeviceID = token.isEmpty ? nil : core.modules.deviceID.deviceID
+    }
+
+    /// Queues a token request with the given base parameters.
+    private func send(token: String, essentials: String) {
         let testMode = core.config.pushTestMode?.wireValue ?? 0
         logD("send", "push token request is being queued, tokenLength: [\(token.count)], pushTestMode: [\(testMode)]")
         logV("send", "push token request detail, token: [\(token)]")
 
-        var queryString = core.network.builder.queryEssentials()
+        var queryString = essentials
         queryString += "&\(QS.pushTokenSession)=1"
         queryString += "&\(QS.pushTokeniOS)=\(token)"
         queryString += "&\(QS.pushTestMode)=\(testMode)"
@@ -314,7 +396,28 @@ final class PushModule: ModuleBase {
         recordActionEvent(notificationID: notificationID, buttonIndex: buttonIndex)
     }
 
-    private func recordActionEvent(notificationID: String?, buttonIndex: Int) {
+    /// Records the taps that arrived before the SDK started, with the time they
+    /// happened, when push consent is given now. Without it they are dropped.
+    private func recordPendingTaps() {
+        guard isDefaultInstance else { return }
+        let taps = core.keyValueStore.pendingPushActions
+        guard !taps.isEmpty else { return }
+        core.keyValueStore.pendingPushActions = []
+
+        guard core.modules.consent.hasConsent(for: .pushNotifications) else {
+            logD("recordPendingTaps", "notification taps from before the start are dropped, push consent is not given, tapCount: [\(taps.count)]")
+            return
+        }
+
+        logD("recordPendingTaps", "notification taps from before the start are recorded with the time they happened, tapCount: [\(taps.count)]")
+        for tap in taps {
+            recordActionEvent(notificationID: tap[PendingPushActionKey.notificationID] as? String,
+                              buttonIndex: (tap[PendingPushActionKey.buttonIndex] as? NSNumber)?.intValue ?? 0,
+                              timestamp: (tap[PendingPushActionKey.time] as? NSNumber)?.doubleValue)
+        }
+    }
+
+    private func recordActionEvent(notificationID: String?, buttonIndex: Int, timestamp: TimeInterval? = nil) {
         // An empty ID is as unusable as a missing one: the event would reach the
         // dashboard as a click nothing can be attributed to. The automatic path
         // and the notification service extension both refuse it, and this is the
@@ -332,10 +435,15 @@ final class PushModule: ModuleBase {
             CountlyPushKey.platform: Self.platformValue,
         ]
 
-        core.modules.events.recordReservedEvent(ReservedEventKey.pushAction, segmentation: segmentation)
+        core.modules.events.recordReservedEvent(ReservedEventKey.pushAction, segmentation: segmentation, timestamp: timestamp)
     }
 
     // MARK: - Lifecycle
+
+    /// Once init is complete, so the consent given at its end applies.
+    override func didInit() {
+        recordPendingTaps()
+    }
 
     override func didEnterForeground() {
         #if os(iOS) || os(visionOS) || os(macOS)

@@ -155,6 +155,11 @@ final class ContentModule: ModuleBase {
 
     /// Starts polling for content.
     func enterContentZone() {
+        guard !core.config.disableWebView else {
+            logW("enterContentZone", "the SDK's web views are turned off by disableWebView, the content zone is not entered")
+            return
+        }
+
         guard !isShown() else {
             logD("enterContentZone", "a content is already shown, skipping this enter")
             return
@@ -214,8 +219,40 @@ final class ContentModule: ModuleBase {
         closeShownContent()
     }
 
-    /// Fetches one content by ID without starting the polling loop.
+    /// Enters the zone again once temporary device ID mode ends, when the server
+    /// asks for the zone to be entered: entering the mode at runtime exited it.
+    func temporaryDeviceIDModeLeft() {
+        enterForServerIfNeeded(from: "temporaryDeviceIDModeLeft")
+    }
+
+    /// Enters the zone when the server's "ecz" setting asks for it and the zone
+    /// is not entered yet.
+    private func enterForServerIfNeeded(from function: String) {
+        guard core.serverConfig.enterContentZone else { return }
+        stateLock.lock()
+        let isEntered = isZoneEntered
+        stateLock.unlock()
+        guard !isEntered else {
+            logD(function, "the server asks for the content zone and it is already entered")
+            return
+        }
+        logD(function, "the server asks for the content zone, it is entered")
+        enterContentZone()
+    }
+
+    /// Fetches one content by ID without starting the polling loop. The ID is the
+    /// 24 character hexadecimal ID of the content; anything else is ignored with a
+    /// warning, since the server would answer it as an ordinary fetch.
     func previewContent(_ contentID: String) {
+        guard contentID.count == 24, contentID.allSatisfy(\.isHexDigit) else {
+            logW("previewContent", "the content ID is not a 24 character hexadecimal ID, the preview is ignored, contentIdLength: [\(contentID.count)]")
+            core.healthTracker.recordLogCode(HealthLogCode.invalidValue)
+            return
+        }
+        guard !core.config.disableWebView else {
+            logW("previewContent", "the SDK's web views are turned off by disableWebView, the content is not previewed")
+            return
+        }
         logD("previewContent", "fetching a content for preview, contentId: [\(contentID)]")
         fetchContents(contentID: contentID, failure: nil)
     }
@@ -494,18 +531,26 @@ final class ContentModule: ModuleBase {
                 return
             }
 
-            self.logD("fetchContents", "the content details response parsed, statusCode: [\((response as? HTTPURLResponse)?.statusCode ?? 0)], responseSize: [\(data?.count ?? 0)]")
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            self.logD("fetchContents", "the content details response parsed, statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)]")
             self.logD("fetchContents", "content details response detail, response: [\(payload)]")
             self.logV("fetchContents", "content details response URL detail, url: [\(response?.url?.absoluteString ?? "")]")
 
-            guard let html = payload["html"] as? String else {
-                self.logD("fetchContents", "the content details response carries no content")
+            guard (200...299).contains(statusCode) else {
+                self.logD("fetchContents", "the content details request was refused, it will be retried on the next content zone tick, statusCode: [\(statusCode)]")
+                failure?()
+                return
+            }
+
+            // Valid only with both: without a placement there is nowhere to put the page.
+            guard let html = payload["html"] as? String, let placement = payload["geo"] as? [String: Any] else {
+                self.logD("fetchContents", "the content details response carries no content, result: [\(payload["result"] as? String ?? "")]")
                 failure?()
                 return
             }
 
             self.logD("fetchContents", "the content details response carries a content, will present it")
-            self.showContent(urlString: html, placement: payload["geo"] as? [String: Any] ?? [:])
+            self.showContent(urlString: html, placement: placement)
         }?.resume()
     }
 
@@ -526,12 +571,9 @@ final class ContentModule: ModuleBase {
             queryString += "&content_id=\(contentID.urlEscaped)&preview=true"
         }
 
-        queryString = core.network.builder.appendChecksum(queryString)
+        queryString = core.network.builder.finishImmediateRequest(queryString)
         let request = core.network.instantRequest(queryString: queryString, path: Self.endpoint)
 
-        // A content fetch the server answers with nothing is usually a question
-        // about what was asked for, and which half of the request carries the query
-        // depends on its length and on `alwaysUsePOST`, so both are reported.
         let body = request.httpBody.map { String(decoding: $0, as: UTF8.self) } ?? ""
         logD("fetchRequest", "content fetch request built, method: [\(request.httpMethod ?? "GET")], path: [\(request.url?.path ?? "")], bodySize: [\(body.count)]")
         logV("fetchRequest", "content fetch request detail, url: [\(request.url?.absoluteString ?? "")], body: [\(body)]")
@@ -671,11 +713,12 @@ final class ContentModule: ModuleBase {
                                 // Only the current content's dismissal may touch
                                 // shared zone state: this block can belong to a
                                 // web view that was already superseded.
+                                // The next fetch waits two intervals, so content does not follow content.
                                 if isCurrent {
                                     self.webViewManager = nil
                                     self.endPresentation()
                                     self.reentryTimer = Timer.scheduledTimer(
-                                        withTimeInterval: TimeInterval(self.core.config.content.zoneTimerInterval),
+                                        withTimeInterval: TimeInterval(2 * self.core.config.content.zoneTimerInterval),
                                         repeats: false) { [weak self] _ in
                                             self?.enterContentZone()
                                         }
@@ -696,9 +739,7 @@ final class ContentModule: ModuleBase {
     override func didInit() {
         // The server can ask for the zone to be entered without the application
         // doing anything.
-        if core.serverConfig.enterContentZone {
-            enterContentZone()
-        }
+        enterForServerIfNeeded(from: "didInit")
     }
 
     override func halt(clearStorage: Bool) {

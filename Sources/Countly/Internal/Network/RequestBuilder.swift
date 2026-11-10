@@ -27,8 +27,8 @@ final class RequestBuilder {
     /// owns them.
     static let reservedKeys: Set<String> = [
         QS.appKey, QS.deviceID, QS.deviceIDType, QS.timestamp, QS.hourOfDay,
-        QS.dayOfWeek, QS.timeZone, QS.sdkVersion, QS.sdkName, QS.deviceIDOld,
-        QS.checksum256,
+        QS.dayOfWeek, QS.timeZone, QS.sdkVersion, QS.sdkName, QS.appVersion,
+        QS.deviceIDOld, QS.remainingRequest, QS.directRequest, "checksum", QS.checksum256,
     ]
 
     /// The nine parameters on every request.
@@ -83,32 +83,11 @@ final class RequestBuilder {
         return "\(queryString)&\(QS.remainingRequest)=\(remaining)"
     }
 
-    /// Location parameters, or an explicit empty location.
-    ///
-    /// An empty `location=` is not the same as omitting it: it tells the server to
-    /// stop inferring location from the request's IP address. That is why this
-    /// returns a value rather than `nil` when location is switched off.
-    func locationQueryString() -> String? {
-        let location = core.modules.location
-
-        guard core.modules.consent.hasConsent(for: .location), !location.isLocationInfoDisabled else {
-            core.logger.d(Self.module, "locationQueryString", "an empty location is sent so the server stops inferring it from the IP address, hasLocationConsent: [\(core.modules.consent.hasConsent(for: .location))], isLocationInfoDisabled: [\(location.isLocationInfoDisabled)]")
-            return "&\(QS.location)="
-        }
-
-        var parts: [String] = []
-        if let value = location.locationCoordinate { parts.append("&\(QS.location)=\(value.urlEscaped)") }
-        if let value = location.city { parts.append("&\(QS.locationCity)=\(value.urlEscaped)") }
-        if let value = location.isoCountryCode { parts.append("&\(QS.locationCountry)=\(value.urlEscaped)") }
-        if let value = location.ipAddress { parts.append("&\(QS.locationIP)=\(value.urlEscaped)") }
-
-        guard !parts.isEmpty else {
-            core.logger.d(Self.module, "locationQueryString", "no location parameters are attached to the request, reason: none of them has a value")
-            return nil
-        }
-
-        core.logger.d(Self.module, "locationQueryString", "location parameters are attached to the request, hasCoordinate: [\(location.locationCoordinate != nil)], hasCity: [\(location.city != nil)], hasCountryCode: [\(location.isoCountryCode != nil)], hasIPAddress: [\(location.ipAddress != nil)]")
-        return parts.joined()
+    /// Finishes a request that skips the queue: `rr` with the number of requests
+    /// waiting in the queue at this moment, then the checksum, which has to cover
+    /// everything that is sent.
+    func finishImmediateRequest(_ queryString: String) -> String {
+        appendChecksum("\(queryString)&\(QS.remainingRequest)=\(core.requestQueueStore.count)")
     }
 
     /// Marks a query string so the connection manager sends it somewhere other

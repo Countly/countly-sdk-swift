@@ -49,9 +49,6 @@ final class RefusalTests: CountlyBaseTestCase {
         countly.events.startEvent("")
         countly.events.endEvent("")
         countly.events.cancelEvent("")
-        countly.performance.startCustomTrace("")
-        countly.performance.endCustomTrace("", metrics: nil)
-        countly.performance.cancelCustomTrace("")
 
         XCTAssertTrue(requestQueue(of: countly).isEmpty)
     }

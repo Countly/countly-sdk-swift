@@ -218,6 +218,76 @@ final class ViewsTests: CountlyBaseTestCase {
         XCTAssertTrue(viewEvents(of: countly).isEmpty)
     }
 
+    /// The end events of views, which carry no `visit` key.
+    private func endEvents(of instance: CountlyInstance) -> [[String: Any]] {
+        viewEvents(of: instance).filter {
+            $0["key"] as? String == ReservedEventKey.view
+                && ($0["segmentation"] as? [String: Any])?[SegKey.visit] == nil
+        }
+    }
+
+    /// A second pause would report the paused time again, and a resume of a view
+    /// that runs would throw away the time it ran so far.
+    func testPausingTwiceAndResumingARunningViewAreIgnored() {
+        let countly = viewInstance()
+        guard let viewID = countly.views.startView("Article") else {
+            XCTFail("the view should have started")
+            return
+        }
+
+        countly.views.resumeView(id: viewID)
+        countly.views.pauseView(id: viewID)
+        countly.views.pauseView(id: viewID)
+
+        XCTAssertEqual(endEvents(of: countly).count, 1, "only the first pause reports the time so far")
+        XCTAssertEqual(logCodeCount(HealthLogCode.viewPauseMismatch, of: countly), 2)
+    }
+
+    /// The time of a paused view went out with the pause, so stopping it adds none.
+    func testStoppingAPausedViewReportsNoFurtherTime() {
+        let countly = viewInstance()
+        guard let viewID = countly.views.startView("Article") else {
+            XCTFail("the view should have started")
+            return
+        }
+
+        TestUtils.pump(1.1)
+        countly.views.pauseView(id: viewID)
+        TestUtils.pump(1.1)
+        countly.views.stopView(id: viewID)
+
+        let durations = endEvents(of: countly).map { TestUtils.double($0["dur"]) ?? -1 }
+        XCTAssertEqual(durations.count, 2)
+        XCTAssertGreaterThanOrEqual(durations.first ?? 0, 1)
+        XCTAssertEqual(durations.last, 0, "the paused time is not reported")
+    }
+
+    func testStoppingByNameStopsTheLastViewStartedWithThatName() {
+        let countly = viewInstance()
+
+        countly.views.startView("Tab")
+        let second = countly.views.startView("Tab")
+        countly.views.addSegmentation(toViewWithName: "Tab", segmentation: ["which": "second"])
+        countly.views.stopView(name: "Tab")
+
+        let ends = endEvents(of: countly)
+        XCTAssertEqual(ends.count, 1)
+        XCTAssertEqual(ends.first?["id"] as? String, second)
+        XCTAssertEqual((ends.first?["segmentation"] as? [String: Any])?["which"] as? String, "second")
+    }
+
+    func testCallsNamingNoOpenViewAreCountedForTheHealthCheck() {
+        let countly = viewInstance()
+
+        countly.views.stopView(id: "nope")
+        countly.views.pauseView(id: "nope")
+        countly.views.addSegmentation(toViewWithName: "Nope", segmentation: ["a": 1])
+        XCTAssertNil(countly.views.startView(""))
+
+        XCTAssertEqual(logCodeCount(HealthLogCode.viewNotFound, of: countly), 3)
+        XCTAssertEqual(logCodeCount(HealthLogCode.emptyViewName, of: countly), 1)
+    }
+
     // MARK: - Global segmentation
 
     func testGlobalSegmentationIsAddedToEveryView() {
@@ -382,6 +452,45 @@ final class ViewsTests: CountlyBaseTestCase {
 
         XCTAssertEqual(events(named: "Article", of: countly).count, 4,
                        "start, close on background, reopen on foreground, stop, and nothing reopened after it")
+    }
+
+    /// With the restart disabled the view still stops on background, so it reports
+    /// no time the application spent there; it is only not opened again.
+    func testTheBackgroundStopsManualViewsEvenWhenTheirRestartIsDisabled() {
+        let countly = viewInstance { $0.disableViewRestartForManualRecording = true }
+        let views = core(of: countly).modules.views
+
+        guard let heldID = countly.views.startView("Article") else {
+            XCTFail("the view should have started")
+            return
+        }
+        views.applicationDidEnterBackground()
+        views.applicationWillEnterForeground()
+        countly.views.stopView(id: heldID)
+
+        XCTAssertEqual(events(named: "Article", of: countly).count, 2,
+                       "the start and the end on background, no restart and nothing for the stop of a view that is gone")
+    }
+
+    /// A paused view counts no time, so the background has nothing to stop and the
+    /// foreground nothing to restart: it stays paused until it is resumed.
+    func testAPausedViewStaysPausedAcrossTheBackground() {
+        let countly = viewInstance()
+        let views = core(of: countly).modules.views
+
+        guard let heldID = countly.views.startView("Article") else {
+            XCTFail("the view should have started")
+            return
+        }
+        countly.views.pauseView(id: heldID)
+        views.applicationDidEnterBackground()
+        views.applicationWillEnterForeground()
+
+        XCTAssertEqual(events(named: "Article", of: countly).count, 2, "the start and the pause")
+
+        countly.views.resumeView(id: heldID)
+        countly.views.stopView(id: heldID)
+        XCTAssertEqual(events(named: "Article", of: countly).count, 3, "the resumed view still stops under the held ID")
     }
 
     /// The held ID keeps working over any number of cycles, not only the first.

@@ -37,10 +37,6 @@ public final class CountlySDKLimitsConfig: NSObject {
     public var maxStackTraceLineLength: Int = DefaultLimits.maxStackTraceLineLength
 
     /// Maximum number of stack trace lines kept per thread. Default 30.
-    ///
-    /// Accepted for configuration parity with the other SDKs. This SDK reports the
-    /// crashed thread only and applies `maxStackTraceLineLength` to it, so the
-    /// value is not consulted.
     public var maxStackTraceLinesPerThread: Int = DefaultLimits.maxStackTraceLinesPerThread
 
     public override init() {}
@@ -56,21 +52,24 @@ public final class CountlySDKLimitsConfig: NSObject {
         maxStackTraceLinesPerThread = other.maxStackTraceLinesPerThread
     }
 
-    /// Raises every limit below one back to its default, in place.
+    /// Puts the default back for every limit below one, in place, and reports
+    /// each with its name, the refused value and the default.
     ///
-    /// A zero or negative limit would silently discard all data, which is a worse
-    /// outcome than ignoring the misconfiguration.
-    func clampToMinimums() {
-        func clamp(_ value: Int, _ fallback: Int) -> Int {
-            value < 1 ? fallback : value
+    /// A zero or negative limit would silently discard all data, so it is ignored
+    /// rather than used, and never raised to one.
+    func resetInvalidValues(_ reject: (String, Int, Int) -> Void) {
+        let checks: [(String, ReferenceWritableKeyPath<CountlySDKLimitsConfig, Int>, Int)] = [
+            ("maxKeyLength", \.maxKeyLength, DefaultLimits.maxKeyLength),
+            ("maxValueSize", \.maxValueSize, DefaultLimits.maxValueSize),
+            ("maxValueSizePicture", \.maxValueSizePicture, DefaultLimits.maxValueSizePicture),
+            ("maxBreadcrumbCount", \.maxBreadcrumbCount, DefaultLimits.maxBreadcrumbCount),
+            ("maxSegmentationValues", \.maxSegmentationValues, DefaultLimits.maxSegmentationValues),
+            ("maxStackTraceLineLength", \.maxStackTraceLineLength, DefaultLimits.maxStackTraceLineLength),
+            ("maxStackTraceLinesPerThread", \.maxStackTraceLinesPerThread, DefaultLimits.maxStackTraceLinesPerThread),
+        ]
+        for (name, keyPath, fallback) in checks where self[keyPath: keyPath] < 1 {
+            reject(name, self[keyPath: keyPath], fallback)
+            self[keyPath: keyPath] = fallback
         }
-
-        maxKeyLength = clamp(maxKeyLength, DefaultLimits.maxKeyLength)
-        maxValueSize = clamp(maxValueSize, DefaultLimits.maxValueSize)
-        maxValueSizePicture = clamp(maxValueSizePicture, DefaultLimits.maxValueSizePicture)
-        maxBreadcrumbCount = clamp(maxBreadcrumbCount, DefaultLimits.maxBreadcrumbCount)
-        maxSegmentationValues = clamp(maxSegmentationValues, DefaultLimits.maxSegmentationValues)
-        maxStackTraceLineLength = clamp(maxStackTraceLineLength, DefaultLimits.maxStackTraceLineLength)
-        maxStackTraceLinesPerThread = clamp(maxStackTraceLinesPerThread, DefaultLimits.maxStackTraceLinesPerThread)
     }
 }

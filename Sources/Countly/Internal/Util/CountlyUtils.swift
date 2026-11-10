@@ -32,13 +32,18 @@ extension String {
         Data(utf8).sha256Hex
     }
 
-    /// How old a queued request is, from the timestamp it carries.
-    ///
-    /// A request with no readable timestamp reads as infinitely old, so the age
-    /// based drop treats it as stale rather than keeping it forever.
+    /// How old a queued request is, from the millisecond timestamp it carries.
+    /// A request with no readable timestamp reads as infinitely old; check
+    /// ``hasRequestTimestamp`` first where that matters.
     var requestAgeSeconds: TimeInterval {
         let millis = Double(valueForQueryStringKey(QS.timestamp) ?? "") ?? 0
         return Date().timeIntervalSince1970 - millis / 1000.0
+    }
+
+    /// Whether a queued request carries a readable timestamp.
+    var hasRequestTimestamp: Bool {
+        guard let value = valueForQueryStringKey(QS.timestamp), let millis = Double(value) else { return false }
+        return millis > 0
     }
 
     /// Reads one parameter out of a query string fragment such as
@@ -115,6 +120,27 @@ func onMainThread(_ work: @escaping () -> Void) {
         work()
     } else {
         DispatchQueue.main.async(execute: work)
+    }
+}
+
+// MARK: - Links
+
+/// Which links the SDK may open for a notification, a content page or a
+/// feedback widget, all of which are remote input.
+enum LinkSchemePolicy {
+
+    /// Schemes never opened: they reach the device's own files, run script or
+    /// start components of other applications.
+    static let dangerousSchemes: Set<String> = ["file", "content", "javascript", "jar", "zip", "intent", "data"]
+
+    /// Whether a link with `scheme` may be opened: never with a dangerous scheme
+    /// or one in `alsoRefused`, and only with a scheme of `allowedSchemes`,
+    /// compared without case, when that list is not empty.
+    static func isAllowed(scheme: String?, allowedSchemes: [String], alsoRefused: Set<String> = []) -> Bool {
+        guard let scheme = scheme?.lowercased(), !scheme.isEmpty else { return false }
+        guard !dangerousSchemes.contains(scheme), !alsoRefused.contains(scheme) else { return false }
+        guard !allowedSchemes.isEmpty else { return true }
+        return allowedSchemes.contains { $0.lowercased() == scheme }
     }
 }
 
@@ -346,7 +372,15 @@ struct LimitsEnforcer {
     /// that feature checks its own consent.
     private(set) var scope: LogGatheringScope = .unattributed
 
+    /// Whether cuts are logged at debug only, with no health check log code. The
+    /// crash handler uses a quiet enforcer: a warning there would reach the health
+    /// tracker, whose dispatch primitives are not async-signal-safe.
+    private(set) var isQuiet = false
+
     private static let module = "Limits"
+
+    /// The whole stack trace of a crash report is cut to this many characters.
+    static let maxStackTraceCharacters = 20_000
 
     /// This enforcer, with what it logs gathered under `scope`.
     func gathered(as scope: LogGatheringScope) -> LimitsEnforcer {
@@ -355,42 +389,81 @@ struct LimitsEnforcer {
         return copy
     }
 
+    /// This enforcer, logging what it cuts at debug only, for the crash handler.
+    func quietly() -> LimitsEnforcer {
+        var copy = self
+        copy.isQuiet = true
+        return copy
+    }
+
+    /// Reports a value that was cut or dropped: a warning with its health check
+    /// log code, or a debug line only when quiet.
+    private func report(_ code: String, _ function: String, _ message: @autoclosure () -> String) {
+        if isQuiet {
+            logger?.d(Self.module, function, scope: scope, message())
+        } else {
+            logger?.w(Self.module, function, scope: scope, message())
+            logger?.healthTracker?.recordLogCode(code)
+        }
+    }
+
     /// Truncates a key to the configured maximum key length.
     func truncatedKey(_ key: String, _ explanation: String) -> String {
         guard key.countlyLength > limits.maxKeyLength else { return key }
-        logger?.d(Self.module, "truncatedKey", scope: scope, "key exceeds the SDK key length limit and will be truncated, target: [\(explanation)], key: [\(key)], keyLength: [\(key.countlyLength)], truncatedTo: [\(limits.maxKeyLength)]")
+        report(HealthLogCode.keyCut, "truncatedKey", "key exceeds the SDK key length limit and will be truncated, target: [\(explanation)], key: [\(key)], keyLength: [\(key.countlyLength)], truncatedTo: [\(limits.maxKeyLength)]")
         return key.countlyPrefix(limits.maxKeyLength)
     }
 
     /// Truncates a value to the configured maximum value length.
     func truncatedValue(_ value: String, _ explanation: String) -> String {
         guard value.countlyLength > limits.maxValueSize else { return value }
-        logger?.d(Self.module, "truncatedValue", scope: scope, "value exceeds the SDK value length limit and will be truncated, target: [\(explanation)], valueLength: [\(value.countlyLength)], truncatedTo: [\(limits.maxValueSize)]")
+        report(HealthLogCode.valueCut, "truncatedValue", "value exceeds the SDK value length limit and will be truncated, target: [\(explanation)], valueLength: [\(value.countlyLength)], truncatedTo: [\(limits.maxValueSize)]")
         logger?.v(Self.module, "truncatedValue", scope: scope, "truncated value detail, target: [\(explanation)], fullValue: [\(value)]")
         return value.countlyPrefix(limits.maxValueSize)
     }
 
-    /// Truncates every frame of a stack trace to `maxStackTraceLineLength`.
-    ///
-    /// The frame count is deliberately not capped. Android applies
-    /// `maxStackTraceLinesPerThread` only to the supplementary other-threads dump,
-    /// never to the exception's own trace, and this SDK records no such dump. The
-    /// crash filters read the trace after this runs, so capping it would silently
-    /// stop a filter written against a deep frame from matching.
+    /// Applies the stack trace limits to the frames of one thread: at most
+    /// `maxStackTraceLinesPerThread` lines, each at most `maxStackTraceLineLength`
+    /// characters, and at most ``maxStackTraceCharacters`` in total once the lines
+    /// are joined with new lines.
     func truncatedStackTrace(_ frames: [String], _ explanation: String) -> [String] {
         let lineLimit = max(1, limits.maxStackTraceLineLength)
+        let lineCountLimit = max(1, limits.maxStackTraceLinesPerThread)
 
-        return frames.map { line in
-            guard line.countlyLength > lineLimit else { return line }
-            logger?.d(Self.module, "truncatedStackTrace", scope: scope, "stack trace line exceeds the SDK stack trace line length limit and will be truncated, target: [\(explanation)], lineLength: [\(line.countlyLength)], truncatedTo: [\(lineLimit)]")
-            return line.countlyPrefix(lineLimit)
+        var wasCut = frames.count > lineCountLimit
+        var remaining = Self.maxStackTraceCharacters
+        var result: [String] = []
+
+        for frame in frames.prefix(lineCountLimit) {
+            var line = frame
+            if line.countlyLength > lineLimit {
+                line = line.countlyPrefix(lineLimit)
+                wasCut = true
+            }
+
+            let separator = result.isEmpty ? 0 : 1
+            guard remaining - separator > 0 else {
+                wasCut = true
+                break
+            }
+            if line.countlyLength > remaining - separator {
+                line = line.countlyPrefix(remaining - separator)
+                wasCut = true
+            }
+            remaining -= line.countlyLength + separator
+            result.append(line)
         }
+
+        if wasCut {
+            report(HealthLogCode.stackTraceCut, "truncatedStackTrace", "stack trace exceeds the SDK stack trace limits and is cut, target: [\(explanation)], lineCount: [\(frames.count)], keptLineCount: [\(result.count)], maxLinesPerThread: [\(lineCountLimit)], maxLineLength: [\(lineLimit)], maxTotalLength: [\(Self.maxStackTraceCharacters)]")
+        }
+        return result
     }
 
     /// Truncates a user profile picture URL, which has its own larger limit.
     func truncatedPictureValue(_ value: String, _ explanation: String) -> String {
         guard value.countlyLength > limits.maxValueSizePicture else { return value }
-        logger?.d(Self.module, "truncatedPictureValue", scope: scope, "value exceeds the SDK picture value limit and will be truncated, target: [\(explanation)], valueLength: [\(value.countlyLength)], truncatedTo: [\(limits.maxValueSizePicture)]")
+        report(HealthLogCode.valueCut, "truncatedPictureValue", "value exceeds the SDK picture value limit and will be truncated, target: [\(explanation)], valueLength: [\(value.countlyLength)], truncatedTo: [\(limits.maxValueSizePicture)]")
         logger?.v(Self.module, "truncatedPictureValue", scope: scope, "truncated picture value detail, target: [\(explanation)], fullValue: [\(value)]")
         return value.countlyPrefix(limits.maxValueSizePicture)
     }
@@ -425,7 +498,7 @@ struct LimitsEnforcer {
 
         let kept = Set(keys.prefix(limits.maxSegmentationValues))
         let dropped = keys.filter { !kept.contains($0) }
-        logger?.d(Self.module, "limited", scope: scope, "segmentation exceeds the SDK segmentation value limit and will be trimmed, target: [\(explanation)], keyCount: [\(keys.count)], trimmedTo: [\(limits.maxSegmentationValues)], droppedKeyCount: [\(dropped.count)], droppedKeys: [\(dropped)]")
+        report(HealthLogCode.entriesDropped, "limited", "segmentation exceeds the SDK segmentation value limit and will be trimmed, target: [\(explanation)], keyCount: [\(keys.count)], trimmedTo: [\(limits.maxSegmentationValues)], droppedKeyCount: [\(dropped.count)], droppedKeys: [\(dropped)]")
 
         return dictionary.filter { kept.contains($0.key) }
     }
@@ -452,11 +525,8 @@ struct LimitsEnforcer {
     ///
     /// Dates are converted rather than dropped, because the server reads a date
     /// as epoch milliseconds and dropping one loses data the caller clearly meant
-    /// to send.
-    ///
-    /// Reachable from the crash signal handler, so the drop is reported at debug.
-    /// Warning level would re-enter the health tracker, whose dispatch primitives
-    /// are not async-signal-safe.
+    /// to send. A dropped value is reported as a warning, or at debug only by a
+    /// quiet enforcer.
     func filterSupportedDataTypes(_ dictionary: [String: Any]) -> [String: Any] {
         var result: [String: Any] = [:]
         for (key, value) in dictionary {
@@ -465,11 +535,11 @@ struct LimitsEnforcer {
             } else if let array = value as? [Any] {
                 result[key] = filterSupportedDataTypes(array)
             } else if value is Date {
-                logger?.d(Self.module, "filterSupportedDataTypes", scope: scope, "dropping dictionary entry with a date that has no representable epoch value, key: [\(key)]")
+                report(HealthLogCode.unsupportedValueRemoved, "filterSupportedDataTypes", "dropping dictionary entry with a date that has no representable epoch value, key: [\(key)]")
             } else if value is NSNumber {
-                logger?.d(Self.module, "filterSupportedDataTypes", scope: scope, "dropping dictionary entry with a number JSON cannot represent, key: [\(key)]")
+                report(HealthLogCode.unsupportedValueRemoved, "filterSupportedDataTypes", "dropping dictionary entry with a number JSON cannot represent, key: [\(key)]")
             } else {
-                logger?.d(Self.module, "filterSupportedDataTypes", scope: scope, "dropping dictionary entry with an unsupported value type, key: [\(key)], receivedType: [\(type(of: value))]")
+                report(HealthLogCode.unsupportedValueRemoved, "filterSupportedDataTypes", "dropping dictionary entry with an unsupported value type, key: [\(key)], receivedType: [\(type(of: value))]")
             }
         }
         return result
@@ -479,7 +549,7 @@ struct LimitsEnforcer {
     func filterSupportedDataTypes(_ array: [Any]) -> [Any] {
         array.compactMap { element in
             if let converted = supportedValue(element) { return converted }
-            logger?.d(Self.module, "filterSupportedDataTypes", scope: scope, "dropping array element with an unsupported type, only numbers, strings and dates are allowed, receivedType: [\(type(of: element))]")
+            report(HealthLogCode.unsupportedValueRemoved, "filterSupportedDataTypes", "dropping array element with an unsupported type, only numbers, strings and dates are allowed, receivedType: [\(type(of: element))]")
             return nil
         }
     }
