@@ -186,7 +186,8 @@
   * One gathered batch waits in the request queue at a time, and the rest wait in a bounded buffer, so a device that cannot reach the server never fills its queue with log batches. While the application is in the background, nothing is uploaded on the session timer.
   * When the server stops a gather, its last lines are still uploaded under it. A batch size outside 10 to 500 falls back to the default of 100.
   * The connection test report needs no consent. It carries the device ID the test was requested for and is dropped when the device ID changes with merge first, since the merge cancels the test on the server.
-  * The connection test does not run while behavior settings switch networking or tracking off, and starts again when the application returns from the background.
+  * The connection test does not run while behavior settings switch networking or tracking off.
+  * On iOS, tvOS, visionOS and watchOS it waits for the foreground, and runs again when the application returns from a background that interrupted it. On macOS it runs right away.
 
 * Added networking configuration on "CountlyConfig":
   * Every request is a POST, with its data in the body.

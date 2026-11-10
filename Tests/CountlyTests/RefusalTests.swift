@@ -224,20 +224,15 @@ final class RefusalTests: CountlyBaseTestCase {
 
     // MARK: - A host that cannot be turned into a URL
 
-    /// A host that cannot form a URL still leaves the crash report in the queue:
-    /// the host may be fixed on a later launch, and trapping while the application
-    /// is already crashing is the worst possible moment.
-    func testACrashIsQueuedWhenTheServerURLCannotBeBuilt() {
+    /// A host that cannot form a URL is refused at start, so no request, a crash
+    /// report included, is ever built against it.
+    func testAHostThatCannotBeTurnedIntoAURLIsRefusedAtStart() {
         let countly = startInstance {
             $0.features = [.crashReporting]
-            // Reachable only through a host that survives validation but cannot be
-            // turned into a URL.
             $0.host = "https://exa mple.com"
         }
 
-        reportAutoDetectedCrash(on: countly)
-
-        XCTAssertEqual(requestQueue(of: countly).filter { $0.contains("crash=") }.count, 1)
+        XCTAssertFalse(countly.isStarted)
     }
 
     // MARK: - Flush runnables after a failure

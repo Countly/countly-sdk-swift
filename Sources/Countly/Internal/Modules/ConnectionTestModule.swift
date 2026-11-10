@@ -155,6 +155,7 @@ final class ConnectionTestModule: ModuleBase {
     }
 
     override func didEnterBackground() {
+        guard Self.waitsForTheForeground else { return }
         stateLock.lock()
         if batteryRunning {
             interrupted = true
@@ -166,13 +167,33 @@ final class ConnectionTestModule: ModuleBase {
         startPendingRun(assumingForeground: true)
     }
 
+    /// Whether the probes wait for the foreground. iOS, tvOS, visionOS and watchOS
+    /// suspend an application in the background, which stalls them; a macOS
+    /// application keeps its network when it is not frontmost.
+    private static var waitsForTheForeground: Bool {
+        #if os(macOS)
+        return false
+        #else
+        return true
+        #endif
+    }
+
+    /// Whether the probes may run now.
+    ///
+    /// - Parameter assumingForeground: whether the caller knows the application
+    ///   is in the foreground, as the foreground hook does before the cached state
+    ///   is updated.
+    private func mayProbeNow(assumingForeground: Bool) -> Bool {
+        assumingForeground || !Self.waitsForTheForeground || AppState.isForeground
+    }
+
     /// Starts the armed run that waited for the foreground, if there is one.
     ///
     /// - Parameter assumingForeground: whether the caller knows the application
     ///   is in the foreground, as the foreground hook does before the cached state
     ///   is updated.
     private func startPendingRun(assumingForeground: Bool) {
-        guard assumingForeground || AppState.isForeground else { return }
+        guard mayProbeNow(assumingForeground: assumingForeground) else { return }
 
         stateLock.lock()
         let pending = pendingRun
@@ -220,7 +241,8 @@ final class ConnectionTestModule: ModuleBase {
     ///     made. A merge since then cancels the run on the server, so the report is
     ///     dropped.
     ///   - assumingForeground: whether the caller knows the application is in the
-    ///     foreground. Otherwise a run armed while it is in the background waits.
+    ///     foreground. Otherwise a run armed while it is in the background waits,
+    ///     except on macOS.
     func startBattery(serverConfigLatencyMs: Int64,
                       armedFor identity: ArmedIdentity? = nil,
                       mergesAtArming: Int? = nil,
@@ -239,7 +261,7 @@ final class ConnectionTestModule: ModuleBase {
 
         let mergesAtArming = mergesAtArming ?? core.modules.deviceID.mergeCount
 
-        guard assumingForeground || AppState.isForeground else {
+        guard mayProbeNow(assumingForeground: assumingForeground) else {
             stateLock.lock()
             pendingRun = PendingRun(serverConfigLatencyMs: serverConfigLatencyMs, identity: identity, mergesAtArming: mergesAtArming)
             stateLock.unlock()

@@ -155,8 +155,8 @@ final class ConnectionManagerTests: CountlyBaseTestCase {
         }
         XCTAssertTrue(MockURLProtocol.requests
             .filter { $0.query.contains("crash=") }
-            .allSatisfy { $0.method == "GET" },
-            "a queued report is an ordinary request")
+            .allSatisfy { $0.method == "POST" },
+            "a queued report is an ordinary request, a POST like every other")
     }
 
     // MARK: - Picture upload

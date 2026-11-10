@@ -18,8 +18,10 @@ Three things this deliberately does:
   percentage is taken over roughly 1,500 fewer lines than the iOS one. The two are not
   comparable and the table has to say so.
 
-There is no coverage threshold and no failure on coverage. Coverage is around 82% and is being
-worked up deliberately; a gate would block every pull request rather than inform it.
+A pull request fails when it lowers the macOS coverage by more than 0.05 points against the base
+branch's last green push (coverage_gate.py, run by the same job). There is no absolute threshold:
+coverage is being worked up deliberately, and a fixed bar would block every pull request rather
+than inform it.
 
 Usage:
     ci_report.py --junit-dir junit --coverage-dir coverage --output ci-report.md
@@ -208,7 +210,8 @@ def coverage_section(coverage_dir):
         "",
         "The platforms measure different amounts of code, so the percentages are not "
         "comparable: `WebViewManager`, `OverlayWindow` and the notification service are "
-        "compiled out on macOS. Reported, not enforced — there is no coverage gate.",
+        "compiled out on macOS. On a pull request the macOS figure is gated: one more "
+        "than 0.05 points below the base branch's fails the report job.",
     ]
 
     for record in records:
