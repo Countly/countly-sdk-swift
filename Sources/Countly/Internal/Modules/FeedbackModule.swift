@@ -201,6 +201,13 @@ final class FeedbackModule: ModuleBase {
             return
         }
 
+        // The widget page is loaded from the server, which networking off forbids.
+        guard core.serverConfig.networkingEnabled else {
+            logD("present", "networking is disabled by the server config, the widget will not be presented, widgetID: [\(widget.id)]")
+            callback?(.failed)
+            return
+        }
+
         #if os(iOS) || os(visionOS) || os(macOS)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
