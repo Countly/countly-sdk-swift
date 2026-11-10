@@ -44,6 +44,7 @@ enum HealthLogCode {
     static let backoffContinued = "w321"
     static let requestTooOld = "w330"
     static let invalidConsentName = "w402"
+    static let storageFailed = "e501"
     static let storedStateReset = "e503"
     static let trackingDisabled = "w505"
     static let invalidDeviceID = "w601"

@@ -228,6 +228,19 @@ final class StorageAndConfigTests: CountlyBaseTestCase {
         XCTAssertNil(store.serverConfig, "the write that raced the erasure was not taken back")
     }
 
+    /// A stored value that cannot be read back is reset to empty, an error the
+    /// health check reports as e503.
+    func testAStoredValueThatCannotBeReadIsResetAndCounted() {
+        let config = baseConfig()
+        let key = StorageNamespace(instanceName: config.instanceName).key(PersistencyKey.remoteConfig)
+        UserDefaults.standard.set(Data("not an archive".utf8), forKey: key)
+
+        let countly = start(config)
+
+        XCTAssertTrue(countly.remoteConfig.getAllValues().isEmpty)
+        XCTAssertEqual(logCodeCount(HealthLogCode.storedStateReset, of: countly), 1)
+    }
+
     // MARK: - The config snapshot
 
     /// What the SDK changes on its config while running stays with that run: the

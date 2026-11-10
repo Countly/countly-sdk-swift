@@ -245,6 +245,7 @@ final class KeyValueStore {
         } catch {
             let failure = error as NSError
             logger?.e(Self.module, "archive", "value could not be archived and is not stored, key: [\(key)], entryCount: [\(value.count)], errorDomain: [\(failure.domain)], errorCode: [\(failure.code)], error: [\(failure.localizedDescription)]")
+            logger?.healthTracker?.recordLogCode(HealthLogCode.storageFailed)
         }
     }
 
@@ -257,14 +258,16 @@ final class KeyValueStore {
         do {
             let value = try CountlyArchive.decodeRoot(from: data)
             guard let dictionary = value as? [String: Any] else {
-                logger?.w(Self.module, "unarchive", "the archived value is not a dictionary and will be treated as empty, key: [\(key)], dataSize: [\(data.count)]")
+                logger?.e(Self.module, "unarchive", "the archived value is not a dictionary and will be treated as empty, key: [\(key)], dataSize: [\(data.count)]")
+                logger?.healthTracker?.recordLogCode(HealthLogCode.storedStateReset)
                 return [:]
             }
             logger?.d(Self.module, "unarchive", "archived value is read back from the key value store, key: [\(key)], entryCount: [\(dictionary.count)], dataSize: [\(data.count)]")
             return dictionary
         } catch {
             let failure = error as NSError
-            logger?.w(Self.module, "unarchive", "stored value could not be read back and will be treated as empty, key: [\(key)], dataSize: [\(data.count)], errorDomain: [\(failure.domain)], errorCode: [\(failure.code)], error: [\(failure.localizedDescription)]")
+            logger?.e(Self.module, "unarchive", "stored value could not be read back and will be treated as empty, key: [\(key)], dataSize: [\(data.count)], errorDomain: [\(failure.domain)], errorCode: [\(failure.code)], error: [\(failure.localizedDescription)]")
+            logger?.healthTracker?.recordLogCode(HealthLogCode.storedStateReset)
             return [:]
         }
     }
