@@ -331,6 +331,34 @@ final class CrashTests: CountlyBaseTestCase {
         XCTAssertEqual(lastCrash(of: countly)?["_type"] as? String, "com.example.storage")
     }
 
+    /// The stack trace line length limit holds for the crash message too, and a
+    /// frame given as one multi-line string is limited line by line.
+    func testTheLineLengthLimitCutsTheMessageAndEachLineOfAMultiLineFrame() {
+        let countly = startInstance { $0.sdkInternalLimits.maxStackTraceLineLength = 10 }
+
+        countly.crashes.recordError(String(repeating: "m", count: 25),
+                                    stackTrace: ["\(String(repeating: "a", count: 25))\nshort"])
+
+        let crash = lastCrash(of: countly)
+        XCTAssertEqual(crash?["_name"] as? String, String(repeating: "m", count: 10))
+        XCTAssertEqual(crash?["_error"] as? String, "\(String(repeating: "a", count: 10))\nshort")
+    }
+
+    /// The segmentation given with the call is the most specific, so it wins over
+    /// the exception's own user info as well as over the global segmentation.
+    func testPerReportSegmentationBeatsTheExceptionsUserInfo() {
+        let countly = startInstance()
+        let exception = NSException(name: .genericException,
+                                    reason: "Failed",
+                                    userInfo: ["screen": "from-exception", "code": "E1"])
+
+        countly.crashes.recordException(exception, segmentation: ["screen": "from-call"])
+
+        let custom = lastCrash(of: countly)?["_custom"] as? [String: Any]
+        XCTAssertEqual(custom?["screen"] as? String, "from-call")
+        XCTAssertEqual(custom?["code"] as? String, "E1")
+    }
+
     /// Every Mac has a shell, so a shell is no jailbreak signal on a Mac or in a
     /// simulator running on one.
     func testAMacOrASimulatorIsNeverReportedAsJailbroken() throws {
@@ -369,9 +397,12 @@ final class CrashTests: CountlyBaseTestCase {
         XCTAssertNotNil(crash["_disk_total"])
         XCTAssertNotNil(crash["_run"], "how long the process had been alive")
 
-        // Booleans on the wire, not integers.
-        XCTAssertNotNil(crash["_root"] as? Bool)
-        XCTAssertNotNil(crash["_background"] as? Bool)
+        // Booleans on the wire, not integers: the server keeps these fields only
+        // when they read as "true" or "false".
+        for key in ["_root", "_background", "_online"] {
+            let value = crash[key] as CFTypeRef?
+            XCTAssertEqual(value.map(CFGetTypeID), CFBooleanGetTypeID(), "\(key) is not a JSON boolean")
+        }
     }
 
     /// Without these the server cannot map an address back to a symbol, so a
@@ -390,6 +421,8 @@ final class CrashTests: CountlyBaseTestCase {
                        "the main executable's UUID identifies the exact build")
         XCTAssertFalse((crash["_executable_name"] as? String ?? "").isEmpty)
         XCTAssertFalse((crash["_architecture"] as? String ?? "").isEmpty)
+        XCTAssertEqual(crash["_cpu"] as? String, crash["_architecture"] as? String,
+                       "the dashboard filters crashes by CPU")
         XCTAssertNotNil(crash["_binary_images"])
     }
 

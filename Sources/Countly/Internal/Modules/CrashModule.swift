@@ -27,6 +27,7 @@ final class CrashModule: ModuleBase {
         static let device = "_device"
         static let manufacture = "_manufacture"
         static let architecture = "_architecture"
+        static let cpu = "_cpu"
         static let resolution = "_resolution"
         static let appVersion = "_app_version"
         static let appBuild = "_app_build"
@@ -332,17 +333,17 @@ final class CrashModule: ModuleBase {
         let currentBreadcrumbs = breadcrumbs
         stateLock.unlock()
 
+        custom.merge(userInfo) { _, new in new }
         if let segmentationOverride {
             custom.merge(segmentationOverride) { _, new in new }
         }
-        custom.merge(userInfo) { _, new in new }
 
         let filterCallback = core.config.crashes.crashFilterCallback
 
         let crashData = CountlyCrashData(
             stackTrace: stackTrace.joined(separator: "\n"),
             name: name,
-            crashDescription: description,
+            crashDescription: limits.truncatedCrashMessage(description),
             crashSegmentation: limits.sanitized(custom, "Exception segmentation") ?? [:],
             breadcrumbs: currentBreadcrumbs,
             crashMetrics: crashMetrics(),
@@ -404,9 +405,9 @@ final class CrashModule: ModuleBase {
     /// Turns the assembled crash data into the payload the server reads.
     ///
     /// When a filter callback had the report, the limits are applied again to
-    /// what it may have changed: the stack trace, the breadcrumbs, the
-    /// segmentation and the value types of the metrics. `_ob` is computed before,
-    /// so it reflects only what the callback changed.
+    /// what it may have changed: the stack trace, the crash message, the
+    /// breadcrumbs, the segmentation and the value types of the metrics. `_ob` is
+    /// computed before, so it reflects only what the callback changed.
     private func wireReport(for crashData: CountlyCrashData,
                             stackTrace: [String],
                             hadFilterCallback: Bool,
@@ -422,14 +423,18 @@ final class CrashModule: ModuleBase {
             : crashData.crashMetrics
 
         report[Key.error] = hadFilterCallback
-            ? limits.truncatedStackTrace(crashData.stackTrace.components(separatedBy: "\n"), "Crash stack trace").joined(separator: "\n")
+            ? limits.truncatedStackTrace([crashData.stackTrace], "Crash stack trace").joined(separator: "\n")
             : crashData.stackTrace
         let symbolication = binaryImages(for: stackTrace)
         report[Key.binaryImages] = symbolication.images
         report[Key.buildUUID] = symbolication.buildUUID ?? ""
         report[Key.executableName] = symbolication.executableName ?? ""
         report[Key.architecture] = symbolication.architecture
-        report[Key.name] = crashData.crashDescription
+        // The dashboard filters crashes by this field, and the architecture is the CPU it names.
+        report[Key.cpu] = symbolication.architecture
+        report[Key.name] = hadFilterCallback
+            ? limits.truncatedCrashMessage(crashData.crashDescription)
+            : crashData.crashDescription
         report[Key.type] = crashData.name
         report[Key.nonfatal] = !crashData.fatal
         report[Key.changedFields] = changed
@@ -526,7 +531,7 @@ final class CrashModule: ModuleBase {
         }
 
         metrics[Key.orientation] = DeviceMetrics.orientation
-        metrics[Key.online] = DeviceMetrics.connectionType != 0 ? 1 : 0
+        metrics[Key.online] = DeviceMetrics.connectionType != 0
         metrics[Key.root] = DeviceMetrics.isJailbroken
         metrics[Key.background] = !AppState.isForeground
         metrics[Key.run] = core.clock.timeSinceLaunch()
