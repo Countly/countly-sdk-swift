@@ -36,6 +36,13 @@ final class PushModule: ModuleBase {
     /// starts again whenever its consent is given again, the replay only once.
     private var hasReplayedLaunchNotification = false
 
+    /// The last token sent and when on the uptime clock, so the same token
+    /// reported again within a minute is sent once.
+    private var lastSentToken: (value: String, uptime: TimeInterval)?
+
+    /// How long a repeat of the last sent token is ignored.
+    private static let repeatedTokenWindow: TimeInterval = 60
+
     // MARK: - Init
 
     func applyInitialConfig() {
@@ -266,6 +273,10 @@ final class PushModule: ModuleBase {
         case .value(let value):
             logI("didReceive", "a device token arrived from the process wide push runtime, tokenLength: [\(value.count)]")
             logV("didReceive", "device token detail, token: [\(value)]")
+            if isRepeatOfLastSentToken(value) {
+                logD("didReceive", "the same token was sent for this device ID less than a minute ago, the repeat is ignored")
+                return
+            }
         case .failed:
             logI("didReceive", "remote notification registration failed for this process, no device token will be available")
         }
@@ -350,6 +361,18 @@ final class PushModule: ModuleBase {
     private func send(token: String) {
         send(token: token, essentials: core.network.builder.queryEssentials())
         core.keyValueStore.pushTokenDeviceID = token.isEmpty ? nil : core.modules.deviceID.deviceID
+        lastSentToken = token.isEmpty ? nil : (token, ProcessInfo.processInfo.systemUptime)
+    }
+
+    /// Whether `token` was sent less than a minute ago and the server still holds
+    /// it for the device ID in use, as when the application forwards the token the
+    /// SDK's own callback already reported. A token that arrived but was not sent
+    /// is never a repeat.
+    private func isRepeatOfLastSentToken(_ token: String) -> Bool {
+        guard let last = lastSentToken else { return false }
+        return last.value == token
+            && core.keyValueStore.pushTokenDeviceID == core.modules.deviceID.deviceID
+            && ProcessInfo.processInfo.systemUptime - last.uptime < Self.repeatedTokenWindow
     }
 
     /// Queues a token request with the given base parameters.

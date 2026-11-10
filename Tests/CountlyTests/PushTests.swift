@@ -43,6 +43,12 @@ final class PushTests: CountlyBaseTestCase {
         TestUtils.requests(requestQueue(of: instance), carrying: "token_session")
     }
 
+    /// A device token no other test reports, since the process ignores a token
+    /// reported again within a minute.
+    private func uniqueToken() -> Data {
+        withUnsafeBytes(of: UUID().uuid) { Data($0) }
+    }
+
     /// Starts the default instance, the only one that handles push.
     ///
     /// Its storage outlives a crashed run, so the stored device ID is reset. The
@@ -387,6 +393,27 @@ final class PushTests: CountlyBaseTestCase {
             error: NSError(domain: "test", code: 1))
 
         XCTAssertEqual(tokenRequests(of: countly).last?["ios_token"] as? String, "")
+        #endif
+    }
+
+    /// The application may forward the token as well as the SDK's own callback, so
+    /// the same token reported again within a minute is sent once.
+    func testTheSameTokenReportedTwiceWithinAMinuteIsSentOnce() throws {
+        #if !(os(iOS) || os(visionOS) || os(macOS))
+        throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
+        #else
+        let countly = startPushInstance {
+            $0.features = [.pushNotifications]
+            $0.disableAutomaticPushHandling = true
+        }
+        let before = tokenRequests(of: countly).count
+        let token = uniqueToken()
+
+        Countly.didRegisterForRemoteNotifications(deviceToken: token)
+        Countly.didRegisterForRemoteNotifications(deviceToken: token)
+
+        XCTAssertEqual(tokenRequests(of: countly).count, before + 1)
+        XCTAssertEqual(tokenRequests(of: countly).last?["ios_token"] as? String, token.hexString)
         #endif
     }
 

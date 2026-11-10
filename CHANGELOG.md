@@ -158,6 +158,7 @@
   * The "CountlyNotificationService" product for notification service extensions, which adds a notification's action buttons and downloads its media attachment while preserving the host's own notification categories
   * Push is handled by the default instance only, since the token and the notification taps belong to the whole process. A named instance that enables push registers for nothing and reports nothing.
   * Before a device ID change without merge, the token is taken back from the leaving user with an empty token, and afterwards it is reported for the new user, so the previous user's notifications stop reaching the device.
+  * The same token reported again within a minute for the same device ID is sent once.
 
 * Added automatic view tracking on iOS, tvOS and visionOS:
   * "CountlyConfig.enableAutomaticViewTracking", with an exclusion list ("automaticViewTrackingExclusionList") matching the resolved view name, the class name or a superclass, and a "CountlyAutoViewTrackingName" protocol for naming a screen explicitly
