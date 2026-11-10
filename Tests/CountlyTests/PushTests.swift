@@ -163,21 +163,19 @@ final class PushTests: CountlyBaseTestCase {
         #endif
     }
 
-    /// Registration failing is worth reporting: an empty token tells the server to
-    /// stop trying to reach this device, which is more useful than silence.
-    func testAFailedRegistrationClearsTheTokenOnTheServer() throws {
+    /// A failed registration may pass by the next start, so the token the server
+    /// holds is left alone: an empty token goes out only for the reasons the token
+    /// lifecycle names.
+    func testAFailedRegistrationLeavesTheTokenOnTheServer() throws {
         #if !(os(iOS) || os(visionOS) || os(macOS))
         throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
         #else
         let countly = startPushInstance { $0.sendPushTokenAlways = true }
+        let before = tokenRequests(of: countly).count
 
         core(of: countly).modules.push.didReceive(.failed)
 
-        guard let request = tokenRequests(of: countly).last else {
-            XCTFail("a failed registration should still have queued a request")
-            return
-        }
-        XCTAssertEqual(request["ios_token"] as? String, "")
+        XCTAssertEqual(tokenRequests(of: countly).count, before)
         #endif
     }
 
@@ -376,9 +374,8 @@ final class PushTests: CountlyBaseTestCase {
         #endif
     }
 
-    /// A failed registration reports an empty token through the default
-    /// instance, so the server stops trying to reach a device that cannot
-    /// receive anything.
+    /// A failure the application forwards reaches the default instance, and a
+    /// token that arrives after it is still sent.
     func testAFailedRegistrationReachesTheDefaultInstance() throws {
         #if !(os(iOS) || os(visionOS) || os(macOS))
         throw XCTSkip("push tokens only exist on iOS, visionOS and macOS")
@@ -389,10 +386,14 @@ final class PushTests: CountlyBaseTestCase {
             $0.disableAutomaticPushHandling = true
         }
 
+        let before = tokenRequests(of: countly).count
         Countly.didFailToRegisterForRemoteNotifications(
             error: NSError(domain: "test", code: 1))
+        XCTAssertEqual(tokenRequests(of: countly).count, before)
 
-        XCTAssertEqual(tokenRequests(of: countly).last?["ios_token"] as? String, "")
+        let token = uniqueToken()
+        Countly.didRegisterForRemoteNotifications(deviceToken: token)
+        XCTAssertEqual(tokenRequests(of: countly).last?["ios_token"] as? String, token.hexString)
         #endif
     }
 

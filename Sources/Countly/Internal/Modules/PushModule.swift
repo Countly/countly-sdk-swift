@@ -279,6 +279,7 @@ final class PushModule: ModuleBase {
             }
         case .failed:
             logI("didReceive", "remote notification registration failed for this process, no device token will be available")
+            return
         }
 
         sendToken(token)
@@ -304,11 +305,9 @@ final class PushModule: ModuleBase {
             return
         }
 
-        // Registration failed. An empty token tells the server to stop trying to
-        // reach this device, which is more useful than silence.
+        // A failed registration may be passing, so the token the server holds stays.
         guard case .value(let token) = received else {
-            logD("sendToken", "push token is in error state, an empty token will be sent to the server instead")
-            clearToken()
+            logD("sendToken", "push token is not sent, the registration for remote notifications failed")
             return
         }
 
