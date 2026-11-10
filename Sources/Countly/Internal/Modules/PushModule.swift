@@ -32,6 +32,10 @@ final class PushModule: ModuleBase {
     /// Whether this instance registered for the process-wide token.
     private var isRegistered = false
 
+    /// Whether the click that cold started the application was replayed. Push
+    /// starts again whenever its consent is given again, the replay only once.
+    private var hasReplayedLaunchNotification = false
+
     // MARK: - Init
 
     func applyInitialConfig() {
@@ -84,8 +88,9 @@ final class PushModule: ModuleBase {
         PushRuntime.shared.register(self, automaticHandling: automatic)
 
         #if os(macOS)
-        if automatic, let launchInfo = core.config.launchNotification {
+        if automatic, !hasReplayedLaunchNotification, let launchInfo = core.config.launchNotification {
             logD("startPushNotifications", "a launch notification was supplied in config, the click that cold started the app is replayed")
+            hasReplayedLaunchNotification = true
             PushRuntime.shared.replayLaunchNotification(launchInfo)
         }
         #endif
