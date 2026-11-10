@@ -311,6 +311,16 @@ final class CrashTests: CountlyBaseTestCase {
         XCTAssertEqual(crash["_nonfatal"] as? Bool, true)
     }
 
+    /// Every Mac has a shell, so a shell is no jailbreak signal on a Mac or in a
+    /// simulator running on one.
+    func testAMacOrASimulatorIsNeverReportedAsJailbroken() throws {
+        #if os(macOS) || targetEnvironment(simulator)
+        XCTAssertFalse(DeviceMetrics.isJailbroken)
+        #else
+        throw XCTSkip("only a Mac or a simulator is known not to be jailbroken")
+        #endif
+    }
+
     func testAFatalErrorReportsNonFatalAsFalse() {
         let countly = startInstance()
 

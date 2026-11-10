@@ -321,15 +321,18 @@ enum DeviceMetrics {
         guard UIDevice.current.batteryState != .unknown else { return -1 }
         return abs(Int(UIDevice.current.batteryLevel * 100))
         #elseif os(watchOS)
-        return abs(Int(WKInterfaceDevice.current().batteryLevel * 100))
+        let device = WKInterfaceDevice.current()
+        guard device.batteryState != .unknown else { return -1 }
+        return abs(Int(device.batteryLevel * 100))
         #elseif os(macOS)
+        // A Mac without a battery has no power source to read.
         guard let blob = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
               let sources = IOPSCopyPowerSourcesList(blob)?.takeRetainedValue() as? [CFTypeRef],
               let source = sources.first,
               let description = IOPSGetPowerSourceDescription(blob, source)?.takeUnretainedValue() as? [String: Any],
               let current = description[kIOPSCurrentCapacityKey] as? Int,
               let maximum = description[kIOPSMaxCapacityKey] as? Int,
-              maximum > 0 else { return 100 }
+              maximum > 0 else { return -1 }
         return Int(Double(current) / Double(maximum) * 100)
         #else
         return -1
@@ -353,10 +356,17 @@ enum DeviceMetrics {
     }
 
     /// Whether a shell is reachable, the cheapest jailbreak signal available.
+    /// Every Mac has one, so a Mac, a simulator and an iOS app running on a Mac
+    /// never count.
     static var isJailbroken: Bool {
-        guard let file = fopen("/bin/bash", "r") else { return false }
+        #if os(macOS) || targetEnvironment(simulator) || targetEnvironment(macCatalyst)
+        return false
+        #else
+        guard !ProcessInfo.processInfo.isiOSAppOnMac,
+              let file = fopen("/bin/bash", "r") else { return false }
         fclose(file)
         return true
+        #endif
     }
 
     // MARK: - Helpers
