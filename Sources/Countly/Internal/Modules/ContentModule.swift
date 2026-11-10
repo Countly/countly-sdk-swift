@@ -181,6 +181,8 @@ final class ContentModule: ModuleBase {
         let generation = zoneGeneration
         stateLock.unlock()
 
+        invalidateTimers()
+
         // The first fetch is held back on a cold launch so content does not land
         // on top of the application's own first screen.
         let delay = core.clock.timeSinceLaunch() < contentInitialDelay ? contentInitialDelay : 0
