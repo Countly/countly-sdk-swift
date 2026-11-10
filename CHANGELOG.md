@@ -27,6 +27,7 @@
   * "recordReservedEvent(key, ...)", which records a reserved event the SDK normally produces itself. An overload takes a "CountlyReservedEvent" instead of a key.
   * Recorded events are kept in storage until they are moved into a request, so they survive the application being closed or killed. At most 1000 are kept.
   * Feedback widget answers and push actions are sent right away rather than with the next batch.
+  * A count below one is recorded as 1, and a sum or duration that is not a finite number, or a negative duration, as 0, with a warning.
 
 * Added the views API on "countly.views":
   * "startView(name, segmentation)" / "startAutoStoppedView(name, segmentation)"

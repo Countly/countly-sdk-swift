@@ -256,6 +256,25 @@ final class EventsTests: CountlyBaseTestCase {
         XCTAssertNil(b?["ratio"])
     }
 
+    /// A sum or a duration JSON cannot represent is ignored with its default used,
+    /// and counted for the health check, so the batch around it still goes out.
+    func testANonFiniteSumOrDurationDoesNotCostTheOtherEvents() {
+        let countly = startInstance { $0.eventSendThreshold = 3 }
+
+        countly.events.recordEvent("a")
+        countly.events.recordEvent("b", sum: .nan)
+        countly.events.recordEvent("c", duration: .infinity)
+
+        let events = TestUtils.requests(requestQueue(of: countly), carrying: "events")
+            .flatMap { TestUtils.events(in: $0) }
+            .filter { ["a", "b", "c"].contains($0["key"] as? String ?? "") }
+        XCTAssertEqual(events.compactMap { $0["key"] as? String }, ["a", "b", "c"])
+        XCTAssertEqual(logCodeCount(HealthLogCode.eventValueIgnored, of: countly), 2)
+        guard events.count == 3 else { return }
+        XCTAssertEqual(TestUtils.double(events[1]["sum"]), 0)
+        XCTAssertEqual(TestUtils.double(events[2]["dur"]), 0)
+    }
+
     // MARK: - Consent
 
     func testNoEventIsRecordedWithoutEventsConsent() {
