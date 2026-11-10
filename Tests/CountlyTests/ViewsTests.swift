@@ -326,10 +326,16 @@ final class ViewsTests: CountlyBaseTestCase {
     func testAViewsOwnSegmentationBeatsTheGlobalOne() {
         let countly = viewInstance { $0.globalViewSegmentation = ["source": "global"] }
 
-        countly.views.startView("Specific", segmentation: ["source": "local"])
+        let viewID = countly.views.startView("Specific", segmentation: ["source": "local"])
+        countly.views.addSegmentation(toViewWithID: viewID ?? "", segmentation: ["added": "local"])
+        countly.views.setGlobalViewSegmentation(["source": "global", "added": "global"])
+        countly.views.stopView(id: viewID ?? "")
 
-        let segmentation = (viewEvents(of: countly)[0]["segmentation"] as? [String: Any]) ?? [:]
-        XCTAssertEqual(segmentation["source"] as? String, "local")
+        let events = viewEvents(of: countly)
+        let opening = (events.first?["segmentation"] as? [String: Any]) ?? [:]
+        let closing = (events.last?["segmentation"] as? [String: Any]) ?? [:]
+        XCTAssertEqual(opening["source"] as? String, "local")
+        XCTAssertEqual(closing["added"] as? String, "local", "what was added to the view beats the global segmentation at its end")
     }
 
     // MARK: - Adding segmentation to a live view
