@@ -493,35 +493,48 @@ final class ContentModule: ModuleBase {
         fetchContents(contentID: nil, failure: nil)
     }
 
-    private func fetchContents(contentID: String?, failure: (() -> Void)?) {
+    /// Whether a content fetch may start now. When it may, the fetch is marked as
+    /// in flight, so a second one waits for its answer.
+    private func claimFetch() -> Bool {
         guard core.modules.consent.hasConsent(for: .content) else {
             logV("fetchContents", "no consent given for content, skipping the content fetch")
-            return
+            return false
         }
 
         guard core.serverConfig.networkingEnabled else {
             logD("fetchContents", "networking is disabled by the server config, skipping the content fetch")
-            return
+            return false
         }
 
         guard !core.modules.deviceID.isTemporary else {
             logD("fetchContents", "content can not be fetched while in temporary device ID mode")
-            return
+            return false
         }
 
         guard !isShown() else {
             logD("fetchContents", "a content is already shown, skipping the content fetch")
-            return
+            return false
         }
 
         stateLock.lock()
         if isFetchInFlight {
             stateLock.unlock()
             logD("fetchContents", "a content fetch is already in flight, skipping this one")
-            return
+            return false
         }
         isFetchInFlight = true
         stateLock.unlock()
+        return true
+    }
+
+    /// Fetches content, or a preview of one content. A fetch that does not start
+    /// reports through `failure` like one that fails, so a journey retry series
+    /// always comes to an end.
+    private func fetchContents(contentID: String?, failure: (() -> Void)?) {
+        guard claimFetch() else {
+            failure?()
+            return
+        }
 
         logD("fetchContents", "fetching the content details, isPreview: [\(contentID != nil)]")
 
