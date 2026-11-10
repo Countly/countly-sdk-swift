@@ -84,13 +84,15 @@ final class MonotonicClock {
         return calendar
     }()
 
-    func hourOfDay() -> Int {
-        MonotonicClock.gregorian.component(.hour, from: Date())
+    /// The hour of `date`, now by default.
+    func hourOfDay(at date: Date = Date()) -> Int {
+        MonotonicClock.gregorian.component(.hour, from: date)
     }
 
-    /// Sunday is 0, matching the server's expectation.
-    func dayOfWeek() -> Int {
-        MonotonicClock.gregorian.component(.weekday, from: Date()) - 1
+    /// The weekday of `date`, now by default. Sunday is 0, matching the server's
+    /// expectation.
+    func dayOfWeek(at date: Date = Date()) -> Int {
+        MonotonicClock.gregorian.component(.weekday, from: date) - 1
     }
 
     /// Offset from GMT in minutes.

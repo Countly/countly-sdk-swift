@@ -364,11 +364,12 @@ final class EventsModule: ModuleBase {
             event.currentViewID = core.modules.views.currentViewID ?? ""
         }
 
+        let recordedAt = Date(timeIntervalSince1970: timestamp)
         event.count = count
         event.sum = sum
         event.timestamp = timestamp
-        event.hourOfDay = core.clock.hourOfDay()
-        event.dayOfWeek = core.clock.dayOfWeek()
+        event.hourOfDay = core.clock.hourOfDay(at: recordedAt)
+        event.dayOfWeek = core.clock.dayOfWeek(at: recordedAt)
         event.duration = duration
 
         // Already filtered by `sanitized` on the public path; reserved events pass

@@ -275,6 +275,25 @@ final class EventsTests: CountlyBaseTestCase {
         XCTAssertEqual(TestUtils.double(events[2]["dur"]), 0)
     }
 
+    /// An event recorded with an earlier timestamp, such as a notification tap
+    /// replayed at the start, carries the hour and the weekday of that moment.
+    func testAnEventCarriesTheHourAndWeekdayOfItsOwnTimestamp() throws {
+        let countly = startInstance { $0.eventSendThreshold = 1 }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        let earlier = try XCTUnwrap(calendar.date(byAdding: .hour, value: -27, to: Date()))
+
+        core(of: countly).modules.events.recordReservedEvent(ReservedEventKey.pushAction,
+                                                             segmentation: ["i": "n-1"],
+                                                             timestamp: earlier.timeIntervalSince1970)
+
+        let event = try XCTUnwrap(TestUtils.requests(requestQueue(of: countly), carrying: "events")
+            .flatMap { TestUtils.events(in: $0) }
+            .first { $0["key"] as? String == ReservedEventKey.pushAction })
+        XCTAssertEqual(TestUtils.int(event["hour"]), calendar.component(.hour, from: earlier))
+        XCTAssertEqual(TestUtils.int(event["dow"]), calendar.component(.weekday, from: earlier) - 1)
+    }
+
     // MARK: - Consent
 
     func testNoEventIsRecordedWithoutEventsConsent() {
