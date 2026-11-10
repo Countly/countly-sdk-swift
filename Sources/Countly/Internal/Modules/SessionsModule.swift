@@ -127,10 +127,6 @@ final class SessionsModule: ModuleBase {
     ///   session tracking does, rather than the host application.
     func beginSession(automatically: Bool = false) {
         logI("beginSession", "session begin requested, isSessionStarted: [\(isSessionStarted)], automaticSessionTracking: [\(core.serverConfig.automaticSessionTrackingEnabled)]")
-        if automatically {
-            core.healthTracker.recordUsage(.sessions, "begin", automatic: true)
-        }
-
         guard core.modules.consent.hasConsent(for: .sessions) else {
             logV("beginSession", "no consent for sessions, no session will be started")
             return
@@ -142,8 +138,8 @@ final class SessionsModule: ModuleBase {
         }
 
         guard !isSessionStarted else {
-            logW("beginSession", "a session is already running, this session begin will be ignored")
-            core.healthTracker.recordLogCode(HealthLogCode.sessionOutOfOrder, area: .sessions)
+            // Every activation resumes, also one that never left the foreground.
+            ignoreOutOfOrder("beginSession", "a session is already running, this session begin will be ignored", automatically: automatically)
             return
         }
 
@@ -152,6 +148,10 @@ final class SessionsModule: ModuleBase {
         if core.serverConfig.automaticSessionTrackingEnabled, !AppState.isForeground {
             logD("beginSession", "app is in the background, the automatic session will not be started")
             return
+        }
+
+        if automatically {
+            core.healthTracker.recordUsage(.sessions, "begin", automatic: true)
         }
 
         if core.modules.userProfile.hasUnsyncedChanges {
@@ -192,10 +192,6 @@ final class SessionsModule: ModuleBase {
     ///   rather than the host application calling for it.
     func updateSession(automatically: Bool = false) {
         logI("updateSession", "session update requested, isSessionStarted: [\(isSessionStarted)]")
-        if automatically {
-            core.healthTracker.recordUsage(.sessions, "update", automatic: true)
-        }
-
         guard core.modules.consent.hasConsent(for: .sessions) else {
             logV("updateSession", "no consent for sessions, the session duration will not be updated")
             return
@@ -207,13 +203,12 @@ final class SessionsModule: ModuleBase {
         }
 
         guard isSessionStarted else {
-            if automatically {
-                logD("updateSession", "no session is running, this session update will be ignored")
-            } else {
-                logW("updateSession", "no session is running, this session update will be ignored")
-                core.healthTracker.recordLogCode(HealthLogCode.sessionOutOfOrder, area: .sessions)
-            }
+            ignoreOutOfOrder("updateSession", "no session is running, this session update will be ignored", automatically: automatically)
             return
+        }
+
+        if automatically {
+            core.healthTracker.recordUsage(.sessions, "update", automatic: true)
         }
 
         if core.modules.userProfile.hasUnsyncedChanges {
@@ -234,24 +229,22 @@ final class SessionsModule: ModuleBase {
     ///   rather than the host application calling for it.
     func endSession(automatically: Bool = false) {
         logI("endSession", "session end requested, isSessionStarted: [\(isSessionStarted)]")
-        if automatically {
-            core.healthTracker.recordUsage(.sessions, "end", automatic: true)
-        }
-
         guard core.modules.consent.hasConsent(for: .sessions) else {
             logV("endSession", "no consent for sessions, the session will not be ended")
             return
         }
 
         guard isSessionStarted else {
-            if automatically {
-                logD("endSession", "no session is running, this session end will be ignored")
-            } else {
-                logW("endSession", "no session is running, this session end will be ignored")
-                core.healthTracker.recordLogCode(HealthLogCode.sessionOutOfOrder, area: .sessions)
-            }
+            ignoreOutOfOrder("endSession", "no session is running, this session end will be ignored", automatically: automatically)
             return
         }
+
+        if automatically {
+            core.healthTracker.recordUsage(.sessions, "end", automatic: true)
+        }
+
+        // Recorded inside the session, so they go out before its end.
+        core.modules.events.sendEventsWithSaveIfNeeded()
 
         isSessionStarted = false
         isSessionStartedAutomatically = false
@@ -265,6 +258,19 @@ final class SessionsModule: ModuleBase {
 
         core.network.enqueueAndProceed(queryString)
         core.modules.views.resetFirstView()
+        core.healthTracker.saveState()
+    }
+
+    /// Ignores a session call made in the wrong session state. Only a call of the
+    /// host application counts as out of order for the health check: the SDK's own
+    /// calls follow the lifecycle, which may meet either state.
+    private func ignoreOutOfOrder(_ function: String, _ message: String, automatically: Bool) {
+        if automatically {
+            logD(function, message)
+        } else {
+            logW(function, message)
+            core.healthTracker.recordLogCode(HealthLogCode.sessionOutOfOrder, area: .sessions)
+        }
     }
 
     /// Whole seconds since the last read, keeping the remainder for the next one.
@@ -407,7 +413,6 @@ final class SessionsModule: ModuleBase {
             beginSession(automatically: true)
         } else if isSessionStarted, isSessionStartedAutomatically {
             logD("applyAutomaticSessionTracking", "automatic session tracking is off, the session the SDK started will be ended")
-            core.modules.events.sendEventsWithSaveIfNeeded()
             endSession(automatically: true)
         }
     }

@@ -216,8 +216,7 @@ public final class SessionsAPI: CountlyAPIBase {
         guard let core = core() else { return }
         core.healthTracker.recordUsage(.sessions, "end")
         guard allowed(core, "endSession") else { return }
-        core.logger.i(Self.module, "endSession", "a session end was requested through the manual sessions API, recorded events are sent first")
-        core.modules.events.sendEventsWithSaveIfNeeded()
+        core.logger.i(Self.module, "endSession", "a session end was requested through the manual sessions API")
         core.modules.sessions.endSession()
     }
 
