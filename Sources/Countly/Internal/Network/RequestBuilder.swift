@@ -83,11 +83,12 @@ final class RequestBuilder {
         return "\(queryString)&\(QS.remainingRequest)=\(remaining)"
     }
 
-    /// Finishes a request that skips the queue: `rr` with the number of requests
-    /// waiting in the queue at this moment, then the checksum, which has to cover
-    /// everything that is sent.
+    /// Finishes a request that skips the queue: the app version, which the queue
+    /// stamps on everything it stores, `rr` with the number of requests waiting in
+    /// the queue at this moment, then the checksum, which has to cover everything
+    /// that is sent.
     func finishImmediateRequest(_ queryString: String) -> String {
-        appendChecksum("\(queryString)&\(QS.remainingRequest)=\(core.requestQueueStore.count)")
+        appendChecksum("\(queryString)&\(QS.appVersion)=\(core.appVersion.urlEscaped)&\(QS.remainingRequest)=\(core.requestQueueStore.count)")
     }
 
     /// Marks a query string so the connection manager sends it somewhere other

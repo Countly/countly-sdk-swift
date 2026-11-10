@@ -439,7 +439,6 @@ final class RemoteConfigModule: ModuleBase {
             queryString += "&\(QS.metrics)=\(CountlyJSON.escapedString(from: core.metricsDictionary(), logger: log))"
         }
 
-        queryString += "&\(QS.appVersion)=\(core.appVersion.urlEscaped)"
         queryString = core.network.builder.finishImmediateRequest(queryString)
 
         return core.network.instantRequest(queryString: queryString, path: Endpoint.output + Endpoint.sdk)
@@ -524,7 +523,6 @@ final class RemoteConfigModule: ModuleBase {
     private func testingQueryString(method: String, parameters: String = "") -> String {
         var queryString = "\(core.network.builder.queryEssentials())&\(QS.method)=\(method)"
         queryString += parameters
-        queryString += "&\(QS.appVersion)=\(core.appVersion.urlEscaped)"
         return core.network.builder.finishImmediateRequest(queryString)
     }
 

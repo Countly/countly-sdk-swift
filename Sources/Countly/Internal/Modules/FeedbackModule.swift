@@ -128,7 +128,6 @@ final class FeedbackModule: ModuleBase {
     private func widgetListRequest() -> URLRequest {
         var queryString = core.network.builder.queryEssentials()
         queryString += "&\(QS.method)=\(Key.feedback)"
-        queryString += "&\(QS.appVersion)=\(core.appVersion.urlEscaped)"
         queryString = core.network.builder.finishImmediateRequest(queryString)
 
         return core.network.instantRequest(queryString: queryString, path: Endpoint.output + Endpoint.sdk)
@@ -425,7 +424,6 @@ final class FeedbackModule: ModuleBase {
         queryString += "&\(Key.platform)=\((DeviceMetrics.osName ?? "").urlEscaped)"
         queryString += "&\(Key.shown)=1"
         queryString += "&\(Key.widgetID)=\(widget.id.urlEscaped)"
-        queryString += "&\(QS.appVersion)=\(core.appVersion.urlEscaped)"
         queryString = core.network.builder.finishImmediateRequest(queryString)
 
         let path = "\(Endpoint.output)\(Endpoint.surveys)/\(widget.type.wireName)\(Endpoint.widget)"

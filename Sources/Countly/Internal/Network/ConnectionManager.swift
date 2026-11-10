@@ -1201,7 +1201,6 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
     func fetchServerConfig(completion: @escaping (Data?, Int, Error?) -> Void) {
         var queryString = builder.queryEssentials()
         queryString += "&\(QS.method)=\(ServerConfig.fetchMethod)"
-        queryString += "&\(QS.appVersion)=\(core.appVersion.urlEscaped)"
         queryString = builder.finishImmediateRequest(queryString)
 
         let request = instantRequest(queryString: queryString, path: Endpoint.output + Endpoint.sdk)
