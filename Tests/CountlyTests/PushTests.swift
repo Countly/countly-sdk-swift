@@ -107,6 +107,7 @@ final class PushTests: CountlyBaseTestCase {
         countly.push.recordAction(for: notification(id: ""), clickedButtonIndex: 0)
 
         XCTAssertTrue(events(of: countly).isEmpty)
+        XCTAssertEqual(logCodeCount(HealthLogCode.invalidValue, of: countly), 3)
     }
 
     func testNoActionIsRecordedWithoutPushConsent() {

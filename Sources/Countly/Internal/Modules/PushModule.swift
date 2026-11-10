@@ -444,6 +444,7 @@ final class PushModule: ModuleBase {
         // manual entry point onto the same event, so it refuses it too.
         guard let notificationID, !notificationID.isEmpty else {
             logW("recordActionEvent", "notification action event is dropped, the notification has no Countly notification ID")
+            core.healthTracker.recordLogCode(HealthLogCode.invalidValue)
             return
         }
 
