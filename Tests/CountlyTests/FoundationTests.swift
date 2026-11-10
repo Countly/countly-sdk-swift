@@ -249,6 +249,22 @@ final class FoundationTests: XCTestCase {
         XCTAssertEqual(config.failedRequestCooldown, 60)
     }
 
+    /// NaN compares false with everything, so it passes a "below the minimum"
+    /// check: it is refused like any other value outside the range.
+    func testANaNIntervalFallsBackToTheDefault() {
+        let config = CountlyConfig(appKey: "key", host: "https://example.com")
+        config.updateSessionPeriod = .nan
+        config.requestTimeoutDuration = .nan
+        config.failedRequestCooldown = .nan
+
+        let resetCount = config.resetInvalidValues(logger: Logger(instanceName: nil))
+
+        XCTAssertEqual(resetCount, 3)
+        XCTAssertEqual(config.updateSessionPeriod, CountlyConfig.defaultUpdateSessionPeriod)
+        XCTAssertEqual(config.requestTimeoutDuration, 30)
+        XCTAssertEqual(config.failedRequestCooldown, 60)
+    }
+
     // MARK: - Registry
 
     func testInstanceLookupIsStableAndDoesNotAutoStart() {
