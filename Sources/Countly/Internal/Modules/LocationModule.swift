@@ -196,10 +196,9 @@ final class LocationModule: ModuleBase {
     // MARK: - Consent
 
     /// The stored values become usable: they go with the next `begin_session`,
-    /// or on their own when none is coming. Location the application turned off
-    /// stays off.
+    /// or on their own when none is coming and no `begin_session` of the same
+    /// grant took them. Location the application turned off stays off.
     func consentGiven() {
-        hasUnsentValues = hasStoredValues
         guard isLocationOn else { return }
         sendUnsentValuesUnlessASessionWillCarryThem()
     }

@@ -281,35 +281,70 @@ final class ConsentTests: CountlyBaseTestCase {
 
     // MARK: - Ordering
 
-    /// Location consent is granted first on purpose. A `begin_session` produced
-    /// before location consent exists carries an explicit empty `location=`, which
-    /// tells the server to stop inferring location from the IP address and cannot
-    /// be undone for that session. So the location request must not come after the
-    /// session request in the queue.
-    func testLocationIsGrantedBeforeTheSessionBegins() {
+    /// Every flag of a grant is set before any feature reacts, so the session the
+    /// grant begins already sees the metrics consent given with it.
+    func testASessionBegunByAGrantCarriesTheMetricsGivenWithIt() {
         let countly = startInstance {
             $0.requiresConsent = true
             $0.manualSessionHandling = false
         }
+        // An automatic session is refused while the application reads as in the background.
+        AppState.setActive(true)
 
         countly.consent.giveAllConsents()
 
-        let queue = requestQueue(of: countly)
-        let sessionIndex = queue.firstIndex { TestUtils.parseQuery($0)["begin_session"] != nil }
-        let locationIndex = queue.firstIndex { request in
-            let parsed = TestUtils.parseQuery(request)
-            return parsed["location"] != nil && parsed["begin_session"] == nil
-        }
-
-        if let sessionIndex, let locationIndex {
-            XCTAssertLessThan(locationIndex, sessionIndex,
-                              "location has to be settled before the session opens")
-        }
+        let begins = TestUtils.requests(requestQueue(of: countly), carrying: "begin_session")
+        XCTAssertEqual(begins.count, 1)
+        XCTAssertNotNil(begins.first?["metrics"], "the metrics consent came with the same grant")
     }
 
-    /// Sessions are revoked first, so the session in flight is closed while there
-    /// is still consent to report it. Withdrawing in the other order would leave
-    /// the session open on the server forever.
+    /// A location stored before its consent rides on the session the same grant
+    /// begins, and is not sent a second time on its own.
+    func testALocationGivenWithTheSessionGoesOutOnce() {
+        let countly = startInstance {
+            $0.requiresConsent = true
+            $0.manualSessionHandling = false
+            $0.city = "Izmir"
+            $0.isoCountryCode = "TR"
+        }
+        AppState.setActive(true)
+
+        countly.consent.giveConsent(for: [.location, .sessions])
+
+        let carriers = TestUtils.requests(requestQueue(of: countly), carrying: "city")
+        XCTAssertEqual(carriers.count, 1)
+        XCTAssertNotNil(carriers.first?["begin_session"], "the session carries the location")
+    }
+
+    /// Profile changes pending when the user consent goes are dropped, also when
+    /// the same call closes the session and sends its events, and the events still
+    /// go out before the session ends.
+    func testWithdrawingEverythingDropsThePendingProfileChanges() {
+        let countly = startInstance {
+            $0.requiresConsent = true
+            $0.manualSessionHandling = true
+        }
+        countly.consent.giveAllConsents()
+        countly.sessions.beginSession()
+        countly.events.recordEvent("inside-the-session")
+        countly.userProfile.setProperty("name", value: "Ada")
+
+        countly.consent.cancelAllConsents()
+
+        let queue = requestQueue(of: countly)
+        XCTAssertTrue(TestUtils.requests(queue, carrying: "user_details").isEmpty)
+        let eventsAt = queue.firstIndex { TestUtils.parseQuery($0)["events"] != nil }
+        let endAt = queue.firstIndex { TestUtils.parseQuery($0)["end_session"] != nil }
+        guard let eventsAt, let endAt else {
+            XCTFail("expected both an events request and an end_session in \(queue.count) requests")
+            return
+        }
+        XCTAssertLessThan(eventsAt, endAt)
+    }
+
+    /// The session in flight is closed while there is still consent to report it.
+    /// Withdrawing in the other order would leave the session open on the server
+    /// forever.
     func testWithdrawingConsentClosesTheSessionThatWasOpen() {
         let countly = startInstance {
             $0.requiresConsent = true
