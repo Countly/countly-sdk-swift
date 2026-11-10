@@ -336,6 +336,12 @@ final class EventsModule: ModuleBase {
             return
         }
 
+        guard core.serverConfig.trackingEnabled else {
+            logW("record", "the event is not recorded, tracking is disabled by the server config, key: [\(key)]")
+            core.healthTracker.recordLogCode(HealthLogCode.trackingDisabled)
+            return
+        }
+
         let isReserved = ReservedEventKey.all.contains(key)
         let event = CountlyEvent(key: key)
         if let id, !id.isEmpty {

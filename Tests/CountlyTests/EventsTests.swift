@@ -316,6 +316,22 @@ final class EventsTests: CountlyBaseTestCase {
 
     // MARK: - Server config
 
+    /// With tracking off the SDK records nothing new: an event is refused when it
+    /// is recorded, counted for the health check, and never reaches the event
+    /// queue, so it cannot go out once tracking is back on.
+    func testWithTrackingOffAnEventIsRefusedWhenRecorded() {
+        let countly = startInstance {
+            $0.eventSendThreshold = 100
+            $0.sdkBehaviorSettings = ServerConfigBuilder().tracking(false).json()
+        }
+
+        countly.events.recordEvent("refused")
+        countly.events.recordEvent("refused-too")
+
+        XCTAssertTrue(countly.events.recordedEvents().isEmpty)
+        XCTAssertEqual(logCodeCount(HealthLogCode.trackingDisabled, of: countly), 2)
+    }
+
     func testTheServerCanSwitchCustomEventTrackingOff() {
         let countly = startInstance {
             $0.eventSendThreshold = 1
