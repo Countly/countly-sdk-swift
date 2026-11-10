@@ -259,6 +259,44 @@ final class LifecycleTests: CountlyBaseTestCase {
         }
     }
 
+    /// Lifting the requirement while the SDK runs acts like giving every consent,
+    /// and sends no consent state: none goes out while consent is not required.
+    func testTheServerLiftingTheRequirementMidSessionSendsNoConsentState() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startInstance { $0.requiresConsent = true }
+        let before = TestUtils.requests(requestQueue(of: countly), carrying: "consent").count
+
+        MockURLProtocol.respond(pathContaining: "/o/sdk",
+                                json: ServerConfigBuilder().consentRequired(false).json())
+        core(countly).serverConfig.fetch(config: core(countly).config)
+
+        TestUtils.waitUntil("the lifted requirement is applied") {
+            countly.consent.hasConsent(for: .events)
+        }
+        TestUtils.pump(0.2)
+        XCTAssertEqual(TestUtils.requests(requestQueue(of: countly), carrying: "consent").count, before)
+    }
+
+    /// A device ID change without merge while the server has lifted the
+    /// requirement still leaves the new user with no consent once it is back.
+    func testAChangeWithoutMergeDuringALiftedRequirementLeavesTheNewUserWithNoConsent() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startInstance {
+            $0.requiresConsent = true
+            $0.consents = [.events]
+            $0.sdkBehaviorSettings = ServerConfigBuilder().consentRequired(false).json()
+        }
+
+        countly.deviceID.changeWithoutMerge("the-next-user")
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: ServerConfigBuilder().json())
+        core(countly).serverConfig.fetch(config: core(countly).config)
+
+        TestUtils.waitUntil("the answer without cr restores the application's requirement") {
+            core(countly).serverConfig.consentRequired == nil && core(countly).modules.consent.requiresConsent
+        }
+        XCTAssertFalse(countly.consent.hasConsent(for: .events), "the previous user's consent stayed")
+    }
+
     /// Lifting the requirement acts like giving every consent, and an answer that
     /// no longer carries "cr" puts the application's own requirement back.
     func testTheServerCanLiftTheConsentRequirementUntilItDropsTheSetting() throws {

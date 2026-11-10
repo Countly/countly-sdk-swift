@@ -187,6 +187,11 @@ final class ConsentModule: ModuleBase {
     /// state on the device.
     func removeAllConsentsForDeviceIDChange() {
         logI("removeAllConsentsForDeviceIDChange", "consent is removed for every feature without informing the server, the device ID changes without merge, featureCount: [\(ConsentFeature.allCases.count)]")
+        guard requiresConsent else {
+            // Lifted by the server for now: the new user still starts with none once it is back.
+            granted = []
+            return
+        }
         cancelConsent(for: ConsentFeature.allCases, source: .deviceIDChangedWithoutMerge)
     }
 
@@ -271,8 +276,9 @@ final class ConsentModule: ModuleBase {
 
     /// Applies a consent requirement the behavior settings changed while the SDK
     /// runs. Turning it on acts like removing consent for every feature that has
-    /// none, and lifting it acts like giving consent for every feature; either way
-    /// the new state is sent.
+    /// none and sends the new state; lifting it acts like giving consent for every
+    /// feature and sends nothing, as no consent request goes out while consent is
+    /// not required.
     func applyRequirementChange(to required: Bool) {
         stateLock.lock()
         let wasRequired = _requiresConsent
@@ -285,13 +291,12 @@ final class ConsentModule: ModuleBase {
             let losing = Self.revokeOrder.filter { !grantedNow.contains($0) }
             logI("applyRequirementChange", "the server turned the consent requirement on, the features without consent stop, features: [\(Self.describe(losing))]")
             withdraw(losing, source: .app) { requiresConsent = true }
+            sendConsents()
         } else {
             let gaining = Self.grantOrder.filter { !grantedNow.contains($0) }
             logI("applyRequirementChange", "the server lifted the consent requirement, every feature works as if consent were given, features: [\(Self.describe(gaining))]")
             grant(gaining) { requiresConsent = false }
         }
-
-        sendConsents()
     }
 
     /// Makes `features` usable through `setFlags`, then runs their reactions in
