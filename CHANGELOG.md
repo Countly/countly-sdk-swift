@@ -43,6 +43,7 @@
   * Manual session control and manual hybrid mode via "CountlyConfig.manualSessionHandling" and "enableManualSessionControlHybridMode"
   * Session durations come from a monotonic clock, so changing the device's date and time cannot stretch or shrink a session.
   * A session that is running when the server turns session tracking off still ends normally.
+  * On macOS the automatic session ends when the application hides or quits, and the next activation begins a new one.
 
 * Added the user profile API on "countly.userProfile":
   * "setProperty(key, value)" / "setProperties(data)"

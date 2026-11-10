@@ -419,6 +419,14 @@ final class SessionsModule: ModuleBase {
 
     // MARK: - Lifecycle
 
+    /// Ends the session automatic session tracking runs, as the application quits.
+    /// A macOS application quits from the foreground, where nothing ended it yet;
+    /// elsewhere the background already did, and this finds no session.
+    func applicationWillTerminate() {
+        guard core.serverConfig.automaticSessionTrackingEnabled else { return }
+        endSession(automatically: true)
+    }
+
     override func didEnterForeground() {
         logD("didEnterForeground", "app entered foreground, behavior settings will be refreshed and the SDK resumed")
         core.serverConfig.fetchIfTimeIsUp(config: core.config)

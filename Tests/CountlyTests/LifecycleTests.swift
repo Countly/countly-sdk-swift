@@ -316,7 +316,49 @@ final class LifecycleTests: CountlyBaseTestCase {
         XCTAssertNil(core(countly).serverConfig.consentRequired)
     }
 
+    /// A hidden application shows no window, so its automatic session ends as it
+    /// would in the background, and the next activation begins a new one.
+    func testHidingTheApplicationEndsTheAutomaticSession() throws {
+        #if !os(macOS)
+        throw XCTSkip("hiding an application is a macOS transition")
+        #else
+        let countly = startInstance { $0.manualSessionHandling = false }
+        let sessions = core(countly).modules.sessions
+        AppState.setActive(true)
+        NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        TestUtils.waitUntil("the activation begins a session") { sessions.isSessionStarted }
+
+        NotificationCenter.default.post(name: NSApplication.didHideNotification, object: nil)
+        TestUtils.waitUntil("hiding ends the session") { !sessions.isSessionStarted }
+        XCTAssertEqual(TestUtils.requests(requestQueue(of: countly), carrying: "end_session").count, 1)
+
+        NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        TestUtils.waitUntil("the next activation begins a new session") { sessions.isSessionStarted }
+        XCTAssertEqual(TestUtils.requests(requestQueue(of: countly), carrying: "begin_session").count, 2)
+        #endif
+    }
+
     // MARK: - Termination
+
+    /// A macOS application quits from the foreground, so quitting ends the
+    /// automatic session, written out for the next launch to send.
+    func testQuittingEndsTheAutomaticSession() throws {
+        #if !os(macOS)
+        throw XCTSkip("elsewhere the background ends the session before the application quits")
+        #else
+        let countly = startInstance { $0.manualSessionHandling = false }
+        let sessions = core(countly).modules.sessions
+        AppState.setActive(true)
+        NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        TestUtils.waitUntil("the activation begins a session") { sessions.isSessionStarted }
+
+        NotificationCenter.default.post(name: NSApplication.willTerminateNotification, object: nil)
+
+        XCTAssertFalse(sessions.isSessionStarted)
+        let onDisk = openStore(core(countly).namespace).snapshot
+        XCTAssertEqual(TestUtils.requests(onDisk, carrying: "end_session").count, 1)
+        #endif
+    }
 
     /// Termination is the one lifecycle event with no second chance: the process is
     /// about to go away, so anything still only in memory is lost. Everything the

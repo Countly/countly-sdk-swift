@@ -280,10 +280,19 @@ final class HealthTracker {
     /// still contributes its numbers to the next one. The current backoff run
     /// keeps going: `cbom` already holds the longest one.
     func saveState() {
-        queue.async {
-            self.store.healthCheckState = self.stateLocked()
-            self.logger?.d(Self.module, "saveState", "counters persisted, errorCount: [\(self.countLogError)], warningCount: [\(self.countLogWarning)], statusCode: [\(self.statusCode)], backoffCount: [\(self.countBackoffRequest)], longestBackoffRun: [\(self.consecutiveBackoffRequest)], methodUsageAreaCount: [\(self.methodUsage.count)], logCodeCount: [\(self.logCodes.count)]")
-        }
+        queue.async { self.persistStateLocked() }
+    }
+
+    /// Persists the counters before returning, for the moment the process quits
+    /// and an asynchronous save might never run. Not to be called on `queue`.
+    func saveStateSync() {
+        queue.sync { self.persistStateLocked() }
+    }
+
+    /// Must be called on `queue`.
+    private func persistStateLocked() {
+        store.healthCheckState = stateLocked()
+        logger?.d(Self.module, "saveState", "counters persisted, errorCount: [\(countLogError)], warningCount: [\(countLogWarning)], statusCode: [\(statusCode)], backoffCount: [\(countBackoffRequest)], longestBackoffRun: [\(consecutiveBackoffRequest)], methodUsageAreaCount: [\(methodUsage.count)], logCodeCount: [\(logCodes.count)]")
     }
 
     /// Must be called on `queue`.
