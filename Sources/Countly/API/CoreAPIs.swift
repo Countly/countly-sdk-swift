@@ -327,7 +327,8 @@ public final class UserProfileAPI: CountlyAPIBase {
     /// Sets one property. Predefined keys such as `name` and `email` are stored as
     /// their own fields; anything else becomes a custom property.
     ///
-    /// Pass `NSNull()` or an empty string to clear a field.
+    /// Pass an empty string to clear a field. A `nil` or `NSNull()` value is
+    /// ignored with a warning.
     public func setProperty(_ key: String, value: Any?) {
         core()?.modules.userProfile.setProperty(key, value: value)
     }

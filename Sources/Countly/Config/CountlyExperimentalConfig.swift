@@ -12,8 +12,9 @@ import Foundation
 @objcMembers
 public final class CountlyExperimentalConfig: NSObject {
 
-    /// Adds `previous_view_name` to view segmentation and `previous_event_name`
-    /// to event segmentation.
+    /// Adds `cly_pvn`, the previous view's name, to view events, and to custom
+    /// events `cly_cvn`, the current view's name, and `cly_pen`, the previous
+    /// custom event's key.
     public var enablePreviousNameRecording: Bool = false
 
     /// Adds a `cly_v` segmentation key recording whether the application was in
