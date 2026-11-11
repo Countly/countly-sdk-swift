@@ -126,6 +126,7 @@
 
 * Added the content API on "countly.content":
   * "enterContentZone()" / "exitContentZone()" / "refreshContentZone()" / "previewContent(contentID)"
+  * Content needs a web view, so on tvOS and watchOS these calls are ignored and nothing is fetched.
   * "setGlobalContentSegmentation(segmentation)", recorded with every content and feedback widget event and handed to a widget page that records its own answers. It never overrides a key the event reports itself, and the keys the server counts and attributes these events by cannot be set through it.
   * "CountlyConfig.content.allowedLinkSchemes", the schemes links from content and feedback widgets may open. The dangerous ones, such as "javascript" and "file", are never opened.
   * After a content closes, the next fetch waits two zone intervals. "zoneTimerInterval" takes 15 seconds or more.
