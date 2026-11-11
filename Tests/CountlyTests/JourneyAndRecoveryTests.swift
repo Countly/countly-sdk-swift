@@ -19,13 +19,23 @@ final class JourneyAndRecoveryTests: CountlyBaseTestCase {
 
     private static let accepted = #"{"result": "Success"}"#
 
+    /// Skips a test that waits for a content fetch: it needs a transport the test
+    /// can see, and a web view, without which content is never fetched.
+    private func skipUnlessContentIsFetched() throws {
+        #if os(iOS) || os(visionOS) || os(macOS)
+        try skipUnlessNetworkIsInterceptable()
+        #else
+        throw XCTSkip("content needs a web view, which tvOS and watchOS have no WebKit for")
+        #endif
+    }
+
     // MARK: - Journey triggers
 
     /// An event named as a journey trigger is flushed on the spot rather than
     /// batched, and once the server confirms it the SDK asks what to show. Batching
     /// it would mean asking about a journey the server has not been told to start.
     func testAJourneyTriggerEventIsFlushedAndFollowedByAContentFetch() throws {
-        try skipUnlessNetworkIsInterceptable()
+        try skipUnlessContentIsFetched()
 
         MockURLProtocol.respond(pathContaining: "/o/sdk/content", json: "{}")
         MockURLProtocol.respond { captured in
@@ -73,7 +83,7 @@ final class JourneyAndRecoveryTests: CountlyBaseTestCase {
     /// A view named as a journey trigger behaves the same way an event does, which
     /// is how a journey can be started by someone arriving on a screen.
     func testAJourneyTriggerViewAlsoLeadsToAContentFetch() throws {
-        try skipUnlessNetworkIsInterceptable()
+        try skipUnlessContentIsFetched()
 
         MockURLProtocol.respond(pathContaining: "/o/sdk/content", json: "{}")
         MockURLProtocol.respond { captured in
@@ -97,7 +107,7 @@ final class JourneyAndRecoveryTests: CountlyBaseTestCase {
     /// The server may still be working out the journey's next step, so a fetch that
     /// comes back with nothing is retried rather than given up on.
     func testAJourneyFetchIsRetriedWhenItComesBackEmpty() throws {
-        try skipUnlessNetworkIsInterceptable()
+        try skipUnlessContentIsFetched()
 
         // The content endpoint never answers, so every attempt fails and the retry
         // path is the only way a second request appears.
@@ -116,7 +126,7 @@ final class JourneyAndRecoveryTests: CountlyBaseTestCase {
     /// Two triggers close together run one retry series, not two: the second
     /// trigger arrives while the first is still asking and is skipped.
     func testASecondTriggerDuringTheRetrySeriesStartsNoSecondSeries() throws {
-        try skipUnlessNetworkIsInterceptable()
+        try skipUnlessContentIsFetched()
 
         MockURLProtocol.respond { captured in
             captured.path == "/i" ? (200, Data(Self.accepted.utf8)) : nil
