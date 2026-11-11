@@ -8,7 +8,7 @@
 
 import Foundation
 
-#if canImport(UserNotifications) && (os(iOS) || os(visionOS))
+#if canImport(UserNotifications) && (os(iOS) || os(visionOS) || os(macOS))
 import UserNotifications
 #endif
 
@@ -51,7 +51,7 @@ public enum CountlyPushKey {
     public static let categoryIdentifierPrefix = "CountlyCategoryIdentifier"
 }
 
-#if canImport(UserNotifications) && (os(iOS) || os(visionOS))
+#if canImport(UserNotifications) && (os(iOS) || os(visionOS) || os(macOS))
 
 /// Turns a Countly push payload into a notification with action buttons and a
 /// media attachment.

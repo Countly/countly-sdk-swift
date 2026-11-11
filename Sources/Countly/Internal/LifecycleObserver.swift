@@ -212,6 +212,11 @@ final class LifecycleObserver {
         addSynchronously(NSApplication.willTerminateNotification, event: "willTerminate") { [weak self] in
             self?.runCallback("onWillTerminate", to: self?.onWillTerminate)
         }
+        // A hidden application shows no window, the macOS counterpart of the
+        // background. It comes back through `didBecomeActive` below.
+        add(NSApplication.didHideNotification, event: "didHide") { [weak self] in
+            self?.runCallback("onBackground", to: self?.onBackground)
+        }
         // The macOS counterpart of foreground: a `begin_session` dropped because
         // the application was not yet active gets another chance here.
         add(NSApplication.didBecomeActiveNotification, event: "didBecomeActive") { [weak self] in

@@ -256,6 +256,44 @@ final class EventsTests: CountlyBaseTestCase {
         XCTAssertNil(b?["ratio"])
     }
 
+    /// A sum or a duration JSON cannot represent is ignored with its default used,
+    /// and counted for the health check, so the batch around it still goes out.
+    func testANonFiniteSumOrDurationDoesNotCostTheOtherEvents() {
+        let countly = startInstance { $0.eventSendThreshold = 3 }
+
+        countly.events.recordEvent("a")
+        countly.events.recordEvent("b", sum: .nan)
+        countly.events.recordEvent("c", duration: .infinity)
+
+        let events = TestUtils.requests(requestQueue(of: countly), carrying: "events")
+            .flatMap { TestUtils.events(in: $0) }
+            .filter { ["a", "b", "c"].contains($0["key"] as? String ?? "") }
+        XCTAssertEqual(events.compactMap { $0["key"] as? String }, ["a", "b", "c"])
+        XCTAssertEqual(logCodeCount(HealthLogCode.eventValueIgnored, of: countly), 2)
+        guard events.count == 3 else { return }
+        XCTAssertEqual(TestUtils.double(events[1]["sum"]), 0)
+        XCTAssertEqual(TestUtils.double(events[2]["dur"]), 0)
+    }
+
+    /// An event recorded with an earlier timestamp, such as a notification tap
+    /// replayed at the start, carries the hour and the weekday of that moment.
+    func testAnEventCarriesTheHourAndWeekdayOfItsOwnTimestamp() throws {
+        let countly = startInstance { $0.eventSendThreshold = 1 }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        let earlier = try XCTUnwrap(calendar.date(byAdding: .hour, value: -27, to: Date()))
+
+        core(of: countly).modules.events.recordReservedEvent(ReservedEventKey.pushAction,
+                                                             segmentation: ["i": "n-1"],
+                                                             timestamp: earlier.timeIntervalSince1970)
+
+        let event = try XCTUnwrap(TestUtils.requests(requestQueue(of: countly), carrying: "events")
+            .flatMap { TestUtils.events(in: $0) }
+            .first { $0["key"] as? String == ReservedEventKey.pushAction })
+        XCTAssertEqual(TestUtils.int(event["hour"]), calendar.component(.hour, from: earlier))
+        XCTAssertEqual(TestUtils.int(event["dow"]), calendar.component(.weekday, from: earlier) - 1)
+    }
+
     // MARK: - Consent
 
     func testNoEventIsRecordedWithoutEventsConsent() {
@@ -315,6 +353,22 @@ final class EventsTests: CountlyBaseTestCase {
     }
 
     // MARK: - Server config
+
+    /// With tracking off the SDK records nothing new: an event is refused when it
+    /// is recorded, counted for the health check, and never reaches the event
+    /// queue, so it cannot go out once tracking is back on.
+    func testWithTrackingOffAnEventIsRefusedWhenRecorded() {
+        let countly = startInstance {
+            $0.eventSendThreshold = 100
+            $0.sdkBehaviorSettings = ServerConfigBuilder().tracking(false).json()
+        }
+
+        countly.events.recordEvent("refused")
+        countly.events.recordEvent("refused-too")
+
+        XCTAssertTrue(countly.events.recordedEvents().isEmpty)
+        XCTAssertEqual(logCodeCount(HealthLogCode.trackingDisabled, of: countly), 2)
+    }
 
     func testTheServerCanSwitchCustomEventTrackingOff() {
         let countly = startInstance {

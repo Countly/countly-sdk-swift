@@ -41,7 +41,7 @@ public final class CrashesAPI: CountlyAPIBase {
                             segmentation: [String: Any]? = nil) {
         guard let core = core() else { return }
         core.healthTracker.recordUsage(.crashes, "record")
-        core.modules.crashes.recordError(String(describing: error), isFatal: isFatal, stackTrace: stackTrace, segmentation: segmentation)
+        core.modules.crashes.recordError(error, isFatal: isFatal, stackTrace: stackTrace, segmentation: segmentation)
     }
 
     /// Records an error described by a name.

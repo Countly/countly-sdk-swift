@@ -51,6 +51,15 @@ final class AttributionTests: CountlyBaseTestCase {
         XCTAssertNil(request["campaign_user"])
     }
 
+    /// Direct attribution in the config needs both values: one alone is reported
+    /// with a warning and nothing is sent.
+    func testACampaignTypeWithoutDataInTheConfigSendsNothing() {
+        let countly = startInstance { $0.campaignType = "countly" }
+
+        XCTAssertTrue(TestUtils.requests(requestQueue(of: countly), carrying: "campaign_id").isEmpty)
+        XCTAssertEqual(logCodeCount(HealthLogCode.invalidValue, of: countly), 1)
+    }
+
     /// The campaign ID is the whole point of the request, so without one there is
     /// nothing to send.
     func testCampaignDataWithoutACampaignIDIsRefused() {

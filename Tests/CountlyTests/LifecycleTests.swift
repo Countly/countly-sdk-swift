@@ -259,6 +259,44 @@ final class LifecycleTests: CountlyBaseTestCase {
         }
     }
 
+    /// Lifting the requirement while the SDK runs acts like giving every consent,
+    /// and sends no consent state: none goes out while consent is not required.
+    func testTheServerLiftingTheRequirementMidSessionSendsNoConsentState() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startInstance { $0.requiresConsent = true }
+        let before = TestUtils.requests(requestQueue(of: countly), carrying: "consent").count
+
+        MockURLProtocol.respond(pathContaining: "/o/sdk",
+                                json: ServerConfigBuilder().consentRequired(false).json())
+        core(countly).serverConfig.fetch(config: core(countly).config)
+
+        TestUtils.waitUntil("the lifted requirement is applied") {
+            countly.consent.hasConsent(for: .events)
+        }
+        TestUtils.pump(0.2)
+        XCTAssertEqual(TestUtils.requests(requestQueue(of: countly), carrying: "consent").count, before)
+    }
+
+    /// A device ID change without merge while the server has lifted the
+    /// requirement still leaves the new user with no consent once it is back.
+    func testAChangeWithoutMergeDuringALiftedRequirementLeavesTheNewUserWithNoConsent() throws {
+        try skipUnlessNetworkIsInterceptable()
+        let countly = startInstance {
+            $0.requiresConsent = true
+            $0.consents = [.events]
+            $0.sdkBehaviorSettings = ServerConfigBuilder().consentRequired(false).json()
+        }
+
+        countly.deviceID.changeWithoutMerge("the-next-user")
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: ServerConfigBuilder().json())
+        core(countly).serverConfig.fetch(config: core(countly).config)
+
+        TestUtils.waitUntil("the answer without cr restores the application's requirement") {
+            core(countly).serverConfig.consentRequired == nil && core(countly).modules.consent.requiresConsent
+        }
+        XCTAssertFalse(countly.consent.hasConsent(for: .events), "the previous user's consent stayed")
+    }
+
     /// Lifting the requirement acts like giving every consent, and an answer that
     /// no longer carries "cr" puts the application's own requirement back.
     func testTheServerCanLiftTheConsentRequirementUntilItDropsTheSetting() throws {
@@ -278,7 +316,49 @@ final class LifecycleTests: CountlyBaseTestCase {
         XCTAssertNil(core(countly).serverConfig.consentRequired)
     }
 
+    /// A hidden application shows no window, so its automatic session ends as it
+    /// would in the background, and the next activation begins a new one.
+    func testHidingTheApplicationEndsTheAutomaticSession() throws {
+        #if !os(macOS)
+        throw XCTSkip("hiding an application is a macOS transition")
+        #else
+        let countly = startInstance { $0.manualSessionHandling = false }
+        let sessions = core(countly).modules.sessions
+        AppState.setActive(true)
+        NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        TestUtils.waitUntil("the activation begins a session") { sessions.isSessionStarted }
+
+        NotificationCenter.default.post(name: NSApplication.didHideNotification, object: nil)
+        TestUtils.waitUntil("hiding ends the session") { !sessions.isSessionStarted }
+        XCTAssertEqual(TestUtils.requests(requestQueue(of: countly), carrying: "end_session").count, 1)
+
+        NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        TestUtils.waitUntil("the next activation begins a new session") { sessions.isSessionStarted }
+        XCTAssertEqual(TestUtils.requests(requestQueue(of: countly), carrying: "begin_session").count, 2)
+        #endif
+    }
+
     // MARK: - Termination
+
+    /// A macOS application quits from the foreground, so quitting ends the
+    /// automatic session, written out for the next launch to send.
+    func testQuittingEndsTheAutomaticSession() throws {
+        #if !os(macOS)
+        throw XCTSkip("elsewhere the background ends the session before the application quits")
+        #else
+        let countly = startInstance { $0.manualSessionHandling = false }
+        let sessions = core(countly).modules.sessions
+        AppState.setActive(true)
+        NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        TestUtils.waitUntil("the activation begins a session") { sessions.isSessionStarted }
+
+        NotificationCenter.default.post(name: NSApplication.willTerminateNotification, object: nil)
+
+        XCTAssertFalse(sessions.isSessionStarted)
+        let onDisk = openStore(core(countly).namespace).snapshot
+        XCTAssertEqual(TestUtils.requests(onDisk, carrying: "end_session").count, 1)
+        #endif
+    }
 
     /// Termination is the one lifecycle event with no second chance: the process is
     /// about to go away, so anything still only in memory is lost. Everything the

@@ -442,11 +442,12 @@ final class UserProfileTests: CountlyBaseTestCase {
         }
 
         countly.userProfile.setCustomProperty("secret", value: "hidden")
+        countly.userProfile.unsetCustomProperty("secret")
         countly.userProfile.setCustomProperty("public", value: "shown")
         countly.userProfile.save()
 
         let custom = lastCustom(of: countly)
-        XCTAssertNil(custom["secret"])
+        XCTAssertNil(custom["secret"], "neither setting nor unsetting a filtered key reaches the server")
         XCTAssertEqual(custom["public"] as? String, "shown")
     }
 

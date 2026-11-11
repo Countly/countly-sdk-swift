@@ -130,6 +130,22 @@ final class SessionsTests: CountlyBaseTestCase {
         XCTAssertEqual(TestUtils.requests(requestQueue(of: countly), carrying: "begin_session").count, 1)
     }
 
+    /// Every activation resumes, also one that never left the foreground, and its
+    /// automatic begin meets the running session: only a manual call out of order
+    /// is counted for the health check.
+    func testAnAutomaticBeginWhileASessionRunsIsNotCountedAsOutOfOrder() {
+        let countly = startInstance { $0.manualSessionHandling = true }
+        countly.sessions.beginSession()
+
+        core(of: countly).modules.sessions.beginSession(automatically: true)
+        XCTAssertEqual(logCodeCount(HealthLogCode.sessionOutOfOrder, of: countly), 0)
+        XCTAssertEqual(usageCount(.sessions, "begin:a", of: countly), 0, "no session was begun")
+
+        countly.sessions.beginSession()
+        XCTAssertEqual(logCodeCount(HealthLogCode.sessionOutOfOrder, of: countly), 1)
+        XCTAssertEqual(TestUtils.requests(requestQueue(of: countly), carrying: "begin_session").count, 1)
+    }
+
     func testUpdatingAndEndingWithoutABeginDoNothing() {
         let countly = startInstance { $0.manualSessionHandling = true }
 

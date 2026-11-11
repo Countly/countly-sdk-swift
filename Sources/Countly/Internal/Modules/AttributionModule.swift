@@ -38,6 +38,8 @@ final class AttributionModule: ModuleBase {
 
         if let type = core.config.campaignType, let data = core.config.campaignData {
             recordDirectAttribution(campaignType: type, campaignData: data)
+        } else if core.config.campaignType != nil || core.config.campaignData != nil {
+            warnIgnored("applyInitialConfig", "direct attribution needs both the campaign type and the campaign data, nothing is sent, campaignTypeGiven: [\(core.config.campaignType != nil)], campaignDataGiven: [\(core.config.campaignData != nil)]")
         }
 
         if let attribution = core.config.indirectAttribution {

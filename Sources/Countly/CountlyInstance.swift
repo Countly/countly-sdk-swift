@@ -421,10 +421,11 @@ public final class CountlyInstance: NSObject {
         guard let core else { return }
         core.logger.d(Self.module, "willTerminate", "the app will terminate, flushing events and saving the state synchronously")
 
-        core.healthTracker.saveState()
         core.isTerminating = true
         core.modules.views.applicationWillTerminate()
         core.modules.events.sendEventsWithSaveIfNeeded()
+        core.modules.sessions.applicationWillTerminate()
+        core.healthTracker.saveStateSync()
         // The queue is not drained while terminating, but a queued tail survives to
         // the next launch through the sync save below.
         core.logGatherer.flushNow(ignoringQueuedBatch: true)

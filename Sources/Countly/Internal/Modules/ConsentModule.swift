@@ -78,22 +78,22 @@ final class ConsentModule: ModuleBase {
     /// `createFeatureGroup(_:features:)`. Kept for the run only, like consent.
     private var featureGroups: [String: [ConsentFeature]] = [:]
 
-    /// The order consent is granted in.
-    ///
-    /// Location comes first deliberately: a `begin_session` produced before
-    /// location consent is granted carries an empty `location=`, which tells the
-    /// server to stop inferring location and cannot be undone for that session.
+    /// The order the reactions to a grant run in, once every flag of the grant is
+    /// set. Sessions before user details, so the orientation a session begins with
+    /// is not recorded a second time.
     private static let grantOrder: [ConsentFeature] = [
-        .location, .userDetails, .sessions, .events, .crashReporting,
+        .sessions, .userDetails, .location, .events, .crashReporting,
         .pushNotifications, .viewTracking, .attribution,
         .feedback, .remoteConfig, .content, .metrics, .starRating,
     ]
 
-    /// The order consent is withdrawn in. Sessions first, so the session in flight
-    /// is closed while there is still consent to report it.
+    /// The order consent is withdrawn in. The features that close while their
+    /// consent still stands come first: pending profile changes are dropped, so
+    /// the session's last flush cannot send them, then the views end inside the
+    /// session, then the session ends.
     private static let revokeOrder: [ConsentFeature] = [
-        .sessions, .events, .userDetails, .crashReporting, .pushNotifications,
-        .location, .viewTracking, .attribution,
+        .userDetails, .viewTracking, .sessions, .events, .crashReporting,
+        .pushNotifications, .location, .attribution,
         .feedback, .remoteConfig, .content, .metrics, .starRating,
     ]
 
@@ -160,18 +160,14 @@ final class ConsentModule: ModuleBase {
 
         let stateBeforeChange = Self.describe(granted)
         let requested = Set(features)
-        var newlyGranted: Set<ConsentFeature> = []
-        for feature in Self.grantOrder where requested.contains(feature) && !granted.contains(feature) {
-            granted.insert(feature)
-            applySideEffect(of: feature, granted: true, source: .app)
-            newlyGranted.insert(feature)
-        }
+        let newlyGranted = Self.grantOrder.filter { requested.contains($0) && !granted.contains($0) }
 
         guard !newlyGranted.isEmpty else {
             logD("giveConsent", "consent was already given for every requested feature, nothing changed and no consent request is sent, granted: [\(stateBeforeChange)]")
             return
         }
-        afterGranting(newlyGranted)
+
+        grant(newlyGranted) { granted.formUnion(newlyGranted) }
 
         logD("giveConsent", "consent state after giving consent, grantedBefore: [\(stateBeforeChange)], grantedAfter: [\(Self.describe(granted))]")
 
@@ -191,6 +187,11 @@ final class ConsentModule: ModuleBase {
     /// state on the device.
     func removeAllConsentsForDeviceIDChange() {
         logI("removeAllConsentsForDeviceIDChange", "consent is removed for every feature without informing the server, the device ID changes without merge, featureCount: [\(ConsentFeature.allCases.count)]")
+        guard requiresConsent else {
+            // Lifted by the server for now: the new user still starts with none once it is back.
+            granted = []
+            return
+        }
         cancelConsent(for: ConsentFeature.allCases, source: .deviceIDChangedWithoutMerge)
     }
 
@@ -213,23 +214,14 @@ final class ConsentModule: ModuleBase {
 
         let stateBeforeChange = Self.describe(granted)
         let requested = Set(features)
-        var changed = false
-        for feature in Self.revokeOrder where requested.contains(feature) && granted.contains(feature) {
-            // Clearing the flag first would make a gated side effect a silent no-op.
-            if Self.closesBeforeFlagClears.contains(feature) {
-                applySideEffect(of: feature, granted: false, source: source)
-                granted.remove(feature)
-            } else {
-                granted.remove(feature)
-                applySideEffect(of: feature, granted: false, source: source)
-            }
-            changed = true
-        }
+        let withdrawn = Self.revokeOrder.filter { requested.contains($0) && granted.contains($0) }
 
-        guard changed else {
+        guard !withdrawn.isEmpty else {
             logD("cancelConsent", "consent was not given for any requested feature, nothing changed and no consent request is sent, granted: [\(stateBeforeChange)]")
             return
         }
+
+        withdraw(withdrawn, source: source) { granted.subtract(withdrawn) }
 
         logD("cancelConsent", "consent state after cancelling consent, grantedBefore: [\(stateBeforeChange)], grantedAfter: [\(Self.describe(granted))]")
 
@@ -284,8 +276,9 @@ final class ConsentModule: ModuleBase {
 
     /// Applies a consent requirement the behavior settings changed while the SDK
     /// runs. Turning it on acts like removing consent for every feature that has
-    /// none, and lifting it acts like giving consent for every feature; either way
-    /// the new state is sent.
+    /// none and sends the new state; lifting it acts like giving consent for every
+    /// feature and sends nothing, as no consent request goes out while consent is
+    /// not required.
     func applyRequirementChange(to required: Bool) {
         stateLock.lock()
         let wasRequired = _requiresConsent
@@ -297,30 +290,43 @@ final class ConsentModule: ModuleBase {
         if required {
             let losing = Self.revokeOrder.filter { !grantedNow.contains($0) }
             logI("applyRequirementChange", "the server turned the consent requirement on, the features without consent stop, features: [\(Self.describe(losing))]")
-            for feature in losing where Self.closesBeforeFlagClears.contains(feature) {
-                applySideEffect(of: feature, granted: false, source: .app)
-            }
-            requiresConsent = true
-            for feature in losing where !Self.closesBeforeFlagClears.contains(feature) {
-                applySideEffect(of: feature, granted: false, source: .app)
-            }
+            withdraw(losing, source: .app) { requiresConsent = true }
+            sendConsents()
         } else {
             let gaining = Self.grantOrder.filter { !grantedNow.contains($0) }
             logI("applyRequirementChange", "the server lifted the consent requirement, every feature works as if consent were given, features: [\(Self.describe(gaining))]")
-            requiresConsent = false
-            for feature in gaining {
-                applySideEffect(of: feature, granted: true, source: .app)
-            }
-            afterGranting(Set(gaining))
+            grant(gaining) { requiresConsent = false }
         }
-
-        sendConsents()
     }
 
-    /// Reactions that wait until every feature of one grant has its consent.
-    /// Location values are sent only then, so a session the same grant began
-    /// carries them rather than a second request.
-    private func afterGranting(_ features: Set<ConsentFeature>) {
+    /// Makes `features` usable through `setFlags`, then runs their reactions in
+    /// order. Every flag comes before any reaction, so a session begun by the
+    /// grant carries the metrics and the location given with it.
+    private func grant(_ features: [ConsentFeature], setFlags: () -> Void) {
+        setFlags()
+        for feature in features {
+            applySideEffect(of: feature, granted: true, source: .app)
+        }
+        afterGranting(features)
+    }
+
+    /// Stops `features` around `clearFlags`: the closings in
+    /// ``closesBeforeFlagClears`` run while the consent is still in place, since
+    /// they are gated on it, and the other reactions after.
+    private func withdraw(_ features: [ConsentFeature], source: ChangeSource, clearFlags: () -> Void) {
+        for feature in features where Self.closesBeforeFlagClears.contains(feature) {
+            applySideEffect(of: feature, granted: false, source: source)
+        }
+        clearFlags()
+        for feature in features where !Self.closesBeforeFlagClears.contains(feature) {
+            applySideEffect(of: feature, granted: false, source: source)
+        }
+    }
+
+    /// Reactions that run after every other reaction of a grant, so after a
+    /// session the same grant began. Location values are sent only then, so that
+    /// session carries them rather than a second request.
+    private func afterGranting(_ features: [ConsentFeature]) {
         if features.contains(.location) {
             logD("consentDidChange", "consent granted, feature: [\(ConsentFeature.location.wireName)], stored location values become usable")
             core.modules.location.consentGiven()
@@ -346,9 +352,11 @@ final class ConsentModule: ModuleBase {
 
     // MARK: - Side effects
 
-    /// Features whose withdrawal side effect has to run while their consent is
-    /// still granted, because what it does is itself gated on that consent.
-    private static let closesBeforeFlagClears: Set<ConsentFeature> = [.sessions, .viewTracking]
+    /// Features whose withdrawal side effect runs before any flag of the
+    /// withdrawal clears: what the views and the session close is itself gated on
+    /// their consent, and the pending profile changes must be gone before the
+    /// session's last flush.
+    private static let closesBeforeFlagClears: Set<ConsentFeature> = [.userDetails, .viewTracking, .sessions]
 
     /// Starts or stops whatever the feature owns.
     ///
@@ -411,7 +419,7 @@ final class ConsentModule: ModuleBase {
             }
 
         case .location:
-            // Granting is handled once the whole grant is in, see `afterGranting`.
+            // Granting runs after the other reactions of the grant, see `afterGranting`.
             if !isGranted {
                 logD("consentDidChange", "consent cancelled, feature: [\(feature.wireName)], stored location values are cleared, eraseRequestSent: [\(!silently)]")
                 modules?.location.consentRemoved(silently: silently)

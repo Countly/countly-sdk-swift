@@ -155,17 +155,12 @@ final class ContentModule: ModuleBase {
 
     /// Starts polling for content.
     func enterContentZone() {
-        guard !core.config.disableWebView else {
-            logW("enterContentZone", "the SDK's web views are turned off by disableWebView, the content zone is not entered")
-            return
-        }
+        guard isContentAvailable("enterContentZone") else { return }
 
         guard !isShown() else {
             logD("enterContentZone", "a content is already shown, skipping this enter")
             return
         }
-
-        invalidateTimers()
 
         guard core.modules.consent.hasConsent(for: .content) else {
             logV("enterContentZone", "no consent given for content, skipping the content zone enter")
@@ -185,6 +180,8 @@ final class ContentModule: ModuleBase {
         zoneGeneration &+= 1
         let generation = zoneGeneration
         stateLock.unlock()
+
+        invalidateTimers()
 
         // The first fetch is held back on a cold launch so content does not land
         // on top of the application's own first screen.
@@ -249,10 +246,7 @@ final class ContentModule: ModuleBase {
             core.healthTracker.recordLogCode(HealthLogCode.invalidValue)
             return
         }
-        guard !core.config.disableWebView else {
-            logW("previewContent", "the SDK's web views are turned off by disableWebView, the content is not previewed")
-            return
-        }
+        guard isContentAvailable("previewContent") else { return }
         logD("previewContent", "fetching a content for preview, contentId: [\(contentID)]")
         fetchContents(contentID: contentID, failure: nil)
     }
@@ -262,6 +256,8 @@ final class ContentModule: ModuleBase {
     /// Refreshing before the queue drains would ask about a user state the server
     /// has not seen yet, so the refresh rides on the flush instead.
     func refreshContentZone() {
+        guard isContentAvailable("refreshContentZone") else { return }
+
         guard core.serverConfig.refreshContentZoneEnabled else {
             logD("refreshContentZone", "the content zone refresh is disabled by the server config, skipping")
             return
@@ -304,6 +300,8 @@ final class ContentModule: ModuleBase {
     /// Refresh path used by journey triggers, which retries a few times because
     /// the server may still be computing the journey's next step.
     func refreshContentZoneForJourneyTrigger() {
+        guard isContentAvailable("refreshContentZoneForJourneyTrigger") else { return }
+
         guard core.serverConfig.refreshContentZoneEnabled else {
             logD("refreshContentZoneForJourneyTrigger", "the content zone refresh is disabled by the server config, skipping the journey content refresh")
             return
@@ -355,6 +353,26 @@ final class ContentModule: ModuleBase {
                 DispatchQueue.main.async { [weak self] in self?.enterContentZone() }
             }
         }
+    }
+
+    /// Whether content can be fetched and shown in this run: the platform has web
+    /// views, the application did not turn them off, and the SDK is not in offline
+    /// mode. Logs why not.
+    private func isContentAvailable(_ function: String) -> Bool {
+        #if os(iOS) || os(visionOS) || os(macOS)
+        guard !core.config.disableWebView else {
+            logW(function, "the SDK's web views are turned off by disableWebView, the call is ignored")
+            return false
+        }
+        guard !core.modules.deviceID.isTemporary else {
+            logD(function, "the SDK is in temporary device ID mode, the call is ignored")
+            return false
+        }
+        return true
+        #else
+        logD(function, "content needs a web view, which this platform does not have, the call is ignored")
+        return false
+        #endif
     }
 
     // MARK: - State
@@ -475,35 +493,48 @@ final class ContentModule: ModuleBase {
         fetchContents(contentID: nil, failure: nil)
     }
 
-    private func fetchContents(contentID: String?, failure: (() -> Void)?) {
+    /// Whether a content fetch may start now. When it may, the fetch is marked as
+    /// in flight, so a second one waits for its answer.
+    private func claimFetch() -> Bool {
         guard core.modules.consent.hasConsent(for: .content) else {
             logV("fetchContents", "no consent given for content, skipping the content fetch")
-            return
+            return false
         }
 
         guard core.serverConfig.networkingEnabled else {
             logD("fetchContents", "networking is disabled by the server config, skipping the content fetch")
-            return
+            return false
         }
 
         guard !core.modules.deviceID.isTemporary else {
             logD("fetchContents", "content can not be fetched while in temporary device ID mode")
-            return
+            return false
         }
 
         guard !isShown() else {
             logD("fetchContents", "a content is already shown, skipping the content fetch")
-            return
+            return false
         }
 
         stateLock.lock()
         if isFetchInFlight {
             stateLock.unlock()
             logD("fetchContents", "a content fetch is already in flight, skipping this one")
-            return
+            return false
         }
         isFetchInFlight = true
         stateLock.unlock()
+        return true
+    }
+
+    /// Fetches content, or a preview of one content. A fetch that does not start
+    /// reports through `failure` like one that fails, so a journey retry series
+    /// always comes to an end.
+    private func fetchContents(contentID: String?, failure: (() -> Void)?) {
+        guard claimFetch() else {
+            failure?()
+            return
+        }
 
         logD("fetchContents", "fetching the content details, isPreview: [\(contentID != nil)]")
 

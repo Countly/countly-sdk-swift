@@ -704,6 +704,7 @@ enum StorageLocation {
                 try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
             } catch {
                 logger?.e("Storage", "directoryURL", "storage directory can not be created, path: [\(url.path)], error: [\(error.localizedDescription)]")
+                logger?.healthTracker?.recordLogCode(HealthLogCode.storageFailed)
             }
         }
 

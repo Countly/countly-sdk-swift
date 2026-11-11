@@ -128,7 +128,6 @@ final class FeedbackModule: ModuleBase {
     private func widgetListRequest() -> URLRequest {
         var queryString = core.network.builder.queryEssentials()
         queryString += "&\(QS.method)=\(Key.feedback)"
-        queryString += "&\(QS.appVersion)=\(core.appVersion.urlEscaped)"
         queryString = core.network.builder.finishImmediateRequest(queryString)
 
         return core.network.instantRequest(queryString: queryString, path: Endpoint.output + Endpoint.sdk)
@@ -198,6 +197,13 @@ final class FeedbackModule: ModuleBase {
 
         guard !core.modules.deviceID.isTemporary else {
             logD("present", "the widget will not be presented in temporary device ID mode, widgetID: [\(widget.id)]")
+            callback?(.failed)
+            return
+        }
+
+        // The widget page is loaded from the server, which networking off forbids.
+        guard core.serverConfig.networkingEnabled else {
+            logD("present", "networking is disabled by the server config, the widget will not be presented, widgetID: [\(widget.id)]")
             callback?(.failed)
             return
         }
@@ -425,7 +431,6 @@ final class FeedbackModule: ModuleBase {
         queryString += "&\(Key.platform)=\((DeviceMetrics.osName ?? "").urlEscaped)"
         queryString += "&\(Key.shown)=1"
         queryString += "&\(Key.widgetID)=\(widget.id.urlEscaped)"
-        queryString += "&\(QS.appVersion)=\(core.appVersion.urlEscaped)"
         queryString = core.network.builder.finishImmediateRequest(queryString)
 
         let path = "\(Endpoint.output)\(Endpoint.surveys)/\(widget.type.wireName)\(Endpoint.widget)"

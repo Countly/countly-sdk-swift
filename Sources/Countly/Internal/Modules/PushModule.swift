@@ -21,16 +21,9 @@ final class PushModule: ModuleBase {
 
     override class var moduleName: String { "Push" }
 
-    /// Platform value reported with a push action.
-    private static var platformValue: String {
-        #if os(iOS) || os(visionOS)
-        return "i"
-        #elseif os(macOS)
-        return "m"
-        #else
-        return "unknown"
-        #endif
-    }
+    /// Platform value reported with a push action: "i" for APNs on every Apple
+    /// platform, the only key the server counts an Apple message under.
+    private static let platformValue = "i"
 
     /// Whether push was switched on in the config. Without it the module does
     /// nothing, whatever consent says.
@@ -38,6 +31,17 @@ final class PushModule: ModuleBase {
 
     /// Whether this instance registered for the process-wide token.
     private var isRegistered = false
+
+    /// Whether the click that cold started the application was replayed. Push
+    /// starts again whenever its consent is given again, the replay only once.
+    private var hasReplayedLaunchNotification = false
+
+    /// The last token sent and when on the uptime clock, so the same token
+    /// reported again within a minute is sent once.
+    private var lastSentToken: (value: String, uptime: TimeInterval)?
+
+    /// How long a repeat of the last sent token is ignored.
+    private static let repeatedTokenWindow: TimeInterval = 60
 
     // MARK: - Init
 
@@ -91,8 +95,9 @@ final class PushModule: ModuleBase {
         PushRuntime.shared.register(self, automaticHandling: automatic)
 
         #if os(macOS)
-        if automatic, let launchInfo = core.config.launchNotification {
+        if automatic, !hasReplayedLaunchNotification, let launchInfo = core.config.launchNotification {
             logD("startPushNotifications", "a launch notification was supplied in config, the click that cold started the app is replayed")
+            hasReplayedLaunchNotification = true
             PushRuntime.shared.replayLaunchNotification(launchInfo)
         }
         #endif
@@ -268,8 +273,13 @@ final class PushModule: ModuleBase {
         case .value(let value):
             logI("didReceive", "a device token arrived from the process wide push runtime, tokenLength: [\(value.count)]")
             logV("didReceive", "device token detail, token: [\(value)]")
+            if isRepeatOfLastSentToken(value) {
+                logD("didReceive", "the same token was sent for this device ID less than a minute ago, the repeat is ignored")
+                return
+            }
         case .failed:
             logI("didReceive", "remote notification registration failed for this process, no device token will be available")
+            return
         }
 
         sendToken(token)
@@ -295,11 +305,9 @@ final class PushModule: ModuleBase {
             return
         }
 
-        // Registration failed. An empty token tells the server to stop trying to
-        // reach this device, which is more useful than silence.
+        // A failed registration may be passing, so the token the server holds stays.
         guard case .value(let token) = received else {
-            logD("sendToken", "push token is in error state, an empty token will be sent to the server instead")
-            clearToken()
+            logD("sendToken", "push token is not sent, the registration for remote notifications failed")
             return
         }
 
@@ -352,6 +360,18 @@ final class PushModule: ModuleBase {
     private func send(token: String) {
         send(token: token, essentials: core.network.builder.queryEssentials())
         core.keyValueStore.pushTokenDeviceID = token.isEmpty ? nil : core.modules.deviceID.deviceID
+        lastSentToken = token.isEmpty ? nil : (token, ProcessInfo.processInfo.systemUptime)
+    }
+
+    /// Whether `token` was sent less than a minute ago and the server still holds
+    /// it for the device ID in use, as when the application forwards the token the
+    /// SDK's own callback already reported. A token that arrived but was not sent
+    /// is never a repeat.
+    private func isRepeatOfLastSentToken(_ token: String) -> Bool {
+        guard let last = lastSentToken else { return false }
+        return last.value == token
+            && core.keyValueStore.pushTokenDeviceID == core.modules.deviceID.deviceID
+            && ProcessInfo.processInfo.systemUptime - last.uptime < Self.repeatedTokenWindow
     }
 
     /// Queues a token request with the given base parameters.
@@ -424,6 +444,7 @@ final class PushModule: ModuleBase {
         // manual entry point onto the same event, so it refuses it too.
         guard let notificationID, !notificationID.isEmpty else {
             logW("recordActionEvent", "notification action event is dropped, the notification has no Countly notification ID")
+            core.healthTracker.recordLogCode(HealthLogCode.invalidValue)
             return
         }
 

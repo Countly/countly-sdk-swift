@@ -248,6 +248,11 @@ final class UserProfileModule: ModuleBase {
         logI("unsetCustomProperty", "custom user property will be unset, key: [\(key)]")
         guard hasConsent("unsetCustomProperty") else { return }
 
+        guard core.serverConfig.shouldRecordUserProperty(key) else {
+            logD("unsetCustomProperty", "custom property key is filtered out by server config user property filter, key: [\(key)], omitting call")
+            return
+        }
+
         let truncatedKey = limits.truncatedKey(key, "unsetCustomProperty")
         stageCustomValue(NSNull(), forKey: truncatedKey, function: "unsetCustomProperty")
         logD("unsetCustomProperty", "custom user property is staged for clearing on the server, key: [\(truncatedKey)]")

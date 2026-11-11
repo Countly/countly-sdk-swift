@@ -142,6 +142,43 @@ final class RemoteConfigTests: CountlyBaseTestCase {
         XCTAssertNil(parsed["keys"])
     }
 
+    /// A partial download with no usable key is a download of every key, so the
+    /// server is not asked for an empty list it would answer in full anyway.
+    func testAPartialDownloadWithNoUsableKeyDownloadsEveryKey() {
+        MockURLProtocol.respond(pathContaining: "/o/sdk", json: #"{"a": 1}"#)
+        let countly = startInstance()
+
+        var fullValueUpdate: Bool?
+        expectCompletion("the download reports back") { done in
+            countly.remoteConfig.downloadSpecificKeys(["", ""]) { _, _, isFull, _ in
+                fullValueUpdate = isFull
+                done()
+            }
+        }
+
+        guard let request = remoteConfigRequests().last else {
+            XCTFail("a request should have gone out")
+            return
+        }
+        let parsed = TestUtils.parseQuery(request.query)
+        XCTAssertNil(parsed["keys"])
+        XCTAssertNil(parsed["omit_keys"])
+        XCTAssertEqual(fullValueUpdate, true)
+        XCTAssertEqual(logCodeCount(HealthLogCode.invalidValue, of: countly), 1)
+    }
+
+    /// Exiting with no key leaves every A/B test: the server reads an empty key
+    /// list as one that matches no test.
+    func testExitingWithNoKeyLeavesEveryABTest() {
+        let countly = startInstance()
+
+        countly.remoteConfig.exitABTests(forKeys: [])
+
+        let exits = requestQueue(of: countly).map(TestUtils.parseQuery).filter { $0["method"] as? String == "ab_opt_out" }
+        XCTAssertEqual(exits.count, 1)
+        XCTAssertNil(exits.first?["keys"])
+    }
+
     /// A full download replaces the cache; a partial one merges into it. Getting
     /// that backwards either loses values the server still serves or keeps values
     /// it has withdrawn.

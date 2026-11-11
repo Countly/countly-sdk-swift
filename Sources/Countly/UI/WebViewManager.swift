@@ -224,7 +224,7 @@ final class WebViewManager: NSObject {
     /// How many reloads a failed critical resource is worth before the page is
     /// given up on. One transient hiccup is common; three in a row is a real
     /// failure.
-    private static let maxResourceRetries = 3
+    private static let maxResourceRetries = 2
 
     /// Base of the linear backoff between resource retries, in seconds.
     private static let resourceRetryBaseDelay: TimeInterval = 1.0

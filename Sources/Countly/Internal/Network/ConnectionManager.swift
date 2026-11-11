@@ -221,10 +221,10 @@ final class ConnectionManager: NSObject {
             return
         }
 
-        // A request recorded before a real device ID was known must wait: sending
-        // it now would attribute the data to the placeholder ID.
-        if head.request.contains("&\(QS.deviceID)=\(TemporaryDeviceID.value)") {
-            abortProcessing("device ID of the request at the head of the queue is the temporary device ID")
+        // Offline mode sends nothing, and a request recorded before a real device
+        // ID was known waits too: sending it would attribute it to the placeholder.
+        if core.modules.deviceID.isTemporary || head.request.contains("&\(QS.deviceID)=\(TemporaryDeviceID.value)") {
+            abortProcessing("the SDK is in temporary device ID mode or the request at the head of the queue carries the temporary device ID")
             return
         }
 
@@ -1201,7 +1201,6 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
     func fetchServerConfig(completion: @escaping (Data?, Int, Error?) -> Void) {
         var queryString = builder.queryEssentials()
         queryString += "&\(QS.method)=\(ServerConfig.fetchMethod)"
-        queryString += "&\(QS.appVersion)=\(core.appVersion.urlEscaped)"
         queryString = builder.finishImmediateRequest(queryString)
 
         let request = instantRequest(queryString: queryString, path: Endpoint.output + Endpoint.sdk)

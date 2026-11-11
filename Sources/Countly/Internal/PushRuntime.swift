@@ -21,10 +21,9 @@ import AppKit
 
 /// What the process knows about its APNs device token.
 ///
-/// A failed registration is not the same as no registration yet: the first means
-/// the server should be told to stop trying to reach this device, the second means
-/// there is nothing to say. A sentinel string spelled the difference before, which
-/// every reader had to remember to compare against.
+/// A failed registration is not the same as no registration yet, although neither
+/// has a token to send: a failure is logged as one, and the token the server holds
+/// is left alone, since the next registration may well succeed.
 enum PushDeviceToken {
     case value(String)
     case failed

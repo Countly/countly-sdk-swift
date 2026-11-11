@@ -216,8 +216,7 @@ public final class SessionsAPI: CountlyAPIBase {
         guard let core = core() else { return }
         core.healthTracker.recordUsage(.sessions, "end")
         guard allowed(core, "endSession") else { return }
-        core.logger.i(Self.module, "endSession", "a session end was requested through the manual sessions API, recorded events are sent first")
-        core.modules.events.sendEventsWithSaveIfNeeded()
+        core.logger.i(Self.module, "endSession", "a session end was requested through the manual sessions API")
         core.modules.sessions.endSession()
     }
 
@@ -327,7 +326,8 @@ public final class UserProfileAPI: CountlyAPIBase {
     /// Sets one property. Predefined keys such as `name` and `email` are stored as
     /// their own fields; anything else becomes a custom property.
     ///
-    /// Pass `NSNull()` or an empty string to clear a field.
+    /// Pass an empty string to clear a field. A `nil` or `NSNull()` value is
+    /// ignored with a warning.
     public func setProperty(_ key: String, value: Any?) {
         core()?.modules.userProfile.setProperty(key, value: value)
     }

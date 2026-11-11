@@ -19,10 +19,15 @@ import XCTest
 final class ContentTests: CountlyBaseTestCase {
 
     /// Every test here asserts on what reached the transport, so the whole suite
-    /// needs a transport it can see.
+    /// needs a transport it can see, and content needs a web view, so it runs only
+    /// where there is one.
     override func setUpWithError() throws {
         try super.setUpWithError()
+        #if os(iOS) || os(visionOS) || os(macOS)
         try skipUnlessNetworkIsInterceptable()
+        #else
+        throw XCTSkip("content needs a web view, which tvOS and watchOS have no WebKit for")
+        #endif
     }
 
     /// A content zone with no initial delay, so a fetch happens as soon as the zone
@@ -509,4 +514,28 @@ final class ContentTests: CountlyBaseTestCase {
         #endif
     }
 
+}
+
+/// Content needs a web view, so where there is none every content call is
+/// ignored and nothing is fetched.
+final class ContentWithoutWebViewTests: CountlyBaseTestCase {
+
+    /// Entering the zone, refreshing it and previewing a content send nothing,
+    /// since nothing the server answered could be shown.
+    func testContentCallsFetchNothingWithoutAWebView() throws {
+        #if os(iOS) || os(visionOS) || os(macOS)
+        throw XCTSkip("this platform has a web view, so content works here")
+        #else
+        try skipUnlessNetworkIsInterceptable()
+        MockURLProtocol.respond(pathContaining: "/o/sdk/content", json: "{}")
+        let countly = startInstance { $0.content.zoneTimerInterval = 30 }
+
+        countly.content.enterContentZone()
+        countly.content.refreshContentZone()
+        countly.content.previewContent("0123456789abcdef01234567")
+        TestUtils.pump(1)
+
+        XCTAssertTrue(MockURLProtocol.requests(pathContaining: "/o/sdk/content").isEmpty)
+        #endif
+    }
 }

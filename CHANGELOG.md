@@ -27,6 +27,7 @@
   * "recordReservedEvent(key, ...)", which records a reserved event the SDK normally produces itself. An overload takes a "CountlyReservedEvent" instead of a key.
   * Recorded events are kept in storage until they are moved into a request, so they survive the application being closed or killed. At most 1000 are kept.
   * Feedback widget answers and push actions are sent right away rather than with the next batch.
+  * A count below one is recorded as 1, and a sum or duration that is not a finite number, or a negative duration, as 0, with a warning.
 
 * Added the views API on "countly.views":
   * "startView(name, segmentation)" / "startAutoStoppedView(name, segmentation)"
@@ -43,6 +44,7 @@
   * Manual session control and manual hybrid mode via "CountlyConfig.manualSessionHandling" and "enableManualSessionControlHybridMode"
   * Session durations come from a monotonic clock, so changing the device's date and time cannot stretch or shrink a session.
   * A session that is running when the server turns session tracking off still ends normally.
+  * On macOS the automatic session ends when the application hides or quits, and the next activation begins a new one.
 
 * Added the user profile API on "countly.userProfile":
   * "setProperty(key, value)" / "setProperties(data)"
@@ -82,6 +84,7 @@
   * A change without merge first stops the views, queues the pending events and profile changes and takes the push token back, all under the leaving user's device ID, then removes consent without a consent request and starts the new user clean.
   * A change with merge fetches the behavior settings and the remote config only once the server has accepted the merge request, so the new user is never created before the merge.
   * Every start replaces the temporary device ID in requests still queued under it, so such a request cannot hold the queue up.
+  * Nothing is sent in temporary device ID mode, also requests queued before the mode began. They go out once it ends.
   * "CountlyConfig.resetStoredDeviceID", which drops the stored device ID at start, one the SDK generated included, so a new one is generated when no device ID is configured. The stored user's pending events and push token are handed back to that user first.
 
 * Added the location API on "countly.location":
@@ -93,7 +96,7 @@
 
 * Added the crashes API on "countly.crashes":
   * "recordException(exception, isFatal, stackTrace, segmentation)"
-  * "recordError(error, ...)" / "recordError(errorName, ...)"
+  * "recordError(error, ...)" / "recordError(errorName, ...)". An error's type is reported as the crash type: the domain of an "NSError", otherwise the Swift type's name.
   * "addCrashBreadcrumb(log)" / "clearCrashBreadcrumbs()"
   * "setCrashSegmentation(segmentation)"
   * Automatic signal and uncaught exception handlers, chaining to any handler already installed, plus a crash filter callback via "CountlyConfig.crashes.crashFilterCallback".
@@ -123,6 +126,7 @@
 
 * Added the content API on "countly.content":
   * "enterContentZone()" / "exitContentZone()" / "refreshContentZone()" / "previewContent(contentID)"
+  * Content needs a web view, so on tvOS and watchOS these calls are ignored and nothing is fetched.
   * "setGlobalContentSegmentation(segmentation)", recorded with every content and feedback widget event and handed to a widget page that records its own answers. It never overrides a key the event reports itself, and the keys the server counts and attributes these events by cannot be set through it.
   * "CountlyConfig.content.allowedLinkSchemes", the schemes links from content and feedback widgets may open. The dangerous ones, such as "javascript" and "file", are never opened.
   * After a content closes, the next fetch waits two zone intervals. "zoneTimerInterval" takes 15 seconds or more.
@@ -155,6 +159,8 @@
   * The "CountlyNotificationService" product for notification service extensions, which adds a notification's action buttons and downloads its media attachment while preserving the host's own notification categories
   * Push is handled by the default instance only, since the token and the notification taps belong to the whole process. A named instance that enables push registers for nothing and reports nothing.
   * Before a device ID change without merge, the token is taken back from the leaving user with an empty token, and afterwards it is reported for the new user, so the previous user's notifications stop reaching the device.
+  * The same token reported again within a minute for the same device ID is sent once.
+  * A failed registration sends nothing, so the token the server holds stays.
 
 * Added automatic view tracking on iOS, tvOS and visionOS:
   * "CountlyConfig.enableAutomaticViewTracking", with an exclusion list ("automaticViewTrackingExclusionList") matching the resolved view name, the class name or a superclass, and a "CountlyAutoViewTrackingName" protocol for naming a screen explicitly

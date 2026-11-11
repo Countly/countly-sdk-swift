@@ -422,20 +422,31 @@ struct LimitsEnforcer {
         return value.countlyPrefix(limits.maxValueSize)
     }
 
+    /// Cuts a crash message to `maxStackTraceLineLength` characters, the limit
+    /// that holds for every line of a crash report.
+    func truncatedCrashMessage(_ message: String) -> String {
+        let limit = max(1, limits.maxStackTraceLineLength)
+        guard message.countlyLength > limit else { return message }
+        report(HealthLogCode.stackTraceCut, "truncatedCrashMessage", "crash message exceeds the stack trace line length limit and will be truncated, messageLength: [\(message.countlyLength)], truncatedTo: [\(limit)]")
+        return message.countlyPrefix(limit)
+    }
+
     /// Applies the stack trace limits to the frames of one thread: at most
     /// `maxStackTraceLinesPerThread` lines, each at most `maxStackTraceLineLength`
     /// characters, and at most ``maxStackTraceCharacters`` in total once the lines
-    /// are joined with new lines.
+    /// are joined with new lines. A frame given as one multi-line string is
+    /// limited line by line.
     func truncatedStackTrace(_ frames: [String], _ explanation: String) -> [String] {
         let lineLimit = max(1, limits.maxStackTraceLineLength)
         let lineCountLimit = max(1, limits.maxStackTraceLinesPerThread)
+        let lines = frames.flatMap { $0.components(separatedBy: "\n") }
 
-        var wasCut = frames.count > lineCountLimit
+        var wasCut = lines.count > lineCountLimit
         var remaining = Self.maxStackTraceCharacters
         var result: [String] = []
 
-        for frame in frames.prefix(lineCountLimit) {
-            var line = frame
+        for original in lines.prefix(lineCountLimit) {
+            var line = original
             if line.countlyLength > lineLimit {
                 line = line.countlyPrefix(lineLimit)
                 wasCut = true
@@ -455,7 +466,7 @@ struct LimitsEnforcer {
         }
 
         if wasCut {
-            report(HealthLogCode.stackTraceCut, "truncatedStackTrace", "stack trace exceeds the SDK stack trace limits and is cut, target: [\(explanation)], lineCount: [\(frames.count)], keptLineCount: [\(result.count)], maxLinesPerThread: [\(lineCountLimit)], maxLineLength: [\(lineLimit)], maxTotalLength: [\(Self.maxStackTraceCharacters)]")
+            report(HealthLogCode.stackTraceCut, "truncatedStackTrace", "stack trace exceeds the SDK stack trace limits and is cut, target: [\(explanation)], lineCount: [\(lines.count)], keptLineCount: [\(result.count)], maxLinesPerThread: [\(lineCountLimit)], maxLineLength: [\(lineLimit)], maxTotalLength: [\(Self.maxStackTraceCharacters)]")
         }
         return result
     }

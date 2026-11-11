@@ -120,20 +120,6 @@ final class EventsModule: ModuleBase {
             }
         }
 
-        var count = count
-        if count < 1 {
-            logW("recordEvent", "the event count is below one, it is ignored and 1 is used, key: [\(key)], providedCount: [\(count)]")
-            core.healthTracker.recordLogCode(HealthLogCode.eventValueIgnored, area: .events)
-            count = 1
-        }
-
-        var duration = duration
-        if duration < 0 {
-            logW("recordEvent", "the event duration is negative, it is ignored and 0 is used, key: [\(key)], providedDuration: [\(duration.logSeconds)]")
-            core.healthTracker.recordLogCode(HealthLogCode.eventValueIgnored, area: .events)
-            duration = 0
-        }
-
         let filtered = isReserved ? segmentation : core.serverConfig.filterSegmentation(segmentation, eventKey: key)
         let sanitized = limits.sanitized(filtered, "Event segmentation")
 
@@ -336,6 +322,32 @@ final class EventsModule: ModuleBase {
             return
         }
 
+        guard core.serverConfig.trackingEnabled else {
+            logW("record", "the event is not recorded, tracking is disabled by the server config, key: [\(key)]")
+            core.healthTracker.recordLogCode(HealthLogCode.trackingDisabled)
+            return
+        }
+
+        var count = count
+        if count < 1 {
+            logW("record", "the event count is below one, it is ignored and 1 is used, key: [\(key)], providedCount: [\(count)]")
+            core.healthTracker.recordLogCode(HealthLogCode.eventValueIgnored, area: .events)
+            count = 1
+        }
+        // JSON has no NaN or infinity, and one in the batch would cost every event in it.
+        var sum = sum
+        if !sum.isFinite {
+            logW("record", "the event sum is not a finite number, it is ignored and 0 is used, key: [\(key)], providedSum: [\(sum)]")
+            core.healthTracker.recordLogCode(HealthLogCode.eventValueIgnored, area: .events)
+            sum = 0
+        }
+        var duration = duration
+        if !duration.isFinite || duration < 0 {
+            logW("record", "the event duration is negative or not a finite number, it is ignored and 0 is used, key: [\(key)], providedDuration: [\(duration.logSeconds)]")
+            core.healthTracker.recordLogCode(HealthLogCode.eventValueIgnored, area: .events)
+            duration = 0
+        }
+
         let isReserved = ReservedEventKey.all.contains(key)
         let event = CountlyEvent(key: key)
         if let id, !id.isEmpty {
@@ -352,12 +364,13 @@ final class EventsModule: ModuleBase {
             event.currentViewID = core.modules.views.currentViewID ?? ""
         }
 
-        event.count = max(count, 1)
+        let recordedAt = Date(timeIntervalSince1970: timestamp)
+        event.count = count
         event.sum = sum
         event.timestamp = timestamp
-        event.hourOfDay = core.clock.hourOfDay()
-        event.dayOfWeek = core.clock.dayOfWeek()
-        event.duration = max(0, duration)
+        event.hourOfDay = core.clock.hourOfDay(at: recordedAt)
+        event.dayOfWeek = core.clock.dayOfWeek(at: recordedAt)
+        event.duration = duration
 
         // Already filtered by `sanitized` on the public path; reserved events pass
         // SDK-built segmentation, which is well formed by construction.

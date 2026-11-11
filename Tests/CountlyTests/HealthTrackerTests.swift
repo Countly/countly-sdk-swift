@@ -110,6 +110,8 @@ final class HealthTrackerTests: CountlyBaseTestCase {
         }
         let request = MockURLProtocol.requests.first { $0.query.contains("hc=") }
         XCTAssertEqual(request?.path, "/i")
+        XCTAssertNotNil(request.flatMap { TestUtils.parseQuery($0.query)["av"] },
+                        "like every request, it carries the app version, also without metrics consent")
     }
 
     /// Once per launch, whatever else happens. A second one would double count the

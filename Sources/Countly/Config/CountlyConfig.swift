@@ -488,13 +488,14 @@ public final class CountlyConfig: NSObject {
     @discardableResult
     func resetInvalidValues(logger: Logger) -> Int {
         var resetCount = 0
+        // The interval checks are written as "not at least", so that NaN is rejected too.
         func reject(_ option: String, _ value: Any, _ fallback: Any) {
             resetCount += 1
             logger.w("Countly", "start", "a config option has an invalid value, the value is ignored and the default is used, option: [\(option)], value: [\(value)], default: [\(fallback)]")
             logger.healthTracker?.recordLogCode(HealthLogCode.invalidSetting)
         }
 
-        if updateSessionPeriod < 1 {
+        if !(updateSessionPeriod >= 1) {
             reject("updateSessionPeriod", updateSessionPeriod, Self.defaultUpdateSessionPeriod)
             updateSessionPeriod = Self.defaultUpdateSessionPeriod
         }
@@ -510,11 +511,11 @@ public final class CountlyConfig: NSObject {
             reject("requestDropAgeHours", requestDropAgeHours, 0)
             requestDropAgeHours = 0
         }
-        if requestTimeoutDuration < 1 {
+        if !(requestTimeoutDuration >= 1) {
             reject("requestTimeoutDuration", requestTimeoutDuration, 30)
             requestTimeoutDuration = 30
         }
-        if failedRequestCooldown < Self.minimumFailedRequestCooldown {
+        if !(failedRequestCooldown >= Self.minimumFailedRequestCooldown) {
             reject("failedRequestCooldown", failedRequestCooldown, 60)
             failedRequestCooldown = 60
         }

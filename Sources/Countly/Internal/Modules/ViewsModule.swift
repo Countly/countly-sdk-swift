@@ -424,11 +424,9 @@ final class ViewsModule: ModuleBase {
             return
         }
 
-        var segmentation = viewData.segmentation
-        if !globalViewSegmentation.isEmpty {
-            logD("stopViewInternal", "global view segmentation takes precedence over the segmentation added to the view, viewID: [\(viewID)], globalKeys: [\(globalViewSegmentation.keys.sorted())], overriddenViewKeys: [\(segmentation.keys.filter { globalViewSegmentation[$0] != nil }.sorted())]")
-        }
-        segmentation.merge(globalViewSegmentation) { _, global in global }
+        // Most specific wins: global, then what was added to the view, then the stop segmentation.
+        var segmentation = globalViewSegmentation
+        segmentation.merge(viewData.segmentation) { _, own in own }
 
         if let customSegmentation {
             let filtered = sanitized(customSegmentation, context: "the segmentation of the view being stopped")
