@@ -23,6 +23,8 @@ Track, measure, and take action - all without leaving Countly.
 
 ## Integrating Countly SDK in your projects
 
+For a detailed description of how to use this SDK, [check out our documentation](https://support.countly.com/hc/en-us/articles/31734326636572).
+
 This SDK supports the following features:
 * [Analytics](https://support.count.ly/hc/en-us/articles/4431589003545-Analytics)
 * [Push Notifications](https://support.count.ly/hc/en-us/articles/4405405459225-Push-Notifications)
