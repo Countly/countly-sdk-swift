@@ -18,34 +18,49 @@ jobs:
       - name: Checkout SDK code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          fetch-depth: 0
+          fetch-depth: 2
           persist-credentials: false
 
-      # SwiftPM's API diagnosis in Xcode 16.4 fails with "Unable to parse empty data".
       - name: Set up Xcode
         run: sudo xcode-select -switch /Applications/Xcode_26.2.app
 
       # The first parent of the pull request's merge commit is the base branch it merges into.
-      # iOS runs beside the host because some public API exists only on iOS, tvOS and visionOS.
+      # Some public API exists on one platform only, so every platform is compared.
+      # `swift package diagnose-api-breaking-changes` is not used: it fails on Xcode 26.2 with "Unable to parse empty data".
       - name: Compare the public API with the base branch
         run: |
-          base=$(git rev-parse HEAD^1)
+          git worktree add "$RUNNER_TEMP/base" HEAD^1
           : > "$RUNNER_TEMP/breaking.txt"
 
-          # Compares the public API with the base branch for the platform the options select and appends each break to breaking.txt.
-          diagnose() {
-            if ! swift package "$@" diagnose-api-breaking-changes "$base" > "$RUNNER_TEMP/diagnose.txt" 2>&1; then
-              if ! grep -q 'API breakage:' "$RUNNER_TEMP/diagnose.txt"; then
-                cat "$RUNNER_TEMP/diagnose.txt"
-                echo "::error::Could not compare the public API with the base branch."
-                exit 1
-              fi
+          # Builds the package from tree $1 into $2 with SDK $3 and destination $4, then writes each library's public API for target $5 to $2/<module>.json.
+          dump() {
+            mkdir -p "$2"
+            if ! (cd "$1" && xcodebuild -scheme Countly-Package -configuration Release -sdk "$3" -destination "$4" \
+                -derivedDataPath "$2/derived" CONFIGURATION_BUILD_DIR="$2/products" CODE_SIGNING_ALLOWED=NO build) > "$2/build.log" 2>&1; then
+              cat "$2/build.log"
+              return 1
             fi
-            grep '💔 API breakage:' "$RUNNER_TEMP/diagnose.txt" | sed 's/^ *💔 //' >> "$RUNNER_TEMP/breaking.txt" || true
+            for module in Countly CountlyNotificationService; do
+              xcrun --sdk "$3" swift-api-digester -dump-sdk -module "$module" -o "$2/$module.json" -abort-on-module-fail \
+                -avoid-tool-args -avoid-location -I "$2/products" -target "$5" -sdk "$(xcrun --sdk "$3" --show-sdk-path)"
+            done
           }
 
-          diagnose
-          diagnose --triple arm64-apple-ios15.0-simulator --sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          for platform in ios macos tvos watchos; do
+            case "$platform" in
+              ios) sdk=iphonesimulator destination="generic/platform=iOS Simulator" target=arm64-apple-ios15.0-simulator ;;
+              macos) sdk=macosx destination="generic/platform=macOS" target=arm64-apple-macos12.0 ;;
+              tvos) sdk=appletvsimulator destination="generic/platform=tvOS Simulator" target=arm64-apple-tvos15.0-simulator ;;
+              watchos) sdk=watchsimulator destination="generic/platform=watchOS Simulator" target=arm64-apple-watchos9.0-simulator ;;
+            esac
+            dump "$RUNNER_TEMP/base" "$RUNNER_TEMP/$platform/base" "$sdk" "$destination" "$target"
+            dump "$GITHUB_WORKSPACE" "$RUNNER_TEMP/$platform/head" "$sdk" "$destination" "$target"
+            for module in Countly CountlyNotificationService; do
+              xcrun swift-api-digester -diagnose-sdk -input-paths "$RUNNER_TEMP/$platform/base/$module.json" \
+                -input-paths "$RUNNER_TEMP/$platform/head/$module.json" -o "$RUNNER_TEMP/$platform/$module.txt"
+              grep -v -e '^/\*' -e '^$' "$RUNNER_TEMP/$platform/$module.txt" >> "$RUNNER_TEMP/breaking.txt" || true
+            done
+          done
           sort -u -o "$RUNNER_TEMP/breaking.txt" "$RUNNER_TEMP/breaking.txt"
 
       - name: Require a CHANGELOG entry for breaking changes
