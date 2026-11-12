@@ -13,7 +13,7 @@ concurrency:
 jobs:
   api:
     name: Breaking changes
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - name: Checkout SDK code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -21,8 +21,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # SwiftPM's API diagnosis in Xcode 16.4 fails with "Unable to parse empty data".
       - name: Set up Xcode
-        run: sudo xcode-select -switch /Applications/Xcode_16.4.app
+        run: sudo xcode-select -switch /Applications/Xcode_26.2.app
 
       # The first parent of the pull request's merge commit is the base branch it merges into.
       # iOS runs beside the host because some public API exists only on iOS, tvOS and visionOS.
