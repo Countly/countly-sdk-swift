@@ -1,0 +1,66 @@
+name: Public API
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api:
+    name: Breaking changes
+    runs-on: macos-15
+    steps:
+      - name: Checkout SDK code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Xcode
+        run: sudo xcode-select -switch /Applications/Xcode_16.4.app
+
+      # The first parent of the pull request's merge commit is the base branch it merges into.
+      # iOS runs beside the host because some public API exists only on iOS, tvOS and visionOS.
+      - name: Compare the public API with the base branch
+        run: |
+          base=$(git rev-parse HEAD^1)
+          : > "$RUNNER_TEMP/breaking.txt"
+
+          # Compares the public API with the base branch for the platform the options select and appends each break to breaking.txt.
+          diagnose() {
+            if ! swift package "$@" diagnose-api-breaking-changes "$base" > "$RUNNER_TEMP/diagnose.txt" 2>&1; then
+              if ! grep -q 'API breakage:' "$RUNNER_TEMP/diagnose.txt"; then
+                cat "$RUNNER_TEMP/diagnose.txt"
+                echo "::error::Could not compare the public API with the base branch."
+                exit 1
+              fi
+            fi
+            grep '💔 API breakage:' "$RUNNER_TEMP/diagnose.txt" | sed 's/^ *💔 //' >> "$RUNNER_TEMP/breaking.txt" || true
+          }
+
+          diagnose
+          diagnose --triple arm64-apple-ios15.0-simulator --sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          sort -u -o "$RUNNER_TEMP/breaking.txt" "$RUNNER_TEMP/breaking.txt"
+
+      - name: Require a CHANGELOG entry for breaking changes
+        run: |
+          if [ ! -s "$RUNNER_TEMP/breaking.txt" ]; then
+            echo "No breaking change to the public API." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "### Breaking changes to the public API"
+            echo '```'
+            cat "$RUNNER_TEMP/breaking.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if git diff --quiet HEAD^1 HEAD -- CHANGELOG.md; then
+            echo "::error title=Breaking API change::This pull request breaks the public API without a CHANGELOG.md entry. The job summary lists each break."
+            exit 1
+          fi
+          echo "::warning title=Breaking API change::This pull request breaks the public API. Check that CHANGELOG.md marks it as a breaking change."
