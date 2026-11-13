@@ -405,6 +405,29 @@ jobs:
             --simulators-result '${{ needs.simulators.result }}' \
             --output ci-report.md
 
+      - name: Write the CI report fragment (coverage)
+        if: ${{ !cancelled() }}
+        run: |
+          [ -s ci-report.md ] || exit 0
+          figures=$(awk '/^### /{inside = ($0 == "### Code coverage")} inside && /^[|] [A-Za-z]+ [|] [0-9.]+% [|]/ {printf "%s%s %s", sep, $2, $4; sep = ", "}' ci-report.md)
+          summary="See details"
+          if [ -n "$figures" ]; then
+            summary="Line coverage $figures"
+          fi
+          mkdir -p "$RUNNER_TEMP/ci-report-coverage"
+          {
+            printf 'Tests and coverage\n%s\n' "$summary"
+            tail -n +2 ci-report.md
+          } > "$RUNNER_TEMP/ci-report-coverage/report.md"
+
+      - name: Upload the CI report fragment (coverage)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-report-coverage
+          path: ${{ runner.temp }}/ci-report-coverage
+          if-no-files-found: ignore
+
       # One comment, updated in place, keyed by the HTML marker. The alternative is a new
       # comment on every push, which nobody reads after the third one.
       - name: Comment the report on the pull request
