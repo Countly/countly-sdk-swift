@@ -17,6 +17,7 @@ on:  # zizmor: ignore[dangerous-triggers] the job reads the pull request's artif
       - "Public API changes"
       - "Static analysis"
       - "Test the SDK"
+      - "Test the dSYM uploader"
     types: [completed]
 
 permissions: {}
