@@ -85,6 +85,8 @@ final class RequestScenarioTests: CountlyBaseTestCase {
 
     func testDeviceID() throws {
         try assertRequests("device-id") { countly, settle in
+            // A behavior settings answer that lands after the ID change makes the SDK fetch again, so it has to land first.
+            settle()
             countly.sessions.beginSession()
             countly.deviceID.changeWithMerge("parity-device-002")
             countly.events.recordEvent("after_merge")
