@@ -19,7 +19,10 @@ final class RequestScenarioTests: CountlyBaseTestCase {
     private static let maskedParams: Set<String> = ["timestamp", "hour", "dow", "tz", "sdk_version", "av", "rr", "checksum", "checksum256", "session_duration"]
     private static let jsonParams: Set<String> = ["events", "metrics", "user_details", "crash", "consent", "hc"]
     private static let maskedEventFields: Set<String> = ["timestamp", "hour", "dow", "id", "pvid", "cvid", "peid"]
-    private static let maskedCrashFields: Set<String> = ["_error", "_run", "_os", "_os_version", "_resolution", "_density", "_locale", "_device", "_device_type", "_manufacturer", "_cpu", "_opengl", "_ram_current", "_ram_total", "_disk_current", "_disk_total", "_bat", "_orientation", "_root", "_online", "_muted", "_background", "_app_version", "_app_build", "_build_uuid", "_binary_images", "_executable_name"]
+    private static let maskedCrashFields: Set<String> = ["_error", "_run", "_os", "_os_version", "_resolution", "_density", "_locale", "_device", "_device_type", "_manufacturer", "_cpu", "_opengl", "_ram_current", "_ram_total", "_disk_current", "_disk_total", "_orientation", "_root", "_online", "_muted", "_background", "_app_version", "_app_build", "_build_uuid", "_binary_images", "_executable_name"]
+    /// Crash fields the SDK sends only on some hardware: a Mac without a battery, such as a CI
+    /// machine, has no `_bat`. A laptop and a CI machine record different keys, so they are not compared.
+    private static let hardwareDependentCrashFields: Set<String> = ["_bat"]
     private static let maxInt = 2147483647
 
     override func setUpWithError() throws {
@@ -82,6 +85,8 @@ final class RequestScenarioTests: CountlyBaseTestCase {
 
     func testDeviceID() throws {
         try assertRequests("device-id") { countly, settle in
+            // A behavior settings answer that lands after the ID change makes the SDK fetch again, so it has to land first.
+            settle()
             countly.sessions.beginSession()
             countly.deviceID.changeWithMerge("parity-device-002")
             countly.events.recordEvent("after_merge")
@@ -259,7 +264,7 @@ final class RequestScenarioTests: CountlyBaseTestCase {
             }
         }
         if key == "crash", let object = parsed as? [String: Any] {
-            return masked(object, maskedCrashFields)
+            return masked(object.filter { !hardwareDependentCrashFields.contains($0.key) }, maskedCrashFields)
         }
         return parsed
     }

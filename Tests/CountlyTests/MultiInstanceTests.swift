@@ -136,18 +136,21 @@ final class MultiInstanceTests: CountlyBaseTestCase {
         let busy = startInstance { $0.eventSendThreshold = 1000 }
         let quiet = startInstance { $0.eventSendThreshold = 1 }
 
-        let before = Int64(Date().timeIntervalSince1970 * 1000)
-        for index in 0..<3000 {
-            busy.events.recordEvent("burst-\(index)")
+        // Straight on the clock rather than through events: only a burst faster than one a millisecond runs a clock ahead.
+        let busyClock = core(of: busy).clock
+        for _ in 0..<3000 {
+            _ = busyClock.nowMs()
         }
 
         quiet.events.recordEvent("after-the-burst")
+        let after = Int64(Date().timeIntervalSince1970 * 1000)
 
         guard let request = TestUtils.request(requestQueue(of: quiet), at: 0) else { return }
         let timestamp = TestUtils.int64(TestUtils.events(in: request)[0]["timestamp"]) ?? 0
 
-        XCTAssertLessThan(timestamp - before, 60_000,
-                          "the quiet instance's clock should be near real time, not dragged forward")
+        XCTAssertGreaterThan(busyClock.nowMs(), after + 2_000, "the burst should have run the busy instance's own clock ahead")
+        XCTAssertLessThanOrEqual(timestamp, after + 1_000,
+                                 "the quiet instance's clock should be near real time, not dragged forward")
     }
 
     // MARK: - Lifecycle

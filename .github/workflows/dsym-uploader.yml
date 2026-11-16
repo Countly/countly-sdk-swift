@@ -1,0 +1,55 @@
+name: Test the dSYM uploader
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - master
+      - staging
+    paths:
+      - countly_dsym_uploader.sh
+      - Tests/DsymUploaderTests/**
+      - .github/workflows/dsym-uploader.yml
+  pull_request:
+    branches:
+      - master
+      - staging
+    paths:
+      - countly_dsym_uploader.sh
+      - Tests/DsymUploaderTests/**
+      - .github/workflows/dsym-uploader.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Customers run the script through `sh` from an Xcode build phase, so it has to stay
+  # POSIX sh: /bin/sh is not bash everywhere it runs.
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout SDK code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Check the script
+        run: shellcheck --shell=sh countly_dsym_uploader.sh
+
+  # macOS because the tests build real dSYMs with clang and dsymutil and the script reads
+  # them with dwarfdump. The path filter above keeps this off the single macOS runner
+  # unless the script or its tests change.
+  tests:
+    name: dSYM uploader tests (macOS)
+    runs-on: macos-15
+    steps:
+      - name: Checkout SDK code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Set up Xcode
+        run: sudo xcode-select -switch /Applications/Xcode_16.4.app
+
+      - name: Run the tests
+        run: python3 -m unittest discover -s Tests/DsymUploaderTests -v

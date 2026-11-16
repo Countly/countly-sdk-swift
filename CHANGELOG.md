@@ -1,3 +1,10 @@
+## XX.XX.XX
+
+* Added the "countly_dsym_uploader.sh" script, which uploads dSYM files to the server so crash reports can be symbolicated:
+  * Called from a Run Script build phase through the Swift Package Manager checkout, or given a dSYM or a folder of them, such as an archive's "dSYMs" folder, on CI
+  * Uploads each dSYM under the platform it was built for, read from the dSYM itself
+  * Never fails the build unless "COUNTLY_DSYM_STRICT" is set to 1, and does not upload a dSYM it could not read in full
+
 ## 26.8.0
 
 * Initial release of the Countly Swift SDK.

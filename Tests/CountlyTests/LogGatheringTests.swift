@@ -1141,13 +1141,18 @@ final class LogGatheringTests: CountlyBaseTestCase {
     private func gatheredMessages(of instance: CountlyInstance, gatherID: String) -> [String] {
         let gatherer = gatherer(of: instance)
         let held = gatherer.currentDirective.gatherID == gatherID ? messages(gatherer) + awaitingMessages(gatherer) : []
-        let handedOver = (requestQueue(of: instance) + MockURLProtocol.requests.map(\.query))
+        return held + handedOverMessages(of: instance, gatherID: gatherID)
+    }
+
+    /// Every line the gather `gatherID` handed to the request queue: still queued
+    /// in a batch, or already taken by the mock, since an accepted batch leaves the queue.
+    private func handedOverMessages(of instance: CountlyInstance, gatherID: String) -> [String] {
+        (requestQueue(of: instance) + MockURLProtocol.requests.map(\.query))
             .map(TestUtils.parseQuery)
             .compactMap { $0["sdk_logs"] as? [String: Any] }
             .filter { ($0["i"] as? String) == gatherID }
             .flatMap { lines(in: $0) }
             .compactMap { $0["m"] as? String }
-        return held + handedOver
     }
 
     /// Whether a captured request is an ordinary one carrying `key`, rather than
@@ -1389,9 +1394,10 @@ final class LogGatheringTests: CountlyBaseTestCase {
 
         countly.events.recordEvent("purchase")
         countly.userProfile.setProperty("email", value: "someone@example.com")
-        gatherer(of: countly).flushNow()
+        // Not held behind a startup batch the mock has not answered yet: this test is about consent, not batch order.
+        gatherer(of: countly).flushNow(ignoringQueuedBatch: true)
 
-        let uploaded = uploadedMessages(of: countly)
+        let uploaded = handedOverMessages(of: countly, gatherID: "gather_open")
         XCTAssertTrue(uploaded.contains { $0.contains("[Events]") && $0.contains("purchase") })
         XCTAssertTrue(uploaded.contains { $0.contains("someone@example.com") })
         XCTAssertTrue(uploaded.contains { $0.contains("initializing, appKey") })
