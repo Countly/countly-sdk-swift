@@ -142,6 +142,30 @@ class NotificationService: UNNotificationServiceExtension {
 }
 ```
 
+## Crash symbolication
+
+Crash reports are symbolicated with the dSYM files of the build they came from.
+To upload them on every archive, add a Run Script phase as the last build phase of each target that ships code (your app and each app extension), check "For install builds only", uncheck "Based on dependency analysis", and call the script that comes with the package:
+
+```sh
+COUNTLY_UPLOADER="${BUILD_DIR%/Build/*}/SourcePackages/checkouts/countly-sdk-swift/countly_dsym_uploader.sh"
+if [ -f "$COUNTLY_UPLOADER" ]; then
+  sh "$COUNTLY_UPLOADER" "https://YOUR_COUNTLY_SERVER" "YOUR_APP_KEY"
+else
+  echo "warning: [Countly] countly_dsym_uploader.sh was not found at $COUNTLY_UPLOADER"
+fi
+```
+
+Add these Input Files to the phase. They make Xcode run it after the dSYM is written, and let it read the dSYM when User Script Sandboxing is enabled:
+
+```text
+${DWARF_DSYM_FOLDER_PATH}/${DWARF_DSYM_FILE_NAME}
+${DWARF_DSYM_FOLDER_PATH}/${DWARF_DSYM_FILE_NAME}/Contents/Info.plist
+${DWARF_DSYM_FOLDER_PATH}/${DWARF_DSYM_FILE_NAME}/Contents/Resources/DWARF/${EXECUTABLE_NAME}
+```
+
+On CI, pass a dSYM or a folder of them, such as an archive's `dSYMs` folder, as a third argument. Each dSYM is uploaded under the platform it was built for. The script never fails the build unless `COUNTLY_DSYM_STRICT=1` is set; its header lists every option.
+
 ## Requirements
 
 iOS 15, tvOS 15, watchOS 9, macOS 12, visionOS 1. Swift 5.9. These are the oldest deployment targets Xcode 27 builds for.
