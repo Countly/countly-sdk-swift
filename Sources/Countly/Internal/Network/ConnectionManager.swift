@@ -77,6 +77,13 @@ final class ConnectionManager: NSObject {
     private var urlSession: URLSession?
     private var immediateSession: URLSession?
 
+    /// The host, as `normalizedHost`, whose last behavior settings answer said
+    /// it reads gzip request bodies, and whether a compressed request was
+    /// refused since. Guarded by `compressionLock`.
+    private let compressionLock = NSLock()
+    private var gzipAcceptingHost: String?
+    private var isCompressionBlocked = false
+
     init(core: SDKCore, builder: RequestBuilder) {
         self.core = core
         self.builder = builder
@@ -319,7 +326,9 @@ final class ConnectionManager: NSObject {
             queryString = builder.appendChecksum(queryString)
         }
 
-        let request = buildRequest(queryString: queryString, endpoint: endpoint, pictureUpload: pictureUpload)
+        var built = buildRequest(queryString: queryString, endpoint: endpoint, pictureUpload: pictureUpload)
+        let isCompressed = compressIfAllowed(&built)
+        let request = built
         let startedAt = Date()
 
         // The core is captured strongly for the life of the callback: it is held
@@ -361,6 +370,9 @@ final class ConnectionManager: NSObject {
                                        response: response,
                                        isSdkLogsTransport: isSdkLogsTransport)
                 } else {
+                    if isCompressed {
+                        self.blockRequestCompression()
+                    }
                     self.handleServerFailure(statusCode: statusCode,
                                              data: data,
                                              request: request,
@@ -855,7 +867,8 @@ final class ConnectionManager: NSObject {
         let sentSize = (request.url?.absoluteString.count ?? 0) + bodySize
         core.logger.i(Self.module, "logRequest", "sending request, endpoint: [\(request.url?.path ?? "")], method: [\(request.httpMethod ?? "GET")], approximateSentDataSize: [\(sentSize)], bodySize: [\(bodySize)]")
 
-        core.logger.v(Self.module, "logRequest", "request detail, method: [\(request.httpMethod ?? "GET")], URL: [\(request.url?.absoluteString ?? "")], body: [\(request.httpBody.flatMap { String(data: $0, encoding: .utf8) } ?? "binary picture upload data")]")
+        let body = Self.isCompressed(request) ? "gzip-compressed" : request.httpBody.flatMap { String(data: $0, encoding: .utf8) } ?? "binary picture upload data"
+        core.logger.v(Self.module, "logRequest", "request detail, method: [\(request.httpMethod ?? "GET")], URL: [\(request.url?.absoluteString ?? "")], body: [\(body)]")
     }
 
     // MARK: - Tasks
@@ -897,16 +910,29 @@ final class ConnectionManager: NSObject {
     }
 
     /// The counterpart of ``queuedTask(with:completionHandler:)`` on the instant
-    /// session, for the requests that skip the queue.
+    /// session, for the requests that skip the queue. Their body is sent
+    /// compressed when ``compressIfAllowed(_:)`` allows it, and an answer that is
+    /// not a 2xx JSON one then stops request compression.
     func instantTask(with request: URLRequest,
                      completionHandler: @escaping (Data?, URLResponse?, Error?) -> Void) -> URLSessionDataTask? {
+        var sent = request
+        var handler = completionHandler
+        if compressIfAllowed(&sent) {
+            handler = { [weak self] data, response, error in
+                if error == nil, response != nil, !Self.isAcceptedInstantAnswer(response: response, data: data) {
+                    self?.blockRequestCompression()
+                }
+                completionHandler(data, response, error)
+            }
+        }
+
         sessionLock.lock()
         defer { sessionLock.unlock() }
         guard !isHalted else {
             core.logger.d(Self.module, "instantTask", "the request is not sent, the connection manager is halted, endpoint: [\(request.url?.path ?? "")]")
             return nil
         }
-        return instantSessionLocked().dataTask(with: request, completionHandler: completionHandler)
+        return instantSessionLocked().dataTask(with: sent, completionHandler: handler)
     }
 
     // MARK: - Sessions
@@ -1201,7 +1227,11 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
     func fetchServerConfig(completion: @escaping (Data?, Int, Error?) -> Void) {
         var queryString = builder.queryEssentials()
         queryString += "&\(QS.method)=\(ServerConfig.fetchMethod)"
+        if core.config.enableRequestCompression {
+            queryString += "&\(Self.gzipKey)=1"
+        }
         queryString = builder.finishImmediateRequest(queryString)
+        let requestedHost = core.config.normalizedHost
 
         let request = instantRequest(queryString: queryString, path: Endpoint.output + Endpoint.sdk)
         core.logger.d(Self.module, "fetchServerConfig", "behavior settings request is prepared, method: [\(request.httpMethod ?? "GET")], queryLength: [\(queryString.count)]")
@@ -1210,6 +1240,9 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
             _ = core
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             self?.core.logger.d(Self.module, "fetchServerConfig", "behavior settings response received, statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)], errorDescription: [\(error?.localizedDescription ?? "none")]")
+            if error == nil {
+                self?.takeGzipAnswer(statusCode: statusCode, data: data, host: requestedHost)
+            }
             completion(data, statusCode, error)
         }?.resume()
     }
@@ -1220,5 +1253,105 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
         Self.setFormBody(queryString, on: &request)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         return request
+    }
+}
+
+// MARK: - Request compression
+
+extension ConnectionManager {
+
+    static let compressionMinBytes = 1024
+    // the server refuses a compressed body that is larger than this once decoded
+    static let compressionMaxBytes = 1024 * 1024
+    static let compressionMarker = "content_encoding=gzip"
+    /// The behavior settings request parameter that asks whether the server reads
+    /// gzip bodies, and the top level answer key, a sibling of `c`, that says so.
+    static let gzipKey = "gzip"
+
+    /// Sends `request` gzip-compressed when request compression is on, the
+    /// current server said in its behavior settings answer that it reads
+    /// compressed bodies, no compressed request was refused since that answer,
+    /// and the request is a form POST between 1 KB and 1 MB whose URL has no
+    /// query: the compression marker has to be the only query of the URL.
+    ///
+    /// - Returns: whether `request` now carries the compressed body.
+    func compressIfAllowed(_ request: inout URLRequest) -> Bool {
+        guard core.config.enableRequestCompression else { return false }
+        compressionLock.lock()
+        let isAllowed = !isCompressionBlocked && gzipAcceptingHost != nil && gzipAcceptingHost == core.config.normalizedHost
+        compressionLock.unlock()
+
+        guard isAllowed,
+              request.httpMethod == "POST",
+              let url = request.url,
+              (url.query ?? "").isEmpty,
+              request.value(forHTTPHeaderField: "Content-Type")?.hasPrefix("multipart/form-data") != true,
+              let body = request.httpBody,
+              (Self.compressionMinBytes...Self.compressionMaxBytes).contains(body.count),
+              let compressed = body.gzipCompressed(),
+              compressed.count < body.count,
+              var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return false }
+
+        components.percentEncodedQuery = Self.compressionMarker
+        guard let marked = components.url else { return false }
+
+        core.logger.d(Self.module, "compressIfAllowed", "the request body is sent gzip-compressed, endpoint: [\(url.path)], bodySize: [\(body.count)] -> [\(compressed.count)]")
+        core.logger.v(Self.module, "compressIfAllowed", "compressed request detail, plain body: [\(String(decoding: body, as: UTF8.self))]")
+        request.url = marked
+        request.httpBody = compressed
+        return true
+    }
+
+    /// Whether `request` sends its body compressed: its URL carries the
+    /// compression marker as its query.
+    static func isCompressed(_ request: URLRequest) -> Bool {
+        request.url?.query == compressionMarker
+    }
+
+    /// Whether the answer to a request that skipped the queue accepted it: a 2xx
+    /// status with a body that is a JSON object or array.
+    static func isAcceptedInstantAnswer(response: URLResponse?, data: Data?) -> Bool {
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+              let data, !data.isEmpty else { return false }
+        return (try? JSONSerialization.jsonObject(with: data, options: [])) != nil
+    }
+
+    /// Stops request compression after the server, or something in front of it,
+    /// answered a compressed request without accepting it, until the next
+    /// behavior settings answer says that the server reads compressed bodies, or
+    /// the SDK starts again.
+    func blockRequestCompression() {
+        compressionLock.lock()
+        let wasBlocked = isCompressionBlocked
+        isCompressionBlocked = true
+        compressionLock.unlock()
+        if !wasBlocked {
+            core.logger.i(Self.module, "blockRequestCompression", "a compressed request was refused, requests are sent uncompressed until a behavior settings answer says that the server reads compressed bodies, or the SDK starts again")
+        }
+    }
+
+    /// Takes the `gzip` key of a live behavior settings answer from `host`:
+    /// `true` turns request compression on for that server, also after a refused
+    /// compressed request had stopped it; an answer without it turns compression
+    /// off. Only a 200 answer that is a JSON object counts. The key is never
+    /// stored, as only `v`, `t` and `c` of an answer are.
+    func takeGzipAnswer(statusCode: Int, data: Data?, host: String) {
+        guard core.config.enableRequestCompression, statusCode == 200,
+              let data, let answer = (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: Any] else { return }
+
+        // a JSON true only: a number 1 also bridges to Bool
+        let isAccepted = (answer[Self.gzipKey] as? NSNumber).map { CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue } ?? false
+        compressionLock.lock()
+        gzipAcceptingHost = isAccepted ? host : nil
+        let wasBlocked = isCompressionBlocked
+        if isAccepted {
+            isCompressionBlocked = false
+        }
+        compressionLock.unlock()
+
+        if isAccepted && wasBlocked {
+            core.logger.i(Self.module, "takeGzipAnswer", "a behavior settings answer says that the server reads compressed bodies, requests are compressed again")
+        }
+        core.logger.d(Self.module, "takeGzipAnswer", "the server \(isAccepted ? "reads" : "does not say it reads") compressed request bodies, host: [\(host)]")
     }
 }
