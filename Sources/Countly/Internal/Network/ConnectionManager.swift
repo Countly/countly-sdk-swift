@@ -327,7 +327,7 @@ final class ConnectionManager: NSObject {
         }
 
         var built = buildRequest(queryString: queryString, endpoint: endpoint, pictureUpload: pictureUpload)
-        let isCompressed = compressIfAllowed(&built)
+        _ = compressIfAllowed(&built)
         let request = built
         let startedAt = Date()
 
@@ -370,9 +370,6 @@ final class ConnectionManager: NSObject {
                                        response: response,
                                        isSdkLogsTransport: isSdkLogsTransport)
                 } else {
-                    if isCompressed {
-                        self.blockRequestCompression()
-                    }
                     self.handleServerFailure(statusCode: statusCode,
                                              data: data,
                                              request: request,
@@ -445,6 +442,10 @@ final class ConnectionManager: NSObject {
                                      callback: RequestCallback?,
                                      callbackID: String?) {
         core.logger.d(Self.module, "proceedOnQueue", "request failed, endpoint: [\(request.url?.path ?? "")], statusCode: [\(statusCode)], responseSize: [\(data?.count ?? 0)]")
+
+        if Self.isCompressed(request) {
+            blockRequestCompression()
+        }
 
         let body = data.flatMap { String(data: $0, encoding: .utf8) }
         core.logger.v(Self.module, "proceedOnQueue", "failed request detail, fullResponseURL: [\(request.url?.absoluteString ?? "")], serverErrorResponseBody: [\(body ?? "")]")
@@ -1296,7 +1297,7 @@ extension ConnectionManager {
         guard let marked = components.url else { return false }
 
         core.logger.d(Self.module, "compressIfAllowed", "the request body is sent gzip-compressed, endpoint: [\(url.path)], bodySize: [\(body.count)] -> [\(compressed.count)]")
-        core.logger.v(Self.module, "compressIfAllowed", "compressed request detail, plain body: [\(String(decoding: body, as: UTF8.self))]")
+        core.logger.v(Self.module, "compressIfAllowed", "compressed request detail, plain body: [\(String(data: body, encoding: .utf8) ?? "")]")
         request.url = marked
         request.httpBody = compressed
         return true
