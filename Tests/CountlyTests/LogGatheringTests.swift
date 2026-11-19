@@ -1209,9 +1209,11 @@ final class LogGatheringTests: CountlyBaseTestCase {
         XCTAssertFalse(core(of: countly).logger.isEnabled(.debug), "nothing reaches the console")
         XCTAssertTrue(core(of: countly).logger.isWanted(.debug), "but the capture still wants the line")
 
-        let before = gatherer(of: countly).heldLineCount
         countly.events.recordEvent("probe")
-        XCTAssertGreaterThan(gatherer(of: countly).heldLineCount, before)
+        // a batch that fills moves the held lines to the request queue, so the line is looked for in both
+        TestUtils.waitUntil("the event's line is captured") {
+            (messages(gatherer(of: countly)) + uploadedMessages(of: countly)).contains { $0.contains("[Events]") && $0.contains("probe") }
+        }
     }
 
     func testTheUploadDoesNotGatherItsOwnTransportLines() throws {
