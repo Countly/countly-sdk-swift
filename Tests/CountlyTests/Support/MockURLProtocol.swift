@@ -25,6 +25,8 @@ final class MockURLProtocol: URLProtocol {
         let url: URL
         let method: String
         let body: String
+        /// The body as it went over the wire, for a body that is not text.
+        let bodyData: Data
         /// Every header on the request, the session's additional headers included.
         let headers: [String: String]
 
@@ -135,16 +137,17 @@ final class MockURLProtocol: URLProtocol {
     override func startLoading() {
         // URLSession strips httpBody by the time the protocol sees the request, so
         // the stream is what a POST body has to be read from.
-        var body = ""
+        var bodyData = Data()
         if let data = request.httpBody {
-            body = String(decoding: data, as: UTF8.self)
+            bodyData = data
         } else if let stream = request.httpBodyStream {
-            body = MockURLProtocol.readAll(stream)
+            bodyData = MockURLProtocol.readAll(stream)
         }
 
         let captured = Captured(url: request.url ?? URL(string: "about:blank")!,
                                 method: request.httpMethod ?? "GET",
-                                body: body,
+                                body: String(decoding: bodyData, as: UTF8.self),
+                                bodyData: bodyData,
                                 headers: request.allHTTPHeaderFields ?? [:])
 
         MockURLProtocol.lock.lock()
@@ -183,7 +186,7 @@ final class MockURLProtocol: URLProtocol {
 
     override func stopLoading() {}
 
-    private static func readAll(_ stream: InputStream) -> String {
+    private static func readAll(_ stream: InputStream) -> Data {
         stream.open()
         defer { stream.close() }
 
@@ -195,6 +198,6 @@ final class MockURLProtocol: URLProtocol {
             if read <= 0 { break }
             data.append(buffer, count: read)
         }
-        return String(decoding: data, as: UTF8.self)
+        return data
     }
 }

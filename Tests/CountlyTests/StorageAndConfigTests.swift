@@ -341,6 +341,7 @@ final class StorageAndConfigTests: CountlyBaseTestCase {
         original.sdkBehaviorSettings = "{}"
         original.disableSDKBehaviorSettingsUpdates = true
         original.disableBackoffMechanism = true
+        original.enableRequestCompression = true
 
         original.sdkInternalLimits.maxKeyLength = 7
         original.sdkInternalLimits.maxValueSize = 7
@@ -366,7 +367,7 @@ final class StorageAndConfigTests: CountlyBaseTestCase {
 
         let copy = original.snapshot()
 
-        XCTAssertEqual(Mirror(reflecting: original).children.count, 67)
+        XCTAssertEqual(Mirror(reflecting: original).children.count, 68)
         XCTAssertEqual(Mirror(reflecting: original.sdkInternalLimits).children.count, 7)
         XCTAssertEqual(Mirror(reflecting: original.crashes).children.count, 1)
         XCTAssertEqual(Mirror(reflecting: original.content).children.count, 11)

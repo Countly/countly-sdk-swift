@@ -12510,6 +12510,83 @@
           },
           {
             "kind": "Var",
+            "name": "enableRequestCompression",
+            "printedName": "enableRequestCompression",
+            "children": [
+              {
+                "kind": "TypeNominal",
+                "name": "Bool",
+                "printedName": "Swift.Bool",
+                "usr": "s:Sb"
+              }
+            ],
+            "declKind": "Var",
+            "usr": "c:@M@Countly@objc(cs)CountlyConfig(py)enableRequestCompression",
+            "mangledName": "$s7Countly0A6ConfigC24enableRequestCompressionSbvp",
+            "moduleName": "Countly",
+            "declAttributes": [
+              "HasInitialValue",
+              "Final",
+              "HasStorage",
+              "ObjC"
+            ],
+            "hasStorage": true,
+            "accessors": [
+              {
+                "kind": "Accessor",
+                "name": "Get",
+                "printedName": "Get()",
+                "children": [
+                  {
+                    "kind": "TypeNominal",
+                    "name": "Bool",
+                    "printedName": "Swift.Bool",
+                    "usr": "s:Sb"
+                  }
+                ],
+                "declKind": "Accessor",
+                "usr": "c:@M@Countly@objc(cs)CountlyConfig(im)enableRequestCompression",
+                "mangledName": "$s7Countly0A6ConfigC24enableRequestCompressionSbvg",
+                "moduleName": "Countly",
+                "implicit": true,
+                "declAttributes": [
+                  "Final",
+                  "ObjC"
+                ],
+                "accessorKind": "get"
+              },
+              {
+                "kind": "Accessor",
+                "name": "Set",
+                "printedName": "Set()",
+                "children": [
+                  {
+                    "kind": "TypeNominal",
+                    "name": "Void",
+                    "printedName": "()"
+                  },
+                  {
+                    "kind": "TypeNominal",
+                    "name": "Bool",
+                    "printedName": "Swift.Bool",
+                    "usr": "s:Sb"
+                  }
+                ],
+                "declKind": "Accessor",
+                "usr": "c:@M@Countly@objc(cs)CountlyConfig(im)setEnableRequestCompression:",
+                "mangledName": "$s7Countly0A6ConfigC24enableRequestCompressionSbvs",
+                "moduleName": "Countly",
+                "implicit": true,
+                "declAttributes": [
+                  "Final",
+                  "ObjC"
+                ],
+                "accessorKind": "set"
+              }
+            ]
+          },
+          {
+            "kind": "Var",
             "name": "disableHealthCheck",
             "printedName": "disableHealthCheck",
             "children": [
