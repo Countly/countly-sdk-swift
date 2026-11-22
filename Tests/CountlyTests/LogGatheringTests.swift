@@ -1557,6 +1557,7 @@ final class LogGatheringTests: CountlyBaseTestCase {
             Thread.sleep(forTimeInterval: 0.5)
             return (200, Data(ServerConfigBuilder().armLogGathering(id: "gather_previous_user").json().utf8))
         }
+        respondToBehaviorSettings(forDeviceID: "new_user", with: ServerConfigBuilder().json())
         let sink = LogSink()
         let countly = startInstance {
             $0.loggerDelegate = sink
