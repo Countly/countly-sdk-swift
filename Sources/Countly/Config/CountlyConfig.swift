@@ -377,6 +377,15 @@ public final class CountlyConfig: NSObject {
     /// still turn it on or off while they contain `bom`.
     public var disableBackoffMechanism: Bool = false
 
+    /// Sends request bodies between 1 KB and 1 MB gzip-compressed, once the
+    /// server's behavior settings answer says it reads them, so older servers
+    /// keep getting plain requests. A compressed request that the server, or
+    /// something in front of it, answers without accepting it stops compression
+    /// until the next behavior settings answer says so again. It needs the
+    /// behavior settings updates, which `disableSDKBehaviorSettingsUpdates` turns
+    /// off. Default off.
+    public var enableRequestCompression: Bool = false
+
     // MARK: - Health check
 
     /// Stops the health check request the SDK sends once per start. The counters
@@ -640,6 +649,7 @@ public final class CountlyConfig: NSObject {
         copy.sdkBehaviorSettings = sdkBehaviorSettings
         copy.disableSDKBehaviorSettingsUpdates = disableSDKBehaviorSettingsUpdates
         copy.disableBackoffMechanism = disableBackoffMechanism
+        copy.enableRequestCompression = enableRequestCompression
         copy.disableHealthCheck = disableHealthCheck
         copy.disableWebView = disableWebView
 

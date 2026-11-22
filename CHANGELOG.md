@@ -4,6 +4,7 @@
   * Called from a Run Script build phase through the Swift Package Manager checkout, or given a dSYM or a folder of them, such as an archive's "dSYMs" folder, on CI
   * Uploads each dSYM under the platform it was built for, read from the dSYM itself
   * Never fails the build unless "COUNTLY_DSYM_STRICT" is set to 1, and does not upload a dSYM it could not read in full
+* Added the "enableRequestCompression" config property. Request bodies between 1 KB and 1 MB are then sent gzip-compressed, once the server's SDK behavior settings answer says it reads them.
 
 ## 26.8.0
 
