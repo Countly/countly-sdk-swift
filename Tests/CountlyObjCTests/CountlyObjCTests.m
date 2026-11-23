@@ -116,6 +116,26 @@
     return [[self.countly.requestQueue queuedRequests] filteredArrayUsingPredicate:carries];
 }
 
+/// The first frame of the stack trace the newest queued crash report carries.
+- (NSString *)firstFrameOfLastCrash
+{
+    NSString *request = [self queuedRequestsContaining:@"crash="].lastObject;
+    NSString *value = [[request componentsSeparatedByString:@"crash="].lastObject componentsSeparatedByString:@"&"].firstObject;
+    NSData *json = [value.stringByRemovingPercentEncoding dataUsingEncoding:NSUTF8StringEncoding];
+    if (!json)
+        return nil;
+
+    NSDictionary *crash = [NSJSONSerialization JSONObjectWithData:json options:0 error:nil];
+    return [crash[@"_error"] componentsSeparatedByString:@"\n"].firstObject;
+}
+
+/// A backtrace line without its frame number, address and offset: the image and
+/// the function, which every call from one function shares.
+- (NSString *)functionOfFrame:(NSString *)frame
+{
+    return [frame stringByReplacingOccurrencesOfString:@"^\\d+\\s+|0x[0-9a-fA-F]+ | \\+ \\d+$" withString:@"" options:NSRegularExpressionSearch range:NSMakeRange(0, frame.length)];
+}
+
 - (void)testTheRegistryHandsBackTheStartedInstance
 {
     XCTAssertTrue(self.countly.isStarted);
@@ -219,6 +239,46 @@
     [self.countly.userProfile save];
 
     XCTAssertEqual([self queuedRequestsContaining:@"user_details="].count, 1u);
+}
+
+/// An error recorded without a stack trace carries the stack of the method that
+/// recorded it, starting at that method, through each of the record methods. The
+/// Objective-C entry each call goes through belongs to the SDK and is left out like
+/// the rest of its frames.
+- (void)testAnErrorRecordedWithoutAStackTraceStartsAtTheMethodThatRecordedIt
+{
+    [self.countly.consent giveConsentForFeatures:@[@(ConsentFeatureCrashReporting)]];
+    NSString *caller = [self functionOfFrame:NSThread.callStackSymbols.firstObject];
+
+    [self.countly.crashes recordError:@"named" isFatal:NO stackTrace:nil segmentation:nil];
+    XCTAssertEqualObjects([self functionOfFrame:[self firstFrameOfLastCrash]], caller, "recordError:");
+
+    [self.countly.crashes recordNSError:[NSError errorWithDomain:@"com.example" code:1 userInfo:nil] isFatal:NO stackTrace:nil segmentation:nil];
+    XCTAssertEqualObjects([self functionOfFrame:[self firstFrameOfLastCrash]], caller, "recordNSError:");
+
+    [self.countly.crashes recordException:[NSException exceptionWithName:@"CLYTestException" reason:@"never raised" userInfo:nil] isFatal:NO stackTrace:nil segmentation:nil];
+    XCTAssertEqualObjects([self functionOfFrame:[self firstFrameOfLastCrash]], caller, "recordException:");
+}
+
+/// An exception that was raised carries the stack it was raised on, and that is
+/// the one reported.
+- (void)testARaisedExceptionKeepsItsOwnStackTrace
+{
+    [self.countly.consent giveConsentForFeatures:@[@(ConsentFeatureCrashReporting)]];
+    NSException *raised = nil;
+    @try
+    {
+        [NSException raise:@"CLYTestException" format:@"raised"];
+    }
+    @catch (NSException *exception)
+    {
+        raised = exception;
+    }
+
+    [self.countly.crashes recordException:raised isFatal:NO stackTrace:nil segmentation:nil];
+
+    XCTAssertGreaterThan(raised.callStackSymbols.count, 0u);
+    XCTAssertEqualObjects([self firstFrameOfLastCrash], raised.callStackSymbols.firstObject);
 }
 
 @end
