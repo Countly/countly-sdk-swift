@@ -148,6 +148,7 @@
       "device_id" : "parity-device-001",
       "dow" : "<masked>",
       "hour" : "<masked>",
+      "jt" : "1",
       "method" : "sc",
       "rr" : "<masked>",
       "sdk_name" : "swift-native-ios",
