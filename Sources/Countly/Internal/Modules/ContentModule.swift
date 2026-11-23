@@ -32,7 +32,15 @@ final class ContentModule: ModuleBase {
 
     /// How many times a journey trigger retries before giving up and going back to
     /// ordinary polling.
-    private static let journeyFetchAttempts = 3
+    private static let queueCheckInterval: TimeInterval = 0.5
+    private static let queueChecks = 5
+    private static let contentRetryInterval: TimeInterval = 1.0
+    private static let contentRequests = 3
+    private static let earlyTriggerLimit = 50
+    /// Least time before the same trigger starts another round: a listed event key, view name or user property
+    private static let gapSpecificMs: Int64 = 10_000
+    /// Least time before the same trigger starts another round: any view, any user property or any error
+    private static let gapNonSpecificMs: Int64 = 60_000
 
     /// How long after launch content is allowed to appear, so it does not land on
     /// top of the application's own first screen.
@@ -63,7 +71,18 @@ final class ContentModule: ModuleBase {
     /// Set while a journey trigger's retry series is running, so a second trigger
     /// arriving during it does not start a series of its own. Cleared when a
     /// content is shown or the attempts run out.
-    private var isJourneyRetrying = false
+    // Guarded by stateLock: wanted after an enter, until an exit; exited after an exit, until an enter.
+    private var isZoneWanted = false
+    private var isZoneExited = false
+    private var behaviorSettingsSettled = false
+    private var triggersHalted = false
+
+    // Content trigger rounds, main queue only.
+    private var isTriggerRoundRunning = false
+    private var isTriggerRoundPending = false
+    private var contentTriggerChain: UInt = 0
+    private var triggerGeneration: UInt = 0
+    private var earlyTriggers: [RecordedTrigger] = []
 
     /// Bumped on every enter and every clear, so work scheduled by one visit to
     /// the zone cannot land after a later exit. The initial fetch is delayed by up
@@ -167,6 +186,11 @@ final class ContentModule: ModuleBase {
             return
         }
 
+        stateLock.lock()
+        isZoneWanted = true
+        isZoneExited = false
+        stateLock.unlock()
+
         // Claimed now rather than when the timer is created: the first fetch is
         // delayed by up to the initial delay, and a second enter inside that window
         // would otherwise pass the guard and leave an orphan timer polling forever.
@@ -212,6 +236,10 @@ final class ContentModule: ModuleBase {
     /// Stops polling and takes any displayed content off screen.
     func exitContentZone() {
         logI("exitContentZone", "exiting the content zone and taking the content off screen")
+        stateLock.lock()
+        isZoneWanted = false
+        isZoneExited = true
+        stateLock.unlock()
         clearContentState()
         closeShownContent()
     }
@@ -297,62 +325,317 @@ final class ContentModule: ModuleBase {
         core.network.proceedOnQueue()
     }
 
-    /// Refresh path used by journey triggers, which retries a few times because
-    /// the server may still be computing the journey's next step.
-    func refreshContentZoneForJourneyTrigger() {
-        guard isContentAvailable("refreshContentZoneForJourneyTrigger") else { return }
+    // MARK: - Content triggers
 
-        guard core.serverConfig.refreshContentZoneEnabled else {
-            logD("refreshContentZoneForJourneyTrigger", "the content zone refresh is disabled by the server config, skipping the journey content refresh")
-            return
-        }
-
-        guard !isShown() else {
-            logD("refreshContentZoneForJourneyTrigger", "a content is already shown, skipping the journey content refresh")
-            return
-        }
-
-        stateLock.lock()
-        if isJourneyRetrying {
-            stateLock.unlock()
-            logD("refreshContentZoneForJourneyTrigger", "a journey content fetch is already retrying, skipping this trigger")
-            return
-        }
-        isJourneyRetrying = true
-        stateLock.unlock()
-
-        clearContentState()
-        fetchForJourney(attempt: 1)
+    /// Something the SDK recorded, as content triggers compare it.
+    struct RecordedTrigger: Equatable {
+        /// The event key as the application passed it, or one of the `ContentTriggerKey` keys.
+        let key: String
+        /// The view name as the application passed it, for a view event.
+        var viewName: String? = nil
+        /// Whether the view event is the one recorded when the view ends.
+        var viewEnd = false
+        /// The user properties a user details request sends.
+        var properties: [String]? = nil
+        /// Whether it is an event of the application rather than one the SDK records itself.
+        var customEvent = false
     }
 
-    private func endJourneyRetry() {
-        stateLock.lock()
-        isJourneyRetrying = false
-        stateLock.unlock()
+    /// A recorded trigger that starts a round: the triggers its gap is kept for,
+    /// and the gap in milliseconds.
+    struct TriggerMatch {
+        let gapKeys: [String]
+        let gapMs: Int64
     }
 
-    private func fetchForJourney(attempt: Int) {
-        logD("fetchForJourney", "journey content fetch starting, attempt: [\(attempt)], maxAttempts: [\(Self.journeyFetchAttempts)]")
+    /// Checks whether something the SDK recorded is a content trigger and, when it
+    /// is, sends the queued requests and asks for content right away instead of
+    /// waiting for the content zone timer. Can be called on any thread.
+    func contentTriggerRecorded(_ trigger: RecordedTrigger) {
+        #if os(iOS) || os(visionOS) || os(macOS)
+        guard !areTriggersHalted else { return }
+        guard !core.config.disableWebView else { return }
+        stateLock.lock()
+        let settled = behaviorSettingsSettled
+        stateLock.unlock()
+        // Once the settings of this run are in, what matches nothing is dropped
+        // here, so only triggers reach the main queue.
+        if settled, contentTriggerMatch(trigger) == nil {
+            return
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.handleContentTrigger(trigger)
+        }
+        #endif
+    }
 
-        fetchContents(contentID: nil) { [weak self] in
+    /// Called when the behavior settings answer of this run arrived, or when none
+    /// will arrive. What was recorded before it and the settings in use did not
+    /// list is checked again, so content for a first session is still asked for.
+    ///
+    /// - Parameters:
+    ///   - answered: whether an answer arrived and was applied.
+    ///   - entersContentZone: whether the answer of a first start has "ecz" on,
+    ///     so the content zone is entered now.
+    func behaviorSettingsSettled(answered: Bool, entersContentZone: Bool) {
+        DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            let early = self.earlyTriggers
+            self.earlyTriggers.removeAll()
 
-            // Both hops capture `self` weakly again. The `guard let self` above
-            // makes it a strong local, and a nested block that captured that local
-            // would keep this module alive past the core it holds `unowned`: the
-            // retry is a second away, and an instance halted in between would be
-            // read after it was released.
-            if attempt < Self.journeyFetchAttempts {
-                self.logD("fetchForJourney", "retrying the journey content fetch in one second, nextAttempt: [\(attempt + 1)]")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                    self?.fetchForJourney(attempt: attempt + 1)
-                }
-            } else {
-                self.logD("fetchForJourney", "the journey content fetch exhausted every attempt, re-entering the content zone")
-                self.endJourneyRetry()
-                DispatchQueue.main.async { [weak self] in self?.enterContentZone() }
+            self.stateLock.lock()
+            let wasSettled = self.behaviorSettingsSettled
+            self.behaviorSettingsSettled = true
+            let isWanted = self.isZoneWanted
+            let isExited = self.isZoneExited
+            self.stateLock.unlock()
+
+            guard !wasSettled, answered else { return }
+
+            if entersContentZone, !isWanted, !isExited {
+                self.logD("behaviorSettingsSettled", "no behavior settings were stored at start, and the first answer has 'ecz' on, the content zone is entered")
+                self.enterContentZone()
+            }
+
+            for trigger in early where self.contentTriggerMatch(trigger) != nil {
+                self.logD("behaviorSettingsSettled", "the trigger was recorded before the behavior settings arrived, key: [\(trigger.key)]")
+                self.handleContentTrigger(trigger)
+                return
             }
         }
+    }
+
+    /// Whether what was recorded is a content trigger. When the behavior settings
+    /// carry content triggers, only they decide, and only while the content zone
+    /// is wanted. Otherwise a custom event key in the journey trigger events and a
+    /// view name in the journey trigger views decide, also while it is not wanted.
+    private func contentTriggerMatch(_ trigger: RecordedTrigger) -> TriggerMatch? {
+        let settings = core.serverConfig
+        let isView = trigger.key == ReservedEventKey.view
+        let viewSuffix = isView && trigger.viewEnd ? ":end" : ""
+
+        if let lists = settings.contentTriggers {
+            stateLock.lock()
+            let isWanted = isZoneWanted
+            stateLock.unlock()
+            guard isWanted else { return nil }
+
+            if isView, let name = trigger.viewName, lists.views.contains(name) {
+                return TriggerMatch(gapKeys: ["v:" + name + viewSuffix], gapMs: Self.gapSpecificMs)
+            }
+            if trigger.key == ContentTriggerKey.userProperties, let properties = trigger.properties {
+                let listed = properties.filter { lists.properties.contains($0) }
+                if !listed.isEmpty {
+                    return TriggerMatch(gapKeys: listed.map { "p:" + $0 }, gapMs: Self.gapSpecificMs)
+                }
+            }
+            guard lists.keys.contains(trigger.key) else { return nil }
+            let nonSpecific = isView || trigger.key == ContentTriggerKey.userProperties || trigger.key == ContentTriggerKey.crash
+            return TriggerMatch(gapKeys: [trigger.key + viewSuffix], gapMs: nonSpecific ? Self.gapNonSpecificMs : Self.gapSpecificMs)
+        }
+
+        if isView {
+            guard let name = trigger.viewName, settings.isJourneyTriggerView(name) else { return nil }
+            return TriggerMatch(gapKeys: ["v:" + name + viewSuffix], gapMs: Self.gapSpecificMs)
+        }
+        guard trigger.customEvent, settings.isJourneyTriggerEvent(trigger.key) else { return nil }
+        return TriggerMatch(gapKeys: [trigger.key], gapMs: Self.gapSpecificMs)
+    }
+
+    /// Main queue only. Starts a round when what was recorded is a content
+    /// trigger, content can be shown, and the trigger is outside its gap. A
+    /// trigger during a running round only makes one more round follow it.
+    private func handleContentTrigger(_ trigger: RecordedTrigger) {
+        guard !areTriggersHalted else { return }
+        guard let match = contentTriggerMatch(trigger) else {
+            rememberEarlyTrigger(trigger)
+            return
+        }
+
+        stateLock.lock()
+        let isExited = isZoneExited
+        stateLock.unlock()
+        guard !isExited, core.modules.consent.hasConsent(for: .content), !core.modules.deviceID.isTemporary else {
+            logD("handleContentTrigger", "the trigger is a content trigger, but content can not be shown now, so it is not asked for, key: [\(trigger.key)]")
+            return
+        }
+
+        guard claimContentTriggerGap(match) else {
+            logD("handleContentTrigger", "the trigger started a round less than [\(match.gapMs / 1000)] seconds ago, key: [\(trigger.key)]")
+            return
+        }
+
+        guard !isTriggerRoundRunning else {
+            logD("handleContentTrigger", "the trigger matched while a round is running, one more round follows it, key: [\(trigger.key)]")
+            isTriggerRoundPending = true
+            return
+        }
+
+        logD("handleContentTrigger", "the trigger matched, the queued requests are sent and content is asked for, key: [\(trigger.key)]")
+        startContentTriggerRound()
+    }
+
+    /// Main queue only. Keeps what was recorded before the behavior settings
+    /// answer of this run arrived.
+    private func rememberEarlyTrigger(_ trigger: RecordedTrigger) {
+        stateLock.lock()
+        let settled = behaviorSettingsSettled
+        stateLock.unlock()
+        guard !settled, earlyTriggers.count < Self.earlyTriggerLimit, !earlyTriggers.contains(trigger) else { return }
+        earlyTriggers.append(trigger)
+    }
+
+    /// Whether a matched trigger may start a round now. When it may, the time of
+    /// the round is stored, so the gap holds after a restart. Times older than the
+    /// longest gap are dropped, and a time in the future is ignored.
+    private func claimContentTriggerGap(_ match: TriggerMatch) -> Bool {
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let stored = core.keyValueStore.contentTriggerGaps
+        func inGap(_ value: Any?, _ gap: Int64) -> Bool {
+            guard let time = (value as? NSNumber)?.int64Value else { return false }
+            return now >= time && now - time < gap
+        }
+
+        guard match.gapKeys.contains(where: { !inGap(stored[$0], match.gapMs) }) else { return false }
+
+        var kept = stored.filter { inGap($0.value, Self.gapNonSpecificMs) }
+        for gapKey in match.gapKeys {
+            kept[gapKey] = NSNumber(value: now)
+        }
+        core.keyValueStore.contentTriggerGaps = kept
+        return true
+    }
+
+    /// Main queue only. Moves the recorded events into the request queue, sends
+    /// the queue, and asks for content once the requests queued until now are sent.
+    private func startContentTriggerRound() {
+        guard !areTriggersHalted else { return }
+        isTriggerRoundRunning = true
+        isTriggerRoundPending = false
+
+        core.modules.events.sendEvents()
+
+        guard let lastQueued = core.requestQueueStore.snapshot.last else {
+            contentTriggerChain &+= 1
+            requestTriggeredContent(chain: contentTriggerChain, attempt: 1)
+            endContentTriggerRound()
+            return
+        }
+
+        let remaining = Self.queuedCount(upTo: lastQueued, in: core.requestQueueStore.snapshot)
+        let generation = triggerGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.queueCheckInterval) { [weak self] in
+            self?.waitForTriggerQueue(lastQueued: lastQueued, previousRemaining: remaining, checksWithoutProgress: 0, generation: generation)
+        }
+    }
+
+    /// How many queued requests there are up to and including the given one, 0
+    /// when it is not queued any more.
+    private static func queuedCount(upTo request: String, in queue: [String]) -> Int {
+        guard let index = queue.lastIndex(of: request) else { return 0 }
+        return index + 1
+    }
+
+    /// Main queue only. Checks every `queueCheckInterval` whether the requests
+    /// queued when the round started are sent, and asks for content once they are.
+    /// When none of them is sent for `queueChecks` checks in a row (a request on
+    /// its way, the backoff mechanism or a failed request holds them back), or
+    /// temporary device ID mode starts, the round ends without asking for content,
+    /// and the content zone timer picks the content up.
+    private func waitForTriggerQueue(lastQueued: String, previousRemaining: Int, checksWithoutProgress: Int, generation: UInt) {
+        guard !areTriggersHalted else { return }
+        guard generation == triggerGeneration else { return }
+
+        guard !core.modules.deviceID.isTemporary else {
+            logD("waitForTriggerQueue", "temporary device ID mode started, the round ends without a content request")
+            endContentTriggerRound()
+            return
+        }
+
+        let remaining = Self.queuedCount(upTo: lastQueued, in: core.requestQueueStore.snapshot)
+        guard remaining > 0 else {
+            contentTriggerChain &+= 1
+            requestTriggeredContent(chain: contentTriggerChain, attempt: 1)
+            endContentTriggerRound()
+            return
+        }
+
+        let withoutProgress = remaining < previousRemaining ? 0 : checksWithoutProgress + 1
+        guard withoutProgress < Self.queueChecks else {
+            logD("waitForTriggerQueue", "the queued requests could not be sent in time, the round ends without a content request")
+            endContentTriggerRound()
+            return
+        }
+
+        core.network.proceedOnQueue()
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.queueCheckInterval) { [weak self] in
+            self?.waitForTriggerQueue(lastQueued: lastQueued, previousRemaining: remaining, checksWithoutProgress: withoutProgress, generation: generation)
+        }
+    }
+
+    /// Main queue only. Sends the content request of a round. When it brings no
+    /// content, it is sent again `contentRetryInterval` later, up to
+    /// `contentRequests` requests, because the server may still be processing what
+    /// triggered it. A newer round's content request stops the remaining ones of an
+    /// older round.
+    private func requestTriggeredContent(chain: UInt, attempt: Int) {
+        guard !areTriggersHalted else { return }
+        guard chain == contentTriggerChain else { return }
+
+        guard !isShown() else {
+            logD("requestTriggeredContent", "a content is already shown, no content request is sent")
+            return
+        }
+
+        stateLock.lock()
+        let isWanted = isZoneWanted
+        let isExited = isZoneExited
+        stateLock.unlock()
+        let zoneNeeded = core.serverConfig.contentTriggers != nil
+        guard !isExited, !zoneNeeded || isWanted else {
+            logD("requestTriggeredContent", "the content zone is not wanted now, no content request is sent")
+            return
+        }
+
+        logD("requestTriggeredContent", "content request is sent, attempt: [\(attempt)], maxAttempts: [\(Self.contentRequests)]")
+        fetchContents(contentID: nil) { [weak self] in
+            guard let self, attempt < Self.contentRequests else { return }
+            _ = self
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.contentRetryInterval) { [weak self] in
+                self?.requestTriggeredContent(chain: chain, attempt: attempt + 1)
+            }
+        }
+    }
+
+    /// Main queue only. Ends the queue part of a round, and starts the round a
+    /// trigger during it asked for.
+    private func endContentTriggerRound() {
+        isTriggerRoundRunning = false
+        guard isTriggerRoundPending else { return }
+        isTriggerRoundPending = false
+        let generation = triggerGeneration
+        DispatchQueue.main.async { [weak self] in
+            guard let self, generation == self.triggerGeneration else { return }
+            self.startContentTriggerRound()
+        }
+    }
+
+    /// Restarts a content zone that is entered, so a changed zone interval applies to it.
+    func restartZoneIfEntered() {
+        stateLock.lock()
+        let isEntered = isZoneEntered
+        stateLock.unlock()
+        guard isEntered else { return }
+        logD("restartZoneIfEntered", "the zone timer interval changed, the content zone is restarted")
+        clearContentState()
+        enterContentZone()
+    }
+
+    /// Whether the instance was halted, after which no content trigger acts.
+    private var areTriggersHalted: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return triggersHalted
     }
 
     /// Whether content can be fetched and shown in this run: the platform has web
@@ -428,7 +711,6 @@ final class ContentModule: ModuleBase {
 
         guard !isContentShown else { return (false, presentationSequence) }
         isContentShown = true
-        isJourneyRetrying = false
         presentationSequence &+= 1
         return (true, presentationSequence)
     }
@@ -778,6 +1060,7 @@ final class ContentModule: ModuleBase {
         closeShownContent()
         stateLock.lock()
         isRefreshPending = false
+        triggersHalted = true
         stateLock.unlock()
     }
 }

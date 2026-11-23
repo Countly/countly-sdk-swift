@@ -44,9 +44,13 @@ final class ServerConfig {
         /// stripped before the response is validated or cached, never persisted.
         static let connectionTest = "ct"
 
+        /// Content triggers, a sibling of `c`. Unlike the operator armed keys they
+        /// are the same for every user of the application, so they are stored with `c`.
+        static let contentTriggers = "jt"
+
         /// The only top level keys that reach storage. Anything else, the two
         /// operator armed keys above included, must not survive into the cache.
-        static let stored: Set<String> = [timestamp, version, config]
+        static let stored: Set<String> = [timestamp, version, config, contentTriggers]
     }
 
     /// Keys inside the `c` section, which also name what an apply changed.
@@ -115,6 +119,21 @@ final class ServerConfig {
 
     /// The `method` value of a behavior settings fetch.
     static let fetchMethod = "sc"
+
+    /// The behavior settings request parameter that asks for the content triggers.
+    static let contentTriggersRequestKey = "jt"
+
+    /// The content triggers of the settings in use, nil when they have none.
+    private(set) var contentTriggers: ContentTriggerLists?
+
+    /// Whether behavior settings were stored or provided at start. On a first
+    /// start, without them, the first answer decides "ecz".
+    private(set) var settingsStoredAtStart = false
+
+    private var autoContentTriggersDisabled = false
+
+    /// Told when the behavior settings answer of this run arrived, or that none will.
+    weak var contentModule: ContentModule?
 
     /// Where the document being applied came from. Carried only so a log dump
     /// says whether the SDK is running on last run's cache, on what the developer
@@ -322,6 +341,7 @@ final class ServerConfig {
         automaticViewTrackingEnabled = config.enableAutomaticViewTracking
         #endif
         automaticCrashReportingEnabled = config.features.contains(.crashReporting)
+        autoContentTriggersDisabled = config.content.disableAutoContentTriggers
 
         logger?.d(Self.module, "retrieveFromStorage", "automatic tracking flags seeded from the developer config, automaticSessionTracking: [\(automaticSessionTrackingEnabled)], automaticViewTracking: [\(automaticViewTrackingEnabled)], automaticCrashReporting: [\(automaticCrashReportingEnabled)], backoffMechanism: [\(backoffMechanism)]")
 
@@ -342,7 +362,9 @@ final class ServerConfig {
             }
         }
 
-        if populate(&stored, config: config, source: source) {
+        let applied = populate(&stored, config: config, source: source)
+        settingsStoredAtStart = applied
+        if applied {
             store.serverConfig = stored
         } else if source == .storedCache, !stored.isEmpty {
             logger?.d(Self.module, "retrieveFromStorage", "the stored behavior settings are not a valid answer and are removed, the developer configuration stays in effect")
@@ -399,12 +421,14 @@ final class ServerConfig {
         guard !updatesDisabled else {
             logger?.d(Self.module, "fetch", "fetch aborted, behavior settings updates are disabled")
             logGatherer?.decideOffIfUndecided("behavior settings updates are disabled, no directive can ever arrive")
+            notifySettled(false)
             return
         }
 
         guard let transport, !transport.isDeviceIDTemporary else {
             logger?.d(Self.module, "fetch", "fetch aborted, sdk is in temporary device ID mode")
             logGatherer?.decideOffIfUndecided("temporary device ID mode, no server response this run")
+            notifySettled(false)
             return
         }
 
@@ -431,18 +455,21 @@ final class ServerConfig {
                 let failure = error as NSError
                 self.logger?.d(Self.module, "fetch", "the behavior settings request failed at the transport level, the stored settings stay in effect, statusCode: [\(statusCode)], errorDomain: [\(failure.domain)], errorCode: [\(failure.code)], error: [\(failure.localizedDescription)]")
                 self.logGatherer?.decideOffIfUndecided("server config fetch failed")
+                self.notifySettled(false)
                 return
             }
 
             guard statusCode == 200 else {
                 self.logger?.d(Self.module, "fetch", "the server refused the behavior settings request, the stored settings stay in effect, statusCode: [\(statusCode)], responseLength: [\(data?.count ?? 0)]")
                 self.logGatherer?.decideOffIfUndecided("server config fetch was refused")
+                self.notifySettled(false)
                 return
             }
 
             guard var response = CountlyJSON.object(from: data, logger: self.logger) as? [String: Any] else {
                 self.logger?.d(Self.module, "fetch", "the behavior settings response is not a JSON object, previously stored behavior settings will be kept, responseLength: [\(data?.count ?? 0)]")
                 self.logGatherer?.decideOffIfUndecided("server config response is not usable")
+                self.notifySettled(false)
                 return
             }
 
@@ -453,12 +480,14 @@ final class ServerConfig {
             // A valid answer replaces the stored one whole: a setting the operator
             // removed has to stop applying, not live on from an earlier answer.
             var answer = response.filter { DocKey.stored.contains($0.key) }
-            if self.populate(&answer, config: config, source: .serverFetch) {
+            let applied = self.populate(&answer, config: config, source: .serverFetch)
+            if applied {
                 self.store.serverConfig = answer
                 self.logger?.d(Self.module, "fetch", "the fetched behavior settings replaced the stored ones, responseLength: [\(data?.count ?? 0)], settingCount: [\((answer[DocKey.config] as? [String: Any])?.count ?? 0)]")
             } else {
                 self.logger?.d(Self.module, "fetch", "the response is not a valid behavior settings answer, the stored settings stay in effect, responseLength: [\(data?.count ?? 0)]")
             }
+            self.notifySettled(applied)
 
             // Only a live response decides log gathering, never a stored document. A
             // live response without a usable directive decides against it.
@@ -581,6 +610,7 @@ final class ServerConfig {
 
         version = intValue(document[DocKey.version]) ?? 0
         timestamp = Int64(intValue(document[DocKey.timestamp]) ?? 0)
+        contentTriggers = readContentTriggers(&document)
 
         var section = rawConfig
         let unknownKeys = section.keys.filter { !Key.known.contains($0) }
@@ -1013,6 +1043,45 @@ final class ServerConfig {
     /// Whether starting this view should also flush the queue.
     func isJourneyTriggerView(_ viewName: String) -> Bool {
         currentFilters.journeyTriggerViews.contains(viewName)
+    }
+
+    // MARK: - Content triggers
+
+    /// Reads the content triggers (`jt`) next to `c`: event keys (`e`), view names
+    /// (`v`) and user properties (`p`) whose recording makes the SDK send the
+    /// queued requests and ask for content right away. Without them, with an
+    /// invalid value or with `disableAutoContentTriggers`, there are none, and the
+    /// journey trigger events and views apply. An invalid value is dropped from
+    /// the document, so it is not cached.
+    private func readContentTriggers(_ document: inout [String: Any]) -> ContentTriggerLists? {
+        guard !autoContentTriggersDisabled, let value = document[DocKey.contentTriggers], !(value is NSNull) else {
+            return nil
+        }
+        guard let lists = value as? [String: Any] else {
+            logger?.w(Self.module, "populate", "content triggers (jt) must be an object, they are ignored")
+            document.removeValue(forKey: DocKey.contentTriggers)
+            return nil
+        }
+
+        func list(_ name: String) -> Set<String> {
+            guard let raw = lists[name], !(raw is NSNull) else { return [] }
+            guard let array = raw as? [Any] else {
+                logger?.w(Self.module, "populate", "content triggers (jt) list [\(name)] must be an array, it is ignored")
+                return []
+            }
+            return Set(array.compactMap { $0 as? String }.filter { !$0.isEmpty })
+        }
+
+        let triggers = ContentTriggerLists(keys: list("e"), views: list("v"), properties: list("p"))
+        logger?.d(Self.module, "populate", "content triggers read, keyCount: [\(triggers.keys.count)], viewCount: [\(triggers.views.count)], propertyCount: [\(triggers.properties.count)]")
+        return triggers
+    }
+
+    /// Tells the content module that the behavior settings answer of this run
+    /// arrived, or that none will. On a first start, without stored or provided
+    /// settings, the first answer's "ecz" decides the content zone entry.
+    private func notifySettled(_ answered: Bool) {
+        contentModule?.behaviorSettingsSettled(answered: answered, entersContentZone: answered && !settingsStoredAtStart && enterContentZone)
     }
 }
 

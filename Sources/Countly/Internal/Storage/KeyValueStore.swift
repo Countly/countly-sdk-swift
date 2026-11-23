@@ -112,6 +112,15 @@ final class KeyValueStore {
         set { set(newValue, PersistencyKey.serverConfig) }
     }
 
+    // MARK: - Content triggers
+
+    /// When each content trigger last started a round, in milliseconds by gap
+    /// key, so that its gap holds after a restart.
+    var contentTriggerGaps: [String: Any] {
+        get { defaults.dictionary(forKey: namespace.key(PersistencyKey.contentTriggerGaps)) ?? [:] }
+        set { set(newValue.isEmpty ? nil : newValue, PersistencyKey.contentTriggerGaps) }
+    }
+
     // MARK: - Events
 
     /// The event queue: the events recorded and not yet moved into a request,
@@ -167,6 +176,7 @@ final class KeyValueStore {
             PersistencyKey.notificationPermission,
             PersistencyKey.remoteConfig,
             PersistencyKey.serverConfig,
+            PersistencyKey.contentTriggerGaps,
             PersistencyKey.healthCheckState,
             PersistencyKey.recordedEvents,
             PersistencyKey.preTemporaryDeviceID,

@@ -172,6 +172,7 @@ final class ConsentModule: ModuleBase {
         logD("giveConsent", "consent state after giving consent, grantedBefore: [\(stateBeforeChange)], grantedAfter: [\(Self.describe(granted))]")
 
         sendConsents()
+        core.modules.content.contentTriggerRecorded(.init(key: ContentTriggerKey.consent))
         core.logGatherer.consentDidChange()
     }
 
@@ -227,6 +228,7 @@ final class ConsentModule: ModuleBase {
 
         if source == .app {
             sendConsents()
+            core.modules.content.contentTriggerRecorded(.init(key: ContentTriggerKey.consent))
         }
         core.logGatherer.consentDidChange()
     }

@@ -386,6 +386,7 @@ final class CrashModule: ModuleBase {
             if isFatal {
                 core.requestQueueStore.saveSync()
             }
+            core.modules.content.contentTriggerRecorded(.init(key: ContentTriggerKey.crash))
         }
 
         finishProcessing(isAutoDetected: isAutoDetected)

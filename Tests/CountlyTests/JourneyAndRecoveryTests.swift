@@ -166,27 +166,36 @@ final class JourneyAndRecoveryTests: CountlyBaseTestCase {
             captured.path == "/i" ? (200, Data(Self.accepted.utf8)) : nil
         }
 
-        let countly = startInstance()
-        core(of: countly).modules.content.refreshContentZoneForJourneyTrigger()
+        let countly = startInstance {
+            $0.eventSendThreshold = 100
+            $0.sdkBehaviorSettings = ServerConfigBuilder()
+                .journeyTriggerEvents(["purchase"])
+                .json()
+        }
+        countly.events.recordEvent("purchase")
 
         TestUtils.waitUntil("the journey fetch is retried") {
             MockURLProtocol.requests.filter { $0.path.contains("/o/sdk/content") }.count >= 2
         }
     }
 
-    /// Two triggers close together run one retry series, not two: the second
-    /// trigger arrives while the first is still asking and is skipped.
-    func testASecondTriggerDuringTheRetrySeriesStartsNoSecondSeries() throws {
+    /// The same trigger twice close together runs one round, not two: the second
+    /// is inside the gap of the first and is skipped.
+    func testTheSameTriggerInsideItsGapStartsNoSecondRound() throws {
         try skipUnlessContentIsFetched()
 
         MockURLProtocol.respond { captured in
             captured.path == "/i" ? (200, Data(Self.accepted.utf8)) : nil
         }
 
-        let countly = startInstance()
-        let content = core(of: countly).modules.content
-        content.refreshContentZoneForJourneyTrigger()
-        content.refreshContentZoneForJourneyTrigger()
+        let countly = startInstance {
+            $0.eventSendThreshold = 100
+            $0.sdkBehaviorSettings = ServerConfigBuilder()
+                .journeyTriggerEvents(["purchase"])
+                .json()
+        }
+        countly.events.recordEvent("purchase")
+        countly.events.recordEvent("purchase")
 
         TestUtils.waitUntil("the retry series ran to its end") {
             MockURLProtocol.requests.filter { $0.path.contains("/o/sdk/content") }.count >= 3
@@ -194,21 +203,31 @@ final class JourneyAndRecoveryTests: CountlyBaseTestCase {
         TestUtils.pump(1.5)
 
         XCTAssertEqual(MockURLProtocol.requests.filter { $0.path.contains("/o/sdk/content") }.count, 3,
-                       "one series of three attempts, the second trigger must not add its own")
+                       "one round of three attempts, the second trigger must not add its own")
     }
 
-    func testTheJourneyRefreshIsSkippedWhenTheServerDisablesIt() throws {
-        try skipUnlessNetworkIsInterceptable()
-        MockURLProtocol.respondToEverything(json: Self.accepted)
+    /// A journey trigger asks for content directly, so the server's switch for the
+    /// content zone refresh does not hold it back.
+    func testAJourneyTriggerAsksForContentAlsoWhenTheServerDisablesTheRefresh() throws {
+        try skipUnlessContentIsFetched()
 
-        let countly = startInstance {
-            $0.sdkBehaviorSettings = ServerConfigBuilder().unknown("rcz", false).json()
+        MockURLProtocol.respond(pathContaining: "/o/sdk/content", json: "{}")
+        MockURLProtocol.respond { captured in
+            captured.path == "/i" ? (200, Data(Self.accepted.utf8)) : nil
         }
 
-        core(of: countly).modules.content.refreshContentZoneForJourneyTrigger()
-        TestUtils.pump(0.4)
+        let countly = startInstance {
+            $0.eventSendThreshold = 100
+            $0.sdkBehaviorSettings = ServerConfigBuilder()
+                .journeyTriggerEvents(["purchase"])
+                .unknown("rcz", false)
+                .json()
+        }
+        countly.events.recordEvent("purchase")
 
-        XCTAssertTrue(MockURLProtocol.requests.filter { $0.path.contains("/o/sdk/content") }.isEmpty)
+        TestUtils.waitUntil("the trigger event is sent and the content fetch follows") {
+            MockURLProtocol.requests.contains { $0.path.contains("/o/sdk/content") }
+        }
     }
 
     // MARK: - Breadcrumbs across launches

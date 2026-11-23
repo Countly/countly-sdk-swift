@@ -142,6 +142,17 @@ public final class CountlyContentConfig: NSObject {
     /// platform except macOS.
     public var showWidgetsWithinApp: Bool = false
 
+    /// Stops the SDK from asking the server for the content triggers of the
+    /// application's journeys and campaigns, and from following them.
+    ///
+    /// By default, when the application records something that starts a journey
+    /// or a campaign with content, the SDK sends what it holds and asks for that
+    /// content right away, instead of waiting for the content zone timer. With this
+    /// set, content comes only with the content zone timer and the application's
+    /// own calls, and the deprecated journey trigger events and views of the SDK
+    /// behavior settings apply instead.
+    public var disableAutoContentTriggers: Bool = false
+
     public override init() {}
 
     /// Takes every value of `other`, for the snapshot an instance runs on.
@@ -157,5 +168,6 @@ public final class CountlyContentConfig: NSObject {
         contentURLHandler = other.contentURLHandler
         allowedLinkSchemes = other.allowedLinkSchemes
         showWidgetsWithinApp = other.showWidgetsWithinApp
+        disableAutoContentTriggers = other.disableAutoContentTriggers
     }
 }

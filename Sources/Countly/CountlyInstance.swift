@@ -228,6 +228,7 @@ public final class CountlyInstance: NSObject {
         core.serverConfig.delegate = self
         core.serverConfig.logGatherer = core.logGatherer
         core.serverConfig.connectionTest = modules.connectionTest
+        core.serverConfig.contentModule = modules.content
     }
 
     /// Applies the config in the order the features depend on each other.
@@ -756,15 +757,10 @@ extension CountlyInstance: ServerConfigDelegate {
             core.modules.location.serverSettingChanged()
         }
 
-        // Only the server's own zone settings may move a zone the app entered; cleared, not exited, so displayed content stays.
-        let zoneSettingsChanged = changedKeys.contains(ServerConfig.Key.enterContentZone)
-            || (serverConfig.enterContentZone && changedKeys.contains(ServerConfig.Key.contentZoneInterval))
-        if zoneSettingsChanged, core.hasFinishedInit {
+        // "ecz" decides only the content zone entry at start; a changed zone interval restarts a zone that is entered.
+        if changedKeys.contains(ServerConfig.Key.contentZoneInterval), core.hasFinishedInit {
             DispatchQueue.main.async {
-                core.modules.content.clearContentState()
-                if serverConfig.enterContentZone {
-                    core.modules.content.enterContentZone()
-                }
+                core.modules.content.restartZoneIfEntered()
             }
         }
 

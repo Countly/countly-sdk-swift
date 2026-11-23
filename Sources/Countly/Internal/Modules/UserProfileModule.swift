@@ -496,8 +496,27 @@ final class UserProfileModule: ModuleBase {
 
         logD("save", "user details save finished, queuedRequestCount: [\(queuedRequestCount)]")
 
+        let sentProperties = sentPropertyNames()
         clearUserDetails()
+        if queuedRequestCount > 0, !sentProperties.isEmpty {
+            core.modules.content.contentTriggerRecorded(.init(key: ContentTriggerKey.userProperties, properties: sentProperties))
+        }
         return true
+    }
+
+    /// The user properties the pending user details send, as content triggers
+    /// name them: a user detail ("email"), or "custom." and the key of a custom
+    /// property. A local picture counts as the picture.
+    private func sentPropertyNames() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        var names = Array(predefinedFields.keys)
+        if pictureLocalPath != nil, !names.contains(UserProfileKey.picture) {
+            names.append(UserProfileKey.picture)
+        }
+        let customKeys = Set(customProperties.keys).union(customModifications.keys)
+        names += customKeys.map { "custom." + $0 }
+        return names
     }
 
     /// Saves automatically once the pending changes reach the server's "upcl"

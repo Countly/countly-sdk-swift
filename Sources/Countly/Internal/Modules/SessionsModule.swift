@@ -184,6 +184,7 @@ final class SessionsModule: ModuleBase {
         core.network.enqueue(queryString)
         core.modules.views.recordOrientation(force: true)
         core.network.proceedOnQueue()
+        core.modules.content.contentTriggerRecorded(.init(key: ContentTriggerKey.session))
     }
 
     /// Reports the time elapsed since the last update.
