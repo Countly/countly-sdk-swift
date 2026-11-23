@@ -32,6 +32,11 @@ let package = Package(
             dependencies: [],
             path: "Sources/Countly",
 
+            resources:
+            [
+                .copy("PrivacyInfo.xcprivacy")
+            ],
+
             linkerSettings:
             [
                 .linkedFramework("Foundation"),
