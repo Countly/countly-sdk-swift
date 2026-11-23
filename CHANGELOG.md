@@ -6,6 +6,8 @@
   * Never fails the build unless "COUNTLY_DSYM_STRICT" is set to 1, and does not upload a dSYM it could not read in full
 * Added the "enableRequestCompression" config property. Request bodies between 1 KB and 1 MB are then sent gzip-compressed, once the server's SDK behavior settings answer says it reads them.
 
+* Mitigated an issue where the SDK had no privacy manifest, so App Store Connect refused an app that did not itself declare the SDK's use of user defaults, disk space and system boot time. The new manifest also declares the crash, performance, device ID and diagnostic data the SDK collects.
+
 ## 26.8.0
 
 * Initial release of the Countly Swift SDK.
