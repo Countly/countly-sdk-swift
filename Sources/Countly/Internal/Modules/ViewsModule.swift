@@ -340,6 +340,16 @@ final class ViewsModule: ModuleBase {
 
     // MARK: - Internals
 
+    /// The name of a view that is open, as the application passed it, before the
+    /// key length limit cut it.
+    ///
+    /// - Parameter viewID: the ID of the view.
+    /// - Returns: the name, or nil for a view that is not open.
+    func viewNameAsGiven(forViewID viewID: String) -> String? {
+        guard let viewData = viewDataDictionary[viewID] else { return nil }
+        return viewData.viewNameAsGiven ?? viewData.viewName
+    }
+
     private func startViewInternal(_ viewName: String,
                                    customSegmentation: [String: Any]?,
                                    isAutoStoppedView: Bool,
@@ -399,6 +409,7 @@ final class ViewsModule: ModuleBase {
         viewData.startSegmentation = customSegmentation ?? [:]
         viewData.isAutoStoppedView = isAutoStoppedView
         viewData.isAutomatic = isAutomatic
+        viewData.viewNameAsGiven = viewName
         viewDataDictionary[viewID] = viewData
 
         core.modules.events.recordReservedEvent(ReservedEventKey.view,

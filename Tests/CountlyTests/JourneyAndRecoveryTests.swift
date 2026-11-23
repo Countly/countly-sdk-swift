@@ -57,6 +57,57 @@ final class JourneyAndRecoveryTests: CountlyBaseTestCase {
         }
     }
 
+    /// A journey trigger key longer than the key length limit is matched as the
+    /// application passed it: the event goes out cut to the limit, and the trigger
+    /// still fires.
+    func testAJourneyTriggerEventLongerThanTheKeyLimitIsMatchedAsPassed() throws {
+        try skipUnlessContentIsFetched()
+
+        let longKey = String(repeating: "k", count: 140)
+        MockURLProtocol.respond(pathContaining: "/o/sdk/content", json: "{}")
+        MockURLProtocol.respond { captured in
+            captured.path == "/i" ? (200, Data(Self.accepted.utf8)) : nil
+        }
+
+        let countly = startInstance {
+            $0.eventSendThreshold = 100
+            $0.sdkBehaviorSettings = ServerConfigBuilder()
+                .journeyTriggerEvents([longKey])
+                .json()
+        }
+
+        countly.events.recordEvent(longKey)
+
+        TestUtils.waitUntil("the trigger event is sent and the content fetch follows") {
+            MockURLProtocol.requests.contains { $0.path.contains("/o/sdk/content") }
+        }
+    }
+
+    /// A journey trigger view name longer than the key length limit is matched as
+    /// the application passed it.
+    func testAJourneyTriggerViewLongerThanTheKeyLimitIsMatchedAsPassed() throws {
+        try skipUnlessContentIsFetched()
+
+        let longName = String(repeating: "v", count: 140)
+        MockURLProtocol.respond(pathContaining: "/o/sdk/content", json: "{}")
+        MockURLProtocol.respond { captured in
+            captured.path == "/i" ? (200, Data(Self.accepted.utf8)) : nil
+        }
+
+        let countly = startInstance {
+            $0.eventSendThreshold = 100
+            $0.sdkBehaviorSettings = ServerConfigBuilder()
+                .journeyTriggerViews([longName])
+                .json()
+        }
+
+        countly.views.startView(longName)
+
+        TestUtils.waitUntil("the trigger view is sent and the content fetch follows") {
+            MockURLProtocol.requests.contains { $0.path.contains("/o/sdk/content") }
+        }
+    }
+
     /// An ordinary event is not a trigger and must not force a flush, or the
     /// batching that makes events cheap would stop working.
     func testAnOrdinaryEventDoesNotTriggerAContentFetch() throws {

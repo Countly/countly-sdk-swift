@@ -383,7 +383,7 @@ final class EventsModule: ModuleBase {
                 logD("record", "the reserved event is sent right away rather than with the next batch, key: [\(key)]")
             }
             enqueue(event,
-                    callback: journeyTriggerCallbackForReserved(key: key, segmentation: event.segmentation),
+                    callback: journeyTriggerCallbackForReserved(key: key, segmentation: event.segmentation, viewID: event.id),
                     sendsAtOnce: sendsAtOnce)
             return
         }
@@ -408,9 +408,9 @@ final class EventsModule: ModuleBase {
 
         logD("record", "the event is chained to the previous non reserved event, key: [\(truncatedKey)], eventID: [\(event.id)], previousEventID: [\(event.previousEventID ?? "")]")
 
-        let isJourneyTrigger = core.serverConfig.isJourneyTriggerEvent(truncatedKey)
+        let isJourneyTrigger = core.serverConfig.isJourneyTriggerEvent(key)
         if isJourneyTrigger {
-            logD("record", "the event key is a journey trigger, the batch will be sent immediately, key: [\(truncatedKey)]")
+            logD("record", "the event key is a journey trigger, the batch will be sent immediately, key: [\(key)]")
         }
 
         enqueue(event, callback: isJourneyTrigger ? journeyTriggerCallback() : nil, sendsAtOnce: false)
@@ -439,11 +439,11 @@ final class EventsModule: ModuleBase {
 
     /// A view event whose name is a journey trigger flushes like a trigger event.
     ///
-    /// The name is matched as sent, after truncation and filtering, so what the
-    /// server configured and what it receives are compared on the same value.
-    private func journeyTriggerCallbackForReserved(key: String, segmentation: [String: Any]?) -> RequestCallback? {
+    /// The name is matched as the application passed it, before the key length
+    /// limit cut it, like the key of a journey trigger event.
+    private func journeyTriggerCallbackForReserved(key: String, segmentation: [String: Any]?, viewID: String) -> RequestCallback? {
         guard key == ReservedEventKey.view,
-              let viewName = segmentation?[SegKey.name] as? String,
+              let viewName = core.modules.views.viewNameAsGiven(forViewID: viewID) ?? segmentation?[SegKey.name] as? String,
               core.serverConfig.isJourneyTriggerView(viewName) else { return nil }
         logD("journeyTriggerCallbackForReserved", "the view name is a journey trigger, the batch will be sent immediately, viewName: [\(viewName)]")
         return journeyTriggerCallback()

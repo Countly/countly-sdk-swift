@@ -46,6 +46,10 @@ final class CountlyViewData {
     /// The segmentation the view was started with, replayed when it restarts.
     var startSegmentation: [String: Any] = [:]
 
+    /// The view name as the application passed it, before the key length limit
+    /// cut it into `viewName`. Journey trigger views are compared with it.
+    var viewNameAsGiven: String?
+
     init(viewID: String, viewName: String, startTime: TimeInterval, startOrder: Int) {
         self.viewID = viewID
         self.viewName = viewName
