@@ -37,10 +37,6 @@ final class ContentModule: ModuleBase {
     private static let contentRetryInterval: TimeInterval = 1.0
     private static let contentRequests = 3
     private static let earlyTriggerLimit = 50
-    /// Least time before the same trigger starts another round: a listed event key, view name or user property
-    private static let gapSpecificMs: Int64 = 10_000
-    /// Least time before the same trigger starts another round: any view, any user property or any error
-    private static let gapNonSpecificMs: Int64 = 60_000
 
     /// How long after launch content is allowed to appear, so it does not land on
     /// top of the application's own first screen.
@@ -327,27 +323,6 @@ final class ContentModule: ModuleBase {
 
     // MARK: - Content triggers
 
-    /// Something the SDK recorded, as content triggers compare it.
-    struct RecordedTrigger: Equatable {
-        /// The event key as the application passed it, or one of the `ContentTriggerKey` keys.
-        let key: String
-        /// The view name as the application passed it, for a view event.
-        var viewName: String? = nil
-        /// Whether the view event is the one recorded when the view ends.
-        var viewEnd = false
-        /// The user properties a user details request sends.
-        var properties: [String]? = nil
-        /// Whether it is an event of the application rather than one the SDK records itself.
-        var customEvent = false
-    }
-
-    /// A recorded trigger that starts a round: the triggers its gap is kept for,
-    /// and the gap in milliseconds.
-    struct TriggerMatch {
-        let gapKeys: [String]
-        let gapMs: Int64
-    }
-
     /// Checks whether something the SDK recorded is a content trigger and, when it
     /// is, sends the queued requests and asks for content right away instead of
     /// waiting for the content zone timer. Can be called on any thread.
@@ -405,41 +380,17 @@ final class ContentModule: ModuleBase {
         }
     }
 
-    /// Whether what was recorded is a content trigger. When the behavior settings
-    /// carry content triggers, only they decide, and only while the content zone
-    /// is wanted. Otherwise a custom event key in the journey trigger events and a
-    /// view name in the journey trigger views decide, also while it is not wanted.
+    /// Whether what was recorded is a content trigger, see `ContentTriggerRules`.
     private func contentTriggerMatch(_ trigger: RecordedTrigger) -> TriggerMatch? {
         let settings = core.serverConfig
-        let isView = trigger.key == ReservedEventKey.view
-        let viewSuffix = isView && trigger.viewEnd ? ":end" : ""
-
-        if let lists = settings.contentTriggers {
-            stateLock.lock()
-            let isWanted = isZoneWanted
-            stateLock.unlock()
-            guard isWanted else { return nil }
-
-            if isView, let name = trigger.viewName, lists.views.contains(name) {
-                return TriggerMatch(gapKeys: ["v:" + name + viewSuffix], gapMs: Self.gapSpecificMs)
-            }
-            if trigger.key == ContentTriggerKey.userProperties, let properties = trigger.properties {
-                let listed = properties.filter { lists.properties.contains($0) }
-                if !listed.isEmpty {
-                    return TriggerMatch(gapKeys: listed.map { "p:" + $0 }, gapMs: Self.gapSpecificMs)
-                }
-            }
-            guard lists.keys.contains(trigger.key) else { return nil }
-            let nonSpecific = isView || trigger.key == ContentTriggerKey.userProperties || trigger.key == ContentTriggerKey.crash
-            return TriggerMatch(gapKeys: [trigger.key + viewSuffix], gapMs: nonSpecific ? Self.gapNonSpecificMs : Self.gapSpecificMs)
-        }
-
-        if isView {
-            guard let name = trigger.viewName, settings.isJourneyTriggerView(name) else { return nil }
-            return TriggerMatch(gapKeys: ["v:" + name + viewSuffix], gapMs: Self.gapSpecificMs)
-        }
-        guard trigger.customEvent, settings.isJourneyTriggerEvent(trigger.key) else { return nil }
-        return TriggerMatch(gapKeys: [trigger.key], gapMs: Self.gapSpecificMs)
+        stateLock.lock()
+        let isWanted = isZoneWanted
+        stateLock.unlock()
+        return ContentTriggerRules.match(trigger,
+                                         lists: settings.contentTriggers,
+                                         zoneWanted: isWanted,
+                                         isJourneyTriggerEvent: settings.isJourneyTriggerEvent,
+                                         isJourneyTriggerView: settings.isJourneyTriggerView)
     }
 
     /// Main queue only. Starts a round when what was recorded is a content
@@ -486,22 +437,10 @@ final class ContentModule: ModuleBase {
     }
 
     /// Whether a matched trigger may start a round now. When it may, the time of
-    /// the round is stored, so the gap holds after a restart. Times older than the
-    /// longest gap are dropped, and a time in the future is ignored.
+    /// the round is stored, so the gap holds after a restart.
     private func claimContentTriggerGap(_ match: TriggerMatch) -> Bool {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
-        let stored = core.keyValueStore.contentTriggerGaps
-        func inGap(_ value: Any?, _ gap: Int64) -> Bool {
-            guard let time = (value as? NSNumber)?.int64Value else { return false }
-            return now >= time && now - time < gap
-        }
-
-        guard match.gapKeys.contains(where: { !inGap(stored[$0], match.gapMs) }) else { return false }
-
-        var kept = stored.filter { inGap($0.value, Self.gapNonSpecificMs) }
-        for gapKey in match.gapKeys {
-            kept[gapKey] = NSNumber(value: now)
-        }
+        guard let kept = ContentTriggerRules.claimGap(match, stored: core.keyValueStore.contentTriggerGaps, now: now) else { return false }
         core.keyValueStore.contentTriggerGaps = kept
         return true
     }
@@ -522,18 +461,11 @@ final class ContentModule: ModuleBase {
             return
         }
 
-        let remaining = Self.queuedCount(upTo: lastQueued, in: core.requestQueueStore.snapshot)
+        let remaining = ContentTriggerRules.queuedCount(upTo: lastQueued, in: core.requestQueueStore.snapshot)
         let generation = triggerGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.queueCheckInterval) { [weak self] in
             self?.waitForTriggerQueue(lastQueued: lastQueued, previousRemaining: remaining, checksWithoutProgress: 0, generation: generation)
         }
-    }
-
-    /// How many queued requests there are up to and including the given one, 0
-    /// when it is not queued any more.
-    private static func queuedCount(upTo request: String, in queue: [String]) -> Int {
-        guard let index = queue.lastIndex(of: request) else { return 0 }
-        return index + 1
     }
 
     /// Main queue only. Checks every `queueCheckInterval` whether the requests
@@ -552,7 +484,7 @@ final class ContentModule: ModuleBase {
             return
         }
 
-        let remaining = Self.queuedCount(upTo: lastQueued, in: core.requestQueueStore.snapshot)
+        let remaining = ContentTriggerRules.queuedCount(upTo: lastQueued, in: core.requestQueueStore.snapshot)
         guard remaining > 0 else {
             contentTriggerChain &+= 1
             requestTriggeredContent(chain: contentTriggerChain, attempt: 1)
@@ -600,7 +532,6 @@ final class ContentModule: ModuleBase {
         logD("requestTriggeredContent", "content request is sent, attempt: [\(attempt)], maxAttempts: [\(Self.contentRequests)]")
         fetchContents(contentID: nil) { [weak self] in
             guard let self, attempt < Self.contentRequests else { return }
-            _ = self
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.contentRetryInterval) { [weak self] in
                 self?.requestTriggeredContent(chain: chain, attempt: attempt + 1)
             }
