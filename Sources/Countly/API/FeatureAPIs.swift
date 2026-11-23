@@ -30,7 +30,7 @@ public final class CrashesAPI: CountlyAPIBase {
                                 segmentation: [String: Any]? = nil) {
         guard let core = core() else { return }
         core.healthTracker.recordUsage(.crashes, "record")
-        core.modules.crashes.recordException(exception, isFatal: isFatal, stackTrace: stackTrace, segmentation: segmentation)
+        core.modules.crashes.recordException(exception, isFatal: isFatal, stackTrace: Self.framesToReport(stackTrace ?? exception.callStackSymbols), segmentation: segmentation)
     }
 
     /// Records a Swift error.
@@ -41,7 +41,7 @@ public final class CrashesAPI: CountlyAPIBase {
                             segmentation: [String: Any]? = nil) {
         guard let core = core() else { return }
         core.healthTracker.recordUsage(.crashes, "record")
-        core.modules.crashes.recordError(error, isFatal: isFatal, stackTrace: stackTrace, segmentation: segmentation)
+        core.modules.crashes.recordError(error, isFatal: isFatal, stackTrace: Self.framesToReport(stackTrace), segmentation: segmentation)
     }
 
     /// Records an error described by a name.
@@ -51,7 +51,7 @@ public final class CrashesAPI: CountlyAPIBase {
                             segmentation: [String: Any]? = nil) {
         guard let core = core() else { return }
         core.healthTracker.recordUsage(.crashes, "record")
-        core.modules.crashes.recordError(errorName, isFatal: isFatal, stackTrace: stackTrace, segmentation: segmentation)
+        core.modules.crashes.recordError(errorName, isFatal: isFatal, stackTrace: Self.framesToReport(stackTrace), segmentation: segmentation)
     }
 
     /// Records a breadcrumb, reported with the next crash.
@@ -71,6 +71,22 @@ public final class CrashesAPI: CountlyAPIBase {
     /// Replaces the segmentation merged into every crash report.
     public func setCrashSegmentation(_ segmentation: [String: Any]) {
         core()?.modules.crashes.setCrashSegmentation(segmentation)
+    }
+
+    /// The frames a report carries: `given` when it has any, otherwise the stack of
+    /// the application's call. Must be called directly from the public method the
+    /// application called, never from a closure or another function: the first two
+    /// frames, this function and that method, are left out, as is the method's
+    /// `@objc` thunk on a call from Objective-C when the binary still names it.
+    @inline(never)
+    private static func framesToReport(_ given: [String]?) -> [String] {
+        if let given, !given.isEmpty { return given }
+        var frames = Thread.callStackSymbols.dropFirst(2)
+        // The thunk of a CrashesAPI method is named $s7Countly10CrashesAPIC...FTo.
+        if let first = frames.first, first.contains(" $s7Countly10CrashesAPIC"), first.contains("FTo + ") {
+            frames.removeFirst()
+        }
+        return Array(frames)
     }
 }
 

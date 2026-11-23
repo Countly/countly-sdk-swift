@@ -199,35 +199,27 @@ final class CrashModule: ModuleBase {
 
     /// Records an exception, fatal or handled.
     ///
-    /// An exception that was never raised has no call stack of its own, so the
-    /// stack of the call that records it is used, and the report always has a
-    /// trace for `_error`.
+    /// - Parameter stackTrace: the frames to report, as `CrashesAPI` resolved them.
     func recordException(_ exception: NSException,
                          isFatal: Bool,
-                         stackTrace: [String]?,
+                         stackTrace: [String],
                          segmentation: [String: Any]?) {
-        logI("recordException", "exception recording requested, exceptionName: [\(exception.name.rawValue)], isFatal: [\(isFatal)], stackTraceFrameCount: [\(stackTrace?.count ?? 0)], segmentationKeyCount: [\(segmentation?.count ?? 0)]")
+        logI("recordException", "exception recording requested, exceptionName: [\(exception.name.rawValue)], isFatal: [\(isFatal)], stackTraceFrameCount: [\(stackTrace.count)], segmentationKeyCount: [\(segmentation?.count ?? 0)]")
         if let segmentation, !segmentation.isEmpty {
             logD("recordException", "exception recording segmentation keys, keys: [\(segmentation.keys.sorted().joined(separator: ", "))]")
         }
-        logV("recordException", "exception recording detail, exception: [\(exception)], stackTrace: [\(stackTrace ?? [])], segmentation: [\(segmentation ?? [:])]")
+        logV("recordException", "exception recording detail, exception: [\(exception)], segmentation: [\(segmentation ?? [:])]")
 
         guard core.modules.consent.hasConsent(for: .crashReporting) else {
             logV("recordException", "no crashes consent given, exception is not recorded")
             return
         }
 
-        var frames = stackTrace ?? exception.callStackSymbols
-        if frames.isEmpty {
-            frames = Thread.callStackSymbols
-        }
-        logD("recordException", "stack trace resolved for the exception, suppliedByCaller: [\(stackTrace != nil)], frameCount: [\(frames.count)]")
-
         let overrides = limits.sanitized(segmentation, "Exception segmentation")
 
         handle(name: exception.name.rawValue,
                description: exception.reason ?? exception.name.rawValue,
-               stackTrace: frames,
+               stackTrace: stackTrace,
                userInfo: exception.userInfo as? [String: Any] ?? [:],
                segmentationOverride: overrides,
                isFatal: isFatal,
@@ -241,10 +233,10 @@ final class CrashModule: ModuleBase {
     func recordError(_ errorName: String,
                      typeName: String = "Swift Error",
                      isFatal: Bool,
-                     stackTrace: [String]?,
+                     stackTrace: [String],
                      segmentation: [String: Any]?) {
-        logI("recordError", "error recording requested, errorNameLength: [\(errorName.count)], typeName: [\(typeName)], isFatal: [\(isFatal)], stackTraceFrameCount: [\(stackTrace?.count ?? 0)], segmentationKeyCount: [\(segmentation?.count ?? 0)]")
-        logV("recordError", "error recording detail, errorName: [\(errorName)], stackTrace: [\(stackTrace ?? [])], segmentation: [\(segmentation ?? [:])]")
+        logI("recordError", "error recording requested, errorNameLength: [\(errorName.count)], typeName: [\(typeName)], isFatal: [\(isFatal)], stackTraceFrameCount: [\(stackTrace.count)], segmentationKeyCount: [\(segmentation?.count ?? 0)]")
+        logV("recordError", "error recording detail, errorName: [\(errorName)], segmentation: [\(segmentation ?? [:])]")
 
         let exception = NSException(name: NSExceptionName(typeName), reason: errorName, userInfo: nil)
         recordException(exception, isFatal: isFatal, stackTrace: stackTrace, segmentation: segmentation)
@@ -252,7 +244,7 @@ final class CrashModule: ModuleBase {
 
     /// Records a Swift error: its description as the name and its type as the
     /// crash type.
-    func recordError(_ error: Error, isFatal: Bool, stackTrace: [String]?, segmentation: [String: Any]?) {
+    func recordError(_ error: Error, isFatal: Bool, stackTrace: [String], segmentation: [String: Any]?) {
         recordError(String(describing: error),
                     typeName: Self.typeName(of: error),
                     isFatal: isFatal,
