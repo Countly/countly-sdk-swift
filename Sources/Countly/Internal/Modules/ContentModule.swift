@@ -64,9 +64,6 @@ final class ContentModule: ModuleBase {
     /// Set from the moment the zone is entered, before the polling timer exists.
     private var isZoneEntered = false
 
-    /// Set while a journey trigger's retry series is running, so a second trigger
-    /// arriving during it does not start a series of its own. Cleared when a
-    /// content is shown or the attempts run out.
     // Guarded by stateLock: wanted after an enter, until an exit; exited after an exit, until an enter.
     private var isZoneWanted = false
     private var isZoneExited = false

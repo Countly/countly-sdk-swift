@@ -362,6 +362,7 @@ final class StorageAndConfigTests: CountlyBaseTestCase {
         original.content.contentURLHandler = { _ in true }
         original.content.allowedLinkSchemes = ["myapp"]
         original.content.showWidgetsWithinApp = true
+        original.content.disableAutoContentTriggers = true
         original.experimental.enablePreviousNameRecording = true
         original.experimental.enableVisibilityTracking = true
 
@@ -370,7 +371,7 @@ final class StorageAndConfigTests: CountlyBaseTestCase {
         XCTAssertEqual(Mirror(reflecting: original).children.count, 68)
         XCTAssertEqual(Mirror(reflecting: original.sdkInternalLimits).children.count, 7)
         XCTAssertEqual(Mirror(reflecting: original.crashes).children.count, 1)
-        XCTAssertEqual(Mirror(reflecting: original.content).children.count, 11)
+        XCTAssertEqual(Mirror(reflecting: original.content).children.count, 12)
         XCTAssertEqual(Mirror(reflecting: original.experimental).children.count, 2)
 
         assertSameValues(original, copy)

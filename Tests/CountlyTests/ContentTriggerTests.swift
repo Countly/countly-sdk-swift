@@ -54,11 +54,13 @@ final class ContentTriggerTests: CountlyBaseTestCase {
         }
     }
 
-    /// Enters the content zone and waits for its own first fetch, so the counts a
-    /// test compares are the trigger's alone.
+    /// Enters the content zone and waits for its own first fetch, which a new
+    /// instance holds back by the content initial delay, so the counts a test
+    /// compares are the trigger's alone.
     private func enterZoneAndSettle(_ countly: CountlyInstance) -> Int {
         countly.content.enterContentZone()
-        TestUtils.pump(1.0)
+        TestUtils.waitUntil("the content zone's own first fetch goes out") { self.contentRequestCount >= 1 }
+        TestUtils.pump(0.5)
         return contentRequestCount
     }
 
