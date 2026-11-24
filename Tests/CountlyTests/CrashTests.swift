@@ -51,6 +51,34 @@ final class CrashTests: CountlyBaseTestCase {
         MockURLProtocol.requests.filter { $0.query.contains("crash=") }.count
     }
 
+    /// An instance that keeps stack trace lines whole, so a reported frame can be
+    /// compared with the same frame read by the test.
+    private func startInstanceKeepingWholeFrames() -> CountlyInstance {
+        startInstance { $0.sdkInternalLimits.maxStackTraceLineLength = 1_000 }
+    }
+
+    /// A backtrace line without its frame number, address and offset: the image and
+    /// the function, which every call from one function shares.
+    private func function(of frame: String) -> String {
+        frame.replacingOccurrences(of: #"^\d+\s+|0x[0-9a-fA-F]+ | \+ \d+$"#, with: "", options: .regularExpression)
+    }
+
+    /// Asserts that a report's stack trace is the stack of the call that recorded
+    /// it: the test's own frame first, then its callers, and no frame of the SDK's.
+    ///
+    /// - Parameter callerStack: `Thread.callStackSymbols` read by the test right
+    ///   before it recorded the error, so its first frame is the test itself.
+    private func assertStartsAtTheCaller(_ crash: [String: Any]?,
+                                         callerStack: [String],
+                                         file: StaticString = #filePath,
+                                         line: UInt = #line) {
+        let reported = (crash?["_error"] as? String ?? "").components(separatedBy: "\n")
+        XCTAssertEqual(reported.map(function(of:)),
+                       callerStack.prefix(reported.count).map(function(of:)),
+                       file: file,
+                       line: line)
+    }
+
     // MARK: - Durability
 
     /// A crash the SDK detects itself is written to disk before the handler
@@ -707,15 +735,67 @@ final class CrashTests: CountlyBaseTestCase {
         XCTAssertEqual(trace.count, 20_000)
     }
 
-    /// An error recorded without a stack trace of its own still gets one, the
-    /// stack of the call that recorded it: `_error` is the field the server cannot
-    /// do without.
-    func testAHandledErrorWithoutAStackTraceStillCarriesOne() {
-        let countly = startInstance()
+    /// An error recorded without a stack trace of its own still gets one, since
+    /// `_error` is the field the server cannot do without: the stack of the call that
+    /// recorded it, starting at the application's frame rather than the SDK's own, so
+    /// the crash location and its grouping point at the application's code.
+    func testAnErrorRecordedWithoutAStackTraceIsSentStartingAtTheCallThatRecordedIt() throws {
+        try skipUnlessNetworkIsInterceptable()
+        MockURLProtocol.respondToEverything(json: #"{"result":"Success"}"#)
+        let countly = startInstanceKeepingWholeFrames()
 
+        let callerStack = Thread.callStackSymbols
         countly.crashes.recordError("No trace given")
 
-        XCTAssertFalse((lastCrash(of: countly)?["_error"] as? String ?? "").isEmpty)
+        TestUtils.waitUntil("the crash report is sent") { self.sentCrashCount == 1 }
+        let sent = MockURLProtocol.requests.first { $0.query.contains("crash=") }
+        XCTAssertEqual(sent?.path, "/i")
+        assertStartsAtTheCaller(sent.flatMap { TestUtils.parseQuery($0.query)["crash"] as? [String: Any] },
+                                callerStack: callerStack)
+    }
+
+    /// A Swift error carries no stack of its own, so it gets the stack of the call.
+    func testASwiftErrorRecordedWithoutAStackTraceStartsAtTheCallThatRecordedIt() {
+        let countly = startInstanceKeepingWholeFrames()
+
+        let callerStack = Thread.callStackSymbols
+        countly.crashes.recordError(SampleError.diskFull)
+
+        assertStartsAtTheCaller(lastCrash(of: countly), callerStack: callerStack)
+    }
+
+    /// An exception that was never raised has no stack of its own either.
+    func testAnExceptionThatWasNeverRaisedStartsAtTheCallThatRecordedIt() {
+        let countly = startInstanceKeepingWholeFrames()
+
+        let callerStack = Thread.callStackSymbols
+        countly.crashes.recordException(NSException(name: .genericException, reason: "Never raised", userInfo: nil))
+
+        assertStartsAtTheCaller(lastCrash(of: countly), callerStack: callerStack)
+    }
+
+    /// An empty stack trace gives the server nothing to show, so it is treated as
+    /// none.
+    func testAnEmptyStackTraceIsReplacedByTheStackOfTheCall() {
+        let countly = startInstanceKeepingWholeFrames()
+
+        let callerStack = Thread.callStackSymbols
+        countly.crashes.recordError("Empty trace given", isFatal: false, stackTrace: [])
+
+        assertStartsAtTheCaller(lastCrash(of: countly), callerStack: callerStack)
+    }
+
+    /// Only the stack the SDK reads itself loses its first frames. A stack trace
+    /// the application gives is sent as it is, even when it starts at the SDK's
+    /// Objective-C entry.
+    func testAGivenStackTraceIsSentAsItIsEvenWhenItStartsInTheSDK() {
+        let countly = startInstanceKeepingWholeFrames()
+        let given = ["0   MyApp 0x0000000100000001 $s7Countly10CrashesAPIC11recordError_7isFatal10stackTrace12segmentationySS_SbSaySSGSgSDySSypGSgtFTo + 4",
+                     "1   MyApp 0x0000000100000002 main + 8"]
+
+        countly.crashes.recordError("Given trace", isFatal: false, stackTrace: given)
+
+        XCTAssertEqual(lastCrash(of: countly)?["_error"] as? String, given.joined(separator: "\n"))
     }
 
     /// A report says which view was on screen, by name and by the ID the view's
