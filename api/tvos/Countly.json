@@ -14847,6 +14847,83 @@
             ]
           },
           {
+            "kind": "Var",
+            "name": "disableAutoContentTriggers",
+            "printedName": "disableAutoContentTriggers",
+            "children": [
+              {
+                "kind": "TypeNominal",
+                "name": "Bool",
+                "printedName": "Swift.Bool",
+                "usr": "s:Sb"
+              }
+            ],
+            "declKind": "Var",
+            "usr": "c:@M@Countly@objc(cs)CountlyContentConfig(py)disableAutoContentTriggers",
+            "mangledName": "$s7Countly0A13ContentConfigC011disableAutoB8TriggersSbvp",
+            "moduleName": "Countly",
+            "declAttributes": [
+              "HasInitialValue",
+              "Final",
+              "HasStorage",
+              "ObjC"
+            ],
+            "hasStorage": true,
+            "accessors": [
+              {
+                "kind": "Accessor",
+                "name": "Get",
+                "printedName": "Get()",
+                "children": [
+                  {
+                    "kind": "TypeNominal",
+                    "name": "Bool",
+                    "printedName": "Swift.Bool",
+                    "usr": "s:Sb"
+                  }
+                ],
+                "declKind": "Accessor",
+                "usr": "c:@M@Countly@objc(cs)CountlyContentConfig(im)disableAutoContentTriggers",
+                "mangledName": "$s7Countly0A13ContentConfigC011disableAutoB8TriggersSbvg",
+                "moduleName": "Countly",
+                "implicit": true,
+                "declAttributes": [
+                  "Final",
+                  "ObjC"
+                ],
+                "accessorKind": "get"
+              },
+              {
+                "kind": "Accessor",
+                "name": "Set",
+                "printedName": "Set()",
+                "children": [
+                  {
+                    "kind": "TypeNominal",
+                    "name": "Void",
+                    "printedName": "()"
+                  },
+                  {
+                    "kind": "TypeNominal",
+                    "name": "Bool",
+                    "printedName": "Swift.Bool",
+                    "usr": "s:Sb"
+                  }
+                ],
+                "declKind": "Accessor",
+                "usr": "c:@M@Countly@objc(cs)CountlyContentConfig(im)setDisableAutoContentTriggers:",
+                "mangledName": "$s7Countly0A13ContentConfigC011disableAutoB8TriggersSbvs",
+                "moduleName": "Countly",
+                "implicit": true,
+                "declAttributes": [
+                  "Final",
+                  "ObjC"
+                ],
+                "accessorKind": "set"
+              }
+            ]
+          },
+          {
             "kind": "Constructor",
             "name": "init",
             "printedName": "init()",

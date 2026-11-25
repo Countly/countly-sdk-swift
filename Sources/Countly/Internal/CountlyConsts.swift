@@ -102,6 +102,24 @@ enum Endpoint {
 ///
 /// Each one is gated on the consent of the feature that owns it rather than on
 /// event consent, which is why they are listed together.
+/// Keys the content triggers (`jt`) use for what the SDK records besides events.
+enum ContentTriggerKey {
+    static let session = "[CLY]_session"
+    static let userProperties = "[CLY]_property_update"
+    static let crash = "[CLY]_crash"
+    static let consent = "[CLY]_consent"
+}
+
+/// The content triggers (`jt`) of a behavior settings answer.
+struct ContentTriggerLists {
+    /// Event keys, and the keys of what the SDK records besides events.
+    let keys: Set<String>
+    /// View names.
+    let views: Set<String>
+    /// User properties: a user detail ("email"), or "custom." and a custom property key.
+    let properties: Set<String>
+}
+
 enum ReservedEventKey {
     static let orientation = "[CLY]_orientation"
     static let view = "[CLY]_view"
@@ -225,6 +243,7 @@ enum PersistencyKey {
     static let isCustomDeviceID = "kCountlyIsCustomDeviceIDKey"
     static let remoteConfig = "kCountlyRemoteConfigKey"
     static let serverConfig = "kCountlyServerConfigPersistencyKey"
+    static let contentTriggerGaps = "kCountlyContentTriggerGapsPersistencyKey"
     static let recordedEvents = "kCountlyRecordedEventsPersistencyKey"
     static let preTemporaryDeviceID = "kCountlyPreTemporaryDeviceIDKey"
     static let preTemporaryIsCustomDeviceID = "kCountlyPreTemporaryIsCustomDeviceIDKey"

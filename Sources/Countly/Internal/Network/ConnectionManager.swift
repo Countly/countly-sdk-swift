@@ -1231,6 +1231,11 @@ extension ConnectionManager: HealthCheckTransport, ServerConfigTransport {
         if core.config.enableRequestCompression {
             queryString += "&\(Self.gzipKey)=1"
         }
+        #if os(iOS) || os(visionOS) || os(macOS)
+        if !core.config.content.disableAutoContentTriggers, !core.config.disableWebView {
+            queryString += "&\(ServerConfig.contentTriggersRequestKey)=1"
+        }
+        #endif
         queryString = builder.finishImmediateRequest(queryString)
         let requestedHost = core.config.normalizedHost
 

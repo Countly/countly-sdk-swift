@@ -203,6 +203,14 @@ final class ServerConfigBuilder {
     @discardableResult
     func journeyTriggerViews(_ names: [String]) -> Self { set("jtv", names) }
 
+    /// The content triggers (`jt`), a sibling of `c`: event keys (`e`), view names
+    /// (`v`) and user properties (`p`).
+    @discardableResult
+    func contentTriggers(_ lists: [String: [String]]) -> Self {
+        topLevel["jt"] = lists
+        return self
+    }
+
     /// A key the SDK does not know, for asserting that unknown keys are pruned
     /// rather than carried into the cache.
     @discardableResult

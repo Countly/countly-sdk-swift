@@ -382,9 +382,15 @@ final class EventsModule: ModuleBase {
             if sendsAtOnce {
                 logD("record", "the reserved event is sent right away rather than with the next batch, key: [\(key)]")
             }
-            enqueue(event,
-                    callback: journeyTriggerCallbackForReserved(key: key, segmentation: event.segmentation),
-                    sendsAtOnce: sendsAtOnce)
+            enqueue(event, callback: nil, sendsAtOnce: sendsAtOnce)
+            if key == ReservedEventKey.view {
+                // the view name is matched as the application passed it, before the key length limit cut it
+                if let viewName = core.modules.views.viewNameAsGiven(forViewID: event.id) ?? event.segmentation?[SegKey.name] as? String {
+                    core.modules.content.contentTriggerRecorded(.init(key: key, viewName: viewName, viewEnd: event.segmentation?[SegKey.visit] == nil))
+                }
+            } else {
+                core.modules.content.contentTriggerRecorded(.init(key: key))
+            }
             return
         }
 
@@ -408,13 +414,10 @@ final class EventsModule: ModuleBase {
 
         logD("record", "the event is chained to the previous non reserved event, key: [\(truncatedKey)], eventID: [\(event.id)], previousEventID: [\(event.previousEventID ?? "")]")
 
-        let isJourneyTrigger = core.serverConfig.isJourneyTriggerEvent(truncatedKey)
-        if isJourneyTrigger {
-            logD("record", "the event key is a journey trigger, the batch will be sent immediately, key: [\(truncatedKey)]")
-        }
-
-        enqueue(event, callback: isJourneyTrigger ? journeyTriggerCallback() : nil, sendsAtOnce: false)
+        enqueue(event, callback: nil, sendsAtOnce: false)
         eventLock.unlock()
+
+        core.modules.content.contentTriggerRecorded(.init(key: key, customEvent: true))
     }
 
     /// Adds the SDK owned segmentation keys.
@@ -435,35 +438,6 @@ final class EventsModule: ModuleBase {
         }
 
         return segmentation.isEmpty ? nil : segmentation
-    }
-
-    /// A view event whose name is a journey trigger flushes like a trigger event.
-    ///
-    /// The name is matched as sent, after truncation and filtering, so what the
-    /// server configured and what it receives are compared on the same value.
-    private func journeyTriggerCallbackForReserved(key: String, segmentation: [String: Any]?) -> RequestCallback? {
-        guard key == ReservedEventKey.view,
-              let viewName = segmentation?[SegKey.name] as? String,
-              core.serverConfig.isJourneyTriggerView(viewName) else { return nil }
-        logD("journeyTriggerCallbackForReserved", "the view name is a journey trigger, the batch will be sent immediately, viewName: [\(viewName)]")
-        return journeyTriggerCallback()
-    }
-
-    /// Recording with a callback force-flushes the batch, and refreshing content
-    /// once the server has it is what makes a journey react to the trigger.
-    private func journeyTriggerCallback() -> RequestCallback {
-        { [weak self] _, success in
-            guard success else { return }
-            // `weak` on the hop as well as on the callback, which is not belt and
-            // braces. Binding `self` in the outer closure and hopping would capture
-            // it strongly, keeping this module alive on the main queue while the
-            // `SDKCore` that owns it is released by a halt. `core` is `unowned`, so
-            // the block would then read a deallocated object and trap, taking the
-            // host application down from a request that had already been answered.
-            DispatchQueue.main.async { [weak self] in
-                self?.core.modules.content.refreshContentZoneForJourneyTrigger()
-            }
-        }
     }
 
     // MARK: - Queueing
