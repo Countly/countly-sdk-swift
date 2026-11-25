@@ -8,6 +8,7 @@
 
 * Mitigated an issue where a journey trigger event or view whose key or name is longer than the key length limit never matched, because the SDK compared it after cutting it to the limit.
 * Mitigated an issue where the SDK had no privacy manifest, so App Store Connect refused an app that did not itself declare the SDK's use of user defaults, disk space and system boot time. The new manifest also declares the crash, performance, device ID and diagnostic data the SDK collects.
+* Fixed the stack trace of an error recorded with "recordError" or "recordException" without one. It now starts at the call that recorded the error instead of inside the SDK, so the crash location is the application's code. Such errors can be grouped anew after the update.
 
 ## 26.8.0
 
